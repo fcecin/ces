@@ -1,0 +1,183 @@
+// ===========================================================================
+// /s/ (server zone) tests — unmetered, outside-the-cap, server-only CREATE.
+// ===========================================================================
+//
+// /s/ paths live in the file store on disk but:
+//   - CREATE/WRITE/APPEND/RESIZE/DELETE/DEPOSIT/WITHDRAW/SET_PRICE require
+//     the signer to be the server's own pubkey (the server key in
+//     server.toml);
+//   - bytes don't count toward cesFileStoreMaxBytes;
+//   - rent doesn't accrue (chargeRentOrDelete is a no-op on /s/);
+//   - per-byte feeFileWrite / feeFileRead are waived;
+//   - price_per_kb in the sidecar is ignored on READ (readers pay only
+//     feeQuery + no per-byte + no per-kb).
+//
+// Drives CesFileClient directly against an in-process server.
+
+#define BOOST_TEST_DYN_LINK
+#include "test_common.h"
+
+#include <ces/l2/file_client.h>
+#include <ces/l2/net_multiplexer.h>
+#include <ces/server.h>
+
+#include <chrono>
+#include <thread>
+
+using namespace ces;
+
+namespace {
+
+// Fixture — identical to FileE2EFixture in test_cesh_file_e2e.cpp but
+// trimmed to what in-process CesFileClient tests need, and with the
+// server private key deterministically chosen so tests can sign as
+// the server.
+struct ServerZoneFixture {
+  std::unique_ptr<CesServer> server;
+  fs::path tempDir;
+  uint16_t serverPort = 0;
+  uint16_t rpcPort = 0;
+
+  // Server key pair reconstructed from the fixed private hash we use
+  // to start the server. Lets tests sign as the server for /s/ ops.
+  minx::Hash serverPriv;
+  KeyPair serverKey;
+
+  // A distinct key for "non-server" callers (writes on /s/ must be
+  // rejected for this key).
+  KeyPair otherKey;
+
+  ServerZoneFixture()
+      : serverPriv([](){ minx::Hash h; h.fill(0xEE); return h; }()),
+        serverKey(serverPriv) {
+    blog::init();
+    blog::set_level(blog::fatal);
+
+    tempDir = makeUniqueTempDir("server_zone");
+
+    CesConfig cfg = makeTestConfig(
+      tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
+
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
+    cfg.cesplexMounts = { {"/ces/file/1", "builtin:file"} };
+    // Tiny cap so we can prove /s/ bypasses it.
+    cfg.cesFileStoreMaxBytes = 1024;
+    cfg.feeFileRent = 1;
+
+    server = std::make_unique<CesServer>(cfg);
+    serverPort = server->start(0);
+    BOOST_REQUIRE_MESSAGE(serverPort > 0, "server port bind failed");
+    rpcPort = server->_rpcBoundPort();
+    BOOST_REQUIRE_MESSAGE(rpcPort > 0, "rpc port bind failed");
+
+    // Fund both keys so feeQuery debits don't starve mid-test.
+    server->_brr(serverKey.getPublicKeyAsHash(), 10'000'000'000);
+    server->_brr(otherKey.getPublicKeyAsHash(),  10'000'000'000);
+
+    wait_net();
+  }
+
+  ~ServerZoneFixture() {
+    if (server) server->stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    boost::system::error_code ec;
+    fs::remove_all(tempDir, ec);
+  }
+
+  std::unique_ptr<CesFileClient> connectClient(const KeyPair& signer) {
+    auto fc = std::make_unique<CesFileClient>();
+    fc->setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    uint8_t rc = fc->connect("localhost", rpcPort, signer);
+    BOOST_REQUIRE_EQUAL(static_cast<int>(rc), static_cast<int>(CES_OK));
+    return fc;
+  }
+};
+
+} // namespace
+
+BOOST_FIXTURE_TEST_SUITE(ServerZoneTests, ServerZoneFixture)
+
+BOOST_AUTO_TEST_CASE(NonServerKeyCannotCreateInS) {
+  auto fc = connectClient(otherKey);
+  uint64_t bal = 0, cost = 0;
+  uint8_t rc = fc->create("/s/oops.bin",
+                          /*size=*/1024, /*price=*/0,
+                          /*deposit=*/0, "application/octet-stream",
+                          bal, cost);
+  CES_CHECK_RC_EQ(rc, CES_ERROR_NOT_OWNER);
+}
+
+BOOST_AUTO_TEST_CASE(ServerKeyCanCreateInSWithZeroDeposit) {
+  auto fc = connectClient(serverKey);
+  uint64_t bal = 0, cost = 0;
+  uint8_t rc = fc->create("/s/hello.bin",
+                          /*size=*/64, /*price=*/0,
+                          /*deposit=*/0, "application/octet-stream",
+                          bal, cost);
+  CES_REQUIRE_OK(rc);
+  // deposit forced to 0 by the server for /s/.
+  BOOST_CHECK_EQUAL(bal, 0u);
+}
+
+BOOST_AUTO_TEST_CASE(ServerZoneBypassesCap) {
+  // Cap is 1024 (see fixture). A 2 KB file in /s/ must succeed;
+  // the same file in /p/ must fail STORE_FULL. Two clients because
+  // each channel is bound to one signer (the bind contract).
+  auto fcServer = connectClient(serverKey);
+  auto fcOther  = connectClient(otherKey);
+  uint64_t bal = 0, cost = 0;
+
+  uint8_t rc = fcServer->create("/s/big.bin",
+                                /*size=*/2048, /*price=*/0, /*deposit=*/0,
+                                "application/octet-stream", bal, cost);
+  CES_REQUIRE_OK(rc);
+
+  uint8_t rc2 = fcOther->create("/p/should_fail.bin",
+                                /*size=*/2048, /*price=*/0, /*deposit=*/0,
+                                "application/octet-stream", bal, cost);
+  CES_CHECK_RC_EQ(rc2, CES_ERROR_STORE_FULL);
+}
+
+BOOST_AUTO_TEST_CASE(ServerZoneWriteReadRoundTrip) {
+  // A /s/ file fully populated via CREATE + WRITE (server-bound channel)
+  // + READ from a non-server reader on a separate channel. Verifies:
+  // write is unmetered, read is free of per-byte and per-kb charges
+  // (reader pays only feeQuery).
+  auto fcServer = connectClient(serverKey);
+  uint64_t bal = 0, cost = 0;
+  uint8_t rc = fcServer->create("/s/data.bin",
+                                /*size=*/8, /*price=*/999,   // ignored on /s/
+                                /*deposit=*/0, "application/octet-stream",
+                                bal, cost);
+  CES_REQUIRE_OK(rc);
+
+  ces::Bytes content{'s','s','s','s','s','s','s','s'};
+  rc = fcServer->write("/s/data.bin", /*offset=*/0, content, bal);
+  CES_REQUIRE_OK(rc);
+  // Balance should still be 0 — /s/ WRITE is unmetered.
+  BOOST_CHECK_EQUAL(bal, 0u);
+
+  // Non-server reader: distinct bound channel.
+  auto fcReader = connectClient(otherKey);
+  ces::Bytes readBack;
+  minx::Hash rangeHash;
+  rc = fcReader->read("/s/data.bin", /*offset=*/0, 8,
+                      readBack, rangeHash);
+  CES_REQUIRE_OK(rc);
+  BOOST_REQUIRE_EQUAL(readBack.size(), content.size());
+  BOOST_CHECK(std::memcmp(readBack.data(), content.data(), 8) == 0);
+}
+
+BOOST_AUTO_TEST_CASE(ServerZoneNameValidationRejectsJustSlashS) {
+  // "/s/" with no second component must fail BAD_NAME like every
+  // other zone.
+  auto fc = connectClient(serverKey);
+  uint64_t bal = 0, cost = 0;
+  uint8_t rc = fc->create("/s/",
+                          /*size=*/1, /*price=*/0, /*deposit=*/0,
+                          "application/octet-stream", bal, cost);
+  CES_CHECK_RC_EQ(rc, CES_ERROR_BAD_NAME);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

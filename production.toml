@@ -1,0 +1,71 @@
+# AI GENERATED — Claude Opus 4.6 (claude-opus-4-6, 1M context), Anthropic
+#
+# CES Production Server Configuration
+#
+# Generate a fresh server key before deploying:
+#   ces --genkeypair
+#
+# Then start:
+#   ces --config production.toml
+
+log_level = "info"
+data_dir = "./data"
+port = 53830
+
+# Server key: generate with ces --genkeypair, set here or pass via -k flag
+# server_key = "your_64_char_hex_key_here"
+
+# Public address for peer discovery. Set to your server's hostname or IP.
+# server_name = "ces.example.com:53830"
+
+# Mining difficulty. Higher = scarcer credits, more CPU per solution.
+# 10 = laptop mines in seconds (dev). 15-20 = minutes (production).
+min_difficulty = 15
+
+# Accept PoW after this many seconds from startup. Gives the RandomX
+# dataset time to initialize before accepting solutions.
+pow_delay = 120
+
+spend_slot_size = 3600
+
+# RandomX mode. Full dataset uses ~2.5 GB RAM but verifies faster.
+# Cache-only uses ~256 MB but is slower. Use full on 8+ GB servers.
+no_pow_engine = false
+cache_only_pow = false
+
+threads = 4
+
+# Account/asset capacity. Each account = 64 bytes, each asset = 256 bytes.
+# 1M accounts = ~64 MB. 10M = ~640 MB.
+min_accounts = 131072
+max_accounts = 1048576
+min_assets = 131072
+max_assets = 1048576
+
+# Flush every 10K units of value change (batches I/O).
+flush_value = 10000
+
+# Auto-snapshot when event log exceeds this size.
+# On a VPS with 50 GB disk, keep this conservative.
+max_log_size_gb = 2
+
+# Fees (internal units). 100,000,000 = 1 whole credit.
+# These prevent spam and give credits economic meaning.
+fee_account = 6400000
+fee_asset = 38400000
+fee_tx = 320000
+fee_query = 80000
+
+# Admin console (Unix domain socket). Uncomment to enable.
+# Connect with: socat READLINE UNIX-CONNECT:./admin.sock
+admin_socket = "./admin.sock"
+
+# Peering (optional). Set peer_target > 0 and add peers to enable
+# inter-server transfers. The server mines PoW on each peer to build
+# bilateral credit reserves for settlement.
+peer_target = 0
+settlement_max_retries = 7
+
+# [[peers]]
+# key = "peer_server_public_key_hex"
+# address = "peer.example.com:53830"

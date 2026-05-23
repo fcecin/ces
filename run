@@ -1,0 +1,57 @@
+#!/bin/bash
+
+# Core script to find and run a binary from CMake build directories.
+# Usage: ./run <binary_name> [binary_arguments...]
+
+# Define the base directory where the build directories are located
+BUILD_DIR="./build"
+
+# Define the build configurations in order of priority for execution
+BUILD_CONFIGS=(
+    "debug"
+    "relwithdebinfo"
+    "release"
+    "minsizerel"
+)
+
+# Check if the binary name is provided
+if [ -z "$1" ]; then
+    echo "run: finds and runs given binary in:"
+    for config in "${BUILD_CONFIGS[@]}"; do
+        echo "     ${BUILD_DIR}/${config}/<binary>" >&2
+    done
+    echo "" >&2
+    echo "Usage: $0 <binary> [binary_arguments...]" >&2
+    exit 1
+fi
+
+BINARY_NAME="$1"
+shift # Remove the binary name, keeping only the arguments for the executable
+
+# Iterate through the priority order to find the executable
+EXECUTABLE_PATH=""
+EXECUTABLE_CONFIG=""
+for config in "${BUILD_CONFIGS[@]}"; do
+    # Construct the full path
+    current_path="${BUILD_DIR}/${config}/${BINARY_NAME}"
+
+    # Check if the file exists and is executable
+    if [ -x "${current_path}" ]; then
+        EXECUTABLE_PATH="${current_path}"
+        EXECUTABLE_CONFIG="${config}"
+        break # Found it, stop searching
+    fi
+done
+
+# Check if an executable was found
+if [ -z "${EXECUTABLE_PATH}" ]; then
+    echo "ERROR: run: Could not find '${BINARY_NAME}' in '${BUILD_DIR}'" >&2
+    exit 1
+fi
+
+# Print the found path and execute
+#echo "run: ${EXECUTABLE_CONFIG} ${BINARY_NAME}"
+
+# Execute the binary, passing all arguments ($@) to it
+# 'exec' replaces the current shell process with the binary, so no child process remains.
+exec "${EXECUTABLE_PATH}" "$@"

@@ -1,0 +1,13 @@
+#!/bin/bash
+# Start CES server on port 53831 (internal) and cesproxy on 53830 (public).
+# Clients connecting to localhost:53830 will auto-detect TCP (proxy mode).
+
+./run ces -p 53831 "$@" &
+CES_PID=$!
+echo "ces started on port 53831 (pid $CES_PID)"
+
+sleep 3
+
+./run cesproxy localhost 53831 -p 53830 &
+PROXY_PID=$!
+echo "cesproxy started on port 53830 -> localhost:53831 (pid $PROXY_PID)"

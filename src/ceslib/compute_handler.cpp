@@ -1,0 +1,2229 @@
+// compute_handler.cpp - builtin:compute CesPlex handler.
+//
+// See the header for the bind-prereq list.
+//
+// One child process per running instance (default cesluajitd, a sandboxed
+// LuaJIT VM; cescompmockd is the no-Lua test stub), connected via a named
+// Unix domain socket. The supervisor ticks periodically, samples the child's
+// /proc CPU + RSS, debits slot/cpu/rss/bucket fees from the source file's
+// file_balance via fileHandlerDebitBalance, and SIGKILLs the instance when a
+// debit would delete the source file. A 15-minute upfront slot+rss fee is
+// debited at LAUNCH to prevent create-and-abandon on the scheduler.
+//
+// Verbs (wire format mirrors builtin:file — preamble-first, signed
+// envelope binding to sha256(verb || preamble), server-signed
+// response):
+//   0x01 LAUNCH  (owner): u16 path_len, path
+//     resp: u64 instance_id, u64 started_at_us
+//   0x02 KILL    (owner): u64 instance_id
+//     resp: (empty)
+//   0x03 LIST    (any):   (no preamble beyond reqNonce)
+//     resp: u32 count, [u64 id, u16 path_len, path,
+//                       u64 started_at_us, u64 file_balance,
+//                       u32 cpu_bp, u64 rss_bytes]*
+//   0x05 INSTANCES (any): u16 path_len, path
+//     reply: u32 count, [u64 id]*count
+//   0x04 STAT    (owner): u8 kind (0 = path, 1 = id),
+//                         [u16 path_len, path | u64 instance_id]
+//     resp: u64 instance_id (0 = not running), u64 started_at_us,
+//           u64 file_balance, u32 cpu_bp, u64 rss_bytes,
+//           u16 path_len, path
+//
+// The wire helpers, ReqCtx, response envelope, and read-verb loop are
+// duplicated from file_handler.cpp.
+
+#include <ces/l2/net_multiplexer.h>
+#include <ces/l2/compute_handler.h>
+#include <ces/l2/file_handler.h>
+#include <ces/buffer.h>
+#include <ces/ramfilestore.h>
+#include <ces/keys.h>
+#include <ces/server.h>
+#include <ces/types.h>
+
+#include <minx/blog.h>
+#include <minx/bucketcache.h>
+
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/local/stream_protocol.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/write.hpp>
+
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/un.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
+
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <set>
+#include <span>
+#include <sstream>
+#include <string>
+#include <vector>
+
+LOG_MODULE("plex");
+
+namespace ces {
+
+namespace {
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kVerbLaunch    = 0x01;
+constexpr uint8_t kVerbKill      = 0x02;
+constexpr uint8_t kVerbList      = 0x03;
+constexpr uint8_t kVerbStat      = 0x04;
+constexpr uint8_t kVerbInstances = 0x05;
+
+constexpr uint16_t kMaxNameLen = 512;   // matches file handler
+constexpr uint16_t kAppPayloadMax = 1024;
+
+// Supervisor cadence is taken from cfg.computeTickIntervalMs (60 s
+// default in production). One tick does procfs sampling + slot-fee
+// debit through the source file's sidecar — each of those is
+// measurable in microseconds per instance, so 60 s gives us decent
+// eviction responsiveness with near-zero steady-state overhead.
+// Tests override the cadence down to 1 s so CPU/RSS assertions
+// don't need a full-minute wait.
+
+// LAUNCH-time burn against create-and-abandon churn. At LAUNCH the
+// source file_balance is debited feeComputeSlotSec × kUpfrontSeconds
+// — a commitment fee, not a runtime credit. Billing starts at
+// t=0 as usual.
+constexpr uint64_t kUpfrontSeconds = 15 * 60;
+
+// Socket-accept timeout for the cesluad-style handshake (ms). If the
+// child fails to connect back within this window we SIGKILL it and
+// return CES_ERROR_INTERNAL.
+constexpr int kAcceptTimeoutMs = 2000;
+
+// IPC tags (mirror cesluajitd/main.cpp).
+constexpr uint8_t kIpcTagBootstrap = 0x00;
+constexpr uint8_t kIpcTagDeliver   = 0x01;
+constexpr uint8_t kIpcTagApiCall   = 0x02;
+constexpr uint8_t kIpcTagApiReply  = 0x03;
+// /ces/lua/1 connection routing tags. Server↔child for forwarding
+// bytes between Lua programs and external users.
+constexpr uint8_t kIpcTagConnOpened   = 0x04;  // server → child
+constexpr uint8_t kIpcTagConnDataIn   = 0x05;  // server → child
+constexpr uint8_t kIpcTagConnClosed   = 0x06;  // server → child
+constexpr uint8_t kIpcTagConnDataOut  = 0x07;  // child → server
+constexpr uint8_t kIpcTagConnClose    = 0x08;  // child → server
+constexpr uint8_t kIpcTagListenOn     = 0x09;  // child → server
+constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
+
+constexpr uint16_t kApiMethodClientSend = 0x0001;
+constexpr uint16_t kApiMethodFileCreate   = 0x0100;
+constexpr uint16_t kApiMethodFileWrite    = 0x0101;
+constexpr uint16_t kApiMethodFileRead     = 0x0102;
+constexpr uint16_t kApiMethodFileStat     = 0x0103;
+constexpr uint16_t kApiMethodFileDeposit  = 0x0104;
+constexpr uint16_t kApiMethodFileWithdraw = 0x0105;
+constexpr uint16_t kApiMethodFileSetPrice = 0x0106;
+constexpr uint16_t kApiMethodFileDelete   = 0x0107;
+constexpr uint16_t kApiMethodFileAppend   = 0x0108;
+constexpr uint16_t kApiMethodFileResize   = 0x0109;
+// Ledger / RNG bindings exposed to the Lua sandbox:
+//   TRANSFER     — program-initiated transfer from owner's account.
+//                  /s/ programs see the server's account, which is
+//                  bottomless by boot top-up.
+//   RANDOM_BYTES — crypto-grade RNG, n ≤ 256.
+//   ACCOUNT_READ — unsigned account query, no fee.
+constexpr uint16_t kApiMethodTransfer     = 0x0200;
+constexpr uint16_t kApiMethodRandomBytes  = 0x0202;
+constexpr uint16_t kApiMethodAccountRead  = 0x0203;
+// Per-instance rotating bucket cache (minx::BucketCache wrapper):
+//   BUCKET_NEW — allocate a bucket with TTL + size cap; returns u32 id
+//   BUCKET_PUT — set k → v in the bucket
+//   BUCKET_GET — read v for k, or "missing" status
+// Used by Lua programs that need replay-protection tables with
+// guaranteed forgetting (e.g. dice.lua's per-user last-consumed
+// transfer time). Charging not yet wired — TODO before scale.
+constexpr uint16_t kApiMethodBucketNew    = 0x0210;
+constexpr uint16_t kApiMethodBucketPut    = 0x0211;
+constexpr uint16_t kApiMethodBucketGet    = 0x0212;
+
+// ces.authentic_asset_create(asset_id, recipient_pubkey, payload, days).
+// Mints an IMMUTABLE asset whose first 32 bytes are the program's
+// identity hash sha256(source_file_bytes || source_file_path), looked
+// up from the source file's sidecar (computed lazily on first call,
+// cached until the file is content-modified). User payload occupies
+// the remaining 178 bytes of asset content. The new asset is owned
+// by `recipient_pubkey` (may differ from the program's owner — the
+// typical case is "program mints loot to a player"). Asset rent is
+// paid by the program's owner account.
+constexpr uint16_t kApiMethodAuthenticAssetCreate = 0x0220;
+
+// File-verb codes mirror file_handler.cpp. Exposed to
+// fileHandlerExec via FileExecReq.verb.
+constexpr uint8_t kFileVerbCreate   = 0x01;
+constexpr uint8_t kFileVerbWrite    = 0x02;
+constexpr uint8_t kFileVerbRead     = 0x03;
+constexpr uint8_t kFileVerbStat     = 0x04;
+constexpr uint8_t kFileVerbDeposit  = 0x05;
+constexpr uint8_t kFileVerbWithdraw = 0x06;
+constexpr uint8_t kFileVerbSetPrice = 0x07;
+constexpr uint8_t kFileVerbDelete   = 0x08;
+constexpr uint8_t kFileVerbAppend   = 0x09;
+constexpr uint8_t kFileVerbResize   = 0x0a;
+
+constexpr uint8_t kApiStatusOk            = 0x00;
+constexpr uint8_t kApiStatusNotConnected  = 0x01;
+constexpr uint8_t kApiStatusInsufficient  = 0x02;
+constexpr uint8_t kApiStatusInternal      = 0xFF;
+
+constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
+
+} // namespace
+// Forward decls into the lua handler — defined in compute_lua_handler.cpp.
+// The compute supervisor calls these when CONN_DATA_OUT / CONN_CLOSE
+// frames arrive from the child, and when an instance is dying (so the
+// lua handler can tear down all its routed connections before the
+// Instance is dropped).
+void luaHandlerHandleConnDataOut(uint64_t instId, uint64_t connId,
+                                  const uint8_t* data, size_t len);
+void luaHandlerHandleConnClose(uint64_t instId, uint64_t connId);
+void luaHandlerOnInstanceDying(uint64_t instId);
+namespace {
+
+// ---------------------------------------------------------------------------
+// Wire helpers (duplicated from file_handler.cpp)
+// ---------------------------------------------------------------------------
+
+// All BE serialization goes through ces::Buffer (see ces/buffer.h).
+
+// ---------------------------------------------------------------------------
+// Global handler state — accessed only from rpcTaskIO_ (the CesPlex /
+// handler strand). APPLICATION messages posted from taskIO_ hop onto
+// rpcTaskIO_ before touching any of this.
+// ---------------------------------------------------------------------------
+
+std::atomic<CesServer*> gServer{nullptr};
+
+using UnixSocket = boost::asio::local::stream_protocol::socket;
+
+struct Instance : std::enable_shared_from_this<Instance> {
+  uint64_t id = 0;
+  std::string sourceName;
+  std::array<uint8_t, 32> ownerPk{};
+  // Program account pubkey from the source file's sidecar. All-zero
+  // means "legacy file, no program account" — Lua API origin falls
+  // back to ownerPk in that case.
+  std::array<uint8_t, 32> programPubkey{};
+  std::array<uint8_t, 8> progPrefix{};  // first 8B of sha256(sourceName)
+  pid_t pid = -1;
+  uint64_t startedAtUs = 0;
+  uint64_t lastTickUs = 0;              // supervisor's last-charged wall time
+  uint64_t upfrontDeposit = 0;
+  // CPU + RSS monitoring. Sampled each supervisor tick from
+  // /proc/<pid>/stat + /proc/<pid>/statm. CPU is in basis points of
+  // one core: 10000 = 100% of a single CPU; sustained ≥10000 on a
+  // multi-core box means this (single-threaded Lua) child is fully
+  // saturating its core. cpuBasisPoints reflects usage between the
+  // last two samples, not cumulative since launch.
+  uint64_t lastCpuTicks = 0;            // utime+stime at last sample (clock ticks)
+  uint64_t lastSampleUs = 0;            // wall-clock at last sample
+  uint32_t cpuBasisPoints = 0;          // 0..10000, of one core
+  uint64_t rssBytes = 0;                // resident pages × page size, last sample
+  int listenFd = -1;                    // host's side of the per-inst socket
+  std::string socketPath;
+  // Async-I/O endpoint to the child. Wraps the accepted fd as an
+  // asio::local::stream_protocol::socket. All reads and writes run
+  // on rpcTaskIO_.
+  std::shared_ptr<UnixSocket> peer;
+  // Outbound frame queue. Kept serial: when empty and caller wants
+  // to write, we start async_write of the new head; completion pops
+  // head and, if the queue is non-empty, starts the next write.
+  // Lets bootstrap + deliver + api-reply interleave safely from
+  // different call sites without torn frames.
+  std::deque<std::shared_ptr<ces::Bytes>> outbox;
+  bool writing = false;
+  // Inbound-frame read state.
+  std::array<uint8_t, 4> rxLenBuf{};
+  ces::Bytes rxBodyBuf;
+
+  // /ces/lua/1 connection state. The accept gate (default closed) is
+  // flipped by the child via TAG_LISTEN_ON / TAG_LISTEN_OFF. The
+  // routing table for active connections is owned by the lua handler
+  // (compute_lua_handler.cpp), keyed by (instId, connId); the
+  // supervisor calls into it via forward-declared dispatchers when
+  // CONN_DATA_OUT / CONN_CLOSE frames arrive from the child.
+  bool acceptsConnections = false;
+  uint64_t nextConnId = 1;
+
+  // Per-instance rotating bucket caches, surfaced to Lua as
+  // ces.bucket_new(ttl_secs, max_entries, max_entry_bytes).
+  // Caches die with the instance — the bucket map clears when the
+  // Instance is destroyed. BucketCache itself is thread-safe
+  // (internal mutex), so reads/writes from the rpcTaskIO_ strand
+  // are fine without extra locks.
+  //
+  // committedBytes is the worst-case footprint pre-declared at
+  // bucket_new time: max_entries × max_entry_bytes. It's what the
+  // supervisor bills against, so the program pays a predictable
+  // capacity rent regardless of actual fill. Per-entry size is
+  // capped at put time against max_entry_bytes (key + value sum).
+  struct LuaBucket {
+    std::shared_ptr<BucketCache<std::string, std::string>> cache;
+    uint32_t maxEntries = 0;
+    uint32_t maxEntryBytes = 0;     // klen + vlen cap per entry
+    uint64_t committedBytes = 0;    // maxEntries × maxEntryBytes
+  };
+  std::map<uint32_t, LuaBucket> buckets;
+  uint32_t nextBucketId = 1;
+};
+
+// Instance registry. Keyed by instance_id (the only identity). The
+// path → ids and prefix → ids indexes are multi-valued: a source path
+// may have N concurrent instances (one cesh compute launch ⇒ one new
+// id), and prog_pfx is content-addressed from the path so all sibling
+// instances on this server share it. APPLICATION routing broadcasts
+// to every matching instance; file-deletion kills every matching
+// instance.
+std::map<uint64_t, std::shared_ptr<Instance>> gInstances;
+std::map<std::array<uint8_t, 8>, std::set<uint64_t>> gByPrefix;
+std::map<std::string, std::set<uint64_t>> gByName;
+uint64_t gNextInstanceId = 1;
+
+// Supervisor tick timer. Lives on rpcTaskIO_'s strand.
+std::shared_ptr<boost::asio::steady_timer> gTickTimer;
+std::atomic<bool> gTickRunning{false};
+
+// True iff we've registered our deletion callback with the file
+// handler. Registration is one-shot per process — fileHandler has no
+// unregister. Repeat binds reuse the same callback, which reads
+// gServer atomically.
+std::atomic<bool> gDeletionCallbackInstalled{false};
+
+// ---------------------------------------------------------------------------
+// Unix socket / process helpers
+// ---------------------------------------------------------------------------
+
+std::filesystem::path resolveWorkDir(const CesConfig& cfg) {
+  if (!cfg.cesComputeWorkDir.empty()) return cfg.cesComputeWorkDir;
+  return std::filesystem::path(cfg.dataDir.string()) / "cescompute";
+}
+
+std::filesystem::path instanceSocketPath(const CesConfig& cfg, uint64_t id) {
+  return resolveWorkDir(cfg) / (std::to_string(id) + ".sock");
+}
+
+// Compute 8B prefix = first 8 bytes of sha256(name).
+std::array<uint8_t, 8> progPrefixOf(const std::string& name) {
+  minx::Hash h = ces::sha256(
+    reinterpret_cast<const uint8_t*>(name.data()), name.size());
+  std::array<uint8_t, 8> pf{};
+  std::memcpy(pf.data(), h.data(), 8);
+  return pf;
+}
+
+// Create + bind + listen on a Unix socket at `path`. Returns fd or
+// -errno.
+int createListenSocket(const std::string& path) {
+  // Clean up any stale socket file; we own this path.
+  std::error_code ec;
+  std::filesystem::remove(path, ec);
+
+  int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) return -errno;
+  sockaddr_un a{};
+  a.sun_family = AF_UNIX;
+  if (path.size() >= sizeof(a.sun_path)) { ::close(fd); return -ENAMETOOLONG; }
+  std::memcpy(a.sun_path, path.data(), path.size());
+  if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) < 0) {
+    int e = errno; ::close(fd); return -e;
+  }
+  if (::listen(fd, 1) < 0) {
+    int e = errno; ::close(fd); return -e;
+  }
+  return fd;
+}
+
+// Accept one connection on `listenFd`, with a poll-based timeout.
+// Returns the accepted fd on success, or -errno / -ETIMEDOUT.
+int acceptWithTimeout(int listenFd, int timeoutMs) {
+  pollfd pfd{};
+  pfd.fd = listenFd;
+  pfd.events = POLLIN;
+  int pr = ::poll(&pfd, 1, timeoutMs);
+  if (pr < 0) return -errno;
+  if (pr == 0) return -ETIMEDOUT;
+  int fd = ::accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
+  if (fd < 0) return -errno;
+  return fd;
+}
+
+// fork+exec the configured child binary. argv[1] is the IPC socket
+// path; argv[2] (optional) is the non-root user to drop to if the
+// server is running as root. Returns pid > 0 on success, -errno
+// on failure.
+pid_t spawnChild(const std::string& binary,
+                 const std::string& sockPath,
+                 const std::string& dropUser) {
+  pid_t pid = ::fork();
+  if (pid < 0) return -errno;
+  if (pid == 0) {
+    // Child. Close stdin; leave stdout/stderr for the runtime's
+    // panic messages (which should only ever fire on host bugs).
+    ::close(STDIN_FILENO);
+    const char* arg0 = binary.c_str();
+    const char* arg1 = sockPath.c_str();
+    if (!dropUser.empty()) {
+      const char* arg2 = dropUser.c_str();
+      ::execlp(arg0, arg0, arg1, arg2, nullptr);
+    } else {
+      ::execlp(arg0, arg0, arg1, nullptr);
+    }
+    std::_Exit(127);
+  }
+  return pid;
+}
+
+// SIGKILL + reap the pid. Best-effort — returns true on success, but
+// callers shouldn't branch on it: a reaped child is a reaped child.
+bool killAndReap(pid_t pid) {
+  if (pid <= 0) return true;
+  ::kill(pid, SIGKILL);
+  // Non-blocking reap loop. The child is dead or dying; WNOHANG
+  // shouldn't wait, but run a short retry in case of SIGKILL delivery
+  // latency.
+  for (int i = 0; i < 50; ++i) {
+    int status = 0;
+    pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid || r < 0) return true;
+    // Not reaped yet.
+    ::usleep(1000);
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
+// CPU + RSS sampling from /proc
+// ---------------------------------------------------------------------------
+//
+// /proc/<pid>/stat — many space-separated fields; field 2 is the comm
+//   in parens and may itself contain spaces/parens. Safe parse: split
+//   AFTER the last ')'. utime (field 14) and stime (field 15) become
+//   the 12th + 13th tokens of that tail.
+// /proc/<pid>/statm — 7 space-separated page counts; field 2 is
+//   "resident" (the RSS in pages).
+
+struct ProcSample {
+  uint64_t ticks = 0;   // utime + stime, in clock ticks
+  uint64_t rssBytes = 0;
+};
+
+bool readProcSample(pid_t pid, ProcSample& out) {
+  {
+    std::string path = "/proc/" + std::to_string(pid) + "/stat";
+    std::ifstream f(path);
+    if (!f) return false;
+    std::string line;
+    if (!std::getline(f, line)) return false;
+    auto rp = line.rfind(')');
+    if (rp == std::string::npos || rp + 2 >= line.size()) return false;
+    std::istringstream ss(line.substr(rp + 2));
+    std::vector<std::string> toks;
+    std::string t;
+    while (ss >> t) toks.push_back(t);
+    // Indices 11 + 12 correspond to utime (14th field) + stime (15th field).
+    if (toks.size() < 13) return false;
+    uint64_t utime = 0, stime = 0;
+    try {
+      utime = std::stoull(toks[11]);
+      stime = std::stoull(toks[12]);
+    } catch (...) {
+      return false;
+    }
+    out.ticks = utime + stime;
+  }
+  {
+    std::string path = "/proc/" + std::to_string(pid) + "/statm";
+    std::ifstream f(path);
+    if (!f) return false;
+    uint64_t sizePages = 0, residentPages = 0;
+    if (!(f >> sizePages >> residentPages)) return false;
+    long ps = ::sysconf(_SC_PAGESIZE);
+    if (ps <= 0) ps = 4096;
+    out.rssBytes = residentPages * static_cast<uint64_t>(ps);
+  }
+  return true;
+}
+
+// Sample the instance's process and refresh cpuBasisPoints + rssBytes.
+// Stale state is kept on failure (process may have gone; the zombie
+// reap path is responsible for teardown). CPU basis points are the
+// mean over the interval since last sample — so a busy-loop Lua will
+// pin at ~10000 (= 100% of one core).
+void sampleInstanceProc(Instance& inst, uint64_t nowUs) {
+  if (inst.pid <= 0) return;
+  ProcSample s;
+  if (!readProcSample(inst.pid, s)) return;
+  uint64_t deltaUs = (nowUs > inst.lastSampleUs)
+    ? (nowUs - inst.lastSampleUs) : 0;
+  uint64_t deltaTicks = (s.ticks >= inst.lastCpuTicks)
+    ? (s.ticks - inst.lastCpuTicks) : 0;
+  long tps = ::sysconf(_SC_CLK_TCK);
+  if (tps <= 0) tps = 100;
+  uint32_t bp = 0;
+  if (deltaUs > 0) {
+    // bp = deltaTicks * 10000 * 1e6 / (tps * deltaUs)
+    // 128-bit to dodge overflow on longer intervals.
+    __uint128_t num =
+      static_cast<__uint128_t>(deltaTicks) * 10000ull * 1'000'000ull;
+    __uint128_t den =
+      static_cast<__uint128_t>(tps) * deltaUs;
+    __uint128_t q = (den > 0) ? (num / den) : 0;
+    uint64_t bp64 = (q > 1000000) ? 1000000 : static_cast<uint64_t>(q);
+    if (bp64 > 10000) bp64 = 10000;
+    bp = static_cast<uint32_t>(bp64);
+  }
+  inst.cpuBasisPoints = bp;
+  inst.rssBytes = s.rssBytes;
+  inst.lastCpuTicks = s.ticks;
+  inst.lastSampleUs = nowUs;
+}
+
+// Tear down per-instance resources (sockets, socket file). Does not
+// manipulate gInstances / gByPrefix / gByName — caller handles the
+// registry.
+void teardownInstance(Instance& inst) {
+  if (inst.peer) {
+    boost::system::error_code ec;
+    inst.peer->close(ec);
+    inst.peer.reset();
+  }
+  if (inst.listenFd >= 0) { ::close(inst.listenFd); inst.listenFd = -1; }
+  if (!inst.socketPath.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(inst.socketPath, ec);
+  }
+}
+
+// Kill an instance by id, remove from registries, clean up resources.
+// No fee refund on kill: the upfront slot-fee paid for a commitment the
+// host already honored by running.
+void killInstanceById(uint64_t id) {
+  auto it = gInstances.find(id);
+  if (it == gInstances.end()) return;
+  auto inst = it->second;
+  // Tear down any /ces/lua/1 connections routed to this instance
+  // before we drop the registry entry, so the lua handler can
+  // still find it (and so the bytes-and-onClosed cascade fires
+  // while the supervisor is still in a coherent state).
+  luaHandlerOnInstanceDying(id);
+  killAndReap(inst->pid);
+  teardownInstance(*inst);
+  gInstances.erase(it);
+  if (auto pit = gByPrefix.find(inst->progPrefix); pit != gByPrefix.end()) {
+    pit->second.erase(id);
+    if (pit->second.empty()) gByPrefix.erase(pit);
+  }
+  if (auto nit = gByName.find(inst->sourceName); nit != gByName.end()) {
+    nit->second.erase(id);
+    if (nit->second.empty()) gByName.erase(nit);
+  }
+  LOGDEBUG << "builtin:compute instance terminated"
+           << VAR(id) << SVAR(inst->sourceName);
+}
+
+// ---------------------------------------------------------------------------
+// IPC framing helpers (host ↔ cesluajitd)
+// ---------------------------------------------------------------------------
+//
+// Frame layout (both directions):
+//   [u32 BE length][u8 tag][u16 BE corr_id][body]
+//
+// `length` covers tag + corr_id + body. Frames that arrive with a
+// malformed length or that miss the pipe cause the instance to be
+// killed — we treat IPC errors as terminal.
+
+// Forward decls for the async reader + dispatcher.
+void startIpcReader(std::shared_ptr<Instance> inst);
+void handleChildFrame(std::shared_ptr<Instance> inst);
+void handleChildApiCall(std::shared_ptr<Instance> inst,
+                        uint16_t corr_id,
+                        const uint8_t* body, size_t bodyLen);
+
+// Build a framed outbound message. Caller fills tag, corr_id, body
+// bytes; this returns the full wire packet with the length prefix.
+std::shared_ptr<ces::Bytes> makeFrame(
+    uint8_t tag, uint16_t corr_id,
+    const uint8_t* body, size_t body_len) {
+  uint32_t len = static_cast<uint32_t>(3 + body_len);
+  ces::Buffer buf(4 + len);
+  buf.put<uint32_t>(len)
+     .put<uint8_t>(tag)
+     .put<uint16_t>(corr_id);
+  if (body_len > 0) {
+    buf.putBytes(std::span<const uint8_t>(body, body_len));
+  }
+  return std::make_shared<ces::Bytes>(std::move(buf).take());
+}
+
+// Forward decl: after a write completes, this tries to kick the
+// next one if the outbox has more.
+void kickOutboundIfIdle(std::shared_ptr<Instance> inst);
+
+// Enqueue a pre-framed packet for async_write. If the outbox was
+// idle, kicks off the next write.
+void enqueueOutbound(std::shared_ptr<Instance> inst,
+                     std::shared_ptr<ces::Bytes> frame) {
+  if (!inst->peer) return;
+  inst->outbox.push_back(std::move(frame));
+  kickOutboundIfIdle(inst);
+}
+
+void kickOutboundIfIdle(std::shared_ptr<Instance> inst) {
+  if (!inst->peer) return;
+  if (inst->writing) return;
+  if (inst->outbox.empty()) return;
+  inst->writing = true;
+  auto head = inst->outbox.front();
+  boost::asio::async_write(
+    *inst->peer, boost::asio::buffer(*head),
+    [inst, head](const boost::system::error_code& ec, std::size_t) {
+      inst->writing = false;
+      if (!inst->outbox.empty()) inst->outbox.pop_front();
+      if (ec) {
+        LOGDEBUG << "builtin:compute ipc write failed"
+                 << VAR(inst->id) << SVAR(ec.message());
+        killInstanceById(inst->id);
+        return;
+      }
+      kickOutboundIfIdle(inst);
+    });
+}
+
+// Send a TAG_DELIVER frame to the child.
+// Body = [8B sender_pfx][payload bytes].
+void sendDeliverFrame(std::shared_ptr<Instance> inst,
+                      const std::array<uint8_t, 8>& senderPfx,
+                      const uint8_t* payload, size_t payloadLen) {
+  ces::Bytes body;
+  body.reserve(8 + payloadLen);
+  body.insert(body.end(), senderPfx.begin(), senderPfx.end());
+  if (payloadLen > 0)
+    body.insert(body.end(), payload, payload + payloadLen);
+  enqueueOutbound(inst, makeFrame(kIpcTagDeliver, 0,
+                                  body.data(), body.size()));
+}
+
+// Send a TAG_API_REPLY frame to the child. Reply body is a 1-byte
+// status code optionally followed by a method-specific payload.
+void sendApiReply(std::shared_ptr<Instance> inst,
+                  uint16_t corr_id, uint8_t status) {
+  uint8_t body = status;
+  enqueueOutbound(inst, makeFrame(kIpcTagApiReply, corr_id, &body, 1));
+}
+
+void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
+                          uint16_t corr_id, uint8_t status,
+                          const ces::Bytes& tail) {
+  ces::Bytes body;
+  body.reserve(1 + tail.size());
+  body.push_back(status);
+  body.insert(body.end(), tail.begin(), tail.end());
+  enqueueOutbound(inst,
+    makeFrame(kIpcTagApiReply, corr_id, body.data(), body.size()));
+}
+
+// Send the bootstrap frame at LAUNCH time. Body layout:
+//   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
+//   [8B start_time_us BE][u32 BE src_len][src bytes]
+// - prog_prefix: first 8B of sha256(source path); used as the
+//   "prog_pfx" field on outbound CES_APP_COMPUTE_MSG packets so the
+//   remote CES client can demux by program.
+// - owner_pubkey: full 32B pubkey of the source file's owner.
+//   Programs surface it via ces.owner_pubkey().
+// - program_pubkey: full 32B pubkey of the file's dedicated program
+//   account — the pool ces.transfer spends from. Programs surface it
+//   via ces.program_pubkey() and advertise it as their receive address
+//   (e.g. a game's "house"), so deposits and payouts share one pool.
+//   All-zero for a legacy file with no program account; the child then
+//   falls back to owner_pubkey, matching ces.transfer's own fallback.
+// - start_time_us: this instance's birth wall-clock micros (same
+//   value as inst->startedAtUs). Programs use it as a freshness
+//   anchor for replay protection — a payment whose lastXferTime is
+//   ≤ this couldn't have been intended for this program-instance.
+void sendBootstrapFrame(std::shared_ptr<Instance> inst,
+                        const uint8_t* src, size_t srcLen) {
+  ces::Bytes body;
+  body.reserve(8 + 32 + 32 + 8 + 4 + srcLen);
+  body.insert(body.end(),
+              inst->progPrefix.begin(), inst->progPrefix.end());
+  body.insert(body.end(),
+              inst->ownerPk.begin(), inst->ownerPk.end());
+  body.insert(body.end(),
+              inst->programPubkey.begin(), inst->programPubkey.end());
+  ces::Buffer::put<uint64_t>(body, inst->startedAtUs);
+  ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(srcLen));
+  if (srcLen > 0)
+    body.insert(body.end(), src, src + srcLen);
+  enqueueOutbound(inst, makeFrame(kIpcTagBootstrap, 0,
+                                  body.data(), body.size()));
+}
+
+// Async-read one frame from the child. On success, dispatches and
+// re-arms itself for the next frame.
+void startIpcReader(std::shared_ptr<Instance> inst) {
+  if (!inst->peer) return;
+  boost::asio::async_read(
+    *inst->peer, boost::asio::buffer(inst->rxLenBuf),
+    [inst](const boost::system::error_code& ec, std::size_t) {
+      if (ec) {
+        // Child closed its end. Reap and clean up.
+        killInstanceById(inst->id);
+        return;
+      }
+      uint32_t len = ces::Buffer::peek<uint32_t>(inst->rxLenBuf.data());
+      if (len < 3 || len > kIpcMaxFrameLen) {
+        LOGDEBUG << "builtin:compute ipc bad frame len"
+                 << VAR(inst->id) << VAR(len);
+        killInstanceById(inst->id);
+        return;
+      }
+      inst->rxBodyBuf.assign(len, 0);
+      boost::asio::async_read(
+        *inst->peer, boost::asio::buffer(inst->rxBodyBuf),
+        [inst](const boost::system::error_code& ec2, std::size_t) {
+          if (ec2) {
+            killInstanceById(inst->id);
+            return;
+          }
+          handleChildFrame(inst);
+          if (gInstances.count(inst->id))
+            startIpcReader(inst);
+        });
+    });
+}
+
+// (Cross-handler dispatchers for the lua handler are forward-declared
+// at the top of this file, near the IPC tag constants, so they're
+// visible to both handleChildFrame and killInstanceById.)
+
+void handleChildFrame(std::shared_ptr<Instance> inst) {
+  const auto& body = inst->rxBodyBuf;
+  if (body.size() < 3) return;
+  uint8_t tag = body[0];
+  uint16_t corr = ces::Buffer::peek<uint16_t>(body.data() + 1);
+  // /ces/lua/1 routing tags. Don't carry corr_id semantics — corr
+  // is reserved zero by the child.
+  if (tag == kIpcTagListenOn || tag == kIpcTagListenOff) {
+    inst->acceptsConnections = (tag == kIpcTagListenOn);
+    LOGDEBUG << "builtin:compute listener gate"
+             << VAR(inst->id) << VAR(inst->acceptsConnections);
+    return;
+  }
+  if (tag == kIpcTagConnDataOut) {
+    // Body after tag/corr: [u64 conn_id][u32 BE len][len bytes]
+    if (body.size() < 3 + 8 + 4) return;
+    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + 3);
+    uint32_t dlen  = ces::Buffer::peek<uint32_t>(body.data() + 11);
+    if (body.size() < 3 + 8 + 4 + dlen) return;
+    luaHandlerHandleConnDataOut(inst->id, connId,
+                                 body.data() + 15, dlen);
+    return;
+  }
+  if (tag == kIpcTagConnClose) {
+    if (body.size() < 3 + 8) return;
+    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + 3);
+    luaHandlerHandleConnClose(inst->id, connId);
+    return;
+  }
+  if (tag != kIpcTagApiCall) {
+    // Child is only supposed to send API_CALL or one of the lua
+    // routing tags above. Anything else is a protocol error.
+    LOGDEBUG << "builtin:compute unexpected child tag"
+             << VAR(inst->id) << VAR(int(tag));
+    killInstanceById(inst->id);
+    return;
+  }
+  if (body.size() < 5) {
+    sendApiReply(inst, corr, kApiStatusInternal);
+    return;
+  }
+  handleChildApiCall(inst, corr, body.data() + 3, body.size() - 3);
+}
+
+void handleChildApiCall(std::shared_ptr<Instance> inst,
+                        uint16_t corr_id,
+                        const uint8_t* args, size_t argsLen) {
+  if (argsLen < 2) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+  uint16_t method = ces::Buffer::peek<uint16_t>(args);
+  const uint8_t* mbody = args + 2;
+  size_t mlen = argsLen - 2;
+  if (method == kApiMethodClientSend) {
+    // Body: [8B target_pfx][u16 BE len][bytes]
+    if (mlen < 8 + 2) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    HashPrefix target{};
+    std::memcpy(target.data(), mbody, 8);
+    uint16_t plen = ces::Buffer::peek<uint16_t>(mbody + 8);
+    if (plen > kAppPayloadMax) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    if (mlen < size_t(8 + 2 + plen)) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    const uint8_t* payload = mbody + 10;
+    // Build the CES_APP_COMPUTE_MSG packet. Wire format (app-data,
+    // after MINX strips its opcode byte):
+    //   [1B flags=0][8B prog_pfx][2B len BE][N payload]
+    minx::Bytes pkt;
+    ces::Buffer::put<uint8_t>(pkt, 0); // flags
+    pkt.insert(pkt.end(),
+               inst->progPrefix.begin(), inst->progPrefix.end());
+    ces::Buffer::put<uint16_t>(pkt, plen);
+    pkt.insert(pkt.end(),
+               reinterpret_cast<const char*>(payload),
+               reinterpret_cast<const char*>(payload) + plen);
+    CesServer* server = gServer.load();
+    bool ok = server && server->send(target, CES_APP_COMPUTE_MSG, pkt);
+    sendApiReply(inst, corr_id,
+                 ok ? kApiStatusOk : kApiStatusNotConnected);
+    return;
+  }
+
+  // ---- ces.transfer(target_pubkey, amount). Origin is the
+  // program's owner. /s/ programs run with owner = server, so this
+  // pulls from the server's bottomless account; /h/ and /f/ programs
+  // pull from their owner's account, exactly as the file verbs do.
+  // Reply: [u8 status][u64 BE new_origin_balance].
+  if (method == kApiMethodTransfer) {
+    if (mlen < 32 + 8) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    minx::Hash dest{};
+    std::memcpy(dest.data(), mbody, 32);
+    uint64_t amount = ces::Buffer::peek<uint64_t>(mbody + 32);
+    CesServer* server = gServer.load();
+    if (!server) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    // Origin = file's program account if migrated, else legacy
+    // owner-account fallback.
+    minx::Hash origin{};
+    bool zero = true;
+    for (auto b : inst->programPubkey) if (b != 0) { zero = false; break; }
+    std::memcpy(origin.data(),
+                zero ? inst->ownerPk.data() : inst->programPubkey.data(),
+                32);
+    auto inst_cap = inst;
+    server->_l2Transfer(origin, dest, amount,
+      [inst_cap, corr_id](uint8_t rc, int64_t newBal) {
+        ces::Bytes tail;
+        ces::Buffer::put<uint64_t>(tail, static_cast<uint64_t>(
+          newBal < 0 ? 0 : newBal));
+        sendApiReplyWithBody(inst_cap, corr_id, rc, tail);
+      },
+      inst->peer->get_executor());
+    return;
+  }
+
+  // ---- ces.random_bytes(n). Pulls n ≤ 256 bytes from the host's
+  // thread-local AutoSeededRandomPool (CryptoPP). Synchronous — no
+  // strand hop.
+  // Reply: [u8 status][n bytes].
+  if (method == kApiMethodRandomBytes) {
+    if (mlen < 2) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint16_t n = ces::Buffer::peek<uint16_t>(mbody);
+    if (n == 0 || n > 256) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    ces::Bytes tail(n);
+    ces::getThreadLocalPRNG().GenerateBlock(
+      reinterpret_cast<CryptoPP::byte*>(tail.data()), n);
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, tail);
+    return;
+  }
+
+  // ---- ces.bucket_new(ttl_secs, max_entries, max_entry_bytes).
+  // Per-instance rotating cache; entries last between ttl_secs and
+  // 2×ttl_secs. Worst-case footprint = max_entries × max_entry_bytes
+  // is what the supervisor bills against (predictable capacity rent),
+  // not actual fill — so a program declares its budget upfront.
+  //   Args: [u32 BE ttl_secs][u32 BE max_entries][u32 BE max_entry_bytes]
+  //   Reply: [u8 status][u32 BE bucket_id]
+  if (method == kApiMethodBucketNew) {
+    if (mlen < 4 + 4 + 4) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint32_t ttl  = ces::Buffer::peek<uint32_t>(mbody);
+    uint32_t maxE = ces::Buffer::peek<uint32_t>(mbody + 4);
+    uint32_t maxB = ces::Buffer::peek<uint32_t>(mbody + 8);
+    if (ttl == 0 || maxE == 0 || maxB == 0 ||
+        maxE > 1'000'000 || maxB > 65'536) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint32_t id = inst->nextBucketId++;
+    Instance::LuaBucket lb;
+    lb.cache = std::make_shared<BucketCache<std::string, std::string>>(
+      maxE, static_cast<int64_t>(ttl));
+    lb.maxEntries = maxE;
+    lb.maxEntryBytes = maxB;
+    lb.committedBytes =
+      static_cast<uint64_t>(maxE) * static_cast<uint64_t>(maxB);
+    inst->buckets[id] = std::move(lb);
+    ces::Bytes tail;
+    ces::Buffer::put<uint32_t>(tail, id);
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, tail);
+    return;
+  }
+
+  // ---- ces.bucket_put(handle, key, value).
+  // klen + vlen must fit in the bucket's declared max_entry_bytes
+  // (the per-entry budget the program committed to at bucket_new).
+  //   Args: [u32 BE bucket_id][u16 BE klen][k][u32 BE vlen][v]
+  //   Reply: [u8 status]
+  if (method == kApiMethodBucketPut) {
+    if (mlen < 4 + 2) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint32_t id = ces::Buffer::peek<uint32_t>(mbody);
+    size_t off = 4;
+    uint16_t klen = ces::Buffer::peek<uint16_t>(mbody + off); off += 2;
+    if (off + klen + 4 > mlen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    std::string key(reinterpret_cast<const char*>(mbody + off), klen);
+    off += klen;
+    uint32_t vlen = ces::Buffer::peek<uint32_t>(mbody + off); off += 4;
+    if (off + vlen > mlen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    auto it = inst->buckets.find(id);
+    if (it == inst->buckets.end()) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    if (klen + vlen > it->second.maxEntryBytes) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    std::string val(reinterpret_cast<const char*>(mbody + off), vlen);
+    it->second.cache->put(key, val);
+    sendApiReply(inst, corr_id, kApiStatusOk);
+    return;
+  }
+
+  // ---- ces.bucket_get(handle, key).
+  //   Args: [u32 BE bucket_id][u16 BE klen][k]
+  //   Reply: [u8 status][u8 found_flag][u32 BE vlen][v]
+  // status is OK whether found or not; the found_flag distinguishes.
+  // Internal status only on malformed args / bad handle.
+  if (method == kApiMethodBucketGet) {
+    if (mlen < 4 + 2) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint32_t id = ces::Buffer::peek<uint32_t>(mbody);
+    size_t off = 4;
+    uint16_t klen = ces::Buffer::peek<uint16_t>(mbody + off); off += 2;
+    if (off + klen > mlen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    std::string key(reinterpret_cast<const char*>(mbody + off), klen);
+    auto it = inst->buckets.find(id);
+    if (it == inst->buckets.end()) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    auto v = it->second.cache->get(key);
+    ces::Bytes tail;
+    if (v.has_value()) {
+      tail.push_back(1);
+      ces::Buffer::put<uint32_t>(tail, static_cast<uint32_t>(v->size()));
+      tail.insert(tail.end(), v->begin(), v->end());
+    } else {
+      tail.push_back(0);
+    }
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, tail);
+    return;
+  }
+
+  // ---- ces.account_read(pubkey). Read-only ledger access. No fee.
+  // Reply: [u8 status][i64 BE balance][u32 BE nonce]
+  //        [8B last_xfer_dest][u64 BE last_xfer_amount]
+  //        [u32 BE last_xfer_time].
+  if (method == kApiMethodAccountRead) {
+    if (mlen < 32) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    minx::Hash key{};
+    std::memcpy(key.data(), mbody, 32);
+    CesServer* server = gServer.load();
+    if (!server) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    auto inst_cap = inst;
+    server->_l2QueryAccount(key,
+      [inst_cap, corr_id](int64_t bal, uint32_t nonce,
+                          HashPrefix lastDest, uint64_t lastAmount,
+                          uint32_t lastTime) {
+        ces::Bytes tail;
+        // Cast int64 → uint64 bit-pattern preserves sign for the
+        // child's 8-byte read. Account balances on the wire are
+        // signed (payment accounts); ces.account_read on the Lua
+        // side returns a Lua number, which is float-double — fine
+        // for everyday balances, may lose precision past 2^53. The
+        // dice game's bet sizes are far below that.
+        ces::Buffer::put<uint64_t>(tail, static_cast<uint64_t>(bal));
+        ces::Buffer::put<uint32_t>(tail, nonce);
+        tail.insert(tail.end(), lastDest.begin(), lastDest.end());
+        ces::Buffer::put<uint64_t>(tail, lastAmount);
+        ces::Buffer::put<uint32_t>(tail, lastTime);
+        sendApiReplyWithBody(inst_cap, corr_id, kApiStatusOk, tail);
+      },
+      inst->peer->get_executor());
+    return;
+  }
+
+  // ---- ces.authentic_asset_create(asset_id, recipient_pubkey,
+  //                                  payload, days).
+  //   Request: [32B asset_id][32B recipient_pubkey][u16 BE days][payload <= 178B]
+  //   Reply:   [u8 status]      (CES_OK or error_code_t)
+  if (method == kApiMethodAuthenticAssetCreate) {
+    constexpr size_t kAuthHeaderLen = 32 + 32 + 2;
+    if (mlen < kAuthHeaderLen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    minx::Hash assetId{};
+    std::memcpy(assetId.data(), mbody, 32);
+    minx::Hash recipient{};
+    std::memcpy(recipient.data(), mbody + 32, 32);
+    uint16_t days = ces::Buffer::peek<uint16_t>(mbody + 64);
+    const uint8_t* payload = mbody + kAuthHeaderLen;
+    size_t payloadLen = mlen - kAuthHeaderLen;
+    if (payloadLen > ces::AUTHENTIC_ASSET_PAYLOAD_SIZE) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+
+    CesServer* server = gServer.load();
+    if (!server) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+
+    // Lookup (or compute on first use) the program-identity hash
+    // from the source file's sidecar. Done synchronously here on
+    // rpcTaskIO_ — it's a single sha256 of a small file (Lua
+    // source). After the first hit it's cached in the sidecar.
+    std::array<uint8_t, ces::AUTHENTIC_ASSET_HASH_SIZE> progHash{};
+    if (!fileHandlerGetProgramHash(inst->sourceName, progHash)) {
+      sendApiReply(inst, corr_id, CES_ERROR_INTERNAL); return;
+    }
+
+    // Pack the variable-length wire payload into a fixed
+    // AuthenticAssetData (zero-padded tail).
+    ces::AuthenticAssetData userPayload{};
+    if (payloadLen > 0)
+      std::memcpy(userPayload.data(), payload, payloadLen);
+
+    // Origin = file's program account if migrated, else legacy
+    // owner-account fallback.
+    minx::Hash origin{};
+    bool ppkZero = true;
+    for (auto b : inst->programPubkey)
+      if (b != 0) { ppkZero = false; break; }
+    std::memcpy(origin.data(),
+                ppkZero ? inst->ownerPk.data() : inst->programPubkey.data(),
+                32);
+    HashPrefix recipientPrefix = ces::Account::getMapKey(recipient);
+
+    auto inst_cap = inst;
+    server->_l2CreateAuthenticAsset(
+      origin, recipientPrefix, assetId, progHash, userPayload, days,
+      [inst_cap, corr_id](uint8_t rc) {
+        sendApiReply(inst_cap, corr_id, rc);
+      },
+      inst->peer->get_executor());
+    return;
+  }
+
+  // ---- File verbs. Reply tail formats are verb-specific (see each
+  // case); reply status is a raw error_code_t (CES_OK = 0x00 on
+  // success; any non-zero is a file-handler error, e.g.
+  // FILE_NOT_FOUND=0x16, NOT_OWNER=0x0a, INSUFFICIENT_BALANCE=0x03,
+  // BAD_NAME=0x18). The Lua side exposes this as the first return
+  // value of ces.file_*.
+
+  // Helper: parse [u16 BE name_len][name] starting at mbody+start.
+  // Returns true with outName populated, false on malformed.
+  auto parseName = [](const uint8_t* mbody, size_t mlen, size_t& off,
+                      std::string& outName) -> bool {
+    if (off + 2 > mlen) return false;
+    uint16_t nl = ces::Buffer::peek<uint16_t>(mbody + off);
+    off += 2;
+    if (nl == 0 || off + nl > mlen) return false;
+    outName.assign(reinterpret_cast<const char*>(mbody + off), nl);
+    off += nl;
+    return true;
+  };
+
+  CesServer* server = gServer.load();
+  if (!server) {
+    sendApiReply(inst, corr_id, kApiStatusInternal); return;
+  }
+  auto cbEx = inst->peer->get_executor();
+
+  FileExecReq req{};
+  req.ownerPubkey = inst->ownerPk;
+  req.sourceName = inst->sourceName;
+
+  size_t off = 0;
+  switch (method) {
+    case kApiMethodFileStat: {
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbStat;
+      break;
+    }
+    case kApiMethodFileRead: {
+      if (mlen < 8 + 4) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.offset = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      req.length = ces::Buffer::peek<uint32_t>(mbody + off); off += 4;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbRead;
+      break;
+    }
+    case kApiMethodFileWrite: {
+      if (mlen < 8) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.offset = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      if (off + 4 > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      uint32_t blen = ces::Buffer::peek<uint32_t>(mbody + off); off += 4;
+      if (off + blen > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.body.assign(mbody + off, mbody + off + blen);
+      off += blen;
+      req.verb = kFileVerbWrite;
+      break;
+    }
+    case kApiMethodFileAppend: {
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      if (off + 4 > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      uint32_t blen = ces::Buffer::peek<uint32_t>(mbody + off); off += 4;
+      if (off + blen > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.body.assign(mbody + off, mbody + off + blen);
+      off += blen;
+      req.verb = kFileVerbAppend;
+      break;
+    }
+    case kApiMethodFileCreate: {
+      if (mlen < 8 + 8 + 8 + 2) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.size           = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      req.pricePerKb     = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      req.initialDeposit = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      uint16_t ctLen = ces::Buffer::peek<uint16_t>(mbody + off); off += 2;
+      if (off + ctLen > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.contentType.assign(
+        reinterpret_cast<const char*>(mbody + off), ctLen);
+      off += ctLen;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbCreate;
+      break;
+    }
+    case kApiMethodFileDeposit:
+    case kApiMethodFileWithdraw: {
+      if (mlen < 8) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.amount = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = (method == kApiMethodFileDeposit)
+        ? kFileVerbDeposit : kFileVerbWithdraw;
+      break;
+    }
+    case kApiMethodFileSetPrice: {
+      if (mlen < 8) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.pricePerKb = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbSetPrice;
+      break;
+    }
+    case kApiMethodFileDelete: {
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbDelete;
+      break;
+    }
+    case kApiMethodFileResize: {
+      if (mlen < 8) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.size = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbResize;
+      break;
+    }
+    default:
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+  }
+
+  // Dispatch to the in-process file primitive. Callback builds the
+  // method-specific reply tail (only on OK) and sends API_REPLY.
+  uint16_t saved_method = method;
+  auto inst_cap = inst;
+  fileHandlerExec(req,
+    [inst_cap, corr_id, saved_method](FileExecResp resp) {
+      if (resp.status != CES_OK) {
+        sendApiReply(inst_cap, corr_id, resp.status);
+        return;
+      }
+      ces::Bytes tail;
+      switch (saved_method) {
+        case kApiMethodFileStat: {
+          tail.insert(tail.end(),
+            resp.ownerPubkey.begin(), resp.ownerPubkey.end());
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          ces::Buffer::put<uint64_t>(tail, resp.pricePerKb);
+          ces::Buffer::put<uint64_t>(tail, resp.size);
+          ces::Buffer::put<uint16_t>(tail,
+            static_cast<uint16_t>(resp.contentType.size()));
+          tail.insert(tail.end(),
+            resp.contentType.begin(), resp.contentType.end());
+          ces::Buffer::put<uint64_t>(tail, resp.createdUs);
+          ces::Buffer::put<uint64_t>(tail, resp.modifiedUs);
+          break;
+        }
+        case kApiMethodFileRead: {
+          ces::Buffer::put<uint32_t>(tail, static_cast<uint32_t>(resp.data.size()));
+          tail.insert(tail.end(), resp.data.begin(), resp.data.end());
+          break;
+        }
+        case kApiMethodFileCreate:
+        case kApiMethodFileWrite:
+        case kApiMethodFileDeposit:
+        case kApiMethodFileWithdraw: {
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          break;
+        }
+        case kApiMethodFileSetPrice: {
+          ces::Buffer::put<uint64_t>(tail, resp.pricePerKb);
+          break;
+        }
+        case kApiMethodFileDelete: {
+          ces::Buffer::put<uint64_t>(tail, resp.refunded);
+          break;
+        }
+        case kApiMethodFileAppend:
+        case kApiMethodFileResize: {
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          ces::Buffer::put<uint64_t>(tail, resp.size);
+          break;
+        }
+        default: break;
+      }
+      sendApiReplyWithBody(inst_cap, corr_id, resp.status, tail);
+    }, cbEx);
+}
+
+// Read the Lua source from disk for a source-file path (e.g.
+// /h/<hex>/echo.lua). Returns empty vector on any failure. The
+// handler is the caller; it already validated that the file exists
+// via fileHandlerReadOwnerAndBalance.
+ces::Bytes readSourceBytes(const CesConfig& cfg,
+                                     const std::string& name) {
+  auto p = std::filesystem::path(cfg.cesFileStoreDir) /
+           name.substr(1);   // name is "/h/..."; drop the leading /
+  std::ifstream f(p, std::ios::binary);
+  if (!f) return {};
+  ces::Bytes out(
+    (std::istreambuf_iterator<char>(f)),
+    std::istreambuf_iterator<char>());
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Response envelope (duplicated from file handler)
+// ---------------------------------------------------------------------------
+
+ces::Bytes buildResponseEnvelope(
+    CesServer* server,
+    uint8_t verb,
+    uint8_t status,
+    std::span<const uint8_t> preamble,
+    uint64_t reqSigHash) {
+  uint64_t timeUs = getMicrosSinceEpoch();
+
+  // Hash input: status || verb || preamble || time_us || req_sig_hash.
+  ces::Buffer hashIn;
+  hashIn.put<uint8_t>(status)
+        .put<uint8_t>(verb)
+        .putBytes(preamble)
+        .put<uint64_t>(timeUs)
+        .put<uint64_t>(reqSigHash);
+  minx::Hash digest = ces::sha256(hashIn.data(), hashIn.size());
+
+  ces::Signature sig = server->_serverKeyPair().signData(
+    std::span<const uint8_t>(digest.data(), digest.size()));
+
+  // Wire: [status][preamble][time_us][reqSigHash][sha256][sig]
+  ces::Buffer out(1 + preamble.size() + 8 + 8 + 32 + 65);
+  out.put<uint8_t>(status)
+     .putBytes(preamble)
+     .put<uint64_t>(timeUs)
+     .put<uint64_t>(reqSigHash)
+     .put(digest)
+     .put(sig);
+  return std::move(out).take();
+}
+
+// ---------------------------------------------------------------------------
+// Per-request ctx + response helpers (duplicated pattern)
+// ---------------------------------------------------------------------------
+
+struct ReqCtx : std::enable_shared_from_this<ReqCtx> {
+  std::shared_ptr<minx::RudpStream> stream;
+  CesServer* server = nullptr;
+  uint8_t verb = 0;
+  // Per-op signature: 65-byte sig over sha256(verb||preamble||sessionToken).
+  // Dedup key = sigDedupHash(sig).
+  std::array<uint8_t, 65> sigBuf{};
+  uint64_t reqSigHash = 0;
+  uint32_t reqNonce = 0;
+  // Channel binding (set once at handoff, copied into each ReqCtx).
+  // Replaces the per-op pubkey + timestamp the old envelope carried.
+  BoundChannelContext bound;
+};
+
+void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
+                  BoundChannelContext bound);
+
+void sendResponseAndLoop(
+    std::shared_ptr<ReqCtx> ctx,
+    uint8_t status,
+    ces::Bytes preamble) {
+  auto stream = ctx->stream;
+  auto bound = ctx->bound;
+  auto env = std::make_shared<ces::Bytes>(
+    buildResponseEnvelope(ctx->server, ctx->verb, status,
+                          preamble, ctx->reqSigHash));
+  boost::asio::async_write(
+    *stream, boost::asio::buffer(*env),
+    [stream, env, bound]
+    (const boost::system::error_code& ec, std::size_t) mutable {
+      if (ec) return;
+      readNextVerb(stream, std::move(bound));
+    });
+}
+
+void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
+  sendResponseAndLoop(ctx, status, {});
+}
+
+// Verb dispatch forward decls.
+void dispatchLaunch    (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchKill      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchList      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchStat      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchInstances (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+
+void readSignedRequest(std::shared_ptr<ReqCtx> ctx) {
+  auto self = ctx;
+  auto lenBuf = std::make_shared<std::array<uint8_t, 4>>();
+  boost::asio::async_read(
+    *ctx->stream, boost::asio::buffer(*lenBuf),
+    [self, lenBuf](const boost::system::error_code& ec, std::size_t) {
+      if (ec) return;
+      uint32_t preLen = ces::Buffer::peek<uint32_t>(lenBuf->data());
+      if (preLen == 0 || preLen > 4096) {
+        // Caller wire format violates the envelope length bounds —
+        // BAD_INPUT, not server fault.
+        sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
+        return;
+      }
+      auto preBuf = std::make_shared<ces::Bytes>(preLen);
+      boost::asio::async_read(
+        *self->stream, boost::asio::buffer(*preBuf),
+        [self, preBuf](const boost::system::error_code& e2, std::size_t) {
+          if (e2) return;
+          auto tail = std::make_shared<std::array<uint8_t, 65>>();
+          boost::asio::async_read(
+            *self->stream, boost::asio::buffer(*tail),
+            [self, preBuf, tail]
+            (const boost::system::error_code& e3, std::size_t) {
+              if (e3) return;
+              std::memcpy(self->sigBuf.data(), tail->data(), 65);
+              self->reqSigHash = ces::sigDedupHash(self->sigBuf);
+
+              if (!ces::verifyPerOp(
+                    self->bound, self->verb,
+                    std::span<const uint8_t>(preBuf->data(), preBuf->size()),
+                    self->sigBuf)) {
+                // Per-op signature didn't verify against the bound pubkey.
+                // Caller signed wrong → BAD_INPUT.
+                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
+                return;
+              }
+              if (preBuf->size() < 4) {
+                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
+                return;
+              }
+              self->reqNonce = ces::Buffer::peek<uint32_t>(preBuf->data());
+              ces::Bytes preRest(
+                preBuf->begin() + 4, preBuf->end());
+              switch (self->verb) {
+                case kVerbLaunch:    dispatchLaunch   (self, std::move(preRest)); break;
+                case kVerbKill:      dispatchKill     (self, std::move(preRest)); break;
+                case kVerbList:      dispatchList     (self, std::move(preRest)); break;
+                case kVerbStat:      dispatchStat     (self, std::move(preRest)); break;
+                case kVerbInstances: dispatchInstances(self, std::move(preRest)); break;
+                default:          sendErrorAndLoop(self, CES_ERROR_BAD_INPUT); break;
+              }
+            });
+        });
+    });
+}
+
+void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
+                  BoundChannelContext bound) {
+  CesServer* server = gServer.load();
+  if (!server) return;
+  auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();
+  auto sharedStream = stream;
+  auto sharedBound = std::make_shared<BoundChannelContext>(std::move(bound));
+  boost::asio::async_read(
+    *sharedStream, boost::asio::buffer(*verbBuf),
+    [verbBuf, sharedStream, server, sharedBound]
+    (const boost::system::error_code& ec, std::size_t) {
+      if (ec) return;
+      uint8_t verb = (*verbBuf)[0];
+      if (verb < kVerbLaunch || verb > kVerbInstances) {
+        LOGDEBUG << "builtin:compute unknown verb" << VAR(int(verb));
+        return;
+      }
+      auto ctx = std::make_shared<ReqCtx>();
+      ctx->stream = sharedStream;
+      ctx->server = server;
+      ctx->verb = verb;
+      ctx->bound = *sharedBound;
+      readSignedRequest(ctx);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Helper: compute slot-fee window in credits.
+// ---------------------------------------------------------------------------
+
+uint64_t slotFeePerSec(const CesConfig& cfg) {
+  int64_t s = cfg.feeComputeSlotSec;
+  if (s <= 0) {
+    // Derive: rent on a nominal 1 KB file per second.
+    // feeFileRent is credits per (byte × day). Seconds-per-day = 86400.
+    // result = feeFileRent * 1024 / 86400, floored to >= 1.
+    int64_t rent = cfg.feeFileRent;
+    if (rent <= 0) rent = 1;
+    int64_t v = (rent * 1024) / 86'400;
+    if (v < 1) v = 1;
+    return static_cast<uint64_t>(v);
+  }
+  return static_cast<uint64_t>(s);
+}
+
+// ---------------------------------------------------------------------------
+// LAUNCH
+// ---------------------------------------------------------------------------
+
+// Strand-only (rpcTaskIO_). Allocate a fresh instance, spawn the
+// child binary, register in gInstances, send the bootstrap frame,
+// arm the IPC reader. Caller has already validated source-file
+// existence + ownership and (if applicable) debited the upfront
+// commitment fee from the source's file_balance.
+//
+// Returns 0 on failure (and tears down anything it allocated);
+// returns the instance id on success. `upfront` is recorded on the
+// Instance for visibility but is not debited here (caller's job).
+//
+// `now` is the wall-clock microseconds the supervisor uses as the
+// instance's birth time and as the start of its first billing tick;
+// passing it lets the caller align with `_l2ValidateDedupAndDebit`'s
+// timing if needed.
+uint64_t allocateAndSpawnInstance(
+    CesServer* server, const std::string& name,
+    const std::array<uint8_t, 32>& ownerPk,
+    uint64_t upfront, uint64_t now) {
+  const auto& cfg = server->_config();
+
+  auto workDir = resolveWorkDir(cfg);
+  std::error_code ec;
+  std::filesystem::create_directories(workDir, ec);
+
+  // Read the source's program-account pubkey from its sidecar. May
+  // be all-zero (legacy file pre-migration) — Lua API origin falls
+  // back to ownerPk in that case.
+  std::array<uint8_t, 32> programPubkey{};
+  fileHandlerReadProgramPubkey(name, programPubkey);
+
+  uint64_t id = gNextInstanceId++;
+  auto inst = std::make_shared<Instance>();
+  inst->id = id;
+  inst->sourceName = name;
+  inst->ownerPk = ownerPk;
+  inst->programPubkey = programPubkey;
+  inst->progPrefix = progPrefixOf(name);
+  inst->socketPath = instanceSocketPath(cfg, id).string();
+  inst->upfrontDeposit = upfront;
+
+  int lfd = createListenSocket(inst->socketPath);
+  if (lfd < 0) {
+    LOGWARNING << "builtin:compute socket create failed"
+               << VAR(lfd);
+    return 0;
+  }
+  inst->listenFd = lfd;
+
+  // Slurp the Lua source before spawning — if the source file is
+  // gone or unreadable on disk we want to fail cleanly rather than
+  // after spawning a child with nothing to run.
+  auto srcBytes = readSourceBytes(cfg, name);
+  if (srcBytes.empty()) {
+    LOGWARNING << "builtin:compute source read failed" << SVAR(name);
+    teardownInstance(*inst);
+    return 0;
+  }
+
+  pid_t pid = spawnChild(cfg.cesComputeChildBinary,
+                         inst->socketPath,
+                         cfg.cesComputeUser);
+  if (pid <= 0) {
+    LOGWARNING << "builtin:compute spawn failed"
+               << VAR(pid) << SVAR(cfg.cesComputeChildBinary);
+    teardownInstance(*inst);
+    return 0;
+  }
+  inst->pid = pid;
+
+  int pfd = acceptWithTimeout(lfd, kAcceptTimeoutMs);
+  if (pfd < 0) {
+    LOGWARNING << "builtin:compute accept failed" << VAR(pfd);
+    killAndReap(pid);
+    teardownInstance(*inst);
+    return 0;
+  }
+
+  // Wrap the accepted fd as an asio local socket for async I/O.
+  auto io = server->_rpcTaskIOExecutor();
+  inst->peer = std::make_shared<UnixSocket>(io);
+  boost::system::error_code aec;
+  inst->peer->assign(boost::asio::local::stream_protocol(), pfd, aec);
+  if (aec) {
+    LOGWARNING << "builtin:compute asio assign failed"
+               << SVAR(aec.message());
+    ::close(pfd);
+    killAndReap(pid);
+    teardownInstance(*inst);
+    return 0;
+  }
+
+  inst->startedAtUs = now;
+  inst->lastTickUs = now;
+  inst->lastSampleUs = now;
+  inst->lastCpuTicks = 0;
+
+  gInstances[id] = inst;
+  gByPrefix[inst->progPrefix].insert(id);
+  gByName[inst->sourceName].insert(id);
+
+  // Bootstrap the child with its Lua source + identity, then
+  // arm the IPC reader loop for API calls.
+  sendBootstrapFrame(inst, srcBytes.data(), srcBytes.size());
+  startIpcReader(inst);
+
+  LOGINFO << "builtin:compute launched"
+          << VAR(id) << SVAR(name) << VAR(pid)
+          << VAR(upfront);
+  return id;
+}
+
+void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+  if (pre.size() < 2) {
+    sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+  }
+  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data());
+  if (nameLen == 0 || nameLen > kMaxNameLen || pre.size() < 2u + nameLen) {
+    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+  }
+  std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
+
+  const auto& cfg = ctx->server->_config();
+
+  // Check instance cap. LAUNCH always mints a fresh id; multiple
+  // instances of the same source path are allowed up to the cap.
+  if (gInstances.size() >= cfg.computeMaxInstances) {
+    sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_MAX_INSTANCES); return;
+  }
+
+  // Source-file owner + balance check via the file handler.
+  std::array<uint8_t, 32> ownerPk{};
+  uint64_t fileBalance = 0;
+  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
+    sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
+  }
+  if (std::memcmp(ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
+    sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
+  }
+  // Discounted slot rate for the upfront commitment (LAUNCH-time price).
+  uint64_t slot = ctx->server->discountFee(
+    FeeKind::ComputeSlot, slotFeePerSec(cfg));
+  uint64_t upfront = slot * kUpfrontSeconds;
+
+  if (fileBalance < upfront) {
+    sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_FUND_TOO_LOW); return;
+  }
+
+  // Compute dedup hash + signer for the _l2 call.
+  const ces::PublicKey& signer = ctx->bound.boundPubkey;
+
+  auto after = [ctx, name, upfront, ownerPk](uint8_t rc) mutable {
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+
+    // Debit the 15-min upfront from the source file's file_balance.
+    // This is a commitment the host honors by starting + monitoring
+    // the instance; no refund on KILL.
+    if (!fileHandlerDebitBalance(name, upfront)) {
+      sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_FUND_TOO_LOW); return;
+    }
+
+    uint64_t now = getMicrosSinceEpoch();
+    uint64_t id = allocateAndSpawnInstance(
+      ctx->server, name, ownerPk, upfront, now);
+    if (id == 0) {
+      sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+    }
+
+    ces::Bytes resp;
+    ces::Buffer::put<uint64_t>(resp, id);
+    ces::Buffer::put<uint64_t>(resp, now);
+    sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+  };
+
+  ctx->server->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    std::move(after), ctx->stream->get_executor());
+}
+
+// ---------------------------------------------------------------------------
+// KILL
+// ---------------------------------------------------------------------------
+
+void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+  // Wire: [u64 instance_id]. Truncated preamble = caller wire-format bug,
+  // not a server failure → BAD_INPUT.
+  if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
+  uint64_t id = ces::Buffer::peek<uint64_t>(pre.data());
+
+  auto it = gInstances.find(id);
+  if (it == gInstances.end()) {
+    sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
+  }
+  if (std::memcmp(it->second->ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
+    sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
+  }
+
+  const auto& cfg = ctx->server->_config();
+  const ces::PublicKey& signer = ctx->bound.boundPubkey;
+
+  auto after = [ctx, id](uint8_t rc) {
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    killInstanceById(id);
+    sendResponseAndLoop(ctx, CES_OK, {});
+  };
+
+  ctx->server->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    std::move(after), ctx->stream->get_executor());
+}
+
+// ---------------------------------------------------------------------------
+// LIST
+// ---------------------------------------------------------------------------
+
+void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
+  const auto& cfg = ctx->server->_config();
+  const ces::PublicKey& signer = ctx->bound.boundPubkey;
+
+  auto after = [ctx](uint8_t rc) {
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    ces::Bytes resp;
+    uint32_t countOff = resp.size();
+    ces::Buffer::put<uint32_t>(resp, 0); // placeholder
+    uint32_t count = 0;
+    for (auto& [id, inst] : gInstances) {
+      if (std::memcmp(inst->ownerPk.data(),
+                      ctx->bound.boundPubkey.getHash().data(), 32) != 0) continue;
+      ces::Buffer::put<uint64_t>(resp, inst->id);
+      ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(inst->sourceName.size()));
+      resp.insert(resp.end(),
+                  reinterpret_cast<const uint8_t*>(inst->sourceName.data()),
+                  reinterpret_cast<const uint8_t*>(inst->sourceName.data())
+                    + inst->sourceName.size());
+      ces::Buffer::put<uint64_t>(resp, inst->startedAtUs);
+      // file_balance as of now — a convenience for clients. We read
+      // it via the file handler (rent-roll included). If the file
+      // was deleted out from under us, report 0.
+      std::array<uint8_t, 32> opk{};
+      uint64_t bal = 0;
+      fileHandlerReadOwnerAndBalance(inst->sourceName, opk, bal);
+      ces::Buffer::put<uint64_t>(resp, bal);
+      // CPU basis points + RSS bytes from last supervisor sample.
+      ces::Buffer::put<uint32_t>(resp, inst->cpuBasisPoints);
+      ces::Buffer::put<uint64_t>(resp, inst->rssBytes);
+      count++;
+    }
+    // Patch count.
+    ces::Buffer::poke<uint32_t>(resp.data() + countOff, count);
+    sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+  };
+
+  ctx->server->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    std::move(after), ctx->stream->get_executor());
+}
+
+// ---------------------------------------------------------------------------
+// STAT
+// ---------------------------------------------------------------------------
+
+void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+  // Wire: [u64 instance_id]. ID is the only identity now — a path can
+  // refer to N instances, so name-keyed STAT is no longer well-defined.
+  if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
+  uint64_t instanceId = ces::Buffer::peek<uint64_t>(pre.data());
+
+  auto it = gInstances.find(instanceId);
+  if (it == gInstances.end()) {
+    sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
+  }
+  std::string name = it->second->sourceName;
+
+  // Owner check: signer must own the source file. Read the file
+  // sidecar (which also rolls rent). If file doesn't exist, that's
+  // FILE_NOT_FOUND — the instance will have been killed by the
+  // deletion callback anyway, but this is the authoritative answer.
+  std::array<uint8_t, 32> ownerPk{};
+  uint64_t fileBalance = 0;
+  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
+    sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
+  }
+  if (std::memcmp(ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
+    sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
+  }
+
+  const auto& cfg = ctx->server->_config();
+  const ces::PublicKey& signer = ctx->bound.boundPubkey;
+
+  auto after = [ctx, name, fileBalance, instanceId](uint8_t rc) {
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    auto it = gInstances.find(instanceId);
+    if (it == gInstances.end()) {
+      sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
+    }
+    auto& inst = *it->second;
+    ces::Bytes resp;
+    ces::Buffer::put<uint64_t>(resp, inst.id);
+    ces::Buffer::put<uint64_t>(resp, inst.startedAtUs);
+    ces::Buffer::put<uint64_t>(resp, fileBalance);
+    ces::Buffer::put<uint32_t>(resp, inst.cpuBasisPoints);
+    ces::Buffer::put<uint64_t>(resp, inst.rssBytes);
+    ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(name.size()));
+    resp.insert(resp.end(),
+                reinterpret_cast<const uint8_t*>(name.data()),
+                reinterpret_cast<const uint8_t*>(name.data())
+                  + name.size());
+    sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+  };
+
+  ctx->server->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    std::move(after), ctx->stream->get_executor());
+}
+
+// ---------------------------------------------------------------------------
+// INSTANCES — public discovery: list ids for a given source path
+// ---------------------------------------------------------------------------
+//
+// Wire in:    [u16 path_len][path]
+// Wire out:   [u32 count][u64 id]*count
+//
+// No owner check, no file-existence check, no path validation beyond
+// the length cap. The path is just a key into gByName; absent → empty
+// list. Same per-op fee as STAT/LIST so signers can't free-flood the
+// lookup, but anyone with a credited account can ask.
+void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
+                       ces::Bytes pre) {
+  if (pre.size() < 2) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
+  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data());
+  if (nameLen == 0 || nameLen > kMaxNameLen ||
+      pre.size() < 2u + nameLen) {
+    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+  }
+  std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
+
+  const auto& cfg = ctx->server->_config();
+  const ces::PublicKey& signer = ctx->bound.boundPubkey;
+
+  auto after = [ctx, name](uint8_t rc) {
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    ces::Bytes resp;
+    auto it = gByName.find(name);
+    uint32_t count = (it == gByName.end())
+                       ? 0
+                       : static_cast<uint32_t>(it->second.size());
+    ces::Buffer::put<uint32_t>(resp, count);
+    if (it != gByName.end()) {
+      // std::set ⇒ ascending iteration; clients shouldn't depend on
+      // the order. Two clients querying the same path back-to-back
+      // see the same list as long as no LAUNCH/KILL hit in between.
+      for (uint64_t id : it->second) ces::Buffer::put<uint64_t>(resp, id);
+    }
+    sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+  };
+
+  ctx->server->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    std::move(after), ctx->stream->get_executor());
+}
+
+// ---------------------------------------------------------------------------
+// Supervisor tick — per-second slot-fee debit + SIGKILL on exhaustion.
+// ---------------------------------------------------------------------------
+
+void supervisorTick() {
+  CesServer* server = gServer.load();
+  if (!server) return;
+  const auto& cfg = server->_config();
+  uint64_t now = getMicrosSinceEpoch();
+
+  // Discounted rates for this tick. The metrics pulse refreshes the
+  // FeeKind multipliers from l2cpu (slot/cpu) and l2mem (rss/bucket),
+  // so the supervisor pays "today's price" — no lock-in across ticks.
+  uint64_t slot       = server->discountFee(FeeKind::ComputeSlot,
+                                            slotFeePerSec(cfg));
+  uint64_t rssRate    = server->discountFee(FeeKind::ComputeRss,
+    static_cast<uint64_t>(cfg.feeComputeRssByteDay > 0
+                            ? cfg.feeComputeRssByteDay : 0));
+  uint64_t cpuRate    = server->discountFee(FeeKind::ComputeCpu,
+    static_cast<uint64_t>(cfg.feeComputeCpuSec > 0
+                            ? cfg.feeComputeCpuSec : 0));
+  uint64_t bucketRate = server->discountFee(FeeKind::BucketByteSec,
+    static_cast<uint64_t>(cfg.feeBucketByteSec > 0
+                            ? cfg.feeBucketByteSec : 0));
+
+  std::vector<uint64_t> toKill;
+  for (auto& [id, inst] : gInstances) {
+    // One tick: procfs sample (CPU delta + RSS) + compound debit.
+    // Runs at cfg.computeTickIntervalMs cadence (default 60 s).
+    sampleInstanceProc(*inst, now);
+    if (now <= inst->lastTickUs) continue;   // still in prepaid window
+    uint64_t elapsedUs = now - inst->lastTickUs;
+
+    // Slot: flat overhead. debit = slot * elapsed_sec.
+    __uint128_t slotDebit =
+      static_cast<__uint128_t>(slot) * elapsedUs / 1'000'000ull;
+
+    // RAM: byte-day → debit = rssBytes * rate * elapsed_sec / 86400.
+    __uint128_t rssDebit = 0;
+    if (rssRate > 0 && inst->rssBytes > 0) {
+      rssDebit = static_cast<__uint128_t>(inst->rssBytes)
+               * static_cast<__uint128_t>(rssRate)
+               * static_cast<__uint128_t>(elapsedUs)
+               / (static_cast<__uint128_t>(86400ull) * 1'000'000ull);
+    }
+
+    // CPU: core-second. debit = cpuBp * rate * elapsed_sec / 10000.
+    __uint128_t cpuDebit = 0;
+    if (cpuRate > 0 && inst->cpuBasisPoints > 0) {
+      cpuDebit = static_cast<__uint128_t>(inst->cpuBasisPoints)
+               * static_cast<__uint128_t>(cpuRate)
+               * static_cast<__uint128_t>(elapsedUs)
+               / (static_cast<__uint128_t>(10000ull) * 1'000'000ull);
+    }
+
+    // Bucket capacity rent: sum committedBytes across all of this
+    // instance's buckets, debit at the per-byte-second rate.
+    // committedBytes is the worst-case footprint declared at
+    // bucket_new (max_entries × max_entry_bytes) — predictable,
+    // not sampled.
+    __uint128_t bucketDebit = 0;
+    if (bucketRate > 0 && !inst->buckets.empty()) {
+      uint64_t totalBytes = 0;
+      for (auto& [_bid, lb] : inst->buckets) totalBytes += lb.committedBytes;
+      if (totalBytes > 0) {
+        bucketDebit = static_cast<__uint128_t>(totalBytes)
+                    * static_cast<__uint128_t>(bucketRate)
+                    * static_cast<__uint128_t>(elapsedUs)
+                    / 1'000'000ull;
+      }
+    }
+
+    __uint128_t total = slotDebit + rssDebit + cpuDebit + bucketDebit;
+    // Clamp to uint64 max (would indicate gross misconfiguration
+    // rather than real usage).
+    uint64_t debit = (total > static_cast<__uint128_t>(UINT64_MAX))
+      ? UINT64_MAX : static_cast<uint64_t>(total);
+    if (debit == 0) continue;
+    if (!fileHandlerDebitBalance(inst->sourceName, debit)) {
+      toKill.push_back(id);
+    } else {
+      inst->lastTickUs = now;
+    }
+
+    // Reap zombies: if the child exited on its own, drop the
+    // instance. No restart — owner re-LAUNCHes manually.
+    int status = 0;
+    pid_t r = ::waitpid(inst->pid, &status, WNOHANG);
+    if (r == inst->pid) {
+      LOGDEBUG << "builtin:compute child exited"
+               << VAR(id) << VAR(status);
+      toKill.push_back(id);
+    }
+  }
+  for (uint64_t id : toKill) killInstanceById(id);
+}
+
+void scheduleNextTick() {
+  if (!gTickTimer) return;
+  if (!gTickRunning.load()) return;
+  CesServer* server = gServer.load();
+  uint32_t ms = (server && server->_config().computeTickIntervalMs > 0)
+    ? server->_config().computeTickIntervalMs : 60000u;
+  gTickTimer->expires_after(std::chrono::milliseconds(ms));
+  gTickTimer->async_wait([](const boost::system::error_code& ec) {
+    if (ec) return;
+    supervisorTick();
+    scheduleNextTick();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// File-deletion interlock: any file handler delete path fires our
+// callback. If the deleted file has a running instance, kill it.
+// ---------------------------------------------------------------------------
+
+void onFileDeleted(const std::string& name) {
+  // Runs on whatever thread drove the deletion — typically rpcTaskIO_,
+  // but we don't assume. Hop onto rpcTaskIO_ so we can touch the
+  // instance registry without taking a lock.
+  CesServer* server = gServer.load();
+  if (!server) return;
+  auto io = server->_rpcTaskIOExecutor();
+  if (!io) return;
+  boost::asio::post(io, [name]() {
+    auto it = gByName.find(name);
+    if (it == gByName.end()) return;
+    // Snapshot ids — killInstanceById mutates gByName.
+    std::vector<uint64_t> ids(it->second.begin(), it->second.end());
+    for (uint64_t id : ids) killInstanceById(id);
+  });
+}
+
+// ---------------------------------------------------------------------------
+// ComputeHandler class + registration
+// ---------------------------------------------------------------------------
+
+class ComputeHandler : public CesPlexHandler {
+public:
+  void serve(std::shared_ptr<minx::RudpStream> stream,
+             BoundChannelContext bound) override {
+    if (!gServer.load()) {
+      LOGWARNING << "builtin:compute invoked with no bound CesServer";
+      return;
+    }
+    readNextVerb(std::move(stream), std::move(bound));
+  }
+};
+
+ComputeHandler gComputeHandler;
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+uint8_t computeHandlerBind(CesServer* server) {
+  if (server == nullptr) {
+    // Teardown. SIGKILL every instance and cancel the tick.
+    gTickRunning.store(false);
+    if (gTickTimer) {
+      boost::system::error_code ec;
+      gTickTimer->cancel(ec);
+    }
+    // Kill all instances. Iterate over a snapshot since
+    // killInstanceById erases.
+    std::vector<uint64_t> ids;
+    ids.reserve(gInstances.size());
+    for (auto& [id, _] : gInstances) ids.push_back(id);
+    for (uint64_t id : ids) killInstanceById(id);
+    gTickTimer.reset();
+    gServer.store(nullptr);
+    return CES_OK;
+  }
+
+  const auto& cfg = server->_config();
+
+  if (cfg.computeMaxInstances == 0)
+    return CES_ERROR_COMPUTE_DISABLED;
+
+  // File handler must be registered.
+  if (findCesPlexBuiltin("file") == nullptr) {
+    LOGERROR << "builtin:compute: requires builtin:file; refusing to bind";
+    return CES_ERROR_COMPUTE_NO_FILE_HANDLER;
+  }
+
+  // Create the workdir eagerly — if we can't, bail now.
+  auto workDir = resolveWorkDir(cfg);
+  std::error_code ec;
+  std::filesystem::create_directories(workDir, ec);
+  if (ec) {
+    LOGERROR << "builtin:compute: workdir unusable"
+             << SVAR(workDir.string());
+    return CES_ERROR_INTERNAL;
+  }
+
+  gServer.store(server);
+
+  // One-shot deletion callback registration.
+  if (!gDeletionCallbackInstalled.exchange(true)) {
+    fileHandlerRegisterDeletionCallback(
+      [](const std::string& name) { onFileDeleted(name); });
+  }
+
+  // Start supervisor timer on rpcTaskIO_.
+  auto io = server->_rpcTaskIOExecutor();
+  if (!io) {
+    LOGERROR << "builtin:compute: rpcTaskIO not available";
+    gServer.store(nullptr);
+    return CES_ERROR_INTERNAL;
+  }
+  gTickTimer = std::make_shared<boost::asio::steady_timer>(io);
+  gTickRunning.store(true);
+  scheduleNextTick();
+
+  LOGINFO << "builtin:compute bound"
+          << VAR(cfg.computeMaxInstances)
+          << SVAR(cfg.cesComputeChildBinary)
+          << SVAR(workDir.string());
+  return CES_OK;
+}
+
+uint8_t computeHandlerLaunchInternal(const std::string& name) {
+  CesServer* server = gServer.load();
+  if (!server) return CES_ERROR_COMPUTE_DISABLED;
+  const auto& cfg = server->_config();
+  if (cfg.computeMaxInstances == 0) return CES_ERROR_COMPUTE_DISABLED;
+  if (gInstances.size() >= cfg.computeMaxInstances) {
+    return CES_ERROR_COMPUTE_MAX_INSTANCES;
+  }
+
+  // Source file must exist; ownership must be the server. /s/-zone
+  // requirement is enforced at deploy time by
+  // fileHandlerEnsureServerFile, so we don't double-check the path
+  // shape here.
+  std::array<uint8_t, 32> ownerPk{};
+  uint64_t fileBalance = 0;
+  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
+    return CES_ERROR_FILE_NOT_FOUND;
+  }
+  std::array<uint8_t, 32> serverPk{};
+  std::memcpy(serverPk.data(),
+              server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
+  if (ownerPk != serverPk) {
+    LOGWARNING << "builtin:compute internal launch: source not owned by server"
+               << SVAR(name);
+    return CES_ERROR_NOT_OWNER;
+  }
+
+  // /s/ files are unmetered → no upfront fee, no rent debit. Pass
+  // upfront=0 so the Instance's bookkeeping field is honest about
+  // what was committed.
+  uint64_t now = getMicrosSinceEpoch();
+  uint64_t id = allocateAndSpawnInstance(server, name, ownerPk, 0, now);
+  if (id == 0) return CES_ERROR_INTERNAL;
+  return CES_OK;
+}
+
+void computeHandlerOnApplicationMsg(
+    const uint8_t* data, std::size_t len,
+    const std::array<uint8_t, 8>& senderPfx) {
+  if (gServer.load() == nullptr) return;
+  // Wire shape (op byte already stripped by CesServer::incomingApplication):
+  //   [1B flags][8B prog_pfx][2B len BE][N payload]
+  if (len < 1 + 8 + 2) return;
+  if (data[0] != 0) return; // flags must be 0 in v1
+  std::array<uint8_t, 8> pfx{};
+  std::memcpy(pfx.data(), data + 1, 8);
+  uint16_t payloadLen = ces::Buffer::peek<uint16_t>(data + 9);
+  if (payloadLen > kAppPayloadMax) return;
+  if (len < static_cast<size_t>(11 + payloadLen)) return;
+
+  auto it = gByPrefix.find(pfx);
+  if (it == gByPrefix.end()) return; // no local instance for this prefix; drop
+  // Broadcast to every local instance sharing this content-addressed
+  // prefix. Sibling instances see sibling traffic — same as if they
+  // were on different servers in the swarm.
+  for (uint64_t id : it->second) {
+    auto inst = gInstances.find(id);
+    if (inst == gInstances.end()) continue;
+    sendDeliverFrame(inst->second, senderPfx, data + 11, payloadLen);
+  }
+}
+
+bool _computeTestReadProcSample(int pid,
+                                uint64_t& outTicks,
+                                uint64_t& outRssBytes) {
+  ProcSample s;
+  if (!readProcSample(static_cast<pid_t>(pid), s)) return false;
+  outTicks = s.ticks;
+  outRssBytes = s.rssBytes;
+  return true;
+}
+
+void _computeTestForceTick() {
+  CesServer* server = gServer.load();
+  if (!server) return;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return;
+  // Post a blocking supervisorTick onto the CesPlex strand and wait
+  // for it to finish, so the caller sees side effects synchronously.
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  boost::asio::post(ex, [&]() {
+    supervisorTick();
+    std::lock_guard lk(m);
+    done = true;
+    cv.notify_all();
+  });
+  std::unique_lock lk(m);
+  cv.wait(lk, [&]{ return done; });
+}
+
+// ---------------------------------------------------------------------------
+// /ces/lua/1 cross-handler primitives — the lua handler calls into
+// these from rpcTaskIO_'s strand. See include/ces/l2/compute_handler.h.
+// ---------------------------------------------------------------------------
+
+bool computeInstanceExists(uint64_t instanceId) {
+  return gInstances.find(instanceId) != gInstances.end();
+}
+
+bool computeInstanceAcceptsConnections(uint64_t instanceId) {
+  auto it = gInstances.find(instanceId);
+  if (it == gInstances.end()) return false;
+  return it->second->acceptsConnections;
+}
+
+uint64_t computeOpenConnection(uint64_t instanceId,
+                                const std::array<uint8_t, 32>& userPubkey) {
+  auto it = gInstances.find(instanceId);
+  if (it == gInstances.end()) return 0;
+  auto inst = it->second;
+  uint64_t connId = inst->nextConnId++;
+  // Body: [u64 conn_id BE][32B user_pubkey].
+  ces::Bytes body;
+  body.reserve(8 + 32);
+  for (int i = 7; i >= 0; --i) body.push_back(uint8_t((connId >> (i * 8)) & 0xFF));
+  body.insert(body.end(), userPubkey.begin(), userPubkey.end());
+  enqueueOutbound(inst, makeFrame(kIpcTagConnOpened, 0,
+                                   body.data(), body.size()));
+  return connId;
+}
+
+void computeSendConnDataIn(uint64_t instanceId, uint64_t connId,
+                            const uint8_t* data, std::size_t len) {
+  auto it = gInstances.find(instanceId);
+  if (it == gInstances.end()) return;
+  // Body: [u64 conn_id BE][u32 BE len][len bytes].
+  ces::Bytes body;
+  body.reserve(8 + 4 + len);
+  ces::Buffer::put<uint64_t>(body, connId);
+  ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(len));
+  if (len > 0) body.insert(body.end(), data, data + len);
+  enqueueOutbound(it->second, makeFrame(kIpcTagConnDataIn, 0,
+                                         body.data(), body.size()));
+}
+
+void computeSendConnClosed(uint64_t instanceId, uint64_t connId,
+                            uint8_t reason) {
+  auto it = gInstances.find(instanceId);
+  if (it == gInstances.end()) return;
+  // Body: [u64 conn_id BE][u8 reason].
+  ces::Bytes body;
+  body.reserve(8 + 1);
+  for (int i = 7; i >= 0; --i) body.push_back(uint8_t((connId >> (i * 8)) & 0xFF));
+  body.push_back(reason);
+  enqueueOutbound(it->second, makeFrame(kIpcTagConnClosed, 0,
+                                         body.data(), body.size()));
+}
+
+} // namespace ces
+
+// ---------------------------------------------------------------------------
+// Static registration: map protocol name "compute" → gComputeHandler.
+// ---------------------------------------------------------------------------
+
+REGISTER_CESPLEX_BUILTIN("compute", ::ces::gComputeHandler, ComputeHandler)
+
+// TU anchor — net_multiplexer.cpp references this via its anchor array.
+extern "C" { int compute_handler_anchor = 1; }

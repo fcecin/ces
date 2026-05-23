@@ -1,0 +1,47 @@
+#!/bin/bash
+# Launch cesqt in the background and record its PID for stopqt.
+# Idempotent — if a tracked instance is already running, just print
+# its pid and exit. Otherwise, detach from the terminal so closing
+# this shell doesn't kill the GUI.
+set -e
+
+DIR="$(dirname "$(readlink -f "$0")")"
+PID_FILE="/tmp/cesqt.pid"
+LOG_FILE="/tmp/cesqt.log"
+
+if [ -f "$PID_FILE" ]; then
+  PID=$(cat "$PID_FILE" 2>/dev/null || true)
+  if [ -n "$PID" ] && kill -0 "$PID" 2>/dev/null; then
+    echo "cesqt already running (pid $PID)"
+    echo "log: $LOG_FILE"
+    exit 0
+  fi
+  rm -f "$PID_FILE"
+fi
+
+# nohup + redirect + disown so cesqt survives the launching shell
+# exiting and doesn't spam stdout. Avoids `setsid` because util-linux
+# setsid forks before exec when the caller is a process-group leader,
+# leaving $! pointing at a short-lived wrapper instead of at cesqt
+# itself — which then made stopqt report "pid not running".
+# --no-daemon disables cesqt's own fork-and-orphan trick. We provide
+# the same detachment via nohup + redirect + disown, and this way $!
+# refers to the actual GUI process so stopqt can target it.
+nohup "${DIR}/run" cesqt --no-daemon "$@" > "$LOG_FILE" 2>&1 < /dev/null &
+PID=$!
+disown
+echo "$PID" > "$PID_FILE"
+
+# Brief liveness probe so we don't silently leave a stale PID if
+# cesqt fails immediately (missing display, libs, segfault, etc.).
+sleep 0.4
+if ! kill -0 "$PID" 2>/dev/null; then
+  rm -f "$PID_FILE"
+  echo "ERROR: cesqt exited immediately (pid $PID gone)"
+  echo "log:   $LOG_FILE"
+  echo "tail:"
+  tail -20 "$LOG_FILE" 2>/dev/null | sed 's/^/  /'
+  exit 1
+fi
+echo "cesqt started (pid $PID)"
+echo "log: $LOG_FILE"

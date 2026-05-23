@@ -1,0 +1,3 @@
+#!/bin/bash
+pkill -f 'cesproxy' && echo "cesproxy stopped" || echo "cesproxy not running"
+pkill -f './build.*/ces ' && echo "ces stopped" || echo "ces not running"

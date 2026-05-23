@@ -1,0 +1,33 @@
+#!/bin/bash
+# Stop the cesqt instance that startqt launched. Targets the PID file,
+# not pkill -f, so it can't catch unrelated processes (build artifacts,
+# editors, this script itself).
+PID_FILE="/tmp/cesqt.pid"
+
+if [ ! -f "$PID_FILE" ]; then
+  echo "cesqt not running (no $PID_FILE)"
+  exit 0
+fi
+
+PID=$(cat "$PID_FILE" 2>/dev/null || true)
+if [ -z "$PID" ] || ! kill -0 "$PID" 2>/dev/null; then
+  rm -f "$PID_FILE"
+  echo "cesqt not running (stale pid file removed)"
+  exit 0
+fi
+
+kill "$PID"
+
+# Wait briefly for graceful exit before escalating.
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if ! kill -0 "$PID" 2>/dev/null; then
+    rm -f "$PID_FILE"
+    echo "cesqt stopped (pid $PID)"
+    exit 0
+  fi
+  sleep 0.2
+done
+
+kill -9 "$PID" 2>/dev/null || true
+rm -f "$PID_FILE"
+echo "cesqt force-killed (pid $PID, did not exit on SIGTERM)"
