@@ -176,6 +176,14 @@ constexpr uint16_t kApiMethodBucketGet    = 0x0212;
 // paid by the program's owner account.
 constexpr uint16_t kApiMethodAuthenticAssetCreate = 0x0220;
 
+// Authentic-asset content layout (a compute-SDK concept, opaque to the
+// server): first 32 bytes are the program-identity hash
+// sha256(source_bytes || source_path); the rest is the user payload. The
+// handler assembles the full AssetData and hands raw bytes to createAssetAsync.
+constexpr size_t AUTHENTIC_ASSET_HASH_SIZE = 32;
+constexpr size_t AUTHENTIC_ASSET_PAYLOAD_SIZE =
+  std::tuple_size_v<AssetData> - AUTHENTIC_ASSET_HASH_SIZE;
+
 // File-verb codes mirror file_handler.cpp. Exposed to
 // fileHandlerExec via FileExecReq.verb.
 constexpr uint8_t kFileVerbCreate   = 0x01;
@@ -1016,7 +1024,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     uint16_t days = ces::Buffer::peek<uint16_t>(mbody + 64);
     const uint8_t* payload = mbody + kAuthHeaderLen;
     size_t payloadLen = mlen - kAuthHeaderLen;
-    if (payloadLen > ces::AUTHENTIC_ASSET_PAYLOAD_SIZE) {
+    if (payloadLen > AUTHENTIC_ASSET_PAYLOAD_SIZE) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
 
@@ -1029,16 +1037,21 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     // from the source file's sidecar. Done synchronously here on
     // rpcTaskIO_ — it's a single sha256 of a small file (Lua
     // source). After the first hit it's cached in the sidecar.
-    std::array<uint8_t, ces::AUTHENTIC_ASSET_HASH_SIZE> progHash{};
+    std::array<uint8_t, AUTHENTIC_ASSET_HASH_SIZE> progHash{};
     if (!fileHandlerGetProgramHash(inst->sourceName, progHash)) {
       sendApiReply(inst, corr_id, CES_ERROR_INTERNAL); return;
     }
 
-    // Pack the variable-length wire payload into a fixed
-    // AuthenticAssetData (zero-padded tail).
-    ces::AuthenticAssetData userPayload{};
+    // Assemble the 210-byte content: [32B programHash][payload, zero-padded].
+    AssetData content{};
+    std::memcpy(content.data(), progHash.data(), AUTHENTIC_ASSET_HASH_SIZE);
     if (payloadLen > 0)
-      std::memcpy(userPayload.data(), payload, payloadLen);
+      std::memcpy(content.data() + AUTHENTIC_ASSET_HASH_SIZE, payload, payloadLen);
+
+    // IMMUTABLE; not private, not asset-owned. createAsset adds the
+    // standard 1-day grace and re-derives the flags from this balance.
+    uint16_t balance = assetBalance(days, /*priv=*/false, /*aowned=*/false,
+                                    /*immutable=*/true);
 
     // Origin = file's program account if migrated, else legacy
     // owner-account fallback.
@@ -1052,8 +1065,8 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     HashPrefix recipientPrefix = ces::Account::getMapKey(recipient);
 
     auto inst_cap = inst;
-    server->_l2CreateAuthenticAsset(
-      origin, recipientPrefix, assetId, progHash, userPayload, days,
+    server->createAssetAsync(
+      origin, recipientPrefix, assetId, content, balance,
       [inst_cap, corr_id](uint8_t rc) {
         sendApiReply(inst_cap, corr_id, rc);
       },

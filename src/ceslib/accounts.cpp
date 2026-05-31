@@ -40,26 +40,9 @@ void Accounts::createAccount(const HashPrefix& id, const Account& acc) {
     Account::SerModeGuard guard(Account::SerMode::Full);
     store_.update(id, acc);
   }
-  if (acc.getBalance() > 0 && !isUncounted(id))
+  if (acc.getBalance() > 0)
     totalCredits_ += acc.getBalance();
   LOGTRACE << "createAccount" << VAR(id) << VAR(acc.getBalance());
-}
-
-void Accounts::setUncountedAccount(const HashPrefix& id) {
-  // First, undo any prior uncounted exemption: re-add its current
-  // balance back into totalCredits_ if there was one.
-  if (hasUncounted_) {
-    auto it = store_.find(uncountedId_);
-    if (it != store_.end() && it->second.getBalance() > 0)
-      totalCredits_ += it->second.getBalance();
-  }
-  uncountedId_ = id;
-  hasUncounted_ = true;
-  // Subtract the new uncounted account's existing balance so the
-  // tally reflects only circulating (non-server) credits from now on.
-  auto it = store_.find(id);
-  if (it != store_.end() && it->second.getBalance() > 0)
-    totalCredits_ -= it->second.getBalance();
 }
 
 void Accounts::checkFlush(uint64_t amount) {
@@ -138,18 +121,15 @@ void Accounts::ActiveAccount::debit(uint64_t totalAmount) {
 
   int64_t oldBal = balance();
   int64_t newBal = oldBal - static_cast<int64_t>(totalAmount);
-  const bool counted = !parent.isUncounted(id);
 
   if (newBal <= 0) {
-    if (counted)
-      parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
+    parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
     parent.store_.erase(it);
     it = parent.store_.end();
     LOGTRACE << "debit: account deleted" << VAR(id) << VAR(oldBal)
              << VAR(totalAmount);
   } else {
-    if (counted)
-      parent.totalCredits_ -= static_cast<int64_t>(totalAmount);
+    parent.totalCredits_ -= static_cast<int64_t>(totalAmount);
     data().setBalance(newBal);
     data().setNonce(nonce() + 1);
     parent.store_.persist(it);
@@ -165,18 +145,15 @@ void Accounts::ActiveAccount::debitTransfer(uint64_t totalAmount,
 
   int64_t oldBal = balance();
   int64_t newBal = oldBal - static_cast<int64_t>(totalAmount);
-  const bool counted = !parent.isUncounted(id);
 
   if (newBal <= 0) {
-    if (counted)
-      parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
+    parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
     parent.store_.erase(it);
     it = parent.store_.end();
     LOGTRACE << "debitTransfer: account deleted" << VAR(id) << VAR(oldBal)
              << VAR(totalAmount);
   } else {
-    if (counted)
-      parent.totalCredits_ -= static_cast<int64_t>(totalAmount);
+    parent.totalCredits_ -= static_cast<int64_t>(totalAmount);
     data().setBalance(newBal);
     data().setNonce(nonce() + 1);
     data().setLastXferDest(destId);
@@ -205,8 +182,7 @@ void Accounts::ActiveAccount::credit(uint64_t amount) {
   } else {
     newBal = std::numeric_limits<int64_t>::max();
   }
-  if (!parent.isUncounted(id))
-    parent.totalCredits_ += (newBal - current);
+  parent.totalCredits_ += (newBal - current);
   data().setBalance(newBal);
   parent.store_.persist(it);
   LOGTRACE << "credit" << VAR(id) << VAR(amount) << VAR(newBal);
@@ -215,8 +191,7 @@ void Accounts::ActiveAccount::credit(uint64_t amount) {
 void Accounts::ActiveAccount::settlePayment(uint64_t amount) {
   if (!exists())
     return;
-  if (!parent.isUncounted(id))
-    parent.totalCredits_ += static_cast<int64_t>(amount);
+  parent.totalCredits_ += static_cast<int64_t>(amount);
   data().setBalance(amount);
   data().setNonce(0);
   parent.store_.persist(it);
@@ -229,17 +204,14 @@ void Accounts::ActiveAccount::chargeError(int64_t errFee) {
 
   int64_t oldBal = balance();
   int64_t b = oldBal - errFee;
-  const bool counted = !parent.isUncounted(id);
   if (b <= 0) {
-    if (counted)
-      parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
+    parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
     parent.store_.erase(it);
     it = parent.store_.end();
     LOGTRACE << "chargeError: account deleted" << VAR(id) << VAR(oldBal)
              << VAR(errFee);
   } else {
-    if (counted)
-      parent.totalCredits_ -= errFee;
+    parent.totalCredits_ -= errFee;
     data().setBalance(b);
     parent.store_.persist(it);
     LOGTRACE << "chargeError" << VAR(id) << VAR(errFee) << VAR(b);

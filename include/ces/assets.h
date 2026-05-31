@@ -4,7 +4,6 @@
 #include <ces/types.h>
 #include <logkv/store.h>
 
-#include <mutex>
 #include <string>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -39,9 +38,6 @@ public:
     void transferOwnership(const HashPrefix& newOwner);
 
   private:
-    // Mutate this asset, then persist it with the given SerMode.
-    // Restores the previous mode after the write (exception-safe via
-    // Asset::SerModeGuard). No-op if this active asset is empty.
     template <typename Mutator>
     void persistWithMode(Asset::SerMode mode, Mutator&& mutate) {
       if (!exists())
@@ -61,10 +57,6 @@ public:
   AssetStore& operator*() { return store_; }
   const AssetStore& operator*() const { return store_; }
 
-  std::unique_lock<std::mutex> lock() {
-    return std::unique_lock<std::mutex>(mutex_);
-  }
-
   ActiveAsset get(const minx::Hash& assetId);
   ActiveAsset getFirst();
 
@@ -74,7 +66,6 @@ private:
   friend struct ActiveAsset;
 
   AssetStore store_;
-  std::mutex mutex_;
   uint64_t flushValue_;
   uint64_t flushAccumulator_ = 0;
 };

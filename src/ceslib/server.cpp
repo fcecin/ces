@@ -977,15 +977,6 @@ CesServer::CesServer(const CesConfig& config)
   minx_->setMinimumDifficulty(cfg_.minDiff);
   minx_->setUseDataset(true);
 
-  // Mark the server's own account as "uncounted" — its balance is
-  // excluded from totalCredits_ and from credit/debit tally updates.
-  // It's forced to exactly 2^60 every boot via topUpServerAccount (far
-  // below INT64_MAX, so incoming transfers can never overflow). This must run
-  // before the first ledger mutation so loaded balances are already
-  // exempt by the time start() runs the top-up.
-  accounts_.setUncountedAccount(
-    Account::getMapKey(serverKeyPair_.getPublicKeyAsHash()));
-
   // Load persisted peer data, then seed with outbound config peers
   loadPeerData();
   for (auto& pc : cfg_.peers) {
@@ -1855,7 +1846,7 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
 
   kv("totalAccounts", std::to_string(accounts_->getObjects().size()));
   kv("totalAssets", std::to_string(assets_->getObjects().size()));
-  kv("totalCredits", std::to_string(accounts_.getTotalCredits()));
+  kv("totalCredits", std::to_string(circulatingCredits()));
   kv("feeAccount", std::to_string(cfg_.feeAccount));
   kv("feeAsset", std::to_string(cfg_.feeAsset));
   kv("feeTx", std::to_string(cfg_.feeTx));
@@ -1959,6 +1950,7 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
 }
 
 uint8_t CesServer::createAsset(const minx::Hash& originKey,
+                               const HashPrefix& ownerId,
                                const minx::Hash& assetId,
                                const AssetData& content, uint16_t balance,
                                uint32_t providedNonce, int64_t rentFee,
@@ -1996,7 +1988,7 @@ uint8_t CesServer::createAsset(const minx::Hash& originKey,
   bool priv = isAssetPrivate(balance);
   bool immut = isAssetImmutable(balance);
   uint16_t days = assetDays(balance);
-  Asset newAsset(origin.id, content,
+  Asset newAsset(ownerId, content,
                  assetBalance(1 + days, priv, /*aowned=*/false, immut), 0);
   Asset::SerModeGuard guard(Asset::SerMode::Full);
   assets_->update(assetId, newAsset);
@@ -2540,7 +2532,8 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
       dispatchSigned(addr, msg, std::move(req), key,
         [this](const CesCreateAsset& req, const HashPrefix& ownerPrefix,
                const SockAddr& addr, const MinxMessage& msg) {
-          uint8_t rc = createAsset(req.ownerId, req.assetId, req.content,
+          uint8_t rc = createAsset(req.ownerId, Account::getMapKey(req.ownerId),
+                                   req.assetId, req.content,
                                    req.amount, req.reqNonce);
 
           CesCreateAssetResult res;
@@ -3683,17 +3676,17 @@ void CesServer::launchBuiltinApps() {
 
 // Boot-time reset of the server's own account to exactly TARGET. Created
 // at TARGET if absent; otherwise its balance is forced to TARGET whether
-// it was below or above. The server account is uncounted and bottomless
-// by design (see server.h).
+// it was below or above.
 //
-// TARGET = 2^60, far below INT64_MAX so signed-int64 addition for incoming
-// transfers (dice bets, fee receipts) cannot overflow. Forcing rather than
-// topping up heals a stale balance corrupted (negative or near-saturation)
-// by an older build, instead of overshooting it.
+// TARGET is far below INT64_MAX so signed-int64 addition for incoming
+// transfers (dice bets, fee receipts) cannot overflow, yet still leaves
+// the credit tally (which counts this balance) far from saturation.
+// Forcing rather than topping up heals a stale balance corrupted
+// (negative or near-saturation) by an older build.
 //
 // Runs on logicStrand_ (caller posts it there).
 void CesServer::topUpServerAccount() {
-  static constexpr int64_t TARGET = int64_t(1) << 60;
+  static constexpr int64_t TARGET = int64_t(1) << 50;
   const minx::Hash& serverPubKey = serverKeyPair_.getPublicKeyAsHash();
   ActiveAccount acc = accounts_.get(serverPubKey);
 
@@ -3709,12 +3702,14 @@ void CesServer::topUpServerAccount() {
   // whether it's below (underfunded) or above (accumulated deposits, or
   // a stale value corrupted negative / near-saturation by an older
   // build). Forcing rather than topping up means a wrong balance can
-  // never get stuck overflowed. Uncounted, so totalCredits_ is untouched.
+  // never get stuck overflowed. The direct setBalance bypasses the
+  // credit/debit tally maintenance, so adjust totalCredits_ by the delta.
   int64_t cur = acc.balance();
   if (cur == TARGET) return;
   acc.data().setBalance(TARGET);
   Account::SerModeGuard guard(Account::SerMode::Full);
   accounts_->persist(acc.it);
+  accounts_.adjustTotalCredits(TARGET - cur);
   LOGINFO << "server account forced to bottomless target"
           << VAR(cur) << VAR(TARGET);
 }
@@ -4013,81 +4008,20 @@ void CesServer::_l2Transfer(
     });
 }
 
-void CesServer::_l2CreateAuthenticAsset(
+void CesServer::createAssetAsync(
     const minx::Hash& originKey,
-    const HashPrefix& assetOwnerId,
+    const HashPrefix& ownerId,
     const minx::Hash& assetId,
-    const std::array<uint8_t, AUTHENTIC_ASSET_HASH_SIZE>& programHash,
-    const AuthenticAssetData& payload,
-    uint16_t days,
+    const AssetData& content,
+    uint16_t balance,
     std::function<void(uint8_t rc)> cb,
     boost::asio::any_io_executor cbExecutor) {
-  // Authentic-asset content layout: [32B programHash][178B payload].
-  AssetData content{};
-  std::memcpy(content.data(),
-              programHash.data(), AUTHENTIC_ASSET_HASH_SIZE);
-  std::memcpy(content.data() + AUTHENTIC_ASSET_HASH_SIZE,
-              payload.data(), AUTHENTIC_ASSET_PAYLOAD_SIZE);
-
   auto self = this;
   postLogic(
-    [self, originKey, assetOwnerId, assetId, content, days,
-     cb, cbExecutor]() {
-      auto& cfg = self->cfg_;
-      int64_t rentFee = cfg.feeAsset;  // raw per-day rate
-      int64_t errFee = self->discountedFlatFee(
-        -1, cfg.getFeeError(), FeeKind::Query);
-
-      ActiveAccount origin =
-        self->accounts_.get(Account::getMapKey(originKey));
-      if (!origin.exists()) {
-        boost::asio::post(cbExecutor,
-          [cb]() { cb(CES_ERROR_ORIGIN_NOT_FOUND); });
-        return;
-      }
-
-      uint16_t cleanDays = assetDays(days);
-      uint64_t totalCost = self->attenuatedFundCost(
-        FeeKind::AssetRent, rentFee, 2u + cleanDays, 0);
-
-      uint8_t rc = origin.validateSpend(0, totalCost,
-                                        CES_NONCELESS, errFee);
-      if (rc != CES_OK) {
-        boost::asio::post(cbExecutor, [cb, rc]() { cb(rc); });
-        return;
-      }
-
-      auto asset = self->assets_.get(assetId);
-      if (asset.exists()) {
-        origin.chargeError(errFee);
-        boost::asio::post(cbExecutor,
-          [cb]() { cb(CES_ERROR_ASSET_EXISTS); });
-        return;
-      }
-      if (self->assets_->getObjects().size() >= cfg.maxAsset) {
-        boost::asio::post(cbExecutor,
-          [cb]() { cb(CES_ERROR_INTERNAL); });
-        return;
-      }
-
-      origin.debit(totalCost);
-      self->accounts_.checkFlush(totalCost);
-
-      // IMMUTABLE = true; PRIVATE / ASSET_OWNED = false.
-      // assetBalance() masks days into the 13-bit field; we add 1 day
-      // grace at create just like the wire path (createAsset).
-      uint16_t balance = assetBalance(
-        static_cast<uint16_t>(1 + cleanDays),
-        /*priv=*/false, /*aowned=*/false, /*immutable=*/true);
-
-      Asset newAsset(assetOwnerId, content, balance, 0);
-      Asset::SerModeGuard guard(Asset::SerMode::Full);
-      self->assets_->update(assetId, newAsset);
-
-      self->assets_.checkFlush(totalCost);
-      self->checkAutoSnapshot();
-
-      boost::asio::post(cbExecutor, [cb]() { cb(CES_OK); });
+    [self, originKey, ownerId, assetId, content, balance, cb, cbExecutor]() {
+      uint8_t rc = self->createAsset(originKey, ownerId, assetId, content,
+                                     balance, CES_NONCELESS);
+      boost::asio::post(cbExecutor, [cb, rc]() { cb(rc); });
     });
 }
 

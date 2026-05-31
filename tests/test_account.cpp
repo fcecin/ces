@@ -139,7 +139,8 @@ BOOST_AUTO_TEST_CASE(Test18_OriginNotFound) {
   CES_CHECK_RC_EQ(rc, CES_ERROR_ORIGIN_NOT_FOUND);
 
   // 4. Create Asset
-  rc = server->createAsset(ghostPub, randomId, data, 10, 1);
+  rc = server->createAsset(ghostPub, Account::getMapKey(ghostPub), randomId,
+                           data, 10, 1);
   CES_CHECK_RC_EQ(rc, CES_ERROR_ORIGIN_NOT_FOUND);
 
   // 5. Update Asset
@@ -272,8 +273,8 @@ BOOST_AUTO_TEST_CASE(Test22_QueryServerInfo) {
   };
 
   // Two accounts: the prefunded client + the server's own bottomless
-  // account auto-topped at boot. The server account is exempt from
-  // totalCredits_ tracking but still occupies a real slot.
+  // account auto-topped at boot. The server account is counted in the
+  // raw tally and subtracted out of the reported circulating total.
   BOOST_CHECK_EQUAL(find("totalAccounts"), "2");
   // One asset deployed at boot: /b/dice (shipped /b/<name> bytecode
   // program; see CesServer::deployBuiltinVmPrograms).
@@ -388,7 +389,9 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   AssetData data;
   data.fill(0xBB);
   minx::Hash assetId = makeHash("CREDITS_TEST_ASSET");
-  rc = server->createAsset(clientKey.getPublicKeyAsHash(), assetId, data, 10, 0);
+  rc = server->createAsset(clientKey.getPublicKeyAsHash(),
+                           Account::getMapKey(clientKey.getPublicKeyAsHash()),
+                           assetId, data, 10, 0);
   CES_CHECK_OK(rc);
   expected -= (2 + 10) * AST; // 460,800,000
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);

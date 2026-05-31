@@ -4,7 +4,6 @@
 #include <ces/types.h>
 #include <logkv/store.h>
 
-#include <mutex>
 #include <string>
 
 #include <boost/unordered/unordered_flat_map.hpp>
@@ -43,9 +42,6 @@ public:
   const AccountStore* operator->() const { return &store_; }
   AccountStore& operator*() { return store_; }
   const AccountStore& operator*() const { return store_; }
-  std::unique_lock<std::mutex> lock() {
-    return std::unique_lock<std::mutex>(mutex_);
-  }
 
   ActiveAccount get(const HashPrefix& id);
   ActiveAccount get(const minx::Hash& key);
@@ -57,27 +53,13 @@ public:
   int64_t getTotalCredits() const { return totalCredits_; }
   void adjustTotalCredits(int64_t delta) { totalCredits_ += delta; }
 
-  // Exclude one account (by HashPrefix) from totalCredits_ and from all
-  // credit/debit/createAccount/settlePayment/chargeError updates. Used for the
-  // server's own account. Call once after the store loads; subtracts any
-  // existing balance from totalCredits_ at call time.
-  void setUncountedAccount(const HashPrefix& id);
-
 private:
   friend struct ActiveAccount;
 
   AccountStore store_;
-  std::mutex mutex_;
   uint64_t flushValue_;
   uint64_t flushAccumulator_ = 0;
   int64_t totalCredits_ = 0;
-  HashPrefix uncountedId_{};
-  bool hasUncounted_ = false;
-
-  // Helper: true iff the given id is the uncounted account.
-  bool isUncounted(const HashPrefix& id) const {
-    return hasUncounted_ && id == uncountedId_;
-  }
 };
 
 } // namespace ces

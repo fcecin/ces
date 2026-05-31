@@ -1,6 +1,6 @@
 #pragma once
 
-#include <algorithm>
+#include <ces/persisted.h>
 #include <ces/types.h>
 #include <logkv/autoser.h>
 
@@ -9,15 +9,16 @@ namespace ces {
 /**
  * Accounts are 64-byte cache-line-aligned structures.
  *
- * Core fields (44 bytes):
- * - HashTail keyTail (24 bytes, combined with 8-byte HashPrefix map key = 32)
- * - int64_t balance (8 bytes)
- * - uint32_t nonce (4 bytes)
+ * Core fields:
+ * - HashTail keyTail (combined with the 8-byte HashPrefix map key to form
+ *   the full 32-byte account key)
+ * - int64_t balance
+ * - uint32_t nonce
  *
- * Last outgoing single-transfer receipt fields (20 bytes):
- * - HashPrefix lastXferDest (8 bytes)
- * - uint64_t lastXferAmount (8 bytes)
- * - uint32_t lastXferTime (4 bytes, Unix epoch seconds, uint32_t)
+ * Last outgoing single-transfer receipt fields:
+ * - HashPrefix lastXferDest
+ * - uint64_t lastXferAmount
+ * - uint32_t lastXferTime (Unix epoch seconds)
  */
 struct Account {
 
@@ -70,32 +71,14 @@ struct Account {
   uint32_t getLastXferTime() const { return lastXferTime_; }
   void setLastXferTime(uint32_t time) { lastXferTime_ = time; }
 
-  // --- Serialization mode control ---
-
   enum class SerMode : uint8_t {
-    Full = 0x00,        // all fields (account creation, snapshots)
+    Full = 0x00,         // all fields (account creation, snapshots)
     BalanceNonce = 0x01, // balance + nonce (PoW, credits, errors, bulk xfer)
     None = 0x02,         // erased object
     Transfer = 0x03      // balance + nonce + lastXferDest + lastXferAmount + lastXferTime
   };
 
-  static void _setSerMode(SerMode m) { serMode_ = m; }
-  static SerMode _getSerMode() { return serMode_; }
-
-  static void _logkvStoreSnapshot(bool s) { snapshotFlag_ = s; }
-  static bool _logkvStoreSnapshot() { return snapshotFlag_; }
-
-  // Scoped override of the thread-local SerMode. Restores the previous
-  // value on destruction even if the guarded operation throws.
-  struct SerModeGuard {
-    SerMode prev;
-    explicit SerModeGuard(SerMode m) : prev(Account::_getSerMode()) {
-      Account::_setSerMode(m);
-    }
-    ~SerModeGuard() { Account::_setSerMode(prev); }
-    SerModeGuard(const SerModeGuard&) = delete;
-    SerModeGuard& operator=(const SerModeGuard&) = delete;
-  };
+  CES_PERSISTED_BOILERPLATE(SerMode::BalanceNonce)
 
 private:
   HashTail keyTail_;
@@ -104,9 +87,6 @@ private:
   HashPrefix lastXferDest_;
   uint64_t lastXferAmount_;
   uint32_t lastXferTime_;
-
-  inline static thread_local SerMode serMode_ = SerMode::BalanceNonce;
-  inline static thread_local bool snapshotFlag_ = false;
 };
 
 } // namespace ces
@@ -121,12 +101,12 @@ struct serializer<ces::Account> {
   using SerMode = ces::Account::SerMode;
 
   // Field group sizes for serialization
-  static constexpr size_t SZ_KEY_TAIL = sizeof(ces::HashTail);       // 24
-  static constexpr size_t SZ_BALANCE = sizeof(int64_t);              // 8
-  static constexpr size_t SZ_NONCE = sizeof(uint32_t);               // 4
-  static constexpr size_t SZ_XFER_DEST = sizeof(ces::HashPrefix);   // 8
-  static constexpr size_t SZ_XFER_AMOUNT = sizeof(uint64_t);        // 8
-  static constexpr size_t SZ_XFER_TIME = sizeof(uint32_t);          // 4
+  static constexpr size_t SZ_KEY_TAIL = sizeof(ces::HashTail);
+  static constexpr size_t SZ_BALANCE = sizeof(int64_t);
+  static constexpr size_t SZ_NONCE = sizeof(uint32_t);
+  static constexpr size_t SZ_XFER_DEST = sizeof(ces::HashPrefix);
+  static constexpr size_t SZ_XFER_AMOUNT = sizeof(uint64_t);
+  static constexpr size_t SZ_XFER_TIME = sizeof(uint32_t);
 
   static constexpr size_t SZ_HEADER = 1;
   static constexpr size_t SZ_BALANCE_NONCE = SZ_BALANCE + SZ_NONCE;

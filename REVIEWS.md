@@ -2,6 +2,10 @@
 
 ## Review PASS 1
 
+* include/ces/account.h
+* include/ces/accounts.h
+* include/ces/asset.h
+* include/ces/assets.h
 * include/ces/buffer.h
 * include/ces/cesvm.h
 * include/ces/feemult.h
@@ -25,10 +29,6 @@
 
 ## Pending review
 
-* include/ces/account.h
-* include/ces/accounts.h
-* include/ces/asset.h
-* include/ces/assets.h
 * include/ces/autoexec.h
 * include/ces/cesco.h
 * include/ces/cesproxy.h

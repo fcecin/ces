@@ -468,10 +468,10 @@ public:
                             uint64_t& outLastXferAmount,
                             uint32_t& outLastXferTime);
 
-  uint8_t createAsset(const minx::Hash& originKey, const minx::Hash& assetId,
-                      const AssetData& content, uint16_t balance,
-                      uint32_t providedNonce, int64_t rentFee = -1,
-                      int64_t errFee = -1);
+  uint8_t createAsset(const minx::Hash& originKey, const HashPrefix& ownerId,
+                      const minx::Hash& assetId, const AssetData& content,
+                      uint16_t balance, uint32_t providedNonce,
+                      int64_t rentFee = -1, int64_t errFee = -1);
 
   uint8_t updateAsset(const minx::Hash& originKey, const minx::Hash& assetId,
                       const HashPrefix& newOwnerId, const AssetData& content,
@@ -522,7 +522,14 @@ public:
   void _burn(const minx::Hash& accountKey, int64_t amount);
   void _save();
 
-  int64_t _getTotalCredits() const { return accounts_.getTotalCredits(); }
+  // Credits in circulation: the raw account tally minus the server's own
+  // bottomless account, which is counted like any other account and
+  // subtracted here so the core ledger class stays unaware of it.
+  int64_t circulatingCredits() {
+    return accounts_.getTotalCredits() -
+           accounts_.get(serverKeyPair_.getPublicKeyAsHash()).balance();
+  }
+  int64_t _getTotalCredits() { return circulatingCredits(); }
 
   void _runDailyMaintenance();
 
@@ -699,29 +706,18 @@ public:
       std::function<void(uint8_t rc, int64_t newOriginBalance)> cb,
       boost::asio::any_io_executor cbExecutor);
 
-  // Program-initiated authentic asset creation. Origin is the
-  // program's owner pubkey (pays the asset rent from its account).
-  // The new asset is owned by `assetOwnerId` (which may differ from
-  // origin — the typical case is "program mints to a recipient
-  // player").
-  //
-  // The server builds the 210-byte asset content internally:
-  //   content[0..31]    = programHash    (caller-supplied stamp)
-  //   content[32..209]  = payload        (the AuthenticAssetData)
-  //
-  // The IMMUTABLE flag is set server-side; PRIVATE/ASSET_OWNED bits
-  // are NOT set. Days are clamped to the 13-bit max.
-  //
-  // Returns CES_OK on success. Same error spectrum as createAsset
-  // (ORIGIN_NOT_FOUND, INSUFFICIENT_BALANCE, ASSET_EXISTS,
-  // INTERNAL).
-  void _l2CreateAuthenticAsset(
+  // Off-strand asset creation for in-process callers (e.g. L2 service
+  // handlers running on rpcTaskIO_). Hops onto logicStrand_, runs the
+  // generic createAsset (origin pays/authorizes; ownerId controls the
+  // result; balance carries days + flag bits; NONCELESS), then posts
+  // the result code to cbExecutor. The caller supplies the full
+  // 210-byte content — the server attaches no meaning to its bytes.
+  void createAssetAsync(
       const minx::Hash& originKey,
-      const HashPrefix& assetOwnerId,
+      const HashPrefix& ownerId,
       const minx::Hash& assetId,
-      const std::array<uint8_t, AUTHENTIC_ASSET_HASH_SIZE>& programHash,
-      const AuthenticAssetData& payload,
-      uint16_t days,
+      const AssetData& content,
+      uint16_t balance,
       std::function<void(uint8_t rc)> cb,
       boost::asio::any_io_executor cbExecutor);
 
@@ -1118,11 +1114,12 @@ private:
   void runAutoexec(); // scan assets for autoexec keys, execute on boot
 
   // One-shot at boot: force the server's own account to exactly the
-  // TARGET balance (2^60). Deeply bottomless yet far below INT64_MAX,
-  // so deposits and fee receipts can never overflow signed-int64
-  // addition; forcing (not just topping up) also heals a stale balance
-  // corrupted by an older build. The server account is uncounted and
-  // bottomless by design.
+  // TARGET balance. Deeply bottomless yet far below INT64_MAX, so
+  // deposits and fee receipts can never overflow signed-int64 addition;
+  // forcing (not just topping up) also heals a stale balance corrupted
+  // by an older build. The server account is counted in the raw credit
+  // tally like any other and subtracted out at the stat
+  // (circulatingCredits()).
   // Strand-only access (called via post(logicStrand_, ...)).
   void topUpServerAccount();
 
