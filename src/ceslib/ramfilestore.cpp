@@ -2,10 +2,12 @@
 #include <ces/buffer.h>
 
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <set>
 #include <sstream>
 
 #include <cryptopp/sha.h>
@@ -17,6 +19,11 @@ namespace ces {
 // their RNG or reuses the same seed could hit repeated ASSET_EXISTS rejections.
 // Retry this many times before surfacing the error.
 static constexpr int MAX_CHUNK_COLLISION_RETRIES = 10;
+
+// Upper bound on the bytes ramfileGet pre-reserves from a head's declared
+// size, so a corrupt/hostile head can't request a giant allocation up front.
+// The output still grows past this if the real chain actually carries more.
+static constexpr size_t RAMFILE_GET_RESERVE_CAP = 64u * 1024 * 1024;
 
 // --- Helpers ---
 
@@ -216,10 +223,12 @@ uint8_t ramfileGet(CesClient& client, const minx::Hash& headKey,
   }
 
   // Walk chunk chain
-  outData.reserve(header.fileSize);
+  outData.reserve(std::min<uint64_t>(header.fileSize, RAMFILE_GET_RESERVE_CAP));
   minx::Hash nextKey = header.firstChunk;
+  std::set<minx::Hash> visited;
 
   while (!isZeroHash(nextKey) && outData.size() < header.fileSize) {
+    if (!visited.insert(nextKey).second) return CES_ERROR_INTERNAL; // cycle
     HashPrefix chunkOwner;
     AssetData chunkContent;
     uint16_t chunkBalance = 0;
@@ -260,7 +269,9 @@ uint8_t ramfileFund(CesClient& client, const minx::Hash& headKey, uint16_t days)
 
   // Walk and fund each chunk
   minx::Hash nextKey = header.firstChunk;
+  std::set<minx::Hash> visited;
   while (!isZeroHash(nextKey)) {
+    if (!visited.insert(nextKey).second) return CES_ERROR_INTERNAL; // cycle
     rc = client.fundAsset(nextKey, days);
     if (rc != CES_OK) return rc;
 
@@ -290,7 +301,9 @@ uint8_t ramfileScan(CesClient& client, const minx::Hash& headKey,
   if (rc != CES_OK) return rc;
 
   minx::Hash nextKey = header.firstChunk;
+  std::set<minx::Hash> visited;
   while (!isZeroHash(nextKey)) {
+    if (!visited.insert(nextKey).second) return CES_ERROR_INTERNAL; // cycle
     outKeys.push_back(nextKey);
 
     HashPrefix chunkOwner;

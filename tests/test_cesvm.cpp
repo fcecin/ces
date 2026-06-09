@@ -2281,8 +2281,9 @@ BOOST_FIXTURE_TEST_CASE(AutoexecAsset, CesFixture) {
   auto autoKey = buildAutoexecKey(getMyId());
   auto autoContent = buildAutoexecContent(
     counterAsset, 1'000'000'000, {}, clientKey, client->getServerId());
+  BOOST_REQUIRE(autoContent);
 
-  rc = client->createAsset(autoKey, autoContent, 30);
+  rc = client->createAsset(autoKey, *autoContent, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   wait_net();
 
@@ -2313,6 +2314,23 @@ BOOST_FIXTURE_TEST_CASE(AutoexecAsset, CesFixture) {
     BOOST_TEST_MESSAGE("Counter after autoexec: " << (int)content[209]);
     BOOST_CHECK_EQUAL(content[209], 1);
   }
+}
+
+BOOST_AUTO_TEST_CASE(AutoexecContentInputCap) {
+  // The whole signed run-request lives in one 210-byte asset cell, so input
+  // that overflows it must be rejected, not silently truncated.
+  KeyPair k;
+  minx::Hash programId;
+  programId.fill(0xAB);
+  HashPrefix serverId;
+  serverId.fill(0x11);
+
+  auto fits = buildAutoexecContent(programId, 1000, {}, k, serverId);
+  BOOST_REQUIRE(fits.has_value());
+
+  ces::Bytes tooBig(256, 0xCD);
+  auto over = buildAutoexecContent(programId, 1000, tooBig, k, serverId);
+  BOOST_CHECK(!over.has_value());
 }
 
 BOOST_FIXTURE_TEST_CASE(AutoexecDeletesGarbage, CesFixture) {
@@ -2361,7 +2379,8 @@ BOOST_FIXTURE_TEST_CASE(AutoexecDeletesBroke, CesFixture) {
   auto autoKey = buildAutoexecKey(Account::getMapKey(brokeKey.getPublicKeyAsHash()));
   auto autoContent = buildAutoexecContent(
     counterAsset, 999999999, {}, brokeKey, client->getServerId());
-  rc = client->createAsset(autoKey, autoContent, 30);
+  BOOST_REQUIRE(autoContent);
+  rc = client->createAsset(autoKey, *autoContent, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   wait_net();
 

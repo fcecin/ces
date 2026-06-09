@@ -7,6 +7,11 @@
  * - Unsigned messages: validate opcode and structure
  * - Unknown opcodes: drop + close
  * - PoW: verify RandomX hash locally before forwarding
+ *
+ * Only the general-purpose server request/response lane (MINX_MESSAGE) is
+ * proxied. The APPLICATION push lane (CES_APP_COMPUTE_MSG) is intentionally
+ * NOT proxied: compute programs are reachable only over a direct UDP
+ * connection.
  */
 
 #include <ces/keys.h>

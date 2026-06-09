@@ -1450,6 +1450,14 @@ BOOST_AUTO_TEST_CASE(CescoLiveSnapshot) {
     assertContains(r.out, "bye");
   }
 
+  // Ctrl+D (EOT, 0x04) takes the other close path and must flush "bye" too
+  {
+    auto r = run("printf '\\004' | socat - UNIX-CONNECT:" + sockPath);
+    BOOST_TEST_MESSAGE("cesco eot: " + r.out);
+    BOOST_CHECK_EQUAL(r.exitCode, 0);
+    assertContains(r.out, "bye");
+  }
+
   // Cleanup
   kill(pid, SIGTERM);
   for (int i = 0; i < 100; ++i) {

@@ -88,7 +88,7 @@ minx::Hash sha256(const uint8_t* data, size_t len);
  * @param headKey The key for the head asset (the "filename")
  * @param data File content bytes
  * @param days Days to fund each asset
- * @param metadata Optional metadata (up to 137 bytes, zero-padded)
+ * @param metadata Optional metadata (up to 121 bytes, zero-padded)
  * @param metaLen Length of metadata
  * @param progress Optional callback(chunksCreated, totalChunks)
  * @return CES_OK on success, error code on failure
@@ -219,7 +219,8 @@ uint8_t ramfileRehash(CesClient& client, const minx::Hash& headKey);
 
 /**
  * Resize a file. Truncate if shorter, zero-extend if longer, nop if same.
- * Requires scan file keys. Updates keys vector (may shrink or grow).
+ * Requires scan file keys. Updates keys vector (may grow on extend; never
+ * shrinks — truncated chunks stay linked as reusable capacity).
  * Zeroes head hash (dirty).
  * @param client Connected CesClient
  * @param keys Scan file keys — may be modified

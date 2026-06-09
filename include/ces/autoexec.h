@@ -17,6 +17,7 @@
 #include <ces/server.h>
 #include <ces/types.h>
 
+#include <optional>
 #include <random>
 
 namespace ces {
@@ -34,12 +35,11 @@ inline minx::Hash buildAutoexecKey(const HashPrefix& accountPrefix) {
 }
 
 /// Build autoexec asset content from a program asset key and budget.
-/// Signs a nonceless CesRunAsset packet with the given key pair.
-inline AssetData buildAutoexecContent(const minx::Hash& programAssetId,
-                                       uint64_t budget,
-                                       const ces::Bytes& input,
-                                       KeyPair& keyPair,
-                                       const HashPrefix& serverId) {
+/// Signs a nonceless CesRunAsset packet with the given key pair. Returns
+/// nullopt when the signed packet does not fit the asset content slot.
+inline std::optional<AssetData> buildAutoexecContent(
+    const minx::Hash& programAssetId, uint64_t budget, const ces::Bytes& input,
+    KeyPair& keyPair, const HashPrefix& serverId) {
   CesRunAsset req;
   req.originId = keyPair.getPublicKeyAsHash();
   req.serverId = serverId;
@@ -51,10 +51,11 @@ inline AssetData buildAutoexecContent(const minx::Hash& programAssetId,
   auto packetBytes = req.toBytes(keyPair);
 
   AssetData content{};
-  uint16_t pktLen = static_cast<uint16_t>(packetBytes.size());
-  ces::Buffer::poke<uint16_t>(content.data(), pktLen);
-  if (pktLen <= 208)
-    std::memcpy(&content[2], packetBytes.data(), pktLen);
+  if (packetBytes.size() > content.size() - 2)
+    return std::nullopt;
+  ces::Buffer::poke<uint16_t>(content.data(),
+                              static_cast<uint16_t>(packetBytes.size()));
+  std::memcpy(&content[2], packetBytes.data(), packetBytes.size());
   return content;
 }
 

@@ -23,6 +23,7 @@
  */
 
 #include <boost/asio.hpp>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -47,6 +48,8 @@ public:
 
 private:
   void doRead();
+  void doWrite();
+  void enqueue(const std::string& data);
   void builtinInterpreter(const uint8_t* data, size_t len);
   std::string dispatchCommand(const std::string& line);
 
@@ -55,6 +58,9 @@ private:
   Interpreter interpreter_;
   std::string lineBuffer_;
   std::array<uint8_t, 4096> readBuf_;
+  std::deque<std::string> writeQueue_;
+  bool writing_ = false;
+  bool closing_ = false;
 };
 
 class Cesco {

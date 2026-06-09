@@ -562,4 +562,33 @@ BOOST_AUTO_TEST_CASE(ReadScanFileMissing) {
   BOOST_CHECK(keys.empty());
 }
 
+BOOST_FIXTURE_TEST_CASE(CyclicChainRejected, CesFixture) {
+  // A chunk whose next-pointer points at itself, under a head whose declared
+  // size spans more than one chunk: without the cycle guard the chain walks
+  // loop forever (Fund would also drain the wallet). All three must error.
+  minx::Hash chunkKey;
+  chunkKey.fill(0);
+  chunkKey[0] = 0xC1;
+  chunkKey[1] = 0xC2;
+  ces::Bytes payload(RAMFILE_CHUNK_DATA_SIZE, 0x7E);
+  AssetData chunk = buildRamfileChunk(payload.data(), payload.size(), chunkKey);
+  BOOST_REQUIRE_EQUAL(client->createAsset(chunkKey, chunk, 30), CES_OK);
+
+  minx::Hash headKey;
+  headKey.fill(0);
+  headKey[0] = 0xC0;
+  AssetData head = buildRamfileHeader(1u << 20, minx::Hash{}, 0, 0,
+                                      nullptr, 0, chunkKey);
+  BOOST_REQUIRE_EQUAL(client->createAsset(headKey, head, 30), CES_OK);
+
+  ces::Bytes got;
+  BOOST_CHECK_EQUAL(ramfileGet(*client, headKey, got, nullptr, nullptr),
+                    CES_ERROR_INTERNAL);
+
+  std::vector<minx::Hash> keys;
+  BOOST_CHECK_EQUAL(ramfileScan(*client, headKey, keys), CES_ERROR_INTERNAL);
+
+  BOOST_CHECK_EQUAL(ramfileFund(*client, headKey, 1), CES_ERROR_INTERNAL);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

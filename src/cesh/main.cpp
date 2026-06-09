@@ -496,7 +496,8 @@ int main(int argc, char* argv[]) {
   auto* cmd_axi = cmd_autoexec->add_subcommand("install", "Install autoexec program");
   cmd_axi->add_option("program", autoexec_program_arg, "Program asset ID or name")->required();
   cmd_axi->add_option("--budget", autoexec_budget_arg, "Gas budget per boot execution");
-  cmd_axi->add_option("--input", autoexec_input_arg, "Input data (hex string)");
+  cmd_axi->add_option("--input", autoexec_input_arg,
+    "Input data (hex string; <= ~40 bytes - must fit in the autoexec asset cell)");
   cmd_axi->add_option("--days", autoexec_days_arg, "Days to fund autoexec asset (default 30)");
 
   // ---- Parse ----
@@ -1825,8 +1826,13 @@ int main(int argc, char* argv[]) {
       auto autoKey = buildAutoexecKey(myPrefix);
       auto autoContent = buildAutoexecContent(
         programId, autoexec_budget_arg, input, actorKey, cc.getServerId());
+      if (!autoContent) {
+        std::cerr << "Install Failed: input too large for autoexec asset "
+                     "(max ~40 bytes of --input)\n";
+        return 1;
+      }
 
-      uint8_t rc = cc.createAsset(autoKey, autoContent, autoexec_days_arg);
+      uint8_t rc = cc.createAsset(autoKey, *autoContent, autoexec_days_arg);
       if (rc == CES_OK) {
         std::string keyHex = minx::hashToString(autoKey);
         print_header("Autoexec Installed");

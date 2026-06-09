@@ -29,17 +29,47 @@ CescoSession::CescoSession(Socket socket, CesServer& server)
 }
 
 void CescoSession::start() {
-  send("cesco> ");
+  enqueue("cesco> ");
   doRead();
 }
 
 void CescoSession::send(const std::string& data) {
+  // Cross-thread entry: marshal onto the session's executor so all socket
+  // I/O happens on the cesco strand (e.g. the logic-strand snapshot callback
+  // routes its reply here).
   auto self = shared_from_this();
-  auto buf = std::make_shared<std::string>(data);
-  boost::asio::async_write(socket_, boost::asio::buffer(*buf),
-    [self, buf](boost::system::error_code ec, size_t) {
+  boost::asio::post(socket_.get_executor(),
+                    [this, self, data]() { enqueue(data); });
+}
+
+void CescoSession::enqueue(const std::string& data) {
+  // Cesco-strand only. One async_write in flight at a time; the rest queue.
+  writeQueue_.push_back(data);
+  if (!writing_)
+    doWrite();
+}
+
+void CescoSession::doWrite() {
+  writing_ = true;
+  auto self = shared_from_this();
+  boost::asio::async_write(socket_, boost::asio::buffer(writeQueue_.front()),
+    [this, self](boost::system::error_code ec, size_t) {
       if (ec) {
-        LOGDEBUG << "cesco send error" << SVAR(ec);
+        if (ec != boost::asio::error::operation_aborted) {
+          LOGDEBUG << "cesco send error" << SVAR(ec);
+        }
+        writing_ = false;
+        return;
+      }
+      writeQueue_.pop_front();
+      if (!writeQueue_.empty()) {
+        doWrite();
+      } else {
+        writing_ = false;
+        if (closing_) {
+          boost::system::error_code ic;
+          socket_.close(ic);
+        }
       }
     });
 }
@@ -64,11 +94,10 @@ void CescoSession::builtinInterpreter(const uint8_t* data, size_t len) {
   for (size_t i = 0; i < len; ++i) {
     uint8_t b = data[i];
 
-    // Ctrl+C (ETX) or Ctrl+D (EOT) → close
+    // Ctrl+C (ETX) or Ctrl+D (EOT) → close after the farewell flushes
     if (b == 0x03 || b == 0x04) {
-      send("bye\n");
-      boost::system::error_code ec;
-      socket_.close(ec);
+      closing_ = true;
+      enqueue("bye\n");
       return;
     }
 
@@ -92,12 +121,11 @@ void CescoSession::builtinInterpreter(const uint8_t* data, size_t len) {
       if (!line.empty()) {
         std::string response = dispatchCommand(line);
         if (!response.empty())
-          send(response);
-        // Check if quit was requested (socket may be closed)
-        if (!socket_.is_open())
+          enqueue(response);
+        if (closing_)
           return;
       }
-      send("cesco> ");
+      enqueue("cesco> ");
       continue;
     }
 
@@ -212,9 +240,8 @@ std::string CescoSession::dispatchCommand(const std::string& line) {
   }
 
   if (line == "q" || line == "quit" || line == "exit") {
-    send("bye\n");
-    boost::system::error_code ec;
-    socket_.close(ec);
+    closing_ = true;
+    enqueue("bye\n");
     return "";
   }
 
