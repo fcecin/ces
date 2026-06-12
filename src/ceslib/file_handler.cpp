@@ -677,7 +677,8 @@ ces::Bytes buildResponseEnvelope(
   minx::Hash digest = ces::sha256(hashIn.data(), hashIn.size());
 
   // Wire: [status][preamble][time_us][reqSigHash][sha256][sig]
-  ces::Buffer out(1 + preamble.size() + 8 + 8 + 32 + 65);
+  ces::Buffer out(
+      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE);
   out.put<uint8_t>(status)
      .putBytes(preamble)
      .put<uint64_t>(timeUs)
@@ -808,7 +809,7 @@ uint8_t verifySignedEnvelope(
     const std::array<uint8_t, 32>& sha256Claim,
     const std::array<uint8_t, 65>& sig) {
   ces::Bytes hashIn;
-  hashIn.reserve(1 + preamble.size());
+  hashIn.reserve(sizeof(uint8_t) + preamble.size());
   hashIn.push_back(verb);
   hashIn.insert(hashIn.end(), preamble.begin(), preamble.end());
   minx::Hash computed = ces::sha256(hashIn.data(), hashIn.size());
@@ -1049,7 +1050,8 @@ void checkZoneOwnership(
 }
 
 void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 8 + 8 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t)
+                     + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1238,7 +1240,8 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // looping would let those bytes land as phantom next-verbs on the
   // wire. The body-phase (after async_read of `state->body`) can use
   // sendErrorAndLoop because the body was consumed.
-  if (pre.size() < 8 + 4 + 32 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint32_t) + sizeof(minx::Hash)
+                     + sizeof(uint16_t)) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1367,7 +1370,7 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 4 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1471,7 +1474,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1529,7 +1532,7 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1606,7 +1609,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -1845,7 +1848,7 @@ struct AppendBodyState : std::enable_shared_from_this<AppendBodyState> {
 void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // APPEND pre-body rejects must CLOSE (body in flight — same
   // rationale as WRITE).
-  if (pre.size() < 4 + 32 + 2) {
+  if (pre.size() < sizeof(uint32_t) + sizeof(minx::Hash) + sizeof(uint16_t)) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;
@@ -2006,7 +2009,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 8 + 2) {
+  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
   size_t off = 0;

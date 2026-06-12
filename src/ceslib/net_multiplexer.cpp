@@ -136,7 +136,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
   std::array<uint8_t, 2> lenBuf{};
   ces::Bytes nameBuf;
   // Tail = [u64 time_us][32 pubkey][32 sha256][65 sig] = 137 bytes.
-  std::array<uint8_t, 8 + 32 + 32 + 65> tailBuf{};
+  std::array<uint8_t, CES_PLEX_BIND_REQ_TAIL_SIZE> tailBuf{};
 
   // Outbound bind reply. Held as a member so the async_write has a
   // stable buffer address.
@@ -321,7 +321,8 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     // way; client may not be able to verify a NACK that came before
     // it sent its preamble.
     std::array<uint8_t, CES_PLEX_SHA256_SIZE> clientSha{};
-    std::memcpy(clientSha.data(), tailBuf.data() + 8 + 32,
+    std::memcpy(clientSha.data(),
+                tailBuf.data() + sizeof(uint64_t) + CES_PLEX_PUBKEY_SIZE,
                 CES_PLEX_SHA256_SIZE);
 
     replyBuf = buildBindReply(

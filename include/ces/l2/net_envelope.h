@@ -132,6 +132,34 @@ constexpr size_t CES_PLEX_BIND_REPLY_TOTAL_SIZE =
 static_assert(CES_PLEX_BIND_REPLY_TOTAL_SIZE == 182,
               "bind reply total size diverged");
 
+// Per-op request envelope header: [u8 verb][u32 BE preamble_len].
+constexpr size_t CES_PLEX_VERB_SIZE         = sizeof(uint8_t);
+constexpr size_t CES_PLEX_PREAMBLE_LEN_SIZE = sizeof(uint32_t);
+
+// Server-signed per-op response envelope:
+//   [u8 status][preamble][u64 time_us][u64 req_sig_hash][sha256][sig]
+constexpr size_t CES_PLEX_STATUS_SIZE       = sizeof(uint8_t);
+constexpr size_t CES_PLEX_TIME_US_SIZE      = sizeof(uint64_t);
+constexpr size_t CES_PLEX_REQ_SIG_HASH_SIZE = sizeof(uint64_t);
+
+// Fixed bytes trailing the response preamble: time_us + req_sig_hash +
+// digest + sig. The status byte and preamble precede it.
+constexpr size_t CES_PLEX_RESP_TRAILER_SIZE =
+    CES_PLEX_TIME_US_SIZE + CES_PLEX_REQ_SIG_HASH_SIZE
+    + CES_PLEX_SHA256_SIZE + CES_PLEX_SIG_SIZE;
+static_assert(CES_PLEX_RESP_TRAILER_SIZE == 113,
+              "response trailer size diverged from documented layout");
+
+// Bind request wire: [u16 name_len][name][u64 client_time_us]
+//   [client_pubkey][client_sha256][sig]. The tail is everything after
+// the name (time + pubkey + digest + sig).
+constexpr size_t CES_PLEX_NAME_LEN_SIZE = sizeof(uint16_t);
+constexpr size_t CES_PLEX_BIND_REQ_TAIL_SIZE =
+    sizeof(uint64_t) + CES_PLEX_PUBKEY_SIZE
+    + CES_PLEX_SHA256_SIZE + CES_PLEX_SIG_SIZE;
+static_assert(CES_PLEX_BIND_REQ_TAIL_SIZE == 137,
+              "bind request tail size diverged from documented layout");
+
 // ---------------------------------------------------------------------------
 // BoundChannelContext — what CesPlex passes to a handler at handoff
 // ---------------------------------------------------------------------------

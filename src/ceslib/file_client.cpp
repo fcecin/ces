@@ -296,7 +296,7 @@ public:
   bool readAndVerifyTail(uint8_t status, uint8_t verb,
                          const ces::Bytes& preamble) {
     if (!stream_) return false;
-    std::array<uint8_t, 8 + 8 + 32 + 65> tail{};
+    std::array<uint8_t, ces::CES_PLEX_RESP_TRAILER_SIZE> tail{};
     auto run = std::make_shared<std::promise<bool>>();
     auto fut = run->get_future();
     auto strm = stream_;
@@ -310,16 +310,27 @@ public:
     if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
     if (!fut.get()) return false;
 
+    // Response trailer layout: [u64 time_us][u64 req_sig_hash]
+    //   [sha256 digest][sig]. Offsets accumulate those field sizes.
+    constexpr size_t kReqSigHashOff = ces::CES_PLEX_TIME_US_SIZE;
+    constexpr size_t kDigestOff =
+        kReqSigHashOff + ces::CES_PLEX_REQ_SIG_HASH_SIZE;
+    constexpr size_t kSigOff = kDigestOff + ces::CES_PLEX_SHA256_SIZE;
+
     uint64_t timeUs = ces::Buffer::peek<uint64_t>(tail.data());
-    std::array<uint8_t, 8> reqSigHash{};
-    std::memcpy(reqSigHash.data(), tail.data() + 8, 8);
-    std::array<uint8_t, 32> claimedHash{};
-    std::memcpy(claimedHash.data(), tail.data() + 16, 32);
+    std::array<uint8_t, ces::CES_PLEX_REQ_SIG_HASH_SIZE> reqSigHash{};
+    std::memcpy(reqSigHash.data(), tail.data() + kReqSigHashOff,
+                reqSigHash.size());
+    std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> claimedHash{};
+    std::memcpy(claimedHash.data(), tail.data() + kDigestOff,
+                claimedHash.size());
     Signature sig{};
-    std::memcpy(sig.data(), tail.data() + 48, 65);
+    std::memcpy(sig.data(), tail.data() + kSigOff, sig.size());
 
     // Recompute sha256(status || verb || preamble || time || reqSigHash).
-    ces::Buffer hashIn(2 + preamble.size() + 8 + 8);
+    ces::Buffer hashIn(ces::CES_PLEX_STATUS_SIZE + ces::CES_PLEX_VERB_SIZE
+                       + preamble.size() + ces::CES_PLEX_TIME_US_SIZE
+                       + ces::CES_PLEX_REQ_SIG_HASH_SIZE);
     hashIn.put<uint8_t>(status)
           .put<uint8_t>(verb)
           .putBytes(std::span<const uint8_t>(preamble))
@@ -328,7 +339,8 @@ public:
             reqSigHash.data(), reqSigHash.size()));
     minx::Hash computed = ces::sha256(hashIn.data(), hashIn.size());
 
-    if (std::memcmp(computed.data(), claimedHash.data(), 32) != 0) {
+    if (std::memcmp(computed.data(), claimedHash.data(),
+                    claimedHash.size()) != 0) {
       LOGERROR << "cesfileclient: response hash mismatch";
       return true; // read succeeded; verification failed (non-fatal)
     }
@@ -709,14 +721,16 @@ uint8_t CesFileClient::read(
   auto env = buildSignedEnvelope(impl_->signerKey(), kVerbRead, pre, impl_->boundSessionToken());
 
   ces::Bytes resp, body;
-  uint8_t rc = driveVerb(*impl_, kVerbRead, env, /*fixedPre=*/8 + 32,
+  uint8_t rc = driveVerb(*impl_, kVerbRead, env,
+                         /*fixedPre=*/sizeof(uint64_t) + sizeof(minx::Hash),
                          nullptr,
                          [](const ces::Bytes& p) -> uint64_t {
                            return ces::Buffer::peek<uint64_t>(p.data());
                          },
                          {}, resp, body);
   if (rc != CES_OK) return rc;
-  std::memcpy(outRangeHash.data(), resp.data() + 8, 32);
+  std::memcpy(outRangeHash.data(), resp.data() + sizeof(uint64_t),
+              sizeof(minx::Hash));
   outContent = std::move(body);
   return CES_OK;
 }
@@ -732,12 +746,17 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
 
   // Variable-length response preamble (content_type is variable).
   // Use the readVariablePreamble hook to extend after the fixed prefix.
+  // STAT fixed preamble: owner_pubkey + file_balance + price_per_kb +
+  // size + content_type_len.
+  constexpr size_t kStatFixedPre =
+      ces::KEY_SIZE + sizeof(uint64_t) * 3 + sizeof(uint16_t);
   ces::Bytes resp, body;
   uint8_t rc = driveVerb(
     *impl_, kVerbStat, env,
-    /*fixedPre=*/32 + 8 + 8 + 8 + 2,
+    /*fixedPre=*/kStatFixedPre,
     [this](ces::Bytes& p) -> bool {
-      uint16_t ctLen = ces::Buffer::peek<uint16_t>(p.data() + 32 + 8 + 8 + 8);
+      uint16_t ctLen = ces::Buffer::peek<uint16_t>(
+          p.data() + (kStatFixedPre - sizeof(uint16_t)));
       if (ctLen > 0) {
         ces::Bytes ct;
         if (!impl_->readExact(ct, ctLen)) return false;
@@ -851,7 +870,8 @@ uint8_t CesFileClient::append(const std::string& name,
   auto env = buildSignedEnvelope(impl_->signerKey(), kVerbAppend, pre, impl_->boundSessionToken());
 
   ces::Bytes resp, body;
-  uint8_t rc = driveVerb(*impl_, kVerbAppend, env, /*fixedPre=*/8 + 8,
+  uint8_t rc = driveVerb(*impl_, kVerbAppend, env,
+                         /*fixedPre=*/sizeof(uint64_t) + sizeof(uint64_t),
                          nullptr, nullptr, content, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());

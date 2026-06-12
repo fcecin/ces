@@ -44,8 +44,8 @@ minx::Bytes buildBindRequest(const std::string& name,
   Signature sig = clientKey.signData(
     std::span<const uint8_t>(digest.data(), digest.size()));
 
-  const size_t total = 2 + name.size() + 8 + CES_PLEX_PUBKEY_SIZE +
-                       CES_PLEX_SHA256_SIZE + CES_PLEX_SIG_SIZE;
+  const size_t total =
+      CES_PLEX_NAME_LEN_SIZE + name.size() + CES_PLEX_BIND_REQ_TAIL_SIZE;
   minx::Bytes bytes(total);
   minx::Buffer buf(bytes);
   buf.put<uint16_t>(static_cast<uint16_t>(name.size()));

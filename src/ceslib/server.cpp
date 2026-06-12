@@ -337,7 +337,7 @@ private:
   void write_request_body() {
     // Wire layout post-bind: [u32 body_len][body bytes].
     requestWireBuf_.clear();
-    requestWireBuf_.reserve(4 + requestBody_.size());
+    requestWireBuf_.reserve(sizeof(uint32_t) + requestBody_.size());
     ces::Buffer::put<uint32_t>(
       requestWireBuf_, static_cast<uint32_t>(requestBody_.size()));
     ces::Buffer::putBytes(

@@ -225,7 +225,7 @@ public:
   bool readAndVerifyTail(uint8_t status, uint8_t verb,
                          const ces::Bytes& preamble) {
     if (!stream_) return false;
-    std::array<uint8_t, 8 + 8 + 32 + 65> tail{};
+    std::array<uint8_t, ces::CES_PLEX_RESP_TRAILER_SIZE> tail{};
     auto run = std::make_shared<std::promise<bool>>();
     auto fut = run->get_future();
     auto strm = stream_;
@@ -240,14 +240,25 @@ public:
     if (!fut.get()) return false;
 
     uint64_t timeUs = ces::Buffer::peek<uint64_t>(tail.data());
-    std::array<uint8_t, 8> reqSigHash{};
-    std::memcpy(reqSigHash.data(), tail.data() + 8, 8);
-    std::array<uint8_t, 32> claimedHash{};
-    std::memcpy(claimedHash.data(), tail.data() + 16, 32);
-    Signature sig{};
-    std::memcpy(sig.data(), tail.data() + 48, 65);
+    // Response trailer layout: [u64 time_us][u64 req_sig_hash]
+    //   [sha256 digest][sig]. Offsets accumulate those field sizes.
+    constexpr size_t kReqSigHashOff = ces::CES_PLEX_TIME_US_SIZE;
+    constexpr size_t kDigestOff =
+        kReqSigHashOff + ces::CES_PLEX_REQ_SIG_HASH_SIZE;
+    constexpr size_t kSigOff = kDigestOff + ces::CES_PLEX_SHA256_SIZE;
 
-    ces::Buffer hashIn(2 + preamble.size() + 16);
+    std::array<uint8_t, ces::CES_PLEX_REQ_SIG_HASH_SIZE> reqSigHash{};
+    std::memcpy(reqSigHash.data(), tail.data() + kReqSigHashOff,
+                reqSigHash.size());
+    std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> claimedHash{};
+    std::memcpy(claimedHash.data(), tail.data() + kDigestOff,
+                claimedHash.size());
+    Signature sig{};
+    std::memcpy(sig.data(), tail.data() + kSigOff, sig.size());
+
+    ces::Buffer hashIn(ces::CES_PLEX_STATUS_SIZE + ces::CES_PLEX_VERB_SIZE
+                       + preamble.size() + ces::CES_PLEX_TIME_US_SIZE
+                       + ces::CES_PLEX_REQ_SIG_HASH_SIZE);
     hashIn.put<uint8_t>(status)
           .put<uint8_t>(verb)
           .putBytes(std::span<const uint8_t>(preamble))
@@ -256,7 +267,8 @@ public:
             reqSigHash.data(), reqSigHash.size()));
     minx::Hash computed = ces::sha256(hashIn.data(), hashIn.size());
 
-    if (std::memcmp(computed.data(), claimedHash.data(), 32) != 0) {
+    if (std::memcmp(computed.data(), claimedHash.data(),
+                    claimedHash.size()) != 0) {
       LOGERROR << "ccc: response hash mismatch";
       return true;
     }
@@ -549,7 +561,8 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
     uint32_t count = ces::Buffer::peek<uint32_t>(countBuf.data());
     for (uint32_t i = 0; i < count; ++i) {
       ces::Bytes header;
-      if (!impl_->readExact(header, 8 + 2)) return false;
+      if (!impl_->readExact(header, sizeof(uint64_t) + sizeof(uint16_t)))
+        return false;
       preamble.insert(preamble.end(), header.begin(), header.end());
       uint16_t nameLen = ces::Buffer::peek<uint16_t>(header.data() + 8);
       ces::Bytes nameBuf;
@@ -559,7 +572,9 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
       }
       // Per-entry trailer: startedAtUs | fileBalance | cpuBp | rssBytes.
       ces::Bytes tail;
-      if (!impl_->readExact(tail, 8 + 8 + 4 + 8)) return false;
+      if (!impl_->readExact(tail, sizeof(uint64_t) + sizeof(uint64_t)
+                                    + sizeof(uint32_t) + sizeof(uint64_t)))
+        return false;
       preamble.insert(preamble.end(), tail.begin(), tail.end());
 
       InstanceInfo info;

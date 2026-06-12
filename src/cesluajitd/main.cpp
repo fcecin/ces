@@ -207,6 +207,12 @@ constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
 constexpr uint8_t STATUS_INSUFFICIENT_BAL = 0x02;
 constexpr uint8_t STATUS_INTERNAL         = 0xFF;
 
+// Byte widths of fixed wire fields shared with the host. This TU has no
+// ces includes, so these mirror ces::KEY_SIZE / the sha256 digest / the
+// 8-byte HashPrefix by value.
+constexpr size_t WIRE_KEY_LEN    = 32;   // pubkey / sha256 / asset id
+constexpr size_t WIRE_PREFIX_LEN = 8;    // account / program hash prefix
+
 struct Frame {
   uint8_t  tag;
   uint16_t corr_id;
@@ -268,7 +274,8 @@ bool read_frame(Frame& out) {
 
 bool write_frame(uint8_t tag, uint16_t corr_id,
                  const uint8_t* body, size_t body_len) {
-  uint32_t len = static_cast<uint32_t>(3 + body_len);
+  uint32_t len = static_cast<uint32_t>(
+      sizeof(uint8_t) + sizeof(uint16_t) + body_len);   // tag + corr + body
   uint8_t hdr[7];
   hdr[0] = uint8_t((len >> 24) & 0xFF);
   hdr[1] = uint8_t((len >> 16) & 0xFF);
@@ -551,7 +558,8 @@ int lua_ces_client_send(lua_State* L) {
   // Marshal API call body:
   //   [u16 BE method][8B target_pfx][u16 BE len][bytes]
   std::vector<uint8_t> body;
-  body.reserve(2 + 8 + 2 + bytes_len);
+  body.reserve(sizeof(uint16_t) + WIRE_PREFIX_LEN + sizeof(uint16_t)
+               + bytes_len);
   body.push_back(uint8_t((METHOD_CLIENT_SEND >> 8) & 0xFF));
   body.push_back(uint8_t( METHOD_CLIENT_SEND       & 0xFF));
   body.insert(body.end(),
@@ -686,7 +694,7 @@ uint64_t get_u64(const uint8_t* p) {
 bool api_call(uint16_t method,
               const std::vector<uint8_t>& args, Frame& reply) {
   std::vector<uint8_t> body;
-  body.reserve(2 + args.size());
+  body.reserve(sizeof(uint16_t) + args.size());
   put_u16(body, method);
   body.insert(body.end(), args.begin(), args.end());
   uint16_t corr = g_next_corr_id++;
@@ -736,7 +744,7 @@ int lua_ces_transfer(lua_State* L) {
   uint64_t amount = static_cast<uint64_t>(amt_n);
 
   std::vector<uint8_t> args;
-  args.reserve(32 + 8);
+  args.reserve(WIRE_KEY_LEN + sizeof(uint64_t));
   put_bytes(args, pk, 32);
   put_u64(args, amount);
 
@@ -749,7 +757,8 @@ int lua_ces_transfer(lua_State* L) {
     return 2;
   }
   // Tail: [u64 BE new_origin_balance]
-  if (reply.body.size() < 1 + 8) return push_file_err(L, STATUS_INTERNAL);
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
+    return push_file_err(L, STATUS_INTERNAL);
   uint64_t newBal = get_u64(reply.body.data() + 1);
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
@@ -801,7 +810,7 @@ int lua_ces_authentic_asset_create(lua_State* L) {
   }
 
   std::vector<uint8_t> args;
-  args.reserve(32 + 32 + 2 + pl_len);
+  args.reserve(WIRE_KEY_LEN + WIRE_KEY_LEN + sizeof(uint16_t) + pl_len);
   put_bytes(args, aid, 32);
   put_bytes(args, rcpt, 32);
   put_u16(args, static_cast<uint16_t>(days_i));
@@ -840,7 +849,8 @@ int lua_ces_random_bytes(lua_State* L) {
   if (!api_call(METHOD_RANDOM_BYTES, args, reply)) return push_ipc_fail(L);
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
-  if (reply.body.size() < 1u + size_t(n)) return push_file_err(L, STATUS_INTERNAL);
+  if (reply.body.size() < sizeof(uint8_t) + size_t(n))
+    return push_file_err(L, STATUS_INTERNAL);
   lua_pushlstring(L,
     reinterpret_cast<const char*>(reply.body.data() + 1),
     static_cast<size_t>(n));
@@ -871,8 +881,11 @@ int lua_ces_account_read(lua_State* L) {
   if (st != STATUS_OK) return push_file_err(L, st);
   // Tail: [i64 BE balance][u32 BE nonce][8B last_xfer_dest]
   //       [u64 BE last_xfer_amount][u32 BE last_xfer_time]
-  constexpr size_t TAIL = 8 + 4 + 8 + 8 + 4;
-  if (reply.body.size() < 1 + TAIL) return push_file_err(L, STATUS_INTERNAL);
+  constexpr size_t TAIL = sizeof(uint64_t) + sizeof(uint32_t)
+                          + WIRE_PREFIX_LEN + sizeof(uint64_t)
+                          + sizeof(uint32_t);
+  if (reply.body.size() < sizeof(uint8_t) + TAIL)
+    return push_file_err(L, STATUS_INTERNAL);
   const uint8_t* p = reply.body.data() + 1;
   uint64_t balU = get_u64(p); p += 8;
   uint32_t nonce = get_u32(p); p += 4;
@@ -978,9 +991,12 @@ int lua_ces_bucket_get(lua_State* L) {
     lua_pushnil(L);
     return 1;
   }
-  if (reply.body.size() < 1 + 1 + 4) return push_file_err(L, STATUS_INTERNAL);
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t))
+    return push_file_err(L, STATUS_INTERNAL);
   uint32_t vlen = get_u32(reply.body.data() + 2);
-  if (reply.body.size() < 1u + 1u + 4u + vlen) return push_file_err(L, STATUS_INTERNAL);
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint8_t) + sizeof(uint32_t)
+                            + vlen)
+    return push_file_err(L, STATUS_INTERNAL);
   lua_pushlstring(L,
     reinterpret_cast<const char*>(reply.body.data() + 6), vlen);
   return 1;
@@ -1024,7 +1040,8 @@ int lua_ces_bucket_new(lua_State* L) {
   if (!api_call(METHOD_BUCKET_NEW, args, reply)) return push_ipc_fail(L);
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
-  if (reply.body.size() < 1 + 4) return push_file_err(L, STATUS_INTERNAL);
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint32_t))
+    return push_file_err(L, STATUS_INTERNAL);
   uint32_t id = get_u32(reply.body.data() + 1);
   // Build the bucket-self Lua table.
   lua_newtable(L);
@@ -1051,7 +1068,8 @@ int lua_ces_file_stat(lua_State* L) {
   //       [u64 createdUs][u64 modifiedUs]
   const uint8_t* p = reply.body.data() + 1;
   size_t rem = reply.body.size() - 1;
-  if (rem < 32 + 8*3 + 2) return push_file_err(L, STATUS_INTERNAL);
+  if (rem < WIRE_KEY_LEN + sizeof(uint64_t) * 3 + sizeof(uint16_t))
+    return push_file_err(L, STATUS_INTERNAL);
   const uint8_t* owner = p; p += 32;
   uint64_t fb = get_u64(p); p += 8;
   uint64_t ppk = get_u64(p); p += 8;
@@ -1091,11 +1109,12 @@ int lua_ces_file_read(lua_State* L) {
   if (!api_call(METHOD_FILE_READ, args, reply)) return push_ipc_fail(L);
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
-  if (reply.body.size() < 5) return push_file_err(L, STATUS_INTERNAL);
-  uint32_t dlen = get_u32(reply.body.data() + 1);
-  if (reply.body.size() < 5 + size_t(dlen))
+  constexpr size_t kHdr = sizeof(uint8_t) + sizeof(uint32_t);  // status + len
+  if (reply.body.size() < kHdr) return push_file_err(L, STATUS_INTERNAL);
+  uint32_t dlen = get_u32(reply.body.data() + sizeof(uint8_t));
+  if (reply.body.size() < kHdr + size_t(dlen))
     return push_file_err(L, STATUS_INTERNAL);
-  lua_pushlstring(L, reinterpret_cast<const char*>(reply.body.data() + 5),
+  lua_pushlstring(L, reinterpret_cast<const char*>(reply.body.data() + kHdr),
                   dlen);
   return 1;
 }
@@ -1331,14 +1350,9 @@ void push_conn_table(lua_State* L, uint64_t conn_id) {
 bool send_conn_data_out(uint64_t conn_id,
                          const uint8_t* data, size_t len) {
   std::vector<uint8_t> body;
-  body.reserve(8 + 4 + len);
-  for (int i = 7; i >= 0; --i)
-    body.push_back(uint8_t((conn_id >> (i * 8)) & 0xFF));
-  uint32_t n = static_cast<uint32_t>(len);
-  body.push_back(uint8_t((n >> 24) & 0xFF));
-  body.push_back(uint8_t((n >> 16) & 0xFF));
-  body.push_back(uint8_t((n >>  8) & 0xFF));
-  body.push_back(uint8_t( n        & 0xFF));
+  body.reserve(sizeof(uint64_t) + sizeof(uint32_t) + len);
+  put_u64(body, conn_id);
+  put_u32(body, static_cast<uint32_t>(len));
   if (len > 0)
     body.insert(body.end(), data, data + len);
   return write_frame(TAG_CONN_DATA_OUT, 0, body.data(), body.size());
@@ -1347,9 +1361,8 @@ bool send_conn_data_out(uint64_t conn_id,
 // Send TAG_CONN_CLOSE for conn_id.
 bool send_conn_close(uint64_t conn_id) {
   std::vector<uint8_t> body;
-  body.reserve(8);
-  for (int i = 7; i >= 0; --i)
-    body.push_back(uint8_t((conn_id >> (i * 8)) & 0xFF));
+  body.reserve(sizeof(uint64_t));
+  put_u64(body, conn_id);
   return write_frame(TAG_CONN_CLOSE, 0, body.data(), body.size());
 }
 
@@ -1486,10 +1499,9 @@ void make_and_register_conn(lua_State* L, uint64_t conn_id,
 // Returns false to signal the run() loop to exit (e.g. socket dead).
 bool dispatch_conn_frame(lua_State* L, Frame f) {
   if (f.tag == TAG_CONN_OPENED) {
-    if (f.body.size() < 8 + 32) return true;
-    uint64_t id = 0;
-    for (int i = 0; i < 8; ++i) id = (id << 8) | f.body[i];
-    const uint8_t* pk = f.body.data() + 8;
+    if (f.body.size() < sizeof(uint64_t) + WIRE_KEY_LEN) return true;
+    uint64_t id = get_u64(f.body.data());
+    const uint8_t* pk = f.body.data() + sizeof(uint64_t);
 
     lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return true; }
@@ -1512,15 +1524,12 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
     return true;
   }
   if (f.tag == TAG_CONN_DATA_IN) {
-    if (f.body.size() < 8 + 4) return true;
-    uint64_t id = 0;
-    for (int i = 0; i < 8; ++i) id = (id << 8) | f.body[i];
-    uint32_t dlen = (uint32_t(f.body[8]) << 24)
-                  | (uint32_t(f.body[9]) << 16)
-                  | (uint32_t(f.body[10]) << 8)
-                  |  uint32_t(f.body[11]);
-    if (f.body.size() < 12u + dlen) return true;
-    const uint8_t* data = f.body.data() + 12;
+    constexpr size_t hdr = sizeof(uint64_t) + sizeof(uint32_t);
+    if (f.body.size() < hdr) return true;
+    uint64_t id = get_u64(f.body.data());
+    uint32_t dlen = get_u32(f.body.data() + sizeof(uint64_t));
+    if (f.body.size() < hdr + dlen) return true;
+    const uint8_t* data = f.body.data() + hdr;
 
     lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return true; }
@@ -1542,9 +1551,8 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
     return true;
   }
   if (f.tag == TAG_CONN_CLOSED) {
-    if (f.body.size() < 8 + 1) return true;
-    uint64_t id = 0;
-    for (int i = 0; i < 8; ++i) id = (id << 8) | f.body[i];
+    if (f.body.size() < sizeof(uint64_t) + sizeof(uint8_t)) return true;
+    uint64_t id = get_u64(f.body.data());
     // Reason byte at body[8] is informational; we don't surface it
     // to v1 callbacks (the program just sees on_close fire).
 
@@ -1696,20 +1704,23 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "cesluajitd: bad bootstrap frame\n");
     return 1;
   }
-  constexpr size_t BS_HEADER = 8 + 32 + 32 + 8 + 4;
+  // Field offsets within the bootstrap body (must match
+  // compute_handler.cpp::sendBootstrapFrame).
+  constexpr size_t kOffPrefix  = 0;
+  constexpr size_t kOffOwner   = kOffPrefix  + WIRE_PREFIX_LEN;
+  constexpr size_t kOffProgram = kOffOwner   + WIRE_KEY_LEN;
+  constexpr size_t kOffStart   = kOffProgram + WIRE_KEY_LEN;
+  constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
+  constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
     std::fprintf(stderr, "cesluajitd: bootstrap too short\n");
     return 1;
   }
-  std::memcpy(g_prog_prefix,    bs.body.data() + 0,  8);
-  std::memcpy(g_owner_pubkey,   bs.body.data() + 8,  32);
-  std::memcpy(g_program_pubkey, bs.body.data() + 40, 32);
-  g_start_time_us = 0;
-  for (int i = 0; i < 8; ++i)
-    g_start_time_us = (g_start_time_us << 8) | bs.body[72 + i];
-  uint32_t src_len =
-    (uint32_t(bs.body[80]) << 24) | (uint32_t(bs.body[81]) << 16) |
-    (uint32_t(bs.body[82]) <<  8) |  uint32_t(bs.body[83]);
+  std::memcpy(g_prog_prefix,    bs.body.data() + kOffPrefix,  WIRE_PREFIX_LEN);
+  std::memcpy(g_owner_pubkey,   bs.body.data() + kOffOwner,   WIRE_KEY_LEN);
+  std::memcpy(g_program_pubkey, bs.body.data() + kOffProgram, WIRE_KEY_LEN);
+  g_start_time_us = get_u64(bs.body.data() + kOffStart);
+  uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {
     std::fprintf(stderr, "cesluajitd: bootstrap truncated\n");
     return 1;

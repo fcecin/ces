@@ -580,8 +580,9 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
 std::shared_ptr<ces::Bytes> makeFrame(
     uint8_t tag, uint16_t corr_id,
     const uint8_t* body, size_t body_len) {
-  uint32_t len = static_cast<uint32_t>(3 + body_len);
-  ces::Buffer buf(4 + len);
+  uint32_t len = static_cast<uint32_t>(
+      sizeof(uint8_t) + sizeof(uint16_t) + body_len);   // tag + corr + body
+  ces::Buffer buf(sizeof(uint32_t) + len);              // length prefix + frame
   buf.put<uint32_t>(len)
      .put<uint8_t>(tag)
      .put<uint16_t>(corr_id);
@@ -631,7 +632,7 @@ void sendDeliverFrame(std::shared_ptr<Instance> inst,
                       const std::array<uint8_t, 8>& senderPfx,
                       const uint8_t* payload, size_t payloadLen) {
   ces::Bytes body;
-  body.reserve(8 + payloadLen);
+  body.reserve(sizeof(senderPfx) + payloadLen);
   body.insert(body.end(), senderPfx.begin(), senderPfx.end());
   if (payloadLen > 0)
     body.insert(body.end(), payload, payload + payloadLen);
@@ -651,7 +652,7 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
                           uint16_t corr_id, uint8_t status,
                           const ces::Bytes& tail) {
   ces::Bytes body;
-  body.reserve(1 + tail.size());
+  body.reserve(sizeof(uint8_t) + tail.size());
   body.push_back(status);
   body.insert(body.end(), tail.begin(), tail.end());
   enqueueOutbound(inst,
@@ -679,7 +680,9 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 void sendBootstrapFrame(std::shared_ptr<Instance> inst,
                         const uint8_t* src, size_t srcLen) {
   ces::Bytes body;
-  body.reserve(8 + 32 + 32 + 8 + 4 + srcLen);
+  body.reserve(sizeof(inst->progPrefix) + sizeof(inst->ownerPk)
+               + sizeof(inst->programPubkey) + sizeof(uint64_t)
+               + sizeof(uint32_t) + srcLen);
   body.insert(body.end(),
               inst->progPrefix.begin(), inst->progPrefix.end());
   body.insert(body.end(),
@@ -745,19 +748,25 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
              << VAR(inst->id) << VAR(inst->acceptsConnections);
     return;
   }
+  // `body` still carries the [u8 tag][u16 corr_id] frame header; the
+  // routing payload begins after it.
+  constexpr size_t kIpcHdr = sizeof(uint8_t) + sizeof(uint16_t);
   if (tag == kIpcTagConnDataOut) {
-    // Body after tag/corr: [u64 conn_id][u32 BE len][len bytes]
-    if (body.size() < 3 + 8 + 4) return;
-    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + 3);
-    uint32_t dlen  = ces::Buffer::peek<uint32_t>(body.data() + 11);
-    if (body.size() < 3 + 8 + 4 + dlen) return;
+    // Payload: [u64 conn_id][u32 BE len][len bytes]
+    constexpr size_t kConnIdOff = kIpcHdr;
+    constexpr size_t kLenOff    = kConnIdOff + sizeof(uint64_t);
+    constexpr size_t kDataOff   = kLenOff + sizeof(uint32_t);
+    if (body.size() < kDataOff) return;
+    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kConnIdOff);
+    uint32_t dlen  = ces::Buffer::peek<uint32_t>(body.data() + kLenOff);
+    if (body.size() < kDataOff + dlen) return;
     luaHandlerHandleConnDataOut(inst->id, connId,
-                                 body.data() + 15, dlen);
+                                 body.data() + kDataOff, dlen);
     return;
   }
   if (tag == kIpcTagConnClose) {
-    if (body.size() < 3 + 8) return;
-    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + 3);
+    if (body.size() < kIpcHdr + sizeof(uint64_t)) return;
+    uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
     luaHandlerHandleConnClose(inst->id, connId);
     return;
   }
@@ -785,7 +794,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   size_t mlen = argsLen - 2;
   if (method == kApiMethodClientSend) {
     // Body: [8B target_pfx][u16 BE len][bytes]
-    if (mlen < 8 + 2) {
+    if (mlen < sizeof(uint64_t) + sizeof(uint16_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     HashPrefix target{};
@@ -794,7 +803,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     if (plen > kAppPayloadMax) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
-    if (mlen < size_t(8 + 2 + plen)) {
+    if (mlen < size_t(sizeof(uint64_t) + sizeof(uint16_t) + plen)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     const uint8_t* payload = mbody + 10;
@@ -822,7 +831,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   // pull from their owner's account, exactly as the file verbs do.
   // Reply: [u8 status][u64 BE new_origin_balance].
   if (method == kApiMethodTransfer) {
-    if (mlen < 32 + 8) {
+    if (mlen < ces::KEY_SIZE + sizeof(uint64_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     minx::Hash dest{};
@@ -879,7 +888,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   //   Args: [u32 BE ttl_secs][u32 BE max_entries][u32 BE max_entry_bytes]
   //   Reply: [u8 status][u32 BE bucket_id]
   if (method == kApiMethodBucketNew) {
-    if (mlen < 4 + 4 + 4) {
+    if (mlen < sizeof(uint32_t) + sizeof(uint32_t) + sizeof(uint32_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     uint32_t ttl  = ces::Buffer::peek<uint32_t>(mbody);
@@ -910,7 +919,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   //   Args: [u32 BE bucket_id][u16 BE klen][k][u32 BE vlen][v]
   //   Reply: [u8 status]
   if (method == kApiMethodBucketPut) {
-    if (mlen < 4 + 2) {
+    if (mlen < sizeof(uint32_t) + sizeof(uint16_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     uint32_t id = ces::Buffer::peek<uint32_t>(mbody);
@@ -944,7 +953,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   // status is OK whether found or not; the found_flag distinguishes.
   // Internal status only on malformed args / bad handle.
   if (method == kApiMethodBucketGet) {
-    if (mlen < 4 + 2) {
+    if (mlen < sizeof(uint32_t) + sizeof(uint16_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     uint32_t id = ces::Buffer::peek<uint32_t>(mbody);
@@ -1013,7 +1022,8 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   //   Request: [32B asset_id][32B recipient_pubkey][u16 BE days][payload <= 178B]
   //   Reply:   [u8 status]      (CES_OK or error_code_t)
   if (method == kApiMethodAuthenticAssetCreate) {
-    constexpr size_t kAuthHeaderLen = 32 + 32 + 2;
+    constexpr size_t kAuthHeaderLen =
+        sizeof(minx::Hash) + ces::KEY_SIZE + sizeof(uint16_t);
     if (mlen < kAuthHeaderLen) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1114,7 +1124,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       break;
     }
     case kApiMethodFileRead: {
-      if (mlen < 8 + 4) {
+      if (mlen < sizeof(uint64_t) + sizeof(uint32_t)) {
         sendApiReply(inst, corr_id, kApiStatusInternal); return;
       }
       req.offset = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
@@ -1162,7 +1172,8 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       break;
     }
     case kApiMethodFileCreate: {
-      if (mlen < 8 + 8 + 8 + 2) {
+      if (mlen < sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t)
+                   + sizeof(uint16_t)) {
         sendApiReply(inst, corr_id, kApiStatusInternal); return;
       }
       req.size           = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
@@ -1326,7 +1337,8 @@ ces::Bytes buildResponseEnvelope(
     std::span<const uint8_t>(digest.data(), digest.size()));
 
   // Wire: [status][preamble][time_us][reqSigHash][sha256][sig]
-  ces::Buffer out(1 + preamble.size() + 8 + 8 + 32 + 65);
+  ces::Buffer out(
+      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE);
   out.put<uint8_t>(status)
      .putBytes(preamble)
      .put<uint64_t>(timeUs)
@@ -1608,7 +1620,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
   }
   uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data());
-  if (nameLen == 0 || nameLen > kMaxNameLen || pre.size() < 2u + nameLen) {
+  if (nameLen == 0 || nameLen > kMaxNameLen || pre.size() < sizeof(uint16_t) + nameLen) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
   }
   std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
@@ -1826,7 +1838,7 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
   if (pre.size() < 2) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
   uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data());
   if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < 2u + nameLen) {
+      pre.size() < sizeof(uint16_t) + nameLen) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
   }
   std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
@@ -2122,7 +2134,7 @@ void computeHandlerOnApplicationMsg(
   if (gServer.load() == nullptr) return;
   // Wire shape (op byte already stripped by CesServer::incomingApplication):
   //   [1B flags][8B prog_pfx][2B len BE][N payload]
-  if (len < 1 + 8 + 2) return;
+  if (len < sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint16_t)) return;
   if (data[0] != 0) return; // flags must be 0 in v1
   std::array<uint8_t, 8> pfx{};
   std::memcpy(pfx.data(), data + 1, 8);
@@ -2195,8 +2207,8 @@ uint64_t computeOpenConnection(uint64_t instanceId,
   uint64_t connId = inst->nextConnId++;
   // Body: [u64 conn_id BE][32B user_pubkey].
   ces::Bytes body;
-  body.reserve(8 + 32);
-  for (int i = 7; i >= 0; --i) body.push_back(uint8_t((connId >> (i * 8)) & 0xFF));
+  body.reserve(sizeof(uint64_t) + sizeof(userPubkey));
+  ces::Buffer::put<uint64_t>(body, connId);
   body.insert(body.end(), userPubkey.begin(), userPubkey.end());
   enqueueOutbound(inst, makeFrame(kIpcTagConnOpened, 0,
                                    body.data(), body.size()));
@@ -2209,7 +2221,7 @@ void computeSendConnDataIn(uint64_t instanceId, uint64_t connId,
   if (it == gInstances.end()) return;
   // Body: [u64 conn_id BE][u32 BE len][len bytes].
   ces::Bytes body;
-  body.reserve(8 + 4 + len);
+  body.reserve(sizeof(uint64_t) + sizeof(uint32_t) + len);
   ces::Buffer::put<uint64_t>(body, connId);
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(len));
   if (len > 0) body.insert(body.end(), data, data + len);
@@ -2223,8 +2235,8 @@ void computeSendConnClosed(uint64_t instanceId, uint64_t connId,
   if (it == gInstances.end()) return;
   // Body: [u64 conn_id BE][u8 reason].
   ces::Bytes body;
-  body.reserve(8 + 1);
-  for (int i = 7; i >= 0; --i) body.push_back(uint8_t((connId >> (i * 8)) & 0xFF));
+  body.reserve(sizeof(uint64_t) + sizeof(uint8_t));
+  ces::Buffer::put<uint64_t>(body, connId);
   body.push_back(reason);
   enqueueOutbound(it->second, makeFrame(kIpcTagConnClosed, 0,
                                          body.data(), body.size()));

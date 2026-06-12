@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <memory>
@@ -201,8 +202,10 @@ public:
                    minx::Hash& serverPubkey) {
     auto run = std::make_shared<std::promise<std::string>>();
     auto fut = run->get_future();
+    auto tokenOut = std::make_shared<uint64_t>(0);
+    auto pubkeyOut = std::make_shared<minx::Hash>();
     boost::asio::post(taskIO_, [this, &signer, expected,
-                                &sessionToken, &serverPubkey, run]() {
+                                tokenOut, pubkeyOut, run]() {
       rudp_->tick(nowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
         taskIO_.get_executor());
@@ -228,7 +231,7 @@ public:
       boost::asio::async_write(
         *stream_, boost::asio::buffer(*bindReq),
         [this, bindReq, clientDigest, expected,
-         &sessionToken, &serverPubkey, run]
+         tokenOut, pubkeyOut, run]
         (const boost::system::error_code& ec, std::size_t) {
           if (ec) { run->set_value("bind write: " + ec.message()); return; }
           auto reply = std::make_shared<
@@ -236,7 +239,7 @@ public:
           boost::asio::async_read(
             *stream_, boost::asio::buffer(*reply),
             [reply, clientDigest, expected,
-             &sessionToken, &serverPubkey, run]
+             tokenOut, pubkeyOut, run]
             (const boost::system::error_code& ec2, std::size_t) {
               if (ec2) {
                 run->set_value("bind read: " + ec2.message()); return;
@@ -262,16 +265,21 @@ public:
                 run->set_value("bind reply pubkey != expected");
                 return;
               }
-              std::memcpy(serverPubkey.data(), r.serverPubkey.data(),
-                          serverPubkey.size());
-              sessionToken = r.channelSessionToken;
+              std::memcpy(pubkeyOut->data(), r.serverPubkey.data(),
+                          pubkeyOut->size());
+              *tokenOut = r.channelSessionToken;
               run->set_value("");
             });
         });
     });
     if (fut.wait_for(kBindTimeout) != std::future_status::ready)
       return "bind handshake timeout";
-    return fut.get();
+    std::string err = fut.get();
+    if (err.empty()) {
+      sessionToken = *tokenOut;
+      serverPubkey = *pubkeyOut;
+    }
+    return err;
   }
 
   // ATTACH verb. Fills outStatus + outConnId. Returns empty string on
@@ -291,7 +299,9 @@ public:
       sessionToken);
 
     // Wire shape: [u8 verb][u32 BE preamble_len][preamble][65 sig].
-    const size_t totalSize = 1 + 4 + preamble.size() + sig.size();
+    const size_t totalSize = ces::CES_PLEX_VERB_SIZE
+                             + ces::CES_PLEX_PREAMBLE_LEN_SIZE
+                             + preamble.size() + sig.size();
     minx::Bytes wire(totalSize);
     minx::Buffer buf(wire);
     buf.put<uint8_t>(kVerbAttach);
@@ -303,12 +313,17 @@ public:
     auto fut = run->get_future();
     auto wireBuf = std::make_shared<minx::Bytes>(std::move(wire));
     auto strm = stream_;
+    // Outputs are written by handlers on taskIO_ and copied to the
+    // caller's refs only once the future is ready — never through the
+    // stack refs, so a late handler can't poke a freed frame on timeout.
+    auto statusOut = std::make_shared<uint8_t>(0xFF);
+    auto connIdOut = std::make_shared<uint64_t>(0);
 
     boost::asio::post(taskIO_,
-      [strm, wireBuf, &outStatus, &outConnId, run]() {
+      [strm, wireBuf, statusOut, connIdOut, run]() {
         boost::asio::async_write(
           *strm, boost::asio::buffer(*wireBuf),
-          [strm, wireBuf, &outStatus, &outConnId, run]
+          [strm, wireBuf, statusOut, connIdOut, run]
           (const boost::system::error_code& ec, std::size_t) {
             if (ec) {
               run->set_value("attach write: " + ec.message()); return;
@@ -316,27 +331,29 @@ public:
             auto stBuf = std::make_shared<std::array<uint8_t, 1>>();
             boost::asio::async_read(
               *strm, boost::asio::buffer(*stBuf),
-              [strm, stBuf, &outStatus, &outConnId, run]
+              [strm, stBuf, statusOut, connIdOut, run]
               (const boost::system::error_code& ec2, std::size_t) {
                 if (ec2) {
                   run->set_value("attach read status: " + ec2.message());
                   return;
                 }
                 uint8_t status = (*stBuf)[0];
-                outStatus = status;
-                const std::size_t okExtra = (status == CES_OK) ? 8 : 0;
-                const std::size_t tailLen = okExtra + 8 + 8 + 32 + 65;
+                *statusOut = status;
+                const std::size_t okExtra =
+                  (status == CES_OK) ? sizeof(uint64_t) : 0;
+                const std::size_t tailLen =
+                  okExtra + ces::CES_PLEX_RESP_TRAILER_SIZE;
                 auto tail = std::make_shared<ces::Bytes>(tailLen);
                 boost::asio::async_read(
                   *strm, boost::asio::buffer(*tail),
-                  [tail, status, &outConnId, run]
+                  [tail, status, connIdOut, run]
                   (const boost::system::error_code& ec3, std::size_t) {
                     if (ec3) {
                       run->set_value("attach read tail: " + ec3.message());
                       return;
                     }
                     if (status == CES_OK) {
-                      outConnId = ces::Buffer::peek<uint64_t>(tail->data());
+                      *connIdOut = ces::Buffer::peek<uint64_t>(tail->data());
                     }
                     run->set_value("");
                   });
@@ -345,7 +362,12 @@ public:
       });
     if (fut.wait_for(kAttachTimeout) != std::future_status::ready)
       return "attach timeout";
-    return fut.get();
+    std::string err = fut.get();
+    if (err.empty()) {
+      outStatus = *statusOut;
+      outConnId = *connIdOut;
+    }
+    return err;
   }
 
   // Drive the data pump until the channel closes (EOF) or a signal
@@ -368,31 +390,25 @@ public:
     };
 
     auto strm = stream_;
-    auto mu = std::make_shared<std::mutex>();
-    auto stdinClosed = std::make_shared<bool>(false);
-    auto streamClosed = std::make_shared<bool>(false);
-    auto checkDone = [setExit, mu, stdinClosed, streamClosed]() {
-      // Stream closing is the terminal signal — exit 0 once both
-      // halves have settled. (stdin alone closing means half-close;
-      // we keep the stream reader alive.)
-      std::lock_guard lk(*mu);
-      if (*streamClosed) setExit(0);
-    };
+
+    // The two recursive pump callbacks are owned here by shared_ptr and
+    // re-armed through weak_ptrs. taskIO_ keeps running until the Dialer
+    // is destroyed (well after this frame returns on exit), so a late
+    // continuation must not re-enter a callback whose frame is gone:
+    // lock() yields null once this frame drops the last strong ref.
 
     // ---- channel → stdout pump ----
     auto chanBuf = std::make_shared<std::array<uint8_t, 4096>>();
-    std::function<void()> readChan;
-    readChan = [strm, chanBuf, &readChan, mu, streamClosed,
-                stdinFd, signals, setExit]() {
+    auto readChan = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> readChanW = readChan;
+    *readChan = [strm, chanBuf, readChanW, stdinFd, signals, setExit]() {
       strm->async_read_some(
         boost::asio::buffer(*chanBuf),
-        [strm, chanBuf, &readChan, mu, streamClosed,
-         stdinFd, signals, setExit]
+        [strm, chanBuf, readChanW, stdinFd, signals, setExit]
         (const boost::system::error_code& ec, std::size_t n) {
           if (ec) {
             // Channel closed by any party. Cancel stdin reader and
             // signal handler so taskIO_ can drain.
-            { std::lock_guard lk(*mu); *streamClosed = true; }
             boost::system::error_code cec;
             stdinFd->cancel(cec);
             signals->cancel(cec);
@@ -421,40 +437,41 @@ public:
               p += w; left -= static_cast<std::size_t>(w);
             }
           }
-          readChan();
+          if (auto self = readChanW.lock()) (*self)();
         });
     };
 
     // ---- stdin → channel pump ----
     auto stdinBuf = std::make_shared<std::array<uint8_t, 4096>>();
-    std::function<void()> readStdin;
-    readStdin = [strm, stdinFd, stdinBuf, &readStdin, mu,
-                 stdinClosed]() {
+    auto readStdin = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> readStdinW = readStdin;
+    *readStdin = [strm, stdinFd, stdinBuf, readStdinW]() {
       stdinFd->async_read_some(
         boost::asio::buffer(*stdinBuf),
-        [strm, stdinFd, stdinBuf, &readStdin, mu, stdinClosed]
+        [strm, stdinBuf, readStdinW]
         (const boost::system::error_code& ec, std::size_t n) {
           if (ec) {
             // EOF (boost::asio::error::eof) or cancel. Half-close: stop
             // reading stdin, leave the channel up so the program can
             // drain replies. Don't close the stream here.
-            { std::lock_guard lk(*mu); *stdinClosed = true; }
             return;
           }
-          if (n == 0) { readStdin(); return; }
+          if (n == 0) {
+            if (auto self = readStdinW.lock()) (*self)();
+            return;
+          }
           auto out = std::make_shared<minx::Bytes>(
             stdinBuf->begin(), stdinBuf->begin() + n);
           boost::asio::async_write(
             *strm, boost::asio::buffer(*out),
-            [strm, stdinFd, stdinBuf, &readStdin, mu, stdinClosed, out]
+            [readStdinW, out]
             (const boost::system::error_code& wec, std::size_t) {
               if (wec) {
                 // Channel write failed — channel reader will pick up
                 // the close on its next async_read_some.
-                std::lock_guard lk(*mu); *stdinClosed = true;
                 return;
               }
-              readStdin();
+              if (auto self = readStdinW.lock()) (*self)();
             });
         });
     };
@@ -474,8 +491,8 @@ public:
       });
 
     boost::asio::post(taskIO_, [readStdin, readChan]() {
-      readStdin();
-      readChan();
+      (*readStdin)();
+      (*readChan)();
     });
 
     int code = exitFut.get();

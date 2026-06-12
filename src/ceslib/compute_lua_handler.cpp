@@ -106,7 +106,8 @@ minx::Bytes buildResponseEnvelope(
     std::span<const uint8_t> preamble,
     uint64_t reqSigHash) {
   // [status][preamble][time_us][reqSigHash][sha256][sig]
-  const size_t total = 1 + preamble.size() + 8 + 8 + 32 + 65;
+  const size_t total =
+      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE;
   minx::Bytes out(total);
   minx::Buffer buf(out);
   buf.put<uint8_t>(status);
@@ -116,7 +117,9 @@ minx::Bytes buildResponseEnvelope(
   buf.put<uint64_t>(reqSigHash);
 
   // Compute the digest over a parallel pre-sized buffer.
-  const size_t hashSize = 1 + 1 + preamble.size() + 8 + 8;
+  const size_t hashSize = CES_PLEX_STATUS_SIZE + CES_PLEX_VERB_SIZE
+                          + preamble.size() + CES_PLEX_TIME_US_SIZE
+                          + CES_PLEX_REQ_SIG_HASH_SIZE;
   minx::Bytes hashIn(hashSize);
   minx::Buffer hbuf(hashIn);
   hbuf.put<uint8_t>(status);

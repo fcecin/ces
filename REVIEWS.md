@@ -29,6 +29,7 @@
 * src/cescompmockd/main.cpp
 * src/cesproxy/main.cpp
 * src/cesqt/about.h
+* src/cesh/dial.h
 
 ## Review PASS 2
 
@@ -48,7 +49,6 @@
 * include/ces/types.h
 * src/ces/main.cpp
 * src/cesbench/cesbench.cpp
-* src/cesh/dial.h
 * src/cesh/main.cpp
 * src/cesluajitd/main.cpp
 * src/cesqt/appmodel.h
