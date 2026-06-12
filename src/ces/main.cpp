@@ -183,14 +183,14 @@ max_reorder_msgs_per_channel = -1
 # that builtin:file is mounted (compute uses the file handler for
 # owner-authority file ops) and that compute_user exists on the
 # host system.
-# compute_max_instances    = 0       # 0 = feature OFF
-# compute_max_memory_bytes = 0       # 0 = no host-level RSS cap
-# compute_max_cpu_percent  = 0       # 0 = no host-level CPU cap
+# compute_max_instances    = 0       # 0 = OFF; caps child processes — the
+#                                    # whole admission bound (× mem cap = RAM)
 #
-# Per-process hard caps (rlimit / cgroup v2).
+# Per-process memory ceiling — RLIMIT_AS in the child (the kernel denies
+# allocations past it; OOM is an instant, machine-wide attack vector).
+# With compute_max_instances this bounds total compute memory. CPU is
+# billed, not capped; the sandbox forbids forking.
 # compute_process_mem_max  = 268435456   # 256 MB ceiling per process
-# compute_process_cpu_max  = 50          # cpu.max percentage per cgroup
-# compute_process_pids_max = 1           # no forking inside sandbox
 #
 # Fees — credits per unit time / per byte. -1 = use default.
 #   fee_compute_cpu_sec     — CPU time, per second (unused in stub phase)
@@ -306,11 +306,7 @@ int main(int argc, char* argv[]) {
   int64_t optFeeFileRead  = -1;
   // Compute feature (CesPlex builtin:compute).
   uint32_t optComputeMaxInstances    = 0;
-  uint64_t optComputeMaxMemoryBytes  = 0;
-  uint32_t optComputeMaxCpuPercent   = 0;
   uint64_t optComputeProcessMemMax   = 268435456; // 256 MB
-  uint32_t optComputeProcessCpuMax   = 50;
-  uint32_t optComputeProcessPidsMax  = 1;
   int64_t optFeeComputeCpuSec     = -1;
   int64_t optFeeComputeRssByteSec = -1;
   int64_t optFeeComputeNetByte    = -1;
@@ -466,21 +462,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--computemaxinstances", optComputeMaxInstances,
       "Compute feature max concurrent instances "
       "(0 = feature off)")->default_val("0");
-    app.add_option("--computemaxmemorybytes", optComputeMaxMemoryBytes,
-      "Compute feature host-level RSS cap in bytes "
-      "(0 = no host-level cap)")->default_val("0");
-    app.add_option("--computemaxcpupercent", optComputeMaxCpuPercent,
-      "Compute feature host-level CPU cap in percent "
-      "(0 = no host-level cap)")->default_val("0");
     app.add_option("--computeprocessmemmax", optComputeProcessMemMax,
-      "Per-process memory ceiling in bytes (rlimit / cgroup)")
+      "Per-process memory ceiling in bytes (child RLIMIT_AS)")
       ->default_val(std::to_string(268435456ULL));
-    app.add_option("--computeprocesscpumax", optComputeProcessCpuMax,
-      "Per-process cpu.max percentage (cgroup)")
-      ->default_val("50");
-    app.add_option("--computeprocesspidsmax", optComputeProcessPidsMax,
-      "Per-process pids.max (cgroup; 1 = no forking)")
-      ->default_val("1");
     app.add_option("--feecomputecpusec", optFeeComputeCpuSec,
       "Compute fee for CPU time (credits per second, -1 = default)");
     app.add_option("--feecomputerssbyteday", optFeeComputeRssByteSec,
@@ -636,16 +620,8 @@ int main(int argc, char* argv[]) {
       // Compute feature knobs.
       applyIfDefault("compute_max_instances",    optComputeMaxInstances,
                      "--computemaxinstances");
-      applyIfDefault("compute_max_memory_bytes", optComputeMaxMemoryBytes,
-                     "--computemaxmemorybytes");
-      applyIfDefault("compute_max_cpu_percent",  optComputeMaxCpuPercent,
-                     "--computemaxcpupercent");
       applyIfDefault("compute_process_mem_max",  optComputeProcessMemMax,
                      "--computeprocessmemmax");
-      applyIfDefault("compute_process_cpu_max",  optComputeProcessCpuMax,
-                     "--computeprocesscpumax");
-      applyIfDefault("compute_process_pids_max", optComputeProcessPidsMax,
-                     "--computeprocesspidsmax");
       applyIfDefault("fee_compute_cpu_sec",      optFeeComputeCpuSec,
                      "--feecomputecpusec");
       applyIfDefault("fee_compute_rss_byte_day", optFeeComputeRssByteSec,
@@ -818,11 +794,7 @@ int main(int argc, char* argv[]) {
 
   // Compute feature config.
   config.computeMaxInstances   = optComputeMaxInstances;
-  config.computeMaxMemoryBytes = optComputeMaxMemoryBytes;
-  config.computeMaxCpuPercent  = optComputeMaxCpuPercent;
   config.computeProcessMemMax  = optComputeProcessMemMax;
-  config.computeProcessCpuMax  = optComputeProcessCpuMax;
-  config.computeProcessPidsMax = optComputeProcessPidsMax;
   if (optFeeComputeCpuSec     >= 0)
     config.feeComputeCpuSec     = optFeeComputeCpuSec;
   if (optFeeComputeRssByteSec >= 0)

@@ -297,6 +297,7 @@ public:
           run->set_value(!ec);
         });
     });
+    if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
     return fut.get();
   }
   bool writeAll(const ces::Bytes& bytes) {

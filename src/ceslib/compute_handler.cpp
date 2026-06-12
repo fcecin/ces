@@ -60,7 +60,6 @@
 #include <unistd.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <poll.h>
 
 #include <array>
 #include <atomic>
@@ -160,7 +159,8 @@ constexpr uint16_t kApiMethodAccountRead  = 0x0203;
 //   BUCKET_GET — read v for k, or "missing" status
 // Used by Lua programs that need replay-protection tables with
 // guaranteed forgetting (e.g. dice.lua's per-user last-consumed
-// transfer time). Charging not yet wired — TODO before scale.
+// transfer time). Capacity is billed on the supervisor tick via
+// feeBucketByteSec (see committedBytes below).
 constexpr uint16_t kApiMethodBucketNew    = 0x0210;
 constexpr uint16_t kApiMethodBucketPut    = 0x0211;
 constexpr uint16_t kApiMethodBucketGet    = 0x0212;
@@ -231,6 +231,7 @@ namespace {
 std::atomic<CesServer*> gServer{nullptr};
 
 using UnixSocket = boost::asio::local::stream_protocol::socket;
+using UnixAcceptor = boost::asio::local::stream_protocol::acceptor;
 
 struct Instance : std::enable_shared_from_this<Instance> {
   uint64_t id = 0;
@@ -255,7 +256,6 @@ struct Instance : std::enable_shared_from_this<Instance> {
   uint64_t lastSampleUs = 0;            // wall-clock at last sample
   uint32_t cpuBasisPoints = 0;          // 0..10000, of one core
   uint64_t rssBytes = 0;                // resident pages × page size, last sample
-  int listenFd = -1;                    // host's side of the per-inst socket
   std::string socketPath;
   // Async-I/O endpoint to the child. Wraps the accepted fd as an
   // asio::local::stream_protocol::socket. All reads and writes run
@@ -315,6 +315,29 @@ std::map<std::array<uint8_t, 8>, std::set<uint64_t>> gByPrefix;
 std::map<std::string, std::set<uint64_t>> gByName;
 uint64_t gNextInstanceId = 1;
 
+// In-flight LAUNCH reservations: launches admitted past the cap check
+// whose instance isn't in gInstances yet (the child is still connecting
+// back — async, up to kAcceptTimeoutMs). Counted against the cap so
+// concurrent launches can't overshoot computeMaxInstances. Strand-only
+// (rpcTaskIO_); no atomic needed.
+uint64_t gPendingLaunches = 0;
+
+// RAII reservation token: ++gPendingLaunches on construct, -- on
+// destruct. Held (via shared_ptr) across the async LAUNCH chain and
+// released once the instance lands in gInstances or the launch fails.
+struct LaunchSlot {
+  LaunchSlot() { ++gPendingLaunches; }
+  ~LaunchSlot() { if (gPendingLaunches > 0) --gPendingLaunches; }
+  LaunchSlot(const LaunchSlot&) = delete;
+  LaunchSlot& operator=(const LaunchSlot&) = delete;
+};
+
+// Launch slots spoken for = registered instances + in-flight launches.
+// The LAUNCH cap is checked against this, never gInstances alone.
+inline std::size_t launchSlotsInUse() {
+  return gInstances.size() + static_cast<std::size_t>(gPendingLaunches);
+}
+
 // Supervisor tick timer. Lives on rpcTaskIO_'s strand.
 std::shared_ptr<boost::asio::steady_timer> gTickTimer;
 std::atomic<bool> gTickRunning{false};
@@ -369,27 +392,18 @@ int createListenSocket(const std::string& path) {
   return fd;
 }
 
-// Accept one connection on `listenFd`, with a poll-based timeout.
-// Returns the accepted fd on success, or -errno / -ETIMEDOUT.
-int acceptWithTimeout(int listenFd, int timeoutMs) {
-  pollfd pfd{};
-  pfd.fd = listenFd;
-  pfd.events = POLLIN;
-  int pr = ::poll(&pfd, 1, timeoutMs);
-  if (pr < 0) return -errno;
-  if (pr == 0) return -ETIMEDOUT;
-  int fd = ::accept4(listenFd, nullptr, nullptr, SOCK_CLOEXEC);
-  if (fd < 0) return -errno;
-  return fd;
-}
-
 // fork+exec the configured child binary. argv[1] is the IPC socket
 // path; argv[2] (optional) is the non-root user to drop to if the
 // server is running as root. Returns pid > 0 on success, -errno
 // on failure.
 pid_t spawnChild(const std::string& binary,
                  const std::string& sockPath,
-                 const std::string& dropUser) {
+                 const std::string& dropUser,
+                 uint64_t memMaxBytes) {
+  // Build argv strings before fork — only async-signal-safe work may run
+  // between fork and exec. dropUser is passed positionally ("" when no
+  // drop is requested) so memMax lands at a fixed argv slot.
+  std::string memMaxStr = std::to_string(memMaxBytes);
   pid_t pid = ::fork();
   if (pid < 0) return -errno;
   if (pid == 0) {
@@ -398,12 +412,9 @@ pid_t spawnChild(const std::string& binary,
     ::close(STDIN_FILENO);
     const char* arg0 = binary.c_str();
     const char* arg1 = sockPath.c_str();
-    if (!dropUser.empty()) {
-      const char* arg2 = dropUser.c_str();
-      ::execlp(arg0, arg0, arg1, arg2, nullptr);
-    } else {
-      ::execlp(arg0, arg0, arg1, nullptr);
-    }
+    const char* arg2 = dropUser.c_str();   // "" = no privilege drop
+    const char* arg3 = memMaxStr.c_str();  // RLIMIT_AS ceiling, bytes
+    ::execlp(arg0, arg0, arg1, arg2, arg3, nullptr);
     std::_Exit(127);
   }
   return pid;
@@ -504,8 +515,7 @@ void sampleInstanceProc(Instance& inst, uint64_t nowUs) {
     __uint128_t den =
       static_cast<__uint128_t>(tps) * deltaUs;
     __uint128_t q = (den > 0) ? (num / den) : 0;
-    uint64_t bp64 = (q > 1000000) ? 1000000 : static_cast<uint64_t>(q);
-    if (bp64 > 10000) bp64 = 10000;
+    uint64_t bp64 = (q > 10000) ? 10000 : static_cast<uint64_t>(q);
     bp = static_cast<uint32_t>(bp64);
   }
   inst.cpuBasisPoints = bp;
@@ -523,7 +533,6 @@ void teardownInstance(Instance& inst) {
     inst.peer->close(ec);
     inst.peer.reset();
   }
-  if (inst.listenFd >= 0) { ::close(inst.listenFd); inst.listenFd = -1; }
   if (!inst.socketPath.empty()) {
     std::error_code ec;
     std::filesystem::remove(inst.socketPath, ec);
@@ -1468,24 +1477,46 @@ uint64_t slotFeePerSec(const CesConfig& cfg) {
 // LAUNCH
 // ---------------------------------------------------------------------------
 
-// Strand-only (rpcTaskIO_). Allocate a fresh instance, spawn the
-// child binary, register in gInstances, send the bootstrap frame,
-// arm the IPC reader. Caller has already validated source-file
-// existence + ownership and (if applicable) debited the upfront
-// commitment fee from the source's file_balance.
+// In-flight LAUNCH accept state. Held by shared_ptr so the async_accept
+// completion and the deadline timer share one `finished` guard —
+// whichever fires first wins, the other no-ops. Everything runs on
+// rpcTaskIO_, so the bool needs no atomic.
+struct LaunchAccept {
+  std::shared_ptr<Instance> inst;
+  std::shared_ptr<UnixAcceptor> acceptor;
+  std::shared_ptr<UnixSocket> peer;
+  std::shared_ptr<boost::asio::steady_timer> timer;
+  ces::Bytes src;
+  std::function<void(uint64_t)> done;
+  uint64_t now = 0;
+  uint64_t upfront = 0;
+  bool finished = false;
+  std::shared_ptr<LaunchSlot> slot;
+};
+
+// Strand-only (rpcTaskIO_). Allocate a fresh instance, spawn the child
+// binary, and asynchronously await its connect-back on the per-instance
+// Unix socket. On success: register in gInstances, send the bootstrap
+// frame, arm the IPC reader, invoke `done(id)`. On any failure:
+// `done(0)` after tearing down whatever was allocated.
 //
-// Returns 0 on failure (and tears down anything it allocated);
-// returns the instance id on success. `upfront` is recorded on the
-// Instance for visibility but is not debited here (caller's job).
+// The connect-back is awaited via async_accept bounded by a
+// kAcceptTimeoutMs timer — it must NEVER block rpcTaskIO_, which also
+// drives every other CesPlex channel, NetworkBilling, and the
+// supervisor. (The old synchronous poll()-accept stalled all of them
+// for up to kAcceptTimeoutMs on every launch.)
 //
-// `now` is the wall-clock microseconds the supervisor uses as the
-// instance's birth time and as the start of its first billing tick;
-// passing it lets the caller align with `_l2ValidateDedupAndDebit`'s
-// timing if needed.
-uint64_t allocateAndSpawnInstance(
+// Caller has already validated source-file existence + ownership and
+// (if applicable) debited the upfront commitment fee from file_balance.
+// `upfront` is recorded on the Instance for visibility, not debited
+// here. `now` is the instance's birth wall-clock and the start of its
+// first billing tick.
+void allocateAndSpawnInstance(
     CesServer* server, const std::string& name,
     const std::array<uint8_t, 32>& ownerPk,
-    uint64_t upfront, uint64_t now) {
+    uint64_t upfront, uint64_t now,
+    std::shared_ptr<LaunchSlot> slot,
+    std::function<void(uint64_t id)> done) {
   const auto& cfg = server->_config();
 
   auto workDir = resolveWorkDir(cfg);
@@ -1510,73 +1541,124 @@ uint64_t allocateAndSpawnInstance(
 
   int lfd = createListenSocket(inst->socketPath);
   if (lfd < 0) {
-    LOGWARNING << "builtin:compute socket create failed"
-               << VAR(lfd);
-    return 0;
+    LOGWARNING << "builtin:compute socket create failed" << VAR(lfd);
+    done(0);
+    return;
   }
-  inst->listenFd = lfd;
 
-  // Slurp the Lua source before spawning — if the source file is
-  // gone or unreadable on disk we want to fail cleanly rather than
-  // after spawning a child with nothing to run.
+  // Slurp the Lua source before spawning — if the source file is gone
+  // or unreadable on disk, fail cleanly rather than after spawning a
+  // child with nothing to run.
   auto srcBytes = readSourceBytes(cfg, name);
   if (srcBytes.empty()) {
     LOGWARNING << "builtin:compute source read failed" << SVAR(name);
+    ::close(lfd);
     teardownInstance(*inst);
-    return 0;
+    done(0);
+    return;
   }
 
   pid_t pid = spawnChild(cfg.cesComputeChildBinary,
                          inst->socketPath,
-                         cfg.cesComputeUser);
+                         cfg.cesComputeUser,
+                         cfg.computeProcessMemMax);
   if (pid <= 0) {
     LOGWARNING << "builtin:compute spawn failed"
                << VAR(pid) << SVAR(cfg.cesComputeChildBinary);
+    ::close(lfd);
     teardownInstance(*inst);
-    return 0;
+    done(0);
+    return;
   }
   inst->pid = pid;
 
-  int pfd = acceptWithTimeout(lfd, kAcceptTimeoutMs);
-  if (pfd < 0) {
-    LOGWARNING << "builtin:compute accept failed" << VAR(pfd);
-    killAndReap(pid);
-    teardownInstance(*inst);
-    return 0;
-  }
-
-  // Wrap the accepted fd as an asio local socket for async I/O.
   auto io = server->_rpcTaskIOExecutor();
-  inst->peer = std::make_shared<UnixSocket>(io);
+  auto st = std::make_shared<LaunchAccept>();
+  st->inst = inst;
+  st->acceptor = std::make_shared<UnixAcceptor>(io);
+  st->peer = std::make_shared<UnixSocket>(io);
+  st->timer = std::make_shared<boost::asio::steady_timer>(io);
+  st->src = std::move(srcBytes);
+  st->done = std::move(done);
+  st->now = now;
+  st->upfront = upfront;
+  st->slot = std::move(slot);
+
+  // Adopt the listen fd into the acceptor — it now owns + closes it.
   boost::system::error_code aec;
-  inst->peer->assign(boost::asio::local::stream_protocol(), pfd, aec);
+  st->acceptor->assign(boost::asio::local::stream_protocol(), lfd, aec);
   if (aec) {
-    LOGWARNING << "builtin:compute asio assign failed"
+    LOGWARNING << "builtin:compute acceptor assign failed"
                << SVAR(aec.message());
-    ::close(pfd);
+    ::close(lfd);
     killAndReap(pid);
     teardownInstance(*inst);
-    return 0;
+    st->done(0);
+    return;
   }
 
-  inst->startedAtUs = now;
-  inst->lastTickUs = now;
-  inst->lastSampleUs = now;
-  inst->lastCpuTicks = 0;
+  // Deadline: the child must connect back within kAcceptTimeoutMs. On
+  // expiry, abort the accept, reap the child, tear the instance down.
+  st->timer->expires_after(std::chrono::milliseconds(kAcceptTimeoutMs));
+  st->timer->async_wait([st](const boost::system::error_code& tec) {
+    if (tec || st->finished) return;
+    st->finished = true;
+    boost::system::error_code ig;
+    st->acceptor->close(ig);
+    LOGWARNING << "builtin:compute accept timed out" << VAR(st->inst->id);
+    killAndReap(st->inst->pid);
+    teardownInstance(*st->inst);
+    st->done(0);
+  });
 
-  gInstances[id] = inst;
-  gByPrefix[inst->progPrefix].insert(id);
-  gByName[inst->sourceName].insert(id);
+  // Async accept the child's connect-back. Never blocks the strand.
+  st->acceptor->async_accept(
+    *st->peer,
+    [st](const boost::system::error_code& cec) {
+      if (st->finished) return;
+      st->finished = true;
+      boost::system::error_code ig;
+      st->timer->cancel(ig);
+      st->acceptor->close(ig);
+      auto inst = st->inst;
+      if (cec) {
+        LOGWARNING << "builtin:compute accept failed" << SVAR(cec.message());
+        killAndReap(inst->pid);
+        teardownInstance(*inst);
+        st->done(0);
+        return;
+      }
+      // Handler unbound mid-launch (server shutting down): don't register
+      // a zombie into gInstances after teardown ran.
+      if (gServer.load() == nullptr) {
+        killAndReap(inst->pid);
+        teardownInstance(*inst);
+        st->done(0);
+        return;
+      }
+      inst->peer = st->peer;
+      inst->startedAtUs = st->now;
+      inst->lastTickUs = st->now;
+      inst->lastSampleUs = st->now;
+      inst->lastCpuTicks = 0;
 
-  // Bootstrap the child with its Lua source + identity, then
-  // arm the IPC reader loop for API calls.
-  sendBootstrapFrame(inst, srcBytes.data(), srcBytes.size());
-  startIpcReader(inst);
+      gInstances[inst->id] = inst;
+      gByPrefix[inst->progPrefix].insert(inst->id);
+      gByName[inst->sourceName].insert(inst->id);
+      // Registered in gInstances now — drop the launch-slot reservation
+      // so it isn't double-counted against the cap.
+      st->slot.reset();
 
-  LOGINFO << "builtin:compute launched"
-          << VAR(id) << SVAR(name) << VAR(pid)
-          << VAR(upfront);
-  return id;
+      // Bootstrap the child with its Lua source + identity, then arm
+      // the IPC reader loop for API calls.
+      sendBootstrapFrame(inst, st->src.data(), st->src.size());
+      startIpcReader(inst);
+
+      LOGINFO << "builtin:compute launched"
+              << VAR(inst->id) << SVAR(inst->sourceName)
+              << VAR(inst->pid) << VAR(st->upfront);
+      st->done(inst->id);
+    });
 }
 
 void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
@@ -1591,9 +1673,10 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const auto& cfg = ctx->server->_config();
 
-  // Check instance cap. LAUNCH always mints a fresh id; multiple
-  // instances of the same source path are allowed up to the cap.
-  if (gInstances.size() >= cfg.computeMaxInstances) {
+  // Check instance cap against registered + in-flight launches. LAUNCH
+  // always mints a fresh id; multiple instances of the same source path
+  // are allowed up to the cap.
+  if (launchSlotsInUse() >= cfg.computeMaxInstances) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_MAX_INSTANCES); return;
   }
 
@@ -1618,7 +1701,13 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // Compute dedup hash + signer for the _l2 call.
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, name, upfront, ownerPk](uint8_t rc) mutable {
+  // Reserve a launch slot now and hold it across the async validate +
+  // spawn chain (released when the instance registers or the launch
+  // fails). Race-free: nothing else runs on this strand between the cap
+  // check above and here, so the reservation reflects that decision.
+  auto launchSlot = std::make_shared<LaunchSlot>();
+
+  auto after = [ctx, name, upfront, ownerPk, launchSlot](uint8_t rc) mutable {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
 
     // Debit the 15-min upfront from the source file's file_balance.
@@ -1629,21 +1718,28 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     }
 
     uint64_t now = getMicrosSinceEpoch();
-    uint64_t id = allocateAndSpawnInstance(
-      ctx->server, name, ownerPk, upfront, now);
-    if (id == 0) {
-      sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
-    }
-
-    ces::Bytes resp;
-    ces::Buffer::put<uint64_t>(resp, id);
-    ces::Buffer::put<uint64_t>(resp, now);
-    sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+    allocateAndSpawnInstance(
+      ctx->server, name, ownerPk, upfront, now, std::move(launchSlot),
+      [ctx, now](uint64_t id) {
+        if (id == 0) {
+          sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+        }
+        ces::Bytes resp;
+        ces::Buffer::put<uint64_t>(resp, id);
+        ces::Buffer::put<uint64_t>(resp, now);
+        sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+      });
   };
 
+  // LAUNCH is non-idempotent (each call mints a fresh instance), and the
+  // NONCELESS sig-dedup can't survive a channel reselect anyway, so opt
+  // out of it: pass reqNonce=0 ("no dedup, no nonce ordering") instead of
+  // the wire CES_NONCELESS. Every LAUNCH is then independently
+  // fee-validated and spawns — a same-name relaunch is a real second
+  // instance, charged, not a dedup-skipped freebie that still spawns.
   ctx->server->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
-    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
+    /*reqNonce=*/0, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
 
@@ -2061,7 +2157,7 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   if (!server) return CES_ERROR_COMPUTE_DISABLED;
   const auto& cfg = server->_config();
   if (cfg.computeMaxInstances == 0) return CES_ERROR_COMPUTE_DISABLED;
-  if (gInstances.size() >= cfg.computeMaxInstances) {
+  if (launchSlotsInUse() >= cfg.computeMaxInstances) {
     return CES_ERROR_COMPUTE_MAX_INSTANCES;
   }
 
@@ -2086,9 +2182,19 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   // /s/ files are unmetered → no upfront fee, no rent debit. Pass
   // upfront=0 so the Instance's bookkeeping field is honest about
   // what was committed.
+  //
+  // The spawn awaits the child's connect-back asynchronously; success
+  // or failure is logged from the callback. CES_OK here means
+  // "validated + spawn started," not "child connected."
   uint64_t now = getMicrosSinceEpoch();
-  uint64_t id = allocateAndSpawnInstance(server, name, ownerPk, 0, now);
-  if (id == 0) return CES_ERROR_INTERNAL;
+  allocateAndSpawnInstance(server, name, ownerPk, 0, now,
+    std::make_shared<LaunchSlot>(),
+    [name](uint64_t id) {
+      if (id == 0) {
+        LOGWARNING << "builtin:compute internal launch spawn failed"
+                   << SVAR(name);
+      }
+    });
   return CES_OK;
 }
 

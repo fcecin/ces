@@ -238,15 +238,25 @@ struct CesConfig {
   //   3. computeUser exists on the host system (a dedicated
   //      unprivileged uid each cesluad child drops to).
   uint32_t computeMaxInstances    = 0;   // 0 = feature OFF
-  uint64_t computeMaxMemoryBytes  = 0;   // 0 = no host-level RSS cap
-  uint32_t computeMaxCpuPercent   = 0;   // 0 = no host-level CPU cap
-  // Per-process hard caps pushed down to rlimit / cgroup v2. The
-  // mem_max default mirrors the spec's 256 MB ceiling; the cpu_max
-  // default is a cgroup `cpu.max` percentage (50 = half a core);
-  // pids_max=1 forbids forking inside the sandbox.
+  // computeMaxInstances is the whole admission story. It caps concurrent
+  // child processes; worst-casing every instance at one saturated core +
+  // computeProcessMemMax of RAM, it statically bounds both resources —
+  // RAM = instances × mem-cap, CPU = instances cores. Size it to the host
+  // (min of cores × factor and RAM ÷ mem-cap). No runtime load sampling:
+  // measuring CPU load without chasing instant peaks or reinventing a load
+  // monitor isn't worth it; a static process cap is simpler and safe.
+  //
+  // Per-process memory ceiling, enforced merciless + instant by the
+  // child's RLIMIT_AS: the kernel denies any allocation past it, so a
+  // runaway or malicious program can never OOM the host (OOM is an
+  // instant, machine-wide attack vector the 60 s billing tick can't react
+  // to in time). The program controls its own footprint, and instances ×
+  // this value is the hard global bound on total L2-compute memory.
+  //
+  // No per-process CPU cap — CPU is a flow, billed (feeComputeCpuSec) and
+  // shared by the scheduler; the process cap above is the CPU bound. No
+  // pids cap — the sandbox exposes no fork/exec, so a child is one process.
   uint64_t computeProcessMemMax   = 268435456; // 256 MB
-  uint32_t computeProcessCpuMax   = 50;
-  uint32_t computeProcessPidsMax  = 1;
   // Fee knobs for compute — credits per unit time / per byte.
   // Every non-zero on a tick is accumulated against the source file's
   // file_balance. 0 = "derive default" at bind time. The four knobs:

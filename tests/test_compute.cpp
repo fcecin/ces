@@ -353,6 +353,42 @@ BOOST_AUTO_TEST_CASE(FileDeletionKillsInstance) {
   cc.disconnect();
 }
 
+// Cap is enforced against registered + in-flight launches: launching up
+// to computeMaxInstances (8 in this fixture) succeeds, the next is
+// rejected, and freeing one (KILL) makes room again. Guards C3 — the
+// pending-launch reservation must release exactly on registration so the
+// boundary launch isn't double-counted and rejected one early.
+BOOST_AUTO_TEST_CASE(LaunchRespectsInstanceCap) {
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000'000));
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+
+  // Fill the cap (computeMaxInstances = 8).
+  std::vector<uint64_t> ids;
+  for (int i = 0; i < 8; ++i) {
+    uint64_t id = 0, started = 0;
+    CES_REQUIRE_OK(cc.launch(ownerPath, id, started));
+    BOOST_CHECK(id > 0);
+    ids.push_back(id);
+  }
+
+  // One past the cap is rejected.
+  uint64_t overId = 0, overStarted = 0;
+  uint8_t rc = cc.launch(ownerPath, overId, overStarted);
+  BOOST_CHECK_MESSAGE(rc == CES_ERROR_COMPUTE_MAX_INSTANCES,
+                      "expected MAX_INSTANCES, got " << int(rc));
+
+  // Free a slot, then a launch fits again.
+  CES_REQUIRE_OK(cc.kill(ids[0]));
+  uint64_t againId = 0, againStarted = 0;
+  CES_REQUIRE_OK(cc.launch(ownerPath, againId, againStarted));
+  BOOST_CHECK(againId > 0);
+
+  cc.disconnect();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ---------------------------------------------------------------------------
@@ -399,6 +435,169 @@ BOOST_AUTO_TEST_CASE(ComputeBindRequiresFileHandler) {
   rc = cc.launch("/p/nope.bin", instId, startedAt);
   BOOST_CHECK_MESSAGE(rc != CES_OK,
                       "LAUNCH must fail without a bound server");
+
+  cc.disconnect();
+  server->stop();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  boost::system::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone: a child that never connects back must not wedge the strand.
+// ---------------------------------------------------------------------------
+//
+// Regression for the synchronous poll()-accept that used to block
+// rpcTaskIO_ for up to kAcceptTimeoutMs on every LAUNCH. The accept is
+// now async + deadline-bounded: a child that fails to connect back (here
+// a nonexistent child binary, so the forked child's execvp fails and it
+// exits immediately) makes LAUNCH return an error at the deadline, leaks
+// no instance, and leaves the channel responsive to further verbs.
+
+BOOST_AUTO_TEST_CASE(ComputeLaunchAcceptTimeoutIsClean) {
+  fs::path tmp = makeUniqueTempDir("compute_e2e_accept_timeout");
+
+  minx::Hash priv; priv.fill(0xCC);
+  CesConfig cfg = makeTestConfig(
+    tmp, priv, std::numeric_limits<uint64_t>::max());
+
+  cfg.rpcPort = 0;
+  cfg.rpcAutoPort = true;
+  cfg.cesplexMounts = {
+    {"/ces/file/1",    "builtin:file"},
+    {"/ces/compute/1", "builtin:compute"},
+  };
+  cfg.cesFileStoreMaxBytes = 128ull * 1024 * 1024;
+  cfg.feeFileRent = 1;
+  cfg.computeMaxInstances = 8;
+  cfg.feeComputeSlotSec = 1;
+  // Nonexistent child binary: fork() succeeds, the child's execvp fails
+  // and it exits without ever connecting back, so the accept must hit
+  // its deadline rather than a connection.
+  cfg.cesComputeChildBinary = (tmp / "no_such_child_binary").string();
+  cfg.cesComputeWorkDir = (tmp / "cescompute").string();
+
+  auto server = std::make_unique<CesServer>(cfg);
+  server->start(0);
+  uint16_t rpcPort = server->_rpcBoundPort();
+  BOOST_REQUIRE(rpcPort > 0);
+
+  KeyPair ownerKey;
+  server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
+  std::string ownerPath = "/h/" + ownerKey.getPublicKeyHexStr() + "/prog.bin";
+
+  wait_net();
+
+  // Source file, funded so the upfront commitment fee clears.
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
+    uint64_t outBal = 0, outCost = 0;
+    CES_REQUIRE_OK(fc.create(ownerPath, /*size=*/1, /*pricePerKb=*/0,
+                             /*deposit=*/1'000'000,
+                             "application/octet-stream", outBal, outCost));
+    fc.disconnect();
+  }
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+
+  uint64_t instId = 0, startedAt = 0;
+  uint8_t rc = cc.launch(ownerPath, instId, startedAt);
+  BOOST_CHECK_MESSAGE(rc != CES_OK,
+                      "LAUNCH must fail when the child never connects back");
+
+  // Strand not wedged: a follow-up verb on the same channel still
+  // answers, and no ghost instance was registered for the source.
+  std::vector<CesComputeClient::InstanceInfo> insts;
+  CES_REQUIRE_OK(cc.list(insts));
+  BOOST_CHECK_EQUAL(insts.size(), 0u);
+
+  std::vector<uint64_t> ids;
+  CES_REQUIRE_OK(cc.instances(ownerPath, ids));
+  BOOST_CHECK_EQUAL(ids.size(), 0u);
+
+  cc.disconnect();
+  server->stop();
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  boost::system::error_code ec;
+  fs::remove_all(tmp, ec);
+}
+
+// ---------------------------------------------------------------------------
+// Standalone: each LAUNCH is independently charged (not NONCELESS-deduped).
+// ---------------------------------------------------------------------------
+//
+// Regression for C4. Two LAUNCHes of the same source on one channel carry
+// an identical signature (preamble = [CES_NONCELESS][name]). The old code
+// dedup-skipped the second's query fee while still spawning it; LAUNCH now
+// opts out of the dedup, so the signer's account is debited feeQuery on
+// BOTH launches. Discount is pinned off so feeQuery is exact.
+BOOST_AUTO_TEST_CASE(LaunchIsNotDeduped) {
+  fs::path tmp = makeUniqueTempDir("compute_e2e_launch_charge");
+
+  minx::Hash priv; priv.fill(0xBB);
+  CesConfig cfg = makeTestConfig(
+    tmp, priv, std::numeric_limits<uint64_t>::max());
+
+  cfg.rpcPort = 0;
+  cfg.rpcAutoPort = true;
+  cfg.cesplexMounts = {
+    {"/ces/file/1",    "builtin:file"},
+    {"/ces/compute/1", "builtin:compute"},
+  };
+  cfg.cesFileStoreMaxBytes = 128ull * 1024 * 1024;
+  cfg.feeFileRent = 1;
+  cfg.computeMaxInstances = 8;
+  cfg.feeComputeSlotSec = 1;
+  // Full fees: pin the load discount off so feeQuery is charged exactly.
+  cfg.feeDiscountEnabled = false;
+  cfg.feeQuery = 1'000'000;
+  cfg.cesComputeChildBinary = ces::e2e::findBinary("cescompmockd");
+  cfg.cesComputeWorkDir = (tmp / "cescompute").string();
+
+  auto server = std::make_unique<CesServer>(cfg);
+  server->start(0);
+  uint16_t rpcPort = server->_rpcBoundPort();
+  BOOST_REQUIRE(rpcPort > 0);
+
+  KeyPair ownerKey;
+  server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
+  std::string ownerPath = "/h/" + ownerKey.getPublicKeyHexStr() + "/prog.bin";
+
+  wait_net();
+
+  // Source, funded so the per-launch upfront (from file_balance, not the
+  // account) never limits us — the account only pays feeQuery per launch.
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
+    uint64_t outBal = 0, outCost = 0;
+    CES_REQUIRE_OK(fc.create(ownerPath, /*size=*/1, /*pricePerKb=*/0,
+                             /*deposit=*/1'000'000'000,
+                             "application/octet-stream", outBal, outCost));
+    fc.disconnect();
+  }
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+
+  const minx::Hash ownerPk = ownerKey.getPublicKeyAsHash();
+  int64_t bal0 = server->_l2ProgramAccountBalanceSync(ownerPk);
+
+  // Two LAUNCHes of the SAME path on the SAME channel → identical sig.
+  uint64_t a = 0, as = 0, b = 0, bs = 0;
+  CES_REQUIRE_OK(cc.launch(ownerPath, a, as));
+  CES_REQUIRE_OK(cc.launch(ownerPath, b, bs));
+  BOOST_CHECK(a != 0 && b != 0 && a != b);   // two distinct instances
+
+  int64_t bal1 = server->_l2ProgramAccountBalanceSync(ownerPk);
+  // Both launches charged feeQuery: the dedup did NOT skip the second.
+  BOOST_CHECK_EQUAL(bal0 - bal1, int64_t(2) * int64_t(cfg.feeQuery));
 
   cc.disconnect();
   server->stop();

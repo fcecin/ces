@@ -410,17 +410,18 @@ bool drop_privileges_if_root(const char* user_name) {
   return true;
 }
 
-void apply_rlimits() {
-  // Hard ceilings that cannot be raised from inside Lua. The
-  // supervisor's SIGKILL-on-fund-depletion is the primary
-  // economic limit; these are panic brakes.
+void apply_rlimits(size_t mem_max_bytes) {
+  // Hard ceilings that cannot be raised from inside Lua. RLIMIT_AS is
+  // the merciless memory cap (from the server's compute_process_mem_max):
+  // the kernel denies any allocation past it, so a runaway or malicious
+  // program can never OOM the host. No RLIMIT_CPU — CPU is billed via
+  // file_balance depletion, not capped; throttling a paying process
+  // would be pointless.
   rlimit r{};
-  r.rlim_cur = r.rlim_max = 256ULL * 1024ULL * 1024ULL; // 256 MB AS
+  r.rlim_cur = r.rlim_max = mem_max_bytes;
   ::setrlimit(RLIMIT_AS, &r);
   r.rlim_cur = r.rlim_max = 8;
   ::setrlimit(RLIMIT_NOFILE, &r);
-  // No RLIMIT_CPU — the supervisor handles time-based SIGKILL via
-  // file_balance depletion; a fixed CPU cap here would be arbitrary.
 }
 
 // ---------------------------------------------------------------------------
@@ -1682,18 +1683,27 @@ void install_ces_api(lua_State* L) {
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: %s <ipc-socket-path> [drop-to-user]\n",
+    std::fprintf(stderr,
+                 "usage: %s <ipc-socket-path> [drop-to-user] [mem-max-bytes]\n",
                  argc > 0 ? argv[0] : "cesluajitd");
     return 2;
   }
   const char* sock_path = argv[1];
   const char* drop_user = argc >= 3 ? argv[2] : "";
+  // argv[3]: address-space ceiling in bytes (RLIMIT_AS), from the
+  // server's compute_process_mem_max. Absent/unparsable → 256 MB.
+  size_t mem_max_bytes = 256ULL * 1024ULL * 1024ULL;
+  if (argc >= 4) {
+    char* end = nullptr;
+    unsigned long long v = std::strtoull(argv[3], &end, 10);
+    if (end != argv[3] && v > 0) mem_max_bytes = static_cast<size_t>(v);
+  }
 
   g_sock_fd = connect_unix_socket(sock_path);
   if (g_sock_fd < 0) return 1;
 
   if (!drop_privileges_if_root(drop_user)) return 1;
-  apply_rlimits();
+  apply_rlimits(mem_max_bytes);
 
   // Read bootstrap frame. Body layout (must match
   // compute_handler.cpp::sendBootstrapFrame):

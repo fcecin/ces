@@ -57,9 +57,12 @@ uint8_t computeHandlerBind(CesServer* server);
 // be in /s/, and be owned by the server's pubkey.
 //
 // Must be called from rpcTaskIO_'s strand (post via
-// CesServer::_rpcTaskIOExecutor). Synchronous; returns CES_OK on
-// success, or a CES_ERROR_COMPUTE_*/CES_ERROR_FILE_*/CES_ERROR_BAD_NAME
-// code on failure.
+// CesServer::_rpcTaskIOExecutor). Validation (instance cap, source
+// existence, server ownership) is synchronous and returns CES_OK, or a
+// CES_ERROR_COMPUTE_*/CES_ERROR_FILE_*/CES_ERROR_BAD_NAME code. The
+// child's connect-back is then awaited asynchronously, so CES_OK means
+// "validated + spawn started," not "child connected"; a connect-back
+// failure is logged, not returned.
 //
 // Owner pubkey is read fresh from the source's sidecar — the caller
 // doesn't pass it. This keeps the contract symmetric with the wire

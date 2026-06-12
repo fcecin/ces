@@ -532,6 +532,49 @@ BOOST_AUTO_TEST_CASE(CpuAndRssReportedForBusyLuaProgram) {
 }
 
 // ---------------------------------------------------------------------------
+// A program whose allocation blows past the per-process RLIMIT_AS dies on
+// the spot — the kernel denies the allocation (compute_process_mem_max,
+// here the 256 MB default, wired into the child). OOM is an instant,
+// machine-wide attack vector, so a memory bomb is contained — killed, not
+// billed-and-tolerated — and the host + other instances are unharmed.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(MemoryBombIsContainedByRlimit) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string bombPath = "/h/" + ownerHex + "/bomb.lua";
+  // 1 GB allocation — far over the 256 MB RLIMIT_AS. string.rep's alloc
+  // fails, the program errors out, the child exits, the supervisor reaps.
+  uploadScript(bombPath,
+    "local big = string.rep('X', 1024 * 1024 * 1024)\n"
+    "_G.__anchor = big\n"
+    "while true do ces.client_recv() end\n");
+  uint64_t bombId = launchScript(bombPath);
+  BOOST_REQUIRE(bombId > 0);   // launch ok: child connects before running Lua
+
+  // The child runs the Lua, the 1 GB alloc is denied, it exits; the IPC
+  // EOF path reaps the instance. Give it a beat.
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+
+  // The bomb is gone.
+  CesComputeClient::InstanceInfo info;
+  uint8_t rc = cc.stat(bombId, info);
+  BOOST_CHECK_MESSAGE(rc == CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND,
+    "memory-bomb instance must be reaped, got rc=" << int(rc));
+
+  // The host still serves: a normal program launches fine afterward.
+  const std::string okPath = "/h/" + ownerHex + "/ok.lua";
+  uploadScript(okPath, "while true do ces.client_recv() end\n");
+  uint64_t okId = launchScript(okPath);
+  BOOST_CHECK(okId > 0);
+  CES_REQUIRE_OK(cc.kill(okId));
+  cc.disconnect();
+}
+
+// ---------------------------------------------------------------------------
 // AuthenticAssetCreate: a Lua program calls ces.authentic_asset_create
 // with a recipient pubkey and a payload. The server stamps the first
 // 32 bytes of the asset's content with sha256(source || path), sets
