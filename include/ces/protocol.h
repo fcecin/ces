@@ -12,7 +12,7 @@
 
 #include <limits>
 #include <map>
-#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -196,8 +196,8 @@ struct CesCrossTransfer {
     buf.put(destKey);
     buf.put(amount);
     buf.put(static_cast<uint8_t>(destServer.size()));
-    for (char c : destServer)
-      buf.put(static_cast<uint8_t>(c));
+    buf.putBytes(std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(destServer.data()), destServer.size()));
   }
 
   void readPayload(minx::ConstBuffer& buf) {
@@ -207,9 +207,7 @@ struct CesCrossTransfer {
     destKey = buf.get<Hash>();
     amount = buf.get<uint64_t>();
     uint8_t len = buf.get<uint8_t>();
-    destServer.resize(len);
-    for (uint8_t i = 0; i < len; ++i)
-      destServer[i] = static_cast<char>(buf.get<uint8_t>());
+    destServer = buf.getBytes<std::string>(len);
   }
   CES_INJECT_SIGNED_METHODS(CES_CROSS_TRANSFER)
 };
@@ -255,7 +253,7 @@ struct CesRunAsset {
     buf.put(allowance);
     buf.put(time);
     buf.put(static_cast<uint16_t>(input.size()));
-    for (uint8_t b : input) buf.put(b);
+    buf.putBytes(input);
   }
 
   void readPayload(minx::ConstBuffer& buf) {
@@ -268,8 +266,7 @@ struct CesRunAsset {
     time = buf.get<uint64_t>();
     uint16_t len = buf.get<uint16_t>();
     if (len > 1024) len = 1024;
-    input.resize(len);
-    for (uint16_t i = 0; i < len; ++i) input[i] = buf.get<uint8_t>();
+    input = buf.getBytes<ces::Bytes>(len);
   }
   CES_INJECT_SIGNED_METHODS(CES_RUN_ASSET)
 };
@@ -302,7 +299,7 @@ struct CesRunAssetResult {
     buf.put(budgetUsed);
     buf.put(allowanceUsed);
     buf.put(static_cast<uint16_t>(output.size()));
-    for (uint8_t b : output) buf.put(b);
+    buf.putBytes(output);
   }
 
   void readPayload(minx::ConstBuffer& buf) {
@@ -314,8 +311,7 @@ struct CesRunAssetResult {
     allowanceUsed = buf.get<uint64_t>();
     uint16_t len = buf.get<uint16_t>();
     if (len > 1024) len = 1024;
-    output.resize(len);
-    for (uint16_t i = 0; i < len; ++i) output[i] = buf.get<uint8_t>();
+    output = buf.getBytes<ces::Bytes>(len);
   }
   CES_INJECT_SIGNED_METHODS(CES_RUN_ASSET_RESULT)
 };
@@ -841,7 +837,8 @@ struct CesQueryServerInfoResult {
       std::vector<char> tmp(sz);
       logkv::serializer<std::map<std::string, std::string>>::write(
         tmp.data(), sz, m);
-      for (char c : tmp) buf.put(static_cast<uint8_t>(c));
+      buf.putBytes(std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(tmp.data()), tmp.size()));
     }
   }
 
@@ -851,13 +848,10 @@ struct CesQueryServerInfoResult {
     rcode = buf.get<uint8_t>();
     entries.clear();
     if (rcode == CES_OK) {
-      // Remaining payload bytes = total - opcode(1) - fixed fields - sig(64)
-      // The buf already consumed opcode + fixed fields, so remaining
-      // minus signature bytes is the map data.
-      size_t remaining = buf.getRemainingBytesCount() - sizeof(Signature);
-      std::vector<char> mapData(remaining);
-      for (size_t i = 0; i < remaining; ++i)
-        mapData[i] = static_cast<char>(buf.get<uint8_t>());
+      size_t avail = buf.getRemainingBytesCount();
+      if (avail < sizeof(Signature))
+        throw std::runtime_error("truncated server-info result");
+      auto mapData = buf.getBytes<std::vector<char>>(avail - sizeof(Signature));
       std::map<std::string, std::string> m;
       logkv::serializer<std::map<std::string, std::string>>::read(
         mapData.data(), mapData.size(), m);

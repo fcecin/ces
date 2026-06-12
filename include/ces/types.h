@@ -6,9 +6,9 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <vector>
 
-#include <boost/endian/conversion.hpp>
-
+#include <logkv/hex.h>
 #include <minx/types.h>
 
 namespace ces {
@@ -39,9 +39,6 @@ enum op_code_t : uint8_t {
 };
 
 /**
- * Server outgoing message codes.
- */
-/**
  * APPLICATION-lane opcodes. These ride MINX's APPLICATION path (not
  * the signed-op path). Clients with an established MINX session may
  * push these directly; servers dispatch by opcode in
@@ -57,6 +54,9 @@ enum app_code_t : uint8_t {
   CES_APP_COMPUTE_MSG = 0x81
 };
 
+/**
+ * Server outgoing message codes.
+ */
 enum result_code_t : uint8_t {
   CES_TRANSFER_RESULT = 0x00,
   CES_BULK_TRANSFER_RESULT = 0x01,
@@ -157,7 +157,7 @@ enum error_code_t : uint8_t {
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
-static constexpr uint32_t CES_NONCELESS = std::numeric_limits<uint32_t>::max();
+static constexpr uint32_t CES_NONCELESS = UINT32_MAX;
 
 /// Microseconds since epoch (UTC). Used for dedup time fields.
 inline uint64_t getMicrosSinceEpoch() {
@@ -175,7 +175,6 @@ inline uint64_t getMicrosSinceEpoch() {
 // The MTU-bounded stack-vector wire-payload type is minx::Bytes; use
 // that explicitly when you specifically want the 1280-cap
 // static_vector for UDP packet construction.
-#include <vector>
 using Bytes = std::vector<uint8_t>;
 using Hash = minx::Hash;
 using HashTail = std::array<uint8_t, 24>;
@@ -322,7 +321,3 @@ template <> struct hash<ces::HashPrefix> {
   }
 };
 } // namespace std
-
-inline std::size_t hash_value(const ces::HashPrefix& key) noexcept {
-  return std::hash<ces::HashPrefix>{}(key);
-}

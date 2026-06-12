@@ -33,20 +33,12 @@ constexpr uint64_t MAX_FLUSH = std::numeric_limits<uint64_t>::max();
 // Wait this many seconds for server replies before giving up on a bench run.
 constexpr int BENCH_REPLY_TIMEOUT_SECS = 15;
 
-struct HashPrefixHasher {
-  std::size_t operator()(const HashPrefix& k) const {
-    size_t h;
-    std::memcpy(&h, k.data(), sizeof(size_t));
-    return h;
-  }
-};
-
 class BenchClient : public minx::MinxListener {
 public:
   BenchClient(
     uint16_t port, bool verbose, int taskThreads,
     size_t totalTx, size_t poolSize,
-    const std::unordered_map<HashPrefix, size_t, HashPrefixHasher>& accMap)
+    const std::unordered_map<HashPrefix, size_t>& accMap)
       : port_(port), verbose_(verbose),
         taskThreadCount_(taskThreads), poolSize_(poolSize), accMap_(accMap) {
     size_t arraySize = totalTx + poolSize + 1000;
@@ -139,7 +131,7 @@ private:
   bool verbose_;
   int taskThreadCount_;
   size_t poolSize_;
-  const std::unordered_map<HashPrefix, size_t, HashPrefixHasher>& accMap_;
+  const std::unordered_map<HashPrefix, size_t>& accMap_;
 
   ces::Bytes seenFlags_;
 
@@ -226,7 +218,7 @@ int main(int argc, char* argv[]) {
   std::cout << "Generating " << optPoolSize << " sender accounts..."
             << std::endl;
   std::vector<SimAccount> pool(optPoolSize);
-  std::unordered_map<HashPrefix, size_t, HashPrefixHasher> accMap;
+  std::unordered_map<HashPrefix, size_t> accMap;
   for (size_t i = 0; i < optPoolSize; ++i) {
     pool[i].key = KeyPair(algo);
     pool[i].nonce = 0;
@@ -462,8 +454,6 @@ int main(int argc, char* argv[]) {
 
         minx::Bytes serverBytes(PAYLOAD_SIZE);
         std::memset(serverBytes.data(), 0xBB, PAYLOAD_SIZE);
-
-        serverKey.signData(serverBytes.data(), PAYLOAD_SIZE);
 
         for (size_t i = 0; i < ITERATIONS_PER_THREAD; ++i) {
 

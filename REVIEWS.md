@@ -37,6 +37,9 @@
 * include/ces/l2/compute_lua_handler.h
 * include/ces/l2/cesplex.h
 * src/cesluajitd/main.cpp
+* include/ces/protocol.h
+* include/ces/types.h
+* src/cesbench/cesbench.cpp
 
 ## Review PASS 2
 
@@ -46,11 +49,8 @@
 
 * include/ces/client.h
 * include/ces/clientasync.h
-* include/ces/protocol.h
 * include/ces/server.h
-* include/ces/types.h
 * src/ces/main.cpp
-* src/cesbench/cesbench.cpp
 * src/cesh/main.cpp
 * src/cesqt/appmodel.h
 * src/cesqt/console.h
