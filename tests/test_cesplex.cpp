@@ -569,20 +569,26 @@ namespace {
 // ---------------------------------------------------------------------------
 
 // Build the per-op envelope for the bind-contract wire (Step 3).
-// Wire shape after the verb byte: [u32 preamble_len][preamble][65 sig].
-// Sig is over sha256(verb || preamble || sessionToken).
+// Wire shape after the verb byte: [u32 preamble_len][salt+preamble][65 sig].
+// Sig is over sha256(verb || salt || preamble || sessionToken).
 static ces::Bytes buildSignedEnvelope(
     const ces::KeyPair& signer,
     uint8_t verb,
     const ces::Bytes& preamble,
     uint64_t sessionToken) {
+  // Match CesPlexClient: prepend an 8-byte per-op salt so repeated ops
+  // sign differently (a static counter gives uniqueness across calls).
+  static uint64_t opSalt = 1;
+  ces::Bytes signedPre;
+  ces::Buffer::put<uint64_t>(signedPre, opSalt++);
+  signedPre.insert(signedPre.end(), preamble.begin(), preamble.end());
   ces::Signature sig = ces::signPerOp(
     signer, verb,
-    std::span<const uint8_t>(preamble.data(), preamble.size()),
+    std::span<const uint8_t>(signedPre.data(), signedPre.size()),
     sessionToken);
   ces::Bytes wire;
-  ces::Buffer::put<uint32_t>(wire, static_cast<uint32_t>(preamble.size()));
-  wire.insert(wire.end(), preamble.begin(), preamble.end());
+  ces::Buffer::put<uint32_t>(wire, static_cast<uint32_t>(signedPre.size()));
+  wire.insert(wire.end(), signedPre.begin(), signedPre.end());
   wire.insert(wire.end(), sig.begin(), sig.end());
   return wire;
 }

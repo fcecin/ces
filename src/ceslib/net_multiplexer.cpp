@@ -24,6 +24,7 @@
 #include <chrono>
 #include <cstring>
 #include <mutex>
+#include <span>
 #include <vector>
 
 LOG_MODULE("plex");

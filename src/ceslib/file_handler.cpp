@@ -33,6 +33,7 @@
 // Net, so the per-verb toll stays flat by design.
 
 #include <ces/l2/net_multiplexer.h>
+#include <ces/l2/cesplex.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
@@ -654,132 +655,26 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
 // Common per-request state
 // ---------------------------------------------------------------------------
 
-struct ReqCtx : std::enable_shared_from_this<ReqCtx> {
-  std::shared_ptr<minx::RudpStream> stream;
-  CesServer* server = nullptr;
-  uint8_t verb = 0;
-  // Per-op signature: 65-byte sig over sha256(verb||preamble||sessionToken).
-  // The dedup key is the first 8 bytes of sig (skipping the algorithm
-  // decorator byte) — see plex_envelope.h::sigDedupHash.
-  std::array<uint8_t, 65> sigBuf{};
-  uint64_t reqSigHash = 0;
-  uint32_t reqNonce = 0;
-  // Channel binding (set once at handoff, copied into each ReqCtx).
-  // Identity comes from here (no per-op pubkey on the wire); per-op
-  // sigs are verified against bound.boundPubkey, anchored by
-  // bound.sessionToken.
-  BoundChannelContext bound;
-};
+// The signed-request loop lives in the CesPlex framework (cesPlexServe /
+// CesPlexRequest, see net_multiplexer.h). ReqCtx aliases the framework
+// request so the dispatchers below need no changes; the thin senders
+// forward to its respond/error helpers. respond's `extraBody` streams a
+// READ payload after the envelope; errorAndClose drops the channel for a
+// body-bearing verb rejected before its trailing body was consumed (a
+// loop there would desync the stream).
 
-// Forward decls for the loop + serve.
-void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound);
+using ReqCtx = ces::CesPlexRequest;
 
-// ---------------------------------------------------------------------------
-// Response finishers — write envelope, then loop back for next verb.
-// ---------------------------------------------------------------------------
-
-// One-shot write of the response followed by re-entry into the verb
-// loop. `extraBody` lets verbs (READ) append streamed content after
-// the envelope.
-void sendResponseAndLoop(
-    std::shared_ptr<ReqCtx> ctx,
-    uint8_t status,
-    ces::Bytes preamble,
-    ces::Bytes extraBody = {}) {
-  auto stream = ctx->stream;
-  auto bound = ctx->bound;
-  auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status,
-                       preamble, ctx->reqSigHash));
-  auto body = std::make_shared<ces::Bytes>(std::move(extraBody));
-  boost::asio::async_write(
-    *stream, boost::asio::buffer(*env),
-    [stream, env, body, bound]
-    (const boost::system::error_code& ec, std::size_t) mutable {
-      if (ec) return;
-      if (!body->empty()) {
-        boost::asio::async_write(
-          *stream, boost::asio::buffer(*body),
-          [stream, body, bound]
-          (const boost::system::error_code& ec2, std::size_t) mutable {
-            if (ec2) return;
-            readNextVerb(stream, std::move(bound));
-          });
-      } else {
-        readNextVerb(stream, std::move(bound));
-      }
-    });
+inline void sendResponseAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status,
+                                ces::Bytes preamble,
+                                ces::Bytes extraBody = {}) {
+  ctx->respond(status, std::move(preamble), std::move(extraBody));
 }
-
-// Error reply (default) — write the server-signed error envelope,
-// then loop back to read the next verb. Used for business rejections
-// where the stream state is clean (envelope fully consumed, no body
-// in flight): FILE_NOT_FOUND, NOT_OWNER, INSUFFICIENT_BALANCE,
-// BAD_NAME, STORE_FULL, etc. Preserves the single-channel-per-peer
-// discipline — clients can do multi-op flows without reconnecting.
-void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
-  auto stream = ctx->stream;
-  auto bound = ctx->bound;
-  auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status, {},
-                       ctx->reqSigHash));
-  boost::asio::async_write(
-    *stream, boost::asio::buffer(*env),
-    [stream, env, bound]
-    (const boost::system::error_code& ec, std::size_t) mutable {
-      if (ec) return;
-      readNextVerb(stream, std::move(bound));
-    });
+inline void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
+  ctx->error(status);
 }
-
-// Error reply (destructive) — write the error response, then drop
-// the stream. Reserved for the narrow cases where the channel would
-// otherwise be polluted: WRITE/APPEND early-reject (body bytes still
-// in flight), or the client itself has gone silent.
-void sendErrorAndClose(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
-  auto stream = ctx->stream;
-  auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status, {},
-                       ctx->reqSigHash));
-  boost::asio::async_write(
-    *stream, boost::asio::buffer(*env),
-    [stream, env](const boost::system::error_code&, std::size_t) {
-      // Graceful close after the error reply has been pushed: drain
-      // into Rudp's sendBuf, then HS_CLOSE within timeout. Without
-      // this the channel sat idle until 60s GC — peer never saw EOF.
-      stream->shutdown(kRudpStreamCloseTimeout);
-    });
-  ctx->stream.reset();
-}
-
-// ---------------------------------------------------------------------------
-// Signed-preamble reader: for all verbs EXCEPT STAT, we read a
-// u32 preamble_len, then preamble bytes, then envelope.
-// ---------------------------------------------------------------------------
-
-// Validates + computes sha256(verb||preamble) and checks the sig.
-// Returns CES_OK on pass, or an error code.
-uint8_t verifySignedEnvelope(
-    uint8_t verb,
-    const ces::Bytes& preamble,
-    uint64_t timeUs,
-    const std::array<uint8_t, 32>& senderKey,
-    const std::array<uint8_t, 32>& sha256Claim,
-    const std::array<uint8_t, 65>& sig) {
-  ces::Bytes hashIn;
-  hashIn.reserve(sizeof(uint8_t) + preamble.size());
-  hashIn.push_back(verb);
-  hashIn.insert(hashIn.end(), preamble.begin(), preamble.end());
-  minx::Hash computed = ces::sha256(hashIn.data(), hashIn.size());
-  if (std::memcmp(computed.data(), sha256Claim.data(), 32) != 0)
-    return CES_ERROR_INTERNAL;
-  (void)timeUs; // window-enforcement hook, handled by dedup
-  ces::PublicKey pk(senderKey);
-  if (!pk.verifySignature(
-        std::span<const uint8_t>(computed.data(), computed.size()), sig))
-    return CES_ERROR_INTERNAL;
-  return CES_OK;
+inline void sendErrorAndClose(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
+  ctx->errorAndClose(status);
 }
 
 // Per-verb dispatch after signed envelope is verified and debited.
@@ -810,113 +705,38 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchDelete (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 
-// Reads the per-op envelope: [u32 preamble_len][preamble][65 sig].
-// Verifies sig against bound.boundPubkey using
-// sha256(verb||preamble||sessionToken). reqNonce is the first 4
-// bytes of the preamble (every signed verb's preamble starts with
-// it). The caller decodes the rest of the preamble.
-void readSignedRequest(std::shared_ptr<ReqCtx> ctx) {
-  auto self = ctx;
-  auto lenBuf = std::make_shared<std::array<uint8_t, 4>>();
-  boost::asio::async_read(
-    *ctx->stream, boost::asio::buffer(*lenBuf),
-    [self, lenBuf](const boost::system::error_code& ec, std::size_t) {
-      if (ec) return;
-      uint32_t preLen = ces::Buffer::peek<uint32_t>(lenBuf->data());
-      if (preLen == 0 || preLen > 4096) {
-        // Caller wire format violates the envelope length bounds —
-        // BAD_INPUT, not server fault.
-        sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-        return;
-      }
-      auto preBuf = std::make_shared<ces::Bytes>(preLen);
-      boost::asio::async_read(
-        *self->stream, boost::asio::buffer(*preBuf),
-        [self, preBuf](const boost::system::error_code& e2, std::size_t) {
-          if (e2) return;
-          auto tail = std::make_shared<std::array<uint8_t, 65>>();
-          boost::asio::async_read(
-            *self->stream, boost::asio::buffer(*tail),
-            [self, preBuf, tail]
-            (const boost::system::error_code& e3, std::size_t) {
-              if (e3) return;
-              std::memcpy(self->sigBuf.data(), tail->data(), 65);
-              self->reqSigHash = ces::sigDedupHash(self->sigBuf);
-
-              if (!ces::verifyPerOp(
-                    self->bound, self->verb,
-                    std::span<const uint8_t>(preBuf->data(), preBuf->size()),
-                    self->sigBuf)) {
-                // Per-op signature didn't verify against the bound pubkey.
-                // Caller signed wrong → BAD_INPUT.
-                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-                return;
-              }
-              if (preBuf->size() < 4) {
-                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-                return;
-              }
-              self->reqNonce = ces::Buffer::peek<uint32_t>(preBuf->data());
-              ces::Bytes preRest(
-                preBuf->begin() + 4, preBuf->end());
-              switch (self->verb) {
-                case kVerbCreate:   dispatchCreate  (self, std::move(preRest)); break;
-                case kVerbWrite:    dispatchWrite   (self, std::move(preRest)); break;
-                case kVerbRead:     dispatchRead    (self, std::move(preRest)); break;
-                case kVerbStat:     dispatchStat    (self, std::move(preRest)); break;
-                case kVerbDeposit:  dispatchDeposit (self, std::move(preRest)); break;
-                case kVerbWithdraw: dispatchWithdraw(self, std::move(preRest)); break;
-                case kVerbSetPrice: dispatchSetPrice(self, std::move(preRest)); break;
-                case kVerbDelete:   dispatchDelete  (self, std::move(preRest)); break;
-                case kVerbAppend:   dispatchAppend  (self, std::move(preRest)); break;
-                case kVerbResize:   dispatchResize  (self, std::move(preRest)); break;
-                default:            sendErrorAndLoop(self, CES_ERROR_BAD_INPUT); break;
-              }
-            });
-        });
-    });
-}
-
-// ---------------------------------------------------------------------------
-// Verb loop entry — read one verb byte and dispatch.
-// ---------------------------------------------------------------------------
-
-void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound) {
-  CesServer* server = gServer.load();
-  if (!server) return;
-  auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();
-  auto sharedStream = stream;
-  auto sharedBound = std::make_shared<BoundChannelContext>(std::move(bound));
-  boost::asio::async_read(
-    *sharedStream, boost::asio::buffer(*verbBuf),
-    [verbBuf, sharedStream, server, sharedBound]
-    (const boost::system::error_code& ec, std::size_t) {
-      if (ec) return;
-      uint8_t verb = (*verbBuf)[0];
-      if (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize)) {
-        auto ctx = std::make_shared<ReqCtx>();
-        ctx->stream = sharedStream;
-        ctx->server = server;
-        ctx->verb = verb;
-        ctx->bound = *sharedBound;
-        readSignedRequest(ctx);
-      } else {
-        LOGDEBUG << "builtin:file unknown verb" << VAR(int(verb));
-        // Drop silently.
-      }
-    });
-}
-
 class FileHandler : public CesPlexHandler {
 public:
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override {
-    if (!gServer.load()) {
+    CesServer* server = gServer.load();
+    if (!server) {
       LOGWARNING << "builtin:file invoked with no bound CesServer";
       return;
     }
-    readNextVerb(std::move(stream), std::move(bound));
+    CesPlexProtocol proto;
+    // accepts() also gates "still bound?" — false on unbind stops the loop.
+    proto.accepts = [](uint8_t verb) {
+      return gServer.load() != nullptr &&
+             (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize));
+    };
+    proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+      switch (ctx->verb) {
+        case kVerbCreate:   dispatchCreate  (ctx, std::move(pre)); break;
+        case kVerbWrite:    dispatchWrite   (ctx, std::move(pre)); break;
+        case kVerbRead:     dispatchRead    (ctx, std::move(pre)); break;
+        case kVerbStat:     dispatchStat    (ctx, std::move(pre)); break;
+        case kVerbDeposit:  dispatchDeposit (ctx, std::move(pre)); break;
+        case kVerbWithdraw: dispatchWithdraw(ctx, std::move(pre)); break;
+        case kVerbSetPrice: dispatchSetPrice(ctx, std::move(pre)); break;
+        case kVerbDelete:   dispatchDelete  (ctx, std::move(pre)); break;
+        case kVerbAppend:   dispatchAppend  (ctx, std::move(pre)); break;
+        case kVerbResize:   dispatchResize  (ctx, std::move(pre)); break;
+        default:            ctx->error(CES_ERROR_BAD_INPUT); break;
+      }
+    };
+    cesPlexServe(std::move(stream), std::move(bound), server,
+                 std::move(proto));
   }
 };
 

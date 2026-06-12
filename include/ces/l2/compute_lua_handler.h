@@ -4,7 +4,7 @@
 // "lua" in the global builtin registry, mounted at /ces/lua/1. Its
 // job is to route a user's RUDP channel to a running cesluajitd
 // instance: the user binds, sends a one-shot ATTACH verb naming the
-// target source file, and from then on the channel is a raw byte
+// target instance_id, and from then on the channel is a raw byte
 // stream into and out of the program.
 //
 // Lifecycle: CesServer::start() calls luaHandlerBind(this) after

@@ -135,4 +135,13 @@ bool _computeTestReadProcSample(int pid,
 // with a blocking post+wait. No-op if the handler is unbound.
 void _computeTestForceTick();
 
+// Test hook: floods an instance with `count` best-effort DELIVER frames
+// back-to-back on the CesPlex strand and returns the resulting outbound
+// queue (`outbox`) depth at saturation. With the flood guard in place this
+// caps at kMaxDeliverBacklog; without it, it grows to `count`. Runs in a
+// single non-yielding strand task so nothing drains mid-flood — the result
+// is deterministic, with no socket-buffer or timing dependence. 0 if the
+// handler is unbound or the instance is gone.
+size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count);
+
 } // namespace ces

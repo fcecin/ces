@@ -29,10 +29,11 @@
 //           u64 file_balance, u32 cpu_bp, u64 rss_bytes,
 //           u16 path_len, path
 //
-// The wire helpers, ReqCtx, response envelope, and read-verb loop are
-// duplicated from file_handler.cpp.
+// The signed-request loop (verb read, envelope verify, server-signed
+// response) is the shared cesPlexServe engine in cesplex.h.
 
 #include <ces/l2/net_multiplexer.h>
+#include <ces/l2/cesplex.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
@@ -204,6 +205,16 @@ constexpr uint8_t kApiStatusInternal      = 0xFF;
 
 constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
 
+// Per-instance cap on queued outbound IPC frames before a best-effort
+// DELIVER (incoming CES_APP_COMPUTE_MSG) is dropped instead of enqueued.
+// CES_APP_COMPUTE_MSG is a lossy lane by contract — an undeliverable
+// message is dropped silently — so shedding it when the child is behind
+// is correct, and it bounds server memory against a remote flood aimed at
+// a slow or non-reading program. Correctness-critical frames (API replies,
+// conn routing, bootstrap) ignore this cap; they are flow-controlled by
+// other means (request/response, RUDP windowing, one-shot).
+constexpr size_t kMaxDeliverBacklog = 1024;
+
 } // namespace
 // Forward decls into the lua handler — defined in compute_lua_handler.cpp.
 // The compute supervisor calls these when CONN_DATA_OUT / CONN_CLOSE
@@ -215,10 +226,6 @@ void luaHandlerHandleConnDataOut(uint64_t instId, uint64_t connId,
 void luaHandlerHandleConnClose(uint64_t instId, uint64_t connId);
 void luaHandlerOnInstanceDying(uint64_t instId);
 namespace {
-
-// ---------------------------------------------------------------------------
-// Wire helpers (duplicated from file_handler.cpp)
-// ---------------------------------------------------------------------------
 
 // All BE serialization goes through ces::Buffer (see ces/buffer.h).
 
@@ -640,6 +647,14 @@ void kickOutboundIfIdle(std::shared_ptr<Instance> inst) {
 void sendDeliverFrame(std::shared_ptr<Instance> inst,
                       const std::array<uint8_t, 8>& senderPfx,
                       const uint8_t* payload, size_t payloadLen) {
+  // Best-effort lane: if the child is already deep behind on its outbound
+  // queue, drop this message rather than grow the server's memory without
+  // bound. A program that wants every message must keep draining.
+  if (inst->peer && inst->outbox.size() >= kMaxDeliverBacklog) {
+    LOGDEBUG << "builtin:compute deliver dropped (outbox full)"
+             << VAR(inst->id) << VAR(inst->outbox.size());
+    return;
+  }
   ces::Bytes body;
   body.reserve(sizeof(senderPfx) + payloadLen);
   body.insert(body.end(), senderPfx.begin(), senderPfx.end());
@@ -1322,46 +1337,20 @@ ces::Bytes readSourceBytes(const CesConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// Per-request ctx + response helpers (duplicated pattern)
+// Verb dispatch — the signed-request loop lives in the CesPlex framework
+// (cesPlexServe / CesPlexRequest, see net_multiplexer.h). ReqCtx aliases
+// the framework request so the dispatchers below need no changes; the
+// thin senders forward to its respond/error helpers.
 // ---------------------------------------------------------------------------
 
-struct ReqCtx : std::enable_shared_from_this<ReqCtx> {
-  std::shared_ptr<minx::RudpStream> stream;
-  CesServer* server = nullptr;
-  uint8_t verb = 0;
-  // Per-op signature: 65-byte sig over sha256(verb||preamble||sessionToken).
-  // Dedup key = sigDedupHash(sig).
-  std::array<uint8_t, 65> sigBuf{};
-  uint64_t reqSigHash = 0;
-  uint32_t reqNonce = 0;
-  // Channel binding (set once at handoff, copied into each ReqCtx).
-  // Replaces the per-op pubkey + timestamp the old envelope carried.
-  BoundChannelContext bound;
-};
+using ReqCtx = ces::CesPlexRequest;
 
-void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound);
-
-void sendResponseAndLoop(
-    std::shared_ptr<ReqCtx> ctx,
-    uint8_t status,
-    ces::Bytes preamble) {
-  auto stream = ctx->stream;
-  auto bound = ctx->bound;
-  auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status,
-                       preamble, ctx->reqSigHash));
-  boost::asio::async_write(
-    *stream, boost::asio::buffer(*env),
-    [stream, env, bound]
-    (const boost::system::error_code& ec, std::size_t) mutable {
-      if (ec) return;
-      readNextVerb(stream, std::move(bound));
-    });
+inline void sendResponseAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status,
+                                ces::Bytes preamble) {
+  ctx->respond(status, std::move(preamble));
 }
-
-void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
-  sendResponseAndLoop(ctx, status, {});
+inline void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
+  ctx->error(status);
 }
 
 // Verb dispatch forward decls.
@@ -1370,89 +1359,6 @@ void dispatchKill      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchList      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchStat      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchInstances (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
-
-void readSignedRequest(std::shared_ptr<ReqCtx> ctx) {
-  auto self = ctx;
-  auto lenBuf = std::make_shared<std::array<uint8_t, 4>>();
-  boost::asio::async_read(
-    *ctx->stream, boost::asio::buffer(*lenBuf),
-    [self, lenBuf](const boost::system::error_code& ec, std::size_t) {
-      if (ec) return;
-      uint32_t preLen = ces::Buffer::peek<uint32_t>(lenBuf->data());
-      if (preLen == 0 || preLen > 4096) {
-        // Caller wire format violates the envelope length bounds —
-        // BAD_INPUT, not server fault.
-        sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-        return;
-      }
-      auto preBuf = std::make_shared<ces::Bytes>(preLen);
-      boost::asio::async_read(
-        *self->stream, boost::asio::buffer(*preBuf),
-        [self, preBuf](const boost::system::error_code& e2, std::size_t) {
-          if (e2) return;
-          auto tail = std::make_shared<std::array<uint8_t, 65>>();
-          boost::asio::async_read(
-            *self->stream, boost::asio::buffer(*tail),
-            [self, preBuf, tail]
-            (const boost::system::error_code& e3, std::size_t) {
-              if (e3) return;
-              std::memcpy(self->sigBuf.data(), tail->data(), 65);
-              self->reqSigHash = ces::sigDedupHash(self->sigBuf);
-
-              if (!ces::verifyPerOp(
-                    self->bound, self->verb,
-                    std::span<const uint8_t>(preBuf->data(), preBuf->size()),
-                    self->sigBuf)) {
-                // Per-op signature didn't verify against the bound pubkey.
-                // Caller signed wrong → BAD_INPUT.
-                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-                return;
-              }
-              if (preBuf->size() < 4) {
-                sendErrorAndLoop(self, CES_ERROR_BAD_INPUT);
-                return;
-              }
-              self->reqNonce = ces::Buffer::peek<uint32_t>(preBuf->data());
-              ces::Bytes preRest(
-                preBuf->begin() + 4, preBuf->end());
-              switch (self->verb) {
-                case kVerbLaunch:    dispatchLaunch   (self, std::move(preRest)); break;
-                case kVerbKill:      dispatchKill     (self, std::move(preRest)); break;
-                case kVerbList:      dispatchList     (self, std::move(preRest)); break;
-                case kVerbStat:      dispatchStat     (self, std::move(preRest)); break;
-                case kVerbInstances: dispatchInstances(self, std::move(preRest)); break;
-                default:          sendErrorAndLoop(self, CES_ERROR_BAD_INPUT); break;
-              }
-            });
-        });
-    });
-}
-
-void readNextVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound) {
-  CesServer* server = gServer.load();
-  if (!server) return;
-  auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();
-  auto sharedStream = stream;
-  auto sharedBound = std::make_shared<BoundChannelContext>(std::move(bound));
-  boost::asio::async_read(
-    *sharedStream, boost::asio::buffer(*verbBuf),
-    [verbBuf, sharedStream, server, sharedBound]
-    (const boost::system::error_code& ec, std::size_t) {
-      if (ec) return;
-      uint8_t verb = (*verbBuf)[0];
-      if (verb < kVerbLaunch || verb > kVerbInstances) {
-        LOGDEBUG << "builtin:compute unknown verb" << VAR(int(verb));
-        return;
-      }
-      auto ctx = std::make_shared<ReqCtx>();
-      ctx->stream = sharedStream;
-      ctx->server = server;
-      ctx->verb = verb;
-      ctx->bound = *sharedBound;
-      readSignedRequest(ctx);
-    });
-}
 
 // ---------------------------------------------------------------------------
 // Helper: compute slot-fee window in credits.
@@ -2070,11 +1976,29 @@ class ComputeHandler : public CesPlexHandler {
 public:
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override {
-    if (!gServer.load()) {
+    CesServer* server = gServer.load();
+    if (!server) {
       LOGWARNING << "builtin:compute invoked with no bound CesServer";
       return;
     }
-    readNextVerb(std::move(stream), std::move(bound));
+    CesPlexProtocol proto;
+    // accepts() also gates "still bound?" — false on unbind stops the loop.
+    proto.accepts = [](uint8_t verb) {
+      return gServer.load() != nullptr &&
+             verb >= kVerbLaunch && verb <= kVerbInstances;
+    };
+    proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+      switch (ctx->verb) {
+        case kVerbLaunch:    dispatchLaunch   (ctx, std::move(pre)); break;
+        case kVerbKill:      dispatchKill     (ctx, std::move(pre)); break;
+        case kVerbList:      dispatchList     (ctx, std::move(pre)); break;
+        case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
+        case kVerbInstances: dispatchInstances(ctx, std::move(pre)); break;
+        default:             ctx->error(CES_ERROR_BAD_INPUT); break;
+      }
+    };
+    cesPlexServe(std::move(stream), std::move(bound), server,
+                 std::move(proto));
   }
 };
 
@@ -2252,6 +2176,39 @@ void _computeTestForceTick() {
   });
   std::unique_lock lk(m);
   cv.wait(lk, [&]{ return done; });
+}
+
+size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count) {
+  CesServer* server = gServer.load();
+  if (!server) return 0;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return 0;
+  // Push `count` best-effort DELIVER frames at the instance back-to-back
+  // inside a SINGLE strand task. Because the task never yields, no
+  // async_write completion runs between pushes — nothing drains — so the
+  // outbox depth read at the end is the exact saturation point: the cap
+  // (kMaxDeliverBacklog) when the flood guard is in place, or `count` when
+  // it is not. Deterministic, with no socket-buffer or timing dependence.
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  size_t depth = 0;
+  boost::asio::post(ex, [&]() {
+    auto it = gInstances.find(instanceId);
+    if (it != gInstances.end()) {
+      std::array<uint8_t, 8> sender{};
+      std::array<uint8_t, 16> payload{};
+      for (size_t i = 0; i < count; ++i)
+        sendDeliverFrame(it->second, sender, payload.data(), payload.size());
+      depth = it->second->outbox.size();
+    }
+    std::lock_guard lk(m);
+    done = true;
+    cv.notify_all();
+  });
+  std::unique_lock lk(m);
+  cv.wait(lk, [&]{ return done; });
+  return depth;
 }
 
 // ---------------------------------------------------------------------------

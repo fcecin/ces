@@ -9,7 +9,8 @@
 //
 // The child is deliberately minimal:
 //   * No filesystem API. No os, io, debug, package, require,
-//     loadfile, dofile, loadstring, ffi.
+//     loadfile, dofile, load, loadstring, ffi (no runtime code/bytecode
+//     loading — bytecode is unverified in LuaJIT and an escape vector).
 //   * No networking primitive beyond client↔program messaging.
 //   * Lua stays in memory, with RLIMIT_AS as a hard ceiling.
 //
@@ -425,29 +426,64 @@ void apply_rlimits(size_t mem_max_bytes) {
 }
 
 // ---------------------------------------------------------------------------
-// LuaJIT locking: strip the stdlib to a safe subset, kill FFI.
+// Sandbox: load ONLY the safe standard libraries (default-deny).
 // ---------------------------------------------------------------------------
+//
+// Rather than open everything (luaL_openlibs) and remove the dangerous
+// libraries afterward, open only the safe subset — base, string, table,
+// math, bit — so os / io / debug / package / ffi / jit are never present
+// at all, regardless of any removal list. None of the loaded libraries
+// expose a filesystem, process, or memory-unsafe surface. A text program
+// can only reach what's here plus the ces.* bindings; it cannot fabricate
+// access to unbound C (no ffi, no pointers), and bytecode never reaches
+// the VM (main()'s program loader is text-only).
 
-void strip_lua_stdlib(lua_State* L) {
-  // Remove unsafe global names. Each becomes nil in _G; scripts that
-  // reference them get a clean "attempt to index a nil value" error.
-  static const char* const kRemove[] = {
-    "os", "io", "debug", "package",
-    "require", "dofile", "loadfile", "loadstring",
-    "module", "collectgarbage", "newproxy",
-    "ffi",
+void load_safe_libs(lua_State* L) {
+  // Open ONLY the safe computation libraries. luaL_openlibs is never
+  // called, so os, io, debug, package, ffi, and jit are never present in
+  // the VM at all — there is no removal list to get wrong for those. What
+  // remains is a pure computation surface: numbers, strings, tables, bit
+  // ops, plus the ces.* host bindings installed separately.
+  static const luaL_Reg kSafeLibs[] = {
+    { "",       luaopen_base },   // also brings coroutine.* (in-VM, benign)
+    { "table",  luaopen_table },
+    { "string", luaopen_string },
+    { "math",   luaopen_math },
+    { "bit",    luaopen_bit },
+    { nullptr,  nullptr }
+  };
+  for (const luaL_Reg* lib = kSafeLibs; lib->func; ++lib) {
+    lua_pushcfunction(L, lib->func);
+    lua_pushstring(L, lib->name);
+    lua_call(L, 1, 0);
+  }
+
+  // The base library brings code loaders, environment reflection, GC
+  // control, and print; remove all of them. After this there is no way
+  // for program text to load code/bytecode, reach another stack frame's
+  // environment, drive the collector, or write to stdout (which goes
+  // nowhere for the daemon child anyway).
+  static const char* const kRemoveGlobals[] = {
+    "load", "loadstring", "dofile", "loadfile", // code / bytecode loaders
+    "getfenv", "setfenv",                       // environment reflection
+    "collectgarbage", "gcinfo",                 // GC control / mem info leak
+    "newproxy",                                 // userdata fabrication
+    "print",                                    // stdout goes nowhere here
     nullptr
   };
-  for (int i = 0; kRemove[i] != nullptr; ++i) {
+  for (int i = 0; kRemoveGlobals[i] != nullptr; ++i) {
     lua_pushnil(L);
-    lua_setglobal(L, kRemove[i]);
+    lua_setglobal(L, kRemoveGlobals[i]);
   }
-  // Also nil package.preload.ffi / package.loaded.ffi in case any
-  // future luaL_openlibs pulls them in.
-  lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+
+  // string.dump serializes a function to BYTECODE. Nothing here can load
+  // it back (the loaders are gone, and main()'s program loader is
+  // text-only), but remove it anyway: the program surface deals in text,
+  // never bytecode, in either direction.
+  lua_getglobal(L, "string");
   if (lua_istable(L, -1)) {
     lua_pushnil(L);
-    lua_setfield(L, -2, "ffi");
+    lua_setfield(L, -2, "dump");
   }
   lua_pop(L, 1);
 }
@@ -1390,6 +1426,11 @@ int lua_ces_conn_write(lua_State* L) {
 
   size_t n = 0;
   const char* s = luaL_checklstring(L, 2, &n);
+  if (n > 1024 * 1024) {
+    lua_pushnil(L);
+    lua_pushstring(L, "payload too large (max 1 MB per write)");
+    return 2;
+  }
   if (!send_conn_data_out(id, reinterpret_cast<const uint8_t*>(s), n)) {
     lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
   }
@@ -1738,16 +1779,28 @@ int main(int argc, char** argv) {
   const char* src =
     reinterpret_cast<const char*>(bs.body.data() + BS_HEADER);
 
+  // Programs are Lua TEXT only. LuaJIT's loader treats a leading ESC
+  // (0x1B) as a precompiled-bytecode chunk, and LuaJIT bytecode is
+  // UNVERIFIED — crafted bytecode is a sandbox-escape vector that bypasses
+  // the language-level safety entirely. A remote-supplied source must
+  // never reach the bytecode path: reject a bytecode marker here, and load
+  // with the explicit text-only mode below.
+  if (src_len > 0 && static_cast<unsigned char>(src[0]) == 0x1b) {
+    std::fprintf(stderr, "cesluajitd: refusing bytecode program (text only)\n");
+    return 1;
+  }
+
   lua_State* L = luaL_newstate();
   if (!L) {
     std::fprintf(stderr, "cesluajitd: luaL_newstate failed\n");
     return 1;
   }
-  luaL_openlibs(L);
-  strip_lua_stdlib(L);
+  load_safe_libs(L);
   install_ces_api(L);
 
-  if (luaL_loadbuffer(L, src, src_len, "=program") != 0) {
+  // "t" = text only; refuses bytecode even if the leading-byte guard above
+  // is ever bypassed (belt-and-suspenders).
+  if (luaL_loadbufferx(L, src, src_len, "=program", "t") != 0) {
     std::fprintf(stderr, "cesluajitd: load failed: %s\n",
                  lua_tostring(L, -1));
     lua_close(L);

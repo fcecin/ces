@@ -186,7 +186,7 @@ void sendAttachReply(std::shared_ptr<ConnCtx> ctx, uint8_t status,
 
 // Read the per-op envelope for the ATTACH verb:
 //   [u8 verb=0x01][u32 preamble_len][preamble][65 sig]
-// preamble = [u16 name_len][source_name].
+// preamble = [u64 instance_id].
 void readAttachVerb(std::shared_ptr<ConnCtx> ctx) {
   auto stream = ctx->stream;
   auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();

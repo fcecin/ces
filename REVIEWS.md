@@ -32,6 +32,11 @@
 * src/cesh/dial.h
 * include/ces/l2/file_handler.h
 * include/ces/l2/file_client.h
+* include/ces/l2/compute_client.h
+* include/ces/l2/compute_handler.h
+* include/ces/l2/compute_lua_handler.h
+* include/ces/l2/cesplex.h
+* src/cesluajitd/main.cpp
 
 ## Review PASS 2
 
@@ -41,16 +46,12 @@
 
 * include/ces/client.h
 * include/ces/clientasync.h
-* include/ces/l2/compute_client.h
-* include/ces/l2/compute_handler.h
-* include/ces/l2/compute_lua_handler.h
 * include/ces/protocol.h
 * include/ces/server.h
 * include/ces/types.h
 * src/ces/main.cpp
 * src/cesbench/cesbench.cpp
 * src/cesh/main.cpp
-* src/cesluajitd/main.cpp
 * src/cesqt/appmodel.h
 * src/cesqt/console.h
 * src/cesqt/main.cpp

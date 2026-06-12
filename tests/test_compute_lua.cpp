@@ -575,6 +575,118 @@ BOOST_AUTO_TEST_CASE(MemoryBombIsContainedByRlimit) {
 }
 
 // ---------------------------------------------------------------------------
+// The sandbox loads only a minimal computation surface (base minus the
+// dangerous primitives, plus string/table/math/bit). A program that finds
+// any banned global present — or string.dump, or a missing safe library —
+// errors at top level (and the child dies); a clean one runs and stays
+// alive. Guards both halves of the contract: nothing dangerous is reachable
+// (notably the code/bytecode loaders), and the calculator surface is intact.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(SandboxStripsDangerousGlobals) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/sandbox.lua";
+  uploadScript(path,
+    // Code/bytecode loaders, OS/process/debug surfaces, environment
+    // reflection, GC control, userdata fabrication, and stdout — all gone.
+    "local banned = {'load','loadstring','loadfile','dofile','require',\n"
+    "  'os','io','debug','package','ffi','newproxy','collectgarbage',\n"
+    "  'getfenv','setfenv','gcinfo','print'}\n"
+    "for _, n in ipairs(banned) do\n"
+    "  if _G[n] ~= nil then error('sandbox breach: ' .. n) end\n"
+    "end\n"
+    // string.dump produces bytecode; it must be gone too (table field).
+    "if string.dump ~= nil then error('sandbox breach: string.dump') end\n"
+    // The safe computation surface must still be present.
+    "if type(string.format) ~= 'function' then error('missing string') end\n"
+    "if type(table.insert) ~= 'function' then error('missing table') end\n"
+    "if type(math.floor) ~= 'function' then error('missing math') end\n"
+    "if type(bit.band) ~= 'function' then error('missing bit') end\n"
+    "while true do ces.client_recv() end\n");
+  uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(instId > 0);
+
+  // If any global leaked, the top-level error kills the child at once;
+  // give it a beat, then confirm the instance is still alive (= clean).
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  CesComputeClient::InstanceInfo info;
+  uint8_t rc = cc.stat(instId, info);
+  BOOST_CHECK_MESSAGE(rc == CES_OK,
+    "sandbox program must survive (all dangerous globals nil); rc=" << int(rc));
+  if (rc == CES_OK) CES_REQUIRE_OK(cc.kill(instId));
+  cc.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// Programs are Lua TEXT only. A "source" whose first byte is the LuaJIT
+// bytecode marker (0x1B) must be refused by the child — unverified bytecode
+// bypasses the language-level sandbox and is an escape vector — killing the
+// instance instead of executing it.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(RefusesBytecodeProgram) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/bytecode.lua";
+  // First byte 0x1B = the bytecode marker; the rest is irrelevant.
+  uploadScript(path, std::string(1, '\x1b') + "LJ not real bytecode");
+  uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(instId > 0);   // launch ok: child connects before it loads
+
+  // The child reads the bootstrap, sees the bytecode marker, refuses, and
+  // exits; the supervisor reaps it. Give it a beat.
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  CesComputeClient::InstanceInfo info;
+  uint8_t rc = cc.stat(instId, info);
+  BOOST_CHECK_MESSAGE(rc == CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND,
+    "bytecode program must be refused and the child die; rc=" << int(rc));
+  cc.disconnect();
+}
+
+// ---------------------------------------------------------------------------
+// Best-effort DELIVER frames (incoming CES_APP_COMPUTE_MSG) are shed once
+// the per-instance outbound queue is deep, so a remote flood aimed at a
+// slow or non-reading program cannot grow the server's memory without
+// bound. Floods far past the cap and asserts the queue saturates rather
+// than tracking the flood size.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(DeliverFloodIsBounded) {
+  const std::string path =
+    "/h/" + ownerKey.getPublicKeyHexStr() + "/idle.lua";
+  uploadScript(path, "while true do ces.client_recv() end\n");
+  uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(instId > 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  // Push 5000 deliver frames at it on the strand, measured at peak (before
+  // anything drains). Without the cap the outbox would hold all 5000 (and
+  // keep climbing under a sustained flood → server OOM); with the cap it
+  // saturates near kMaxDeliverBacklog (1024).
+  size_t depth = ces::_computeTestFloodDeliver(instId, 5000);
+  BOOST_CHECK_MESSAGE(depth > 0 && depth < 2000,
+    "deliver flood must saturate at the cap, not the flood size; depth="
+    << depth);
+
+  // The instance survives the flood — it sheds messages, it does not die.
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  CesComputeClient::InstanceInfo info;
+  BOOST_CHECK_EQUAL(static_cast<int>(cc.stat(instId, info)),
+                    static_cast<int>(CES_OK));
+  cc.kill(instId);
+  cc.disconnect();
+}
+
+// ---------------------------------------------------------------------------
 // AuthenticAssetCreate: a Lua program calls ces.authentic_asset_create
 // with a recipient pubkey and a payload. The server stamps the first
 // 32 bytes of the asset's content with sha256(source || path), sets
