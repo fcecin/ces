@@ -206,9 +206,8 @@ uint8_t validateCesFileName(const std::string& name) {
     size_t len = i - start;
     if (len == 0) return CES_ERROR_BAD_NAME; // empty component
     if (len > 255) return CES_ERROR_BAD_NAME; // filesystem limit
-    if (len == 1 && name[start] == '.') return CES_ERROR_BAD_NAME;
-    if (len == 2 && name[start] == '.' && name[start + 1] == '.')
-      return CES_ERROR_BAD_NAME;
+    // Reject any component starting with '.' — one check covers ".", "..",
+    // and dotfiles, blocking traversal and hidden entries.
     if (name[start] == '.') return CES_ERROR_BAD_NAME;
     ++comp_count;
     if (comp_count > kMaxPathComponents) return CES_ERROR_BAD_NAME;
@@ -349,29 +348,32 @@ struct Sidecar {
 };
 
 bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
-  std::ostringstream oss;
-  oss << "version = " << s.version << "\n";
-  oss << "name = \"" << s.name << "\"\n"; // name is validated — no quoting
-  oss << "owner_pubkey = \""
-      << hexOf(s.owner_pubkey.data(), s.owner_pubkey.size()) << "\"\n";
-  oss << "program_pubkey = \""
-      << hexOf(s.program_pubkey.data(), s.program_pubkey.size()) << "\"\n";
-  oss << "price_per_kb = " << s.price_per_kb << "\n";
-  oss << "size = " << s.size << "\n";
-  oss << "content_type = \"" << s.content_type << "\"\n";
-  oss << "created_us = " << s.created_us << "\n";
-  oss << "modified_us = " << s.modified_us << "\n";
-  oss << "last_rent_us = " << s.last_rent_us << "\n";
-  oss << "program_hash = \""
-      << hexOf(s.program_hash.data(), s.program_hash.size()) << "\"\n";
+  // Serialize through tomlplusplus (symmetric with readSidecar) so name /
+  // content_type are escaped. A hand-rolled `key = "val"` dump corrupts the
+  // sidecar when those fields contain quotes or newlines, which they can:
+  // validateCesFileName only filters '/' and NUL.
+  toml::table tbl;
+  tbl.insert_or_assign("version", static_cast<int64_t>(s.version));
+  tbl.insert_or_assign("name", s.name);
+  tbl.insert_or_assign("owner_pubkey",
+                       hexOf(s.owner_pubkey.data(), s.owner_pubkey.size()));
+  tbl.insert_or_assign("program_pubkey",
+                       hexOf(s.program_pubkey.data(), s.program_pubkey.size()));
+  tbl.insert_or_assign("price_per_kb", static_cast<int64_t>(s.price_per_kb));
+  tbl.insert_or_assign("size", static_cast<int64_t>(s.size));
+  tbl.insert_or_assign("content_type", s.content_type);
+  tbl.insert_or_assign("created_us", static_cast<int64_t>(s.created_us));
+  tbl.insert_or_assign("modified_us", static_cast<int64_t>(s.modified_us));
+  tbl.insert_or_assign("last_rent_us", static_cast<int64_t>(s.last_rent_us));
+  tbl.insert_or_assign("program_hash",
+                       hexOf(s.program_hash.data(), s.program_hash.size()));
 
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   {
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
     if (!f) return false;
-    const std::string body = oss.str();
-    f.write(body.data(), body.size());
+    f << tbl << '\n';
     if (!f.good()) return false;
     f.flush();
   }
@@ -649,49 +651,6 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
 // All BE serialization goes through ces::Buffer (see ces/buffer.h).
 
 // ---------------------------------------------------------------------------
-// Response envelope builder (server-signed)
-// ---------------------------------------------------------------------------
-
-// Build the full response wire bytes:
-//   [u8 status][preamble...][u64 time_us][u8 req_sig_hash[8]]
-//   [u8 sha256[32]][u8 sig[65]]
-//
-// `verb` is echoed into the hash input (to bind the response to a
-// specific verb) but not on the wire — the client already knows which
-// verb it sent.
-ces::Bytes buildResponseEnvelope(
-    CesServer* server,
-    uint8_t verb,
-    uint8_t status,
-    std::span<const uint8_t> preamble,
-    uint64_t reqSigHash) {
-  uint64_t timeUs = getMicrosSinceEpoch();
-
-  // sha256 over: status || verb || preamble || time_us || req_sig_hash.
-  ces::Buffer hashIn;
-  hashIn.put<uint8_t>(status)
-        .put<uint8_t>(verb)
-        .putBytes(preamble)
-        .put<uint64_t>(timeUs)
-        .put<uint64_t>(reqSigHash);
-  minx::Hash digest = ces::sha256(hashIn.data(), hashIn.size());
-
-  // Wire: [status][preamble][time_us][reqSigHash][sha256][sig]
-  ces::Buffer out(
-      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE);
-  out.put<uint8_t>(status)
-     .putBytes(preamble)
-     .put<uint64_t>(timeUs)
-     .put<uint64_t>(reqSigHash)
-     .put(digest);
-
-  ces::Signature sig = server->_serverKeyPair().signData(
-    std::span<const uint8_t>(digest.data(), digest.size()));
-  out.put(sig);
-  return std::move(out).take();
-}
-
-// ---------------------------------------------------------------------------
 // Common per-request state
 // ---------------------------------------------------------------------------
 
@@ -731,8 +690,8 @@ void sendResponseAndLoop(
   auto stream = ctx->stream;
   auto bound = ctx->bound;
   auto env = std::make_shared<ces::Bytes>(
-    buildResponseEnvelope(ctx->server, ctx->verb, status, preamble,
-                          ctx->reqSigHash));
+    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status,
+                       preamble, ctx->reqSigHash));
   auto body = std::make_shared<ces::Bytes>(std::move(extraBody));
   boost::asio::async_write(
     *stream, boost::asio::buffer(*env),
@@ -763,8 +722,8 @@ void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
   auto stream = ctx->stream;
   auto bound = ctx->bound;
   auto env = std::make_shared<ces::Bytes>(
-    buildResponseEnvelope(ctx->server, ctx->verb, status, {},
-                          ctx->reqSigHash));
+    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status, {},
+                       ctx->reqSigHash));
   boost::asio::async_write(
     *stream, boost::asio::buffer(*env),
     [stream, env, bound]
@@ -781,8 +740,8 @@ void sendErrorAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
 void sendErrorAndClose(std::shared_ptr<ReqCtx> ctx, uint8_t status) {
   auto stream = ctx->stream;
   auto env = std::make_shared<ces::Bytes>(
-    buildResponseEnvelope(ctx->server, ctx->verb, status, {},
-                          ctx->reqSigHash));
+    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status, {},
+                       ctx->reqSigHash));
   boost::asio::async_write(
     *stream, boost::asio::buffer(*env),
     [stream, env](const boost::system::error_code&, std::size_t) {
@@ -1050,28 +1009,26 @@ void checkZoneOwnership(
 }
 
 void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t)
-                     + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t size = 0, pricePerKb = 0, initialDeposit = 0;
+  std::string contentType, name;
+  try {
+    size = buf.get<uint64_t>();
+    pricePerKb = buf.get<uint64_t>();
+    initialDeposit = buf.get<uint64_t>();
+    uint16_t ctLen = buf.get<uint16_t>();
+    if (ctLen > kMaxContentTypeLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
+    }
+    contentType = buf.getBytes<std::string>(ctLen);
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t size = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint64_t pricePerKb = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint64_t initialDeposit = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint16_t ctLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (ctLen > kMaxContentTypeLen || pre.size() < off + ctLen + 2) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
-  }
-  std::string contentType(
-    reinterpret_cast<const char*>(pre.data() + off), ctLen);
-  off += ctLen;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   if (size == 0 || size > kMaxFileSize) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
@@ -1240,22 +1197,23 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // looping would let those bytes land as phantom next-verbs on the
   // wire. The body-phase (after async_read of `state->body`) can use
   // sendErrorAndLoop because the body was consumed.
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint32_t) + sizeof(minx::Hash)
-                     + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t offset = 0;
+  uint32_t length = 0;
+  std::array<uint8_t, 32> contentHash{};
+  std::string name;
+  try {
+    offset = buf.get<uint64_t>();
+    length = buf.get<uint32_t>();
+    contentHash = buf.get<std::array<uint8_t, 32>>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndClose(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t offset = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint32_t length = ces::Buffer::peek<uint32_t>(pre.data() + off); off += 4;
-  std::array<uint8_t, 32> contentHash{};
-  std::memcpy(contentHash.data(), pre.data() + off, 32); off += 32;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndClose(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   if (length == 0 || length > kMaxWriteLen) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
@@ -1370,19 +1328,21 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t offset = 0;
+  uint32_t length = 0;
+  std::string name;
+  try {
+    offset = buf.get<uint64_t>();
+    length = buf.get<uint32_t>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t offset = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint32_t length = ces::Buffer::peek<uint32_t>(pre.data() + off); off += 4;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   if (length == 0 || length > kMaxReadLen) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
@@ -1474,18 +1434,19 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t amount = 0;
+  std::string name;
+  try {
+    amount = buf.get<uint64_t>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t amount = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -1532,18 +1493,19 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t amount = 0;
+  std::string name;
+  try {
+    amount = buf.get<uint64_t>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t amount = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -1609,18 +1571,19 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t newPrice = 0;
+  std::string name;
+  try {
+    newPrice = buf.get<uint64_t>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t newPrice = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -1675,17 +1638,17 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 2) {
+  ces::Buffer buf(std::move(pre));
+  std::string name;
+  try {
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
   }
-  size_t off = 0;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -1739,17 +1702,17 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < 2) {
+  ces::Buffer buf(std::move(pre));
+  std::string name;
+  try {
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -1848,20 +1811,21 @@ struct AppendBodyState : std::enable_shared_from_this<AppendBodyState> {
 void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // APPEND pre-body rejects must CLOSE (body in flight — same
   // rationale as WRITE).
-  if (pre.size() < sizeof(uint32_t) + sizeof(minx::Hash) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint32_t length = 0;
+  std::array<uint8_t, 32> contentHash{};
+  std::string name;
+  try {
+    length = buf.get<uint32_t>();
+    contentHash = buf.get<std::array<uint8_t, 32>>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndClose(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint32_t length = ces::Buffer::peek<uint32_t>(pre.data() + off); off += 4;
-  std::array<uint8_t, 32> contentHash{};
-  std::memcpy(contentHash.data(), pre.data() + off, 32); off += 32;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndClose(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   if (length == 0 || length > kMaxWriteLen) {
     sendErrorAndClose(ctx, CES_ERROR_BAD_INPUT); return;
@@ -2009,18 +1973,19 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  if (pre.size() < sizeof(uint64_t) + sizeof(uint16_t)) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t newSize = 0;
+  std::string name;
+  try {
+    newSize = buf.get<uint64_t>();
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
   }
-  size_t off = 0;
-  uint64_t newSize = ces::Buffer::peek<uint64_t>(pre.data() + off); off += 8;
-  uint16_t nameLen = ces::Buffer::peek<uint16_t>(pre.data() + off); off += 2;
-  if (nameLen == 0 || nameLen > kMaxNameLen ||
-      pre.size() < off + nameLen) {
-    sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
-  }
-  std::string name(
-    reinterpret_cast<const char*>(pre.data() + off), nameLen);
 
   if (newSize == 0 || newSize > kMaxFileSize) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;

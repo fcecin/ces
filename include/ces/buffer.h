@@ -140,6 +140,34 @@ public:
     return *this;
   }
 
+  // ---- get raw byte ranges — advance read cursor ----
+  //
+  // The read counterpart to putBytes. getBytesSpan is zero-copy (the span
+  // points into this Buffer — consume before any further mutation);
+  // getBytes copies into a fresh R. Both throw on short read, so parsers
+  // guard with remaining() first. Mirrors minx::Buffer::getBytesSpan/getBytes.
+
+  std::span<const uint8_t> getBytesSpan(size_t n) {
+    if (n > remaining())
+      throw std::out_of_range("ces::Buffer::getBytesSpan: short read");
+    std::span<const uint8_t> result(v_.data() + rPos_, n);
+    rPos_ += n;
+    return result;
+  }
+
+  template <typename R = Bytes>
+  R getBytes(size_t n) {
+    if (n > remaining())
+      throw std::out_of_range("ces::Buffer::getBytes: short read");
+    R result;
+    result.resize(n);
+    if (n > 0) {
+      std::memcpy(result.data(), v_.data() + rPos_, n);
+      rPos_ += n;
+    }
+    return result;
+  }
+
   // ---- BE peek / poke (no cursor change) ----
 
   // Read at a specific offset without advancing the cursor.

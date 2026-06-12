@@ -210,4 +210,40 @@ uint64_t sigDedupHash(const Signature& sig) {
     std::span<const uint8_t>(sig.data() + 1, 8), 0);
 }
 
+ces::Bytes buildPerOpResponse(const KeyPair& serverKey,
+                              uint8_t verb,
+                              uint8_t status,
+                              std::span<const uint8_t> preamble,
+                              uint64_t reqSigHash) {
+  const uint64_t timeUs = getMicrosSinceEpoch();
+
+  // Digest binds the verb: status || verb || preamble || time_us ||
+  // req_sig_hash. verb is hashed but not emitted on the wire.
+  ces::Buffer hashIn;
+  hashIn.put<uint8_t>(status)
+        .put<uint8_t>(verb)
+        .putBytes(preamble)
+        .put<uint64_t>(timeUs)
+        .put<uint64_t>(reqSigHash);
+  // Plain single SHA256 of the buffer — identical to ces::sha256, which is
+  // what the client recomputes to verify (kept inline so this low-level
+  // envelope module doesn't pull in a higher-layer header for it).
+  minx::Hash digest;
+  CryptoPP::SHA256().CalculateDigest(
+      digest.data(), hashIn.data(), hashIn.size());
+
+  // Wire: [status][preamble][time_us][req_sig_hash][sha256][sig].
+  ces::Buffer out(
+      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE);
+  out.put<uint8_t>(status)
+     .putBytes(preamble)
+     .put<uint64_t>(timeUs)
+     .put<uint64_t>(reqSigHash)
+     .put(digest);
+  Signature sig = serverKey.signData(
+      std::span<const uint8_t>(digest.data(), digest.size()));
+  out.put(sig);
+  return std::move(out).take();
+}
+
 } // namespace ces

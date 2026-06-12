@@ -30,6 +30,8 @@
 * src/cesproxy/main.cpp
 * src/cesqt/about.h
 * src/cesh/dial.h
+* include/ces/l2/file_handler.h
+* include/ces/l2/file_client.h
 
 ## Review PASS 2
 
@@ -42,8 +44,6 @@
 * include/ces/l2/compute_client.h
 * include/ces/l2/compute_handler.h
 * include/ces/l2/compute_lua_handler.h
-* include/ces/l2/file_client.h
-* include/ces/l2/file_handler.h
 * include/ces/protocol.h
 * include/ces/server.h
 * include/ces/types.h

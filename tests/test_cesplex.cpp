@@ -1701,4 +1701,77 @@ BOOST_AUTO_TEST_CASE(FileBadZoneRejected) {
   CES_CHECK_RC_EQ(c.status, CES_ERROR_BAD_NAME);
 }
 
+// Regression: writeSidecar used to hand-roll `key = "val"` TOML, which
+// corrupted the sidecar when name / content_type held quotes or newlines
+// (validateCesFileName permits everything except '/' and NUL). It now
+// serializes via tomlplusplus, so these round-trip through STAT's re-read.
+BOOST_AUTO_TEST_CASE(FileSidecarSurvivesQuotesAndNewlines) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+
+  minx::Hash priv; priv.fill(0x5C);
+  ces::KeyPair signer(priv);
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  wait_net();
+
+  auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
+  BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+
+  const std::string name = "/p/has\"quote/f.txt";
+  const std::string contentType =
+      "text/x; a=\"b\"\ninjected = \"evil\"\ttab\\back";
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+                      CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
+                      /*initialDeposit=*/1'000'000, contentType, name);
+  CES_CHECK_RC_EQ(c.status, CES_OK);
+
+  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  CES_CHECK_RC_EQ(st.status, CES_OK);
+  BOOST_CHECK_EQUAL(st.contentType, contentType);
+  BOOST_CHECK_EQUAL(st.size, 16u);
+}
+
+// validateCesFileName is the path-traversal / junk gate that runs before
+// any disk path is built. Every one of these must be rejected.
+BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+
+  minx::Hash priv; priv.fill(0xD7);
+  ces::KeyPair signer(priv);
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  wait_net();
+
+  auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
+  BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+
+  std::string nullComp = "/p/a";
+  nullComp.push_back('\0');
+  nullComp += "b/x";              // embedded NUL inside a component
+
+  const std::vector<std::string> bad = {
+    "/p/../etc/passwd",           // parent traversal
+    "/p/./here",                  // dot component
+    "/p/.hidden/x",               // dotfile component
+    "/p//x",                      // empty component
+    "/p/x/",                      // trailing slash
+    "/x/y",                       // unknown zone
+    "/p",                         // no second component
+    "/",                          // just root
+    "/h/tooshort/x",              // /h/ second is not 64 hex
+    nullComp,                     // NUL byte in a component
+  };
+
+  for (const auto& name : bad) {
+    auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+                        CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
+                        /*initialDeposit=*/1'000'000, "text/plain", name);
+    BOOST_CHECK_MESSAGE(c.status == CES_ERROR_BAD_NAME,
+                        "expected BAD_NAME for '" << name << "' got "
+                        << int(c.status));
+  }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

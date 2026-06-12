@@ -325,4 +325,16 @@ bool verifyPerOp(const BoundChannelContext& bound,
 // lifetime.
 uint64_t sigDedupHash(const Signature& sig);
 
+// Build a server-signed per-op response envelope:
+//   [u8 status][preamble][u64 time_us][u64 req_sig_hash][sha256][sig]
+// The signature covers sha256(status || verb || preamble || time_us ||
+// req_sig_hash) — verb is bound into the digest but not emitted (the
+// client already knows which verb it sent). Shared by every CesPlex
+// handler that answers a per-op verb.
+ces::Bytes buildPerOpResponse(const KeyPair& serverKey,
+                              uint8_t verb,
+                              uint8_t status,
+                              std::span<const uint8_t> preamble,
+                              uint64_t reqSigHash);
+
 } // namespace ces

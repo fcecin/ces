@@ -85,57 +85,6 @@ struct ConnCtx : std::enable_shared_from_this<ConnCtx> {
 using ConnKey = std::pair<uint64_t, uint64_t>;
 std::map<ConnKey, std::shared_ptr<ConnCtx>> gConns;
 
-// ---------------------------------------------------------------------------
-// Wire helpers (response envelope mirrors file/compute: server-signed)
-// ---------------------------------------------------------------------------
-
-uint64_t nowMicros() {
-  return static_cast<uint64_t>(
-    std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count());
-}
-
-// Build the full response wire bytes, server-signed:
-//   [u8 status][preamble][u64 time_us][u64 req_sig_hash]
-//   [u8 sha256[32]][u8 sig[65]]
-// sha256 input: status || verb || preamble || time_us || req_sig_hash.
-minx::Bytes buildResponseEnvelope(
-    CesServer* server,
-    uint8_t verb,
-    uint8_t status,
-    std::span<const uint8_t> preamble,
-    uint64_t reqSigHash) {
-  // [status][preamble][time_us][reqSigHash][sha256][sig]
-  const size_t total =
-      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE;
-  minx::Bytes out(total);
-  minx::Buffer buf(out);
-  buf.put<uint8_t>(status);
-  buf.put(preamble);
-  uint64_t timeUs = nowMicros();
-  buf.put<uint64_t>(timeUs);
-  buf.put<uint64_t>(reqSigHash);
-
-  // Compute the digest over a parallel pre-sized buffer.
-  const size_t hashSize = CES_PLEX_STATUS_SIZE + CES_PLEX_VERB_SIZE
-                          + preamble.size() + CES_PLEX_TIME_US_SIZE
-                          + CES_PLEX_REQ_SIG_HASH_SIZE;
-  minx::Bytes hashIn(hashSize);
-  minx::Buffer hbuf(hashIn);
-  hbuf.put<uint8_t>(status);
-  hbuf.put<uint8_t>(verb);
-  hbuf.put(preamble);
-  hbuf.put<uint64_t>(timeUs);
-  hbuf.put<uint64_t>(reqSigHash);
-  minx::Hash digest = ces::sha256(
-    reinterpret_cast<const uint8_t*>(hashIn.data()), hashIn.size());
-  buf.put(digest);
-
-  ces::Signature sig = server->_serverKeyPair().signData(
-    std::span<const uint8_t>(digest.data(), digest.size()));
-  buf.put(sig);
-  return out;
-}
 
 // ---------------------------------------------------------------------------
 // Per-connection lifecycle helpers
@@ -206,9 +155,9 @@ void sendAttachReply(std::shared_ptr<ConnCtx> ctx, uint8_t status,
   if (status == CES_OK) {
     ces::Buffer::put<uint64_t>(preamble, ctx->connId);
   }
-  auto env = std::make_shared<minx::Bytes>(
-    buildResponseEnvelope(
-      server, kVerbAttach, status,
+  auto env = std::make_shared<ces::Bytes>(
+    buildPerOpResponse(
+      server->_serverKeyPair(), kVerbAttach, status,
       std::span<const uint8_t>(
         reinterpret_cast<const uint8_t*>(preamble.data()), preamble.size()),
       reqSigHash));

@@ -770,17 +770,19 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
     nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
 
-  size_t off = 0;
-  std::memcpy(outInfo.ownerPubkey.data(), resp.data() + off, 32); off += 32;
-  outInfo.fileBalance = ces::Buffer::peek<uint64_t>(resp.data() + off); off += 8;
-  outInfo.pricePerKb = ces::Buffer::peek<uint64_t>(resp.data() + off); off += 8;
-  outInfo.size = ces::Buffer::peek<uint64_t>(resp.data() + off); off += 8;
-  uint16_t ctLen = ces::Buffer::peek<uint16_t>(resp.data() + off); off += 2;
-  outInfo.contentType.assign(
-    reinterpret_cast<const char*>(resp.data() + off), ctLen);
-  off += ctLen;
-  outInfo.createdUs = ces::Buffer::peek<uint64_t>(resp.data() + off); off += 8;
-  outInfo.modifiedUs = ces::Buffer::peek<uint64_t>(resp.data() + off); off += 8;
+  ces::Buffer buf(std::move(resp));
+  try {
+    outInfo.ownerPubkey = buf.get<std::array<uint8_t, 32>>();
+    outInfo.fileBalance = buf.get<uint64_t>();
+    outInfo.pricePerKb = buf.get<uint64_t>();
+    outInfo.size = buf.get<uint64_t>();
+    uint16_t ctLen = buf.get<uint16_t>();
+    outInfo.contentType = buf.getBytes<std::string>(ctLen);
+    outInfo.createdUs = buf.get<uint64_t>();
+    outInfo.modifiedUs = buf.get<uint64_t>();
+  } catch (const std::out_of_range&) {
+    return CES_ERROR_INTERNAL;
+  }
   return CES_OK;
 }
 

@@ -1313,42 +1313,6 @@ ces::Bytes readSourceBytes(const CesConfig& cfg,
 }
 
 // ---------------------------------------------------------------------------
-// Response envelope (duplicated from file handler)
-// ---------------------------------------------------------------------------
-
-ces::Bytes buildResponseEnvelope(
-    CesServer* server,
-    uint8_t verb,
-    uint8_t status,
-    std::span<const uint8_t> preamble,
-    uint64_t reqSigHash) {
-  uint64_t timeUs = getMicrosSinceEpoch();
-
-  // Hash input: status || verb || preamble || time_us || req_sig_hash.
-  ces::Buffer hashIn;
-  hashIn.put<uint8_t>(status)
-        .put<uint8_t>(verb)
-        .putBytes(preamble)
-        .put<uint64_t>(timeUs)
-        .put<uint64_t>(reqSigHash);
-  minx::Hash digest = ces::sha256(hashIn.data(), hashIn.size());
-
-  ces::Signature sig = server->_serverKeyPair().signData(
-    std::span<const uint8_t>(digest.data(), digest.size()));
-
-  // Wire: [status][preamble][time_us][reqSigHash][sha256][sig]
-  ces::Buffer out(
-      CES_PLEX_STATUS_SIZE + preamble.size() + CES_PLEX_RESP_TRAILER_SIZE);
-  out.put<uint8_t>(status)
-     .putBytes(preamble)
-     .put<uint64_t>(timeUs)
-     .put<uint64_t>(reqSigHash)
-     .put(digest)
-     .put(sig);
-  return std::move(out).take();
-}
-
-// ---------------------------------------------------------------------------
 // Per-request ctx + response helpers (duplicated pattern)
 // ---------------------------------------------------------------------------
 
@@ -1376,8 +1340,8 @@ void sendResponseAndLoop(
   auto stream = ctx->stream;
   auto bound = ctx->bound;
   auto env = std::make_shared<ces::Bytes>(
-    buildResponseEnvelope(ctx->server, ctx->verb, status,
-                          preamble, ctx->reqSigHash));
+    buildPerOpResponse(ctx->server->_serverKeyPair(), ctx->verb, status,
+                       preamble, ctx->reqSigHash));
   boost::asio::async_write(
     *stream, boost::asio::buffer(*env),
     [stream, env, bound]
