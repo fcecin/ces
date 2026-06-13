@@ -1360,13 +1360,17 @@ void CesServer::stop(bool flushEvents) {
     verifyPoWThread_.join();
   }
   LOGDEBUG << "stopping settlement worker";
-  for (auto& [addr, client] : settlementClients_)
-    client->close();
-  settlementClients_.clear();
+  // Stop and join settlementThread_ BEFORE closing the clients. close()
+  // mutates per-channel state, the queue and the socket — all of which
+  // otherwise live solely on settlementThread_ — so closing while that thread
+  // still runs settlementIO_ would be a data race.
   settlementWorkGuard_.reset();
   settlementIO_.stop();
   if (settlementThread_.joinable())
     settlementThread_.join();
+  for (auto& [addr, client] : settlementClients_)
+    client->close();
+  settlementClients_.clear();
 
   // SYS_RPC bridge teardown: cancel the Rudp tick timer, close the
   // socket, stop io contexts, join threads, destroy Rudp and Minx.
@@ -1573,8 +1577,9 @@ void CesServer::dispatchSigned(const SockAddr& addr, const MinxMessage& msg,
 
 CesServer::NoncelessResult CesServer::resolveNonceless(
     uint64_t time, const Signature& sig, const HashPrefix& originPrefix,
-    uint32_t reqNonce, uint32_t& outNonce) {
+    uint32_t reqNonce, uint32_t& outNonce, uint64_t& outSigHash) {
   outNonce = reqNonce;
+  outSigHash = 0;
   if (reqNonce != CES_NONCELESS)
     return NoncelessResult::Proceed;
   uint64_t now = getMicrosSinceEpoch();
@@ -1582,8 +1587,11 @@ CesServer::NoncelessResult CesServer::resolveNonceless(
     return NoncelessResult::Stale;
   uint64_t sigHash;
   std::memcpy(&sigHash, sig.data(), sizeof(sigHash));
-  if (!checkAndInsertDedup(sigHash))
+  // Check only — the caller records the dedup after the op commits a ledger
+  // event (recordDedup). A failed op records nothing and stays retryable.
+  if (isDuplicateDedup(sigHash))
     return NoncelessResult::Duplicate;
+  outSigHash = sigHash;
   auto acc = accounts_.get(originPrefix);
   outNonce = acc.exists() ? acc.nonce() + 1 : 1;
   return NoncelessResult::Proceed;
@@ -1964,9 +1972,18 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
     return CES_ERROR_UNKNOWN_PEER;
   }
 
-  // 3. Check settlement queue capacity
+  // 3. Resolve the settlement client and check queue capacity. A null
+  // client means the peer's address would not resolve right now
+  // (getOrCreateSettlementClient already logged it): reject BEFORE any
+  // debit, so we never commit a local debit with no settlement dispatch
+  // behind it. Mirrors the unreachable-peer rejection above.
   auto* settlementClient = getOrCreateSettlementClient(destServer, peerKey);
-  if (settlementClient && settlementClient->load() >= 95) {
+  if (!settlementClient) {
+    origin.chargeError(errFee);
+    outOriginBalance = origin.balance();
+    return CES_ERROR_UNKNOWN_PEER;
+  }
+  if (settlementClient->load() >= 95) {
     origin.chargeError(errFee);
     outOriginBalance = origin.balance();
     return CES_ERROR_QUEUE_FULL;
@@ -1989,11 +2006,21 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
 
   accounts_.checkFlush(totalDeduction);
 
-  // 5. Dispatch remote transfer
-  if (settlementClient) {
-    settlementClient->openTransfer(destKey, amount,
-      [](uint8_t) {});
-  }
+  // 5. Dispatch remote transfer (settlementClient is non-null here). The
+  // callback fires only on a TERMINAL failure: settlement retries until the
+  // peer confirms, so a non-OK rc means we ultimately gave up (peer stayed
+  // unreachable past the dedup window). That should not happen in a healthy
+  // mesh — if it does, it is probably a peering bug — so log every detail at
+  // INFO. The local debit + vostro credit already stand.
+  settlementClient->openTransfer(destKey, amount,
+    [originKey, destKey, peerKey, destServer, amount](uint8_t rc) {
+      if (rc != CES_OK) {
+        LOGINFO << "cross-transfer settlement GAVE UP "
+                   "(peer never confirmed; likely a peering bug)"
+                << VAR(rc) << SVAR(destServer) << VAR(amount)
+                << BVAR(originKey) << BVAR(destKey) << BVAR(peerKey);
+      }
+    });
   checkAutoSnapshot();
   return CES_OK;
 }
@@ -2483,8 +2510,9 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           };
 
           uint32_t effectiveNonce;
+          uint64_t sigHash = 0;
           switch (resolveNonceless(req.time, req.sig, originPrefix,
-                                   req.reqNonce, effectiveNonce)) {
+                                   req.reqNonce, effectiveNonce, sigHash)) {
             case NoncelessResult::Stale:
               return reply(req.reqNonce, 0, CES_ERROR_WRONG_NONCE);
             case NoncelessResult::Duplicate:
@@ -2496,6 +2524,11 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           int64_t newBal = 0;
           uint8_t rc = transfer(req.originId, req.destKey, req.amount,
                                 TransferMode::Open, 0, effectiveNonce, newBal);
+          // Record the dedup only once the transfer has committed: a NONCELESS
+          // open-transfer that failed (e.g. insufficient balance) leaves no
+          // event and must stay retryable so a later attempt can land.
+          if (rc == CES_OK && req.reqNonce == CES_NONCELESS)
+            recordDedup(sigHash);
           reply(effectiveNonce, newBal, rc);
         }, /*noncelessOk=*/true);
       break;
@@ -3065,7 +3098,29 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
     for (auto& cx : deferredCrossXfers) {
       auto* client = getOrCreateSettlementClient(cx.server, cx.peerKey);
       if (client) {
-        client->openTransfer(cx.dest, cx.amount, [](uint8_t) {});
+        // Terminal-failure callback (see crossTransfer): a non-OK rc means
+        // settlement gave up after retries — should not happen; log it all
+        // at INFO so a peering bug is debuggable.
+        client->openTransfer(cx.dest, cx.amount,
+          [server = cx.server, peerKey = cx.peerKey,
+           dest = cx.dest, amount = cx.amount](uint8_t rc) {
+            if (rc != CES_OK) {
+              LOGINFO << "VM cross-transfer settlement GAVE UP "
+                         "(peer never confirmed; likely a peering bug)"
+                      << VAR(rc) << SVAR(server) << VAR(amount)
+                      << BVAR(dest) << BVAR(peerKey);
+            }
+          });
+      } else {
+        // Null client: the peer address won't resolve right now, so the
+        // deferred wire settlement is dropped while the VM's vostro credit
+        // already stands (the ledger legs ran during execution and can't be
+        // rejected here). Same "should not happen" peering-bug signal — log
+        // every detail at INFO.
+        LOGINFO << "VM cross-transfer settlement DROPPED "
+                   "(peer address unresolvable; likely a peering bug)"
+                << SVAR(cx.server) << VAR(cx.amount)
+                << BVAR(cx.dest) << BVAR(cx.peerKey);
       }
     }
     // Durably journal the VM's committed ledger mutations. VM syscalls mutate
@@ -3143,8 +3198,9 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
 
   // --- Nonceless dedup ---
   uint32_t effectiveNonce;
+  uint64_t sigHash = 0;
   switch (resolveNonceless(req.time, req.sig, originPrefix,
-                           req.reqNonce, effectiveNonce)) {
+                           req.reqNonce, effectiveNonce, sigHash)) {
     case NoncelessResult::Stale:
       res.reqNonce = req.reqNonce;
       res.rcode = CES_ERROR_WRONG_NONCE;
@@ -3166,6 +3222,8 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
     uint8_t rc = origin.validateSpend(0, req.budget, effectiveNonce,
                                       resolveFee(-1, cfg_.getFeeError()));
     if (rc != CES_OK) {
+      // No gas debited — nothing committed. Leave the dedup unrecorded so a
+      // NONCELESS run that couldn't afford the budget stays retryable.
       res.rcode = rc;
       sendSignedReply(addr, msg, std::move(res));
       return;
@@ -3176,6 +3234,12 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
     origin.debit(req.budget);
     accounts_.checkFlush(req.budget);
   }
+
+  // Gas is committed: this is the run's first ledger event, so record the
+  // NONCELESS dedup here. Everything past this point (asset lookup, VM run,
+  // vmError) is part of the same committed run and a retry must dedup to it.
+  if (req.reqNonce == CES_NONCELESS)
+    recordDedup(sigHash);
 
   // --- Scheduled execution? ---
   if (req.time > 0 && req.reqNonce != CES_NONCELESS) {
@@ -4262,19 +4326,37 @@ void CesServer::_save() {
   assets_->save(logkv::StoreSaveMode::syncSave);
 }
 
-bool CesServer::checkAndInsertDedup(uint64_t sigHash, uint64_t epochNow) {
-  if (epochNow == 0) epochNow = getMicrosSinceEpoch();
-  std::lock_guard lock(dedupMutex_);
+void CesServer::rotateDedupLocked(uint64_t epochNow) {
   if (dedupBaseTime_ == 0) dedupBaseTime_ = epochNow;
   if (epochNow - dedupBaseTime_ >= DEDUP_WINDOW_US) {
     dedupOlder_ = std::move(dedupCurrent_);
     dedupCurrent_.clear();
     dedupBaseTime_ = epochNow;
   }
+}
+
+bool CesServer::checkAndInsertDedup(uint64_t sigHash, uint64_t epochNow) {
+  if (epochNow == 0) epochNow = getMicrosSinceEpoch();
+  std::lock_guard lock(dedupMutex_);
+  rotateDedupLocked(epochNow);
   if (dedupOlder_.count(sigHash) || dedupCurrent_.count(sigHash))
     return false; // duplicate
   dedupCurrent_.insert(sigHash);
   return true; // new
+}
+
+bool CesServer::isDuplicateDedup(uint64_t sigHash, uint64_t epochNow) {
+  if (epochNow == 0) epochNow = getMicrosSinceEpoch();
+  std::lock_guard lock(dedupMutex_);
+  rotateDedupLocked(epochNow);
+  return dedupOlder_.count(sigHash) || dedupCurrent_.count(sigHash);
+}
+
+void CesServer::recordDedup(uint64_t sigHash, uint64_t epochNow) {
+  if (epochNow == 0) epochNow = getMicrosSinceEpoch();
+  std::lock_guard lock(dedupMutex_);
+  rotateDedupLocked(epochNow);
+  dedupCurrent_.insert(sigHash);
 }
 
 CesClientAsync* CesServer::getOrCreateSettlementClient(

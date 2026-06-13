@@ -42,6 +42,13 @@
 * src/cesbench/cesbench.cpp
 * include/ces/server.h
 * src/ceslib/server.cpp
+* include/ces/client.h
+* src/ceslib/client.cpp
+* include/ces/clientasync.h
+* src/ceslib/clientasync.cpp
+* src/cesh/main.cpp
+* src/cesh/dial.cpp
+* src/ces/main.cpp
 
 ## Review PASS 2
 
@@ -49,10 +56,6 @@
 
 ## Pending review
 
-* include/ces/client.h
-* include/ces/clientasync.h
-* src/ces/main.cpp
-* src/cesh/main.cpp
 * src/cesqt/appmodel.h
 * src/cesqt/console.h
 * src/cesqt/main.cpp

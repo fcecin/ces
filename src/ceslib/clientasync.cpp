@@ -292,10 +292,15 @@ uint64_t CesClientAsync::genPassword() { return rngDist_(rng_); }
 
 template <size_t N>
 void CesClientAsync::sendBuf(minx::ArrayBuffer<N>& buf) {
+  // Copy the framed bytes into a heap buffer owned by the completion handler.
+  // async_send_to references the storage until the send completes, but `buf`
+  // is a stack local in the caller and would be destroyed before then.
   auto span = buf.getBackingSpan();
+  auto data = std::make_shared<ces::Bytes>(span.data(),
+                                           span.data() + buf.getSize());
   socket_.async_send_to(
-    boost::asio::buffer(span.data(), buf.getSize()), serverEp_,
-    [](const boost::system::error_code&, size_t) {});
+    boost::asio::buffer(*data), serverEp_,
+    [data](const boost::system::error_code&, size_t) {});
 }
 
 } // namespace ces

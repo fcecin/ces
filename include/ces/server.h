@@ -850,10 +850,16 @@ private:
   // replay, then resolves the server-assigned nonce into `outNonce`. A non-
   // NONCELESS reqNonce short-circuits to Proceed with outNonce = reqNonce.
   // Callers map the verdict to their own reply shape.
+  //
+  // Dedup is CHECK-ONLY here: on Proceed it returns the op's sig-hash in
+  // `outSigHash` (0 for non-NONCELESS), and the caller must `recordDedup` it
+  // ONLY after the op commits a ledger event. This keys dedup on the committed
+  // event, not the request — a failed op records nothing and stays retryable.
   enum class NoncelessResult { Proceed, Stale, Duplicate };
   NoncelessResult resolveNonceless(uint64_t time, const Signature& sig,
                                    const HashPrefix& originPrefix,
-                                   uint32_t reqNonce, uint32_t& outNonce);
+                                   uint32_t reqNonce, uint32_t& outNonce,
+                                   uint64_t& outSigHash);
 
   // The neutral VM-execution transaction core. Both run paths (CES_RUN_ASSET
   // dispatch and executeScheduledRun) call this with the gas budget already
@@ -1279,7 +1285,15 @@ private:
   std::unordered_set<uint64_t> dedupCurrent_;
   std::unordered_set<uint64_t> dedupOlder_;
   uint64_t dedupBaseTime_ = 0;
+  // Atomic check+insert — used where seeing the request IS the dedupable
+  // event (CesPlex per-op bind dedup).
   bool checkAndInsertDedup(uint64_t sigHash, uint64_t epochNow = 0);
+  // Split check / record — used by NONCELESS ops, which must record the
+  // dedup only after the op commits a ledger event (so a failed op stays
+  // retryable). See resolveNonceless / recordDedup call sites.
+  bool isDuplicateDedup(uint64_t sigHash, uint64_t epochNow = 0);
+  void recordDedup(uint64_t sigHash, uint64_t epochNow = 0);
+  void rotateDedupLocked(uint64_t epochNow);  // caller holds dedupMutex_
 
   // Async cross-transfer settlement
   IOContext settlementIO_;

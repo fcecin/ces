@@ -18,9 +18,6 @@ LOG_MODULE("ccl");
 
 namespace ces {
 
-// Default try count is now on CesClient::tries_ (settable via setTries).
-// The retry interval itself is the header-declared CesClient::kRetryIntervalMs.
-
 // Plain unit conversion, used when the server reports its minimum-time-before-
 // accepting-PoW in minutes and we need an absolute UTC-seconds deadline.
 static constexpr uint64_t SECS_PER_MIN = 60;
@@ -288,6 +285,7 @@ uint8_t CesClient::queryAccount(const ces::HashPrefix& accountMapKey,
     case ces::WaitResult::Success:
       if (accQueryId_ != accountMapKey) {
         LOGTRACE << "got queryAccount response mismatched ID; ignoring";
+        g = accQueryGen_;
         if (++staleCount < tries_) { --i; }
         continue;
       }
@@ -770,9 +768,8 @@ uint8_t CesClient::queryAssetSigned(const Hash& assetId, uint8_t items,
   req.assetId = assetId;
   req.items = items;
 
-  // Note: the original code only checked gen here (no reqNonce/originId
-  // match). Preserve that loose check — the query response pipeline doesn't
-  // track which request is which.
+  // Loose match (gen only, no reqNonce/originId): the asset-query response
+  // pipeline doesn't track which request is which.
   uint8_t rc = sendSigned(req, assetQueryGen_, assetQueryResultCode_,
                           [] { return true; });
 
@@ -809,6 +806,7 @@ uint8_t CesClient::queryAsset(const Hash& assetId, HashPrefix& outOwner,
     case ces::WaitResult::Success:
       if (assetUnsignedQueryId_ != assetId) {
         LOGTRACE << "got queryAsset response mismatched ID; ignoring";
+        g = assetUnsignedQueryGen_;
         if (++staleCount < tries_) { --i; }
         continue;
       }
@@ -830,11 +828,8 @@ uint8_t CesClient::queryAsset(const Hash& assetId, HashPrefix& outOwner,
 
 uint8_t CesClient::queryServerInfo(std::vector<ServerInfoEntry>& outEntries) {
   LOGTRACE << "queryServerInfo";
-  if (!ensureServerTicket())
-    return CES_ERROR_INTERNAL;
-
   uint32_t reqNonce;
-  if (getMyNonce(reqNonce) != CES_OK)
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
     return CES_ERROR_INTERNAL;
 
   Hash myFullKey = keyPair_.getPublicKeyAsHash();
@@ -845,36 +840,18 @@ uint8_t CesClient::queryServerInfo(std::vector<ServerInfoEntry>& outEntries) {
   req.serverId = getServerId();
   req.reqNonce = reqNonce;
 
-  minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
-                        req.toBytes(keyPair_)};
+  uint8_t rc = sendSigned(req, serverInfoExtGen_, serverInfoExtResultCode_, [&] {
+    return serverInfoExtReqNonce_ == reqNonce &&
+           serverInfoExtOriginId_ == myId;
+  });
 
-  uint64_t g = serverInfoExtGen_;
-
-  for (int i = 0; i < tries_; ++i) {
-    transport_->sendMessage(msg);
-    auto res = ces::waitFor(kRetryIntervalMs, [&]() {
-      if (g < serverInfoExtGen_) {
-        return (serverInfoExtReqNonce_ == reqNonce &&
-                serverInfoExtOriginId_ == myId);
-      }
-      return false;
-    });
-
-    switch (res) {
-    case ces::WaitResult::Success:
-      if (serverInfoExtResultCode_ == CES_OK)
-        outEntries = serverInfoExtEntries_;
-      else
-        outEntries.clear();
-      return serverInfoExtResultCode_;
-
-    case ces::WaitResult::Interrupted:
-      return CES_ERROR_INTERNAL;
-    case ces::WaitResult::Timeout:
-      break;
-    }
+  if (rc != CES_ERROR_INTERNAL && rc != CES_ERROR_TIMEOUT) {
+    if (serverInfoExtResultCode_ == CES_OK)
+      outEntries = serverInfoExtEntries_;
+    else
+      outEntries.clear();
   }
-  return CES_ERROR_TIMEOUT;
+  return rc;
 }
 
 // =============================================================================

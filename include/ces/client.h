@@ -101,8 +101,8 @@ public:
    * Mine a PoW solution.
    * @param extraDifficulty Added to server's minDiff.
    * @param appData Optional application data (map<string,string>).
-   *   Serialized into the PoW data field, hashed into hdata.
-   *   Empty map = all-zero hdata (backwards compatible).
+   *   Serialized into the PoW data field; hdata = SHA256 of that payload.
+   *   An empty map hashes the empty payload (a fixed, non-zero digest).
    */
   std::optional<minx::MinxProveWork> mine(
     const uint8_t extraDifficulty,
@@ -247,7 +247,7 @@ private:
   KeyPair keyPair_;
   int tries_ = 3;
   ApplicationCallback appCallback_;
-  bool connected_;
+  bool connected_ = false;
   minx::Hash serverKey_;
   uint8_t serverMinDiff_ = 0;
   uint64_t serverMinPoWTimestamp_ = 0;

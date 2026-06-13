@@ -347,8 +347,8 @@ compute_max_instances = 0    # 0 = compute feature off
 # "/ces/compute/1" = "builtin:compute"
 # "/ces/lua/1"     = "builtin:lua"
 
-[[peer]]
-pubkey  = "..."
+[[peers]]
+key     = "..."
 address = "host:port"
 ```
 

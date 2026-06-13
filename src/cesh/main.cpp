@@ -291,10 +291,9 @@ int main(int argc, char* argv[]) {
   cmd_asq->add_option("id", asset_id_arg, "Asset ID or name")->required();
 
   // ---- ramfile subcommands ----
-  // (Previously `cesh file`. Renamed to disambiguate from the L2
-  // disk-backed file store on rpc_port — this command operates on
-  // the in-ledger RAM-backed asset-chain file API, suitable for
-  // VM-reachable small files, not host-scale storage.)
+  // In-ledger RAM-backed asset-chain file API (L1) — distinct from the
+  // `file` command's L2 disk-backed store on rpc_port. Suited to small
+  // VM-reachable files, not host-scale storage.
   auto* cmd_file = app.add_subcommand(
     "ramfile", "RAM-backed file storage (asset-chain, L1)");
   cmd_file->require_subcommand(1);

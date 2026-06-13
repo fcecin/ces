@@ -49,7 +49,8 @@ void dumpKeyPair(const KeyPair& keyPair) {
 
 // Dump default config to stdout.
 void dumpDefaultConfig() {
-  int defaultThreads = std::thread::hardware_concurrency() / 2 - 2;
+  int defaultThreads =
+    static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
   if (defaultThreads < 1) defaultThreads = 1;
 
   std::cout << R"(# CES Server Configuration
@@ -280,7 +281,8 @@ int main(int argc, char* argv[]) {
   bool optGenerateKeyPair = false;
   bool optNoPowEngine = false;
   bool optCacheOnlyPoWEngine = false;
-  int defaultOptTaskThreads = std::thread::hardware_concurrency() / 2 - 2;
+  int defaultOptTaskThreads =
+    static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
   int optTaskThreads = defaultOptTaskThreads;
   if (optTaskThreads < 1) optTaskThreads = 1;
   std::string optConfigFile;

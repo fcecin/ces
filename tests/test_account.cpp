@@ -32,6 +32,87 @@ BOOST_AUTO_TEST_CASE(NoncelessDroppedOnNonOpenTransfer) {
   BOOST_CHECK_EQUAL(destBal, 1'000'000);  // not 1'000'000 + 12345
 }
 
+// Regression: a nonceless op that FAILED must not poison the dedup. The dedup
+// must key on the committed event, not the request — so replaying a failed
+// nonceless op after conditions improve must RE-EXECUTE and land, not return a
+// masked dup-OK that silently drops it forever. Settlement depends on this: a
+// transient reserve shortfall must never permanently mask a cross-transfer.
+BOOST_AUTO_TEST_CASE(NoncelessFailedOpRetriesNotMasked) {
+  KeyPair poor(KeyAlgo::ED25519);
+  KeyPair dest(KeyAlgo::ED25519);
+  server->_brr(poor.getPublicKeyAsHash(), 1000);    // too poor for the transfer
+  server->_brr(dest.getPublicKeyAsHash(), 5000);    // pre-existing destination
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  const uint64_t amount = 1'000'000;
+  CesOpenTransfer req;
+  req.originId = poor.getPublicKeyAsHash();
+  req.serverId = Account::getMapKey(server->_serverKeyPair().getPublicKeyAsHash());
+  req.reqNonce = CES_NONCELESS;
+  req.destKey  = dest.getPublicKeyAsHash();
+  req.amount   = amount;
+  req.time     = ces::getMicrosSinceEpoch();
+  minx::Bytes signedBytes = req.toBytes(poor);
+
+  minx::SockAddr addr(boost::asio::ip::address_v6::loopback(), 40000);
+
+  // 1. First attempt fails — poor can't afford amount + fee.
+  server->incomingMessage(addr, minx::MinxMessage{0, 0, 0, signedBytes});
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // 2. Fund the origin so the identical transfer would now succeed.
+  server->_brr(poor.getPublicKeyAsHash(), 10'000'000);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  // 3. Replay the identical signed payload (the settlement-style retry).
+  server->incomingMessage(addr, minx::MinxMessage{0, 0, 0, signedBytes});
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // 4. The replay must have re-executed and landed. BUG: the failed first
+  //    attempt poisoned the dedup, the replay was a masked dup-OK, and the
+  //    destination was never credited (stays 5000).
+  int64_t destBal = 0; uint32_t n = 0;
+  HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0;
+  server->unsignedQueryAccount(Account::getMapKey(dest.getPublicKeyAsHash()),
+                               destBal, n, xd, xa, xt);
+  BOOST_CHECK_EQUAL(destBal, static_cast<int64_t>(5000 + amount));
+}
+
+// Guard: the dedup fix must still suppress replays of a SUCCEEDED nonceless op
+// — a duplicate must not re-apply (no double-credit). Passes before and after
+// the fix; protects the legitimate idempotent-retry property.
+BOOST_AUTO_TEST_CASE(NoncelessSucceededOpNotReapplied) {
+  KeyPair rich(KeyAlgo::ED25519);
+  KeyPair dest(KeyAlgo::ED25519);
+  server->_brr(rich.getPublicKeyAsHash(), 10'000'000);
+  server->_brr(dest.getPublicKeyAsHash(), 5000);
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  const uint64_t amount = 1'000'000;
+  CesOpenTransfer req;
+  req.originId = rich.getPublicKeyAsHash();
+  req.serverId = Account::getMapKey(server->_serverKeyPair().getPublicKeyAsHash());
+  req.reqNonce = CES_NONCELESS;
+  req.destKey  = dest.getPublicKeyAsHash();
+  req.amount   = amount;
+  req.time     = ces::getMicrosSinceEpoch();
+  minx::Bytes signedBytes = req.toBytes(rich);
+
+  minx::SockAddr addr(boost::asio::ip::address_v6::loopback(), 40000);
+
+  // First attempt succeeds; the replay must be deduped (no second credit).
+  server->incomingMessage(addr, minx::MinxMessage{0, 0, 0, signedBytes});
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  server->incomingMessage(addr, minx::MinxMessage{0, 0, 0, signedBytes});
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  int64_t destBal = 0; uint32_t n = 0;
+  HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0;
+  server->unsignedQueryAccount(Account::getMapKey(dest.getPublicKeyAsHash()),
+                               destBal, n, xd, xa, xt);
+  BOOST_CHECK_EQUAL(destBal, static_cast<int64_t>(5000 + amount));
+}
+
 BOOST_AUTO_TEST_CASE(Test01_BalanceQuery) {
   LOGINFO << "TEST: Starting BalanceQuery";
   int64_t bal = 0;
