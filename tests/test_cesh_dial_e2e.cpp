@@ -195,10 +195,9 @@ struct DialFixture {
 
     CesConfig cfg = makeTestConfig(
       tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
-    uint64_t t = static_cast<uint64_t>(
-      std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::system_clock::now().time_since_epoch()).count());
-    cfg.rpcPort = static_cast<uint16_t>(56000 + (t % 8000));
+    // OS-allocated rpc port; read back via _rpcBoundPort() below.
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
     cfg.cesplexMounts = {
       {"/ces/file/1",    "builtin:file"},
       {"/ces/compute/1", "builtin:compute"},

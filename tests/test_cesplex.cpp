@@ -390,16 +390,6 @@ private:
 // cesplexMounts on an ephemeral rpcPort, tears it down on drop.
 // ---------------------------------------------------------------------------
 
-static uint16_t pickEphemeralRpcPort() {
-  // Same pattern test_sysrpc.cpp uses: 55000-63999 avoids IANA/dynamic
-  // ranges on most Linux distros. Mild randomness from clock so
-  // parallel test runs don't collide.
-  uint16_t base = 55000;
-  uint16_t span = 9000;
-  uint64_t t = nowMicros();
-  return static_cast<uint16_t>(base + (t % span));
-}
-
 struct CesPlexFixture {
   fs::path tempDir;
   std::unique_ptr<CesServer> server;
@@ -418,7 +408,11 @@ struct CesPlexFixture {
 
     CesConfig cfg = makeTestConfig(
       tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
-    cfg.rpcPort = pickEphemeralRpcPort();
+    // OS-allocated rpc port (rpcAutoPort → openSocket(0) picks a guaranteed-
+    // free port). Manually picking risked colliding with the OS ephemeral
+    // range that client sockets bind into.
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
     cfg.cesplexMounts = mounts;
     // Enable the file-store feature for any test that wants it;
     // 1 GB is plenty for unit tests.

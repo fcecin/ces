@@ -483,14 +483,11 @@ protected:
       makeTestConfig(tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
     // Configure the dedicated RPC port. 0 would skip the second Minx
     // construction entirely — we want the full bridge spun up.
-    cfg.rpcPort = 0;  // will be overridden via the subclass path below
-
-    // Bind ephemeral — CesServer::start() passes this to rpcMinx_->openSocket.
-    // makeTestConfig leaves rpcPort=0; we set a specific port here after.
-    // The scaffolding commit accepts any uint16_t; 0 means "disabled".
-    // For an ephemeral port we'd need a pre-bound socket or an explicit
-    // port. Easiest: pick a random high port and hope it's free.
-    cfg.rpcPort = pickEphemeralRpcPort();
+    // OS-allocated rpc port: rpcAutoPort makes openSocket(0) pick a
+    // guaranteed-free port. The SYS_RPC target is the mock server's own
+    // (also OS-allocated) port, so this fixture never needs the number.
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
 
     if (cfgMod) cfgMod(cfg);
 
@@ -532,21 +529,6 @@ protected:
     mock = std::make_unique<MockRpcServer>(std::move(t));
     mockPort = mock->start();
     BOOST_REQUIRE(mockPort > 0);
-  }
-
-protected:
-  // Pick a port in the high ephemeral range. If it's already bound,
-  // CesServer::start() will log "rpc: failed to open socket" and
-  // reset rpcMinx_; the tests that depend on rpcPort will then fail
-  // visibly. For CI we'd want a retry loop; for now, one attempt.
-  static uint16_t pickEphemeralRpcPort() {
-    // Range 55000-63999: avoids IANA-registered / dynamic OS ranges
-    // on most Linux distros. Use a mild randomness source so parallel
-    // test runs don't collide.
-    uint16_t base = 55000;
-    uint16_t span = 9000;
-    uint64_t t = mockNowMicros();
-    return static_cast<uint16_t>(base + (t % span));
   }
 };
 
@@ -1270,10 +1252,9 @@ struct InboundProbeFixture {
 
     CesConfig cfg = makeTestConfig(
       tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
-    uint16_t base = 55000;
-    uint16_t span = 9000;
-    cfg.rpcPort = static_cast<uint16_t>(
-      base + (mockNowMicros() % span));
+    // OS-allocated rpc port; read back via _rpcBoundPort() in the tests.
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
 
     server = std::make_unique<CesServer>(cfg);
     serverPort = server->start(0);

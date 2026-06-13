@@ -281,11 +281,6 @@ private:
 // mounted. Re-uses CesPlexFixture's pattern. fs::path is the boost
 // alias inherited from test_common.h.
 
-uint16_t pickEphemeralRpcPort_nb() {
-  static std::atomic<uint16_t> nextPort{45000};
-  return nextPort.fetch_add(1);
-}
-
 struct NetBillFixture {
   std::unique_ptr<ces::CesServer> server;
   fs::path tempDir;
@@ -304,7 +299,10 @@ struct NetBillFixture {
 
     ces::CesConfig cfg = makeTestConfig(
       tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
-    cfg.rpcPort = pickEphemeralRpcPort_nb();
+    // OS-allocated rpc port (avoids colliding with the OS ephemeral range
+    // that client sockets bind into).
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
     cfg.cesplexMounts = { {"/ces/test/echo/1", "builtin:echo"} };
     cfg.cesFileStoreMaxBytes = 1ull * 1024 * 1024 * 1024;
     cfg.feeFileRent = 1;

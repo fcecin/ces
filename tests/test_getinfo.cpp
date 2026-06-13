@@ -11,15 +11,6 @@
 
 BOOST_AUTO_TEST_SUITE(GetInfoTests)
 
-static uint16_t pickRpcPort() {
-  // Same pattern used by the CesPlex/SYS_RPC tests.
-  uint16_t base = 55000;
-  uint16_t span = 9000;
-  auto now = std::chrono::system_clock::now().time_since_epoch();
-  uint64_t t = std::chrono::duration_cast<std::chrono::microseconds>(now).count();
-  return static_cast<uint16_t>(base + (t % span));
-}
-
 BOOST_AUTO_TEST_CASE(RpcPortRoundtrip) {
   blog::init();
   blog::set_level(blog::info);
@@ -29,7 +20,9 @@ BOOST_AUTO_TEST_CASE(RpcPortRoundtrip) {
 
   CesConfig cfg = makeTestConfig(
     dir, priv, std::numeric_limits<uint64_t>::max());
-  cfg.rpcPort = pickRpcPort();
+  // OS-allocated rpc port; the test reads it back via _rpcBoundPort() below.
+  cfg.rpcPort = 0;
+  cfg.rpcAutoPort = true;
 
   auto server = std::make_unique<CesServer>(cfg);
   uint16_t serverPort = server->start(0);
