@@ -397,6 +397,43 @@ BOOST_FIXTURE_TEST_CASE(DeltasResetEachTick, NetBillFixture) {
   peer.closeStream();
 }
 
+// A reused (peer, channelId) whose stale ChannelBill baseline exceeds a fresh
+// channel's smaller counters must not unsigned-underflow the per-tick byte delta
+// into a near-2^64 debit. _testSetBaseline forces the stale-high baseline;
+// doTick must clamp the delta (bill the fresh counter from zero), not wrap.
+BOOST_FIXTURE_TEST_CASE(ReusedChannelDoesNotUnderflowDelta, NetBillFixture) {
+  NbTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  auto stream = peer.selectAndOpen(rpcPort, "/ces/test/echo/1", testKey);
+  BOOST_REQUIRE(stream != nullptr);
+  BOOST_REQUIRE_EQUAL(peer.echo(stream, std::string(64, 'a')),
+                      std::string(64, 'a'));
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  server->_netBilling()->_runTick();
+
+  auto rows0 = server->_netBilling()->snapshot();
+  BOOST_REQUIRE_EQUAL(rows0.size(), 1u);
+  const auto peerAddr = rows0[0].peer;
+  const uint32_t cid = rows0[0].channelId;
+  const uint64_t cur = rows0[0].metrics.bytesSent;
+
+  // Simulate a reused channelId: stale baseline far above the fresh counter.
+  const uint64_t BIG = 1'000'000'000ull;
+  server->_netBilling()->_testSetBaseline(peerAddr, cid,
+                                          cur + BIG, cur + BIG, BIG);
+  server->_netBilling()->_runTick();
+
+  auto rows1 = server->_netBilling()->snapshot();
+  BOOST_REQUIRE_EQUAL(rows1.size(), 1u);
+  // Pre-fix: cur - (cur+BIG) wraps to ~2^64. Post-fix: clamped to the fresh
+  // counter (a few KB). Either way, far below BIG.
+  BOOST_CHECK_LT(rows1[0].deltaBytesSent, BIG);
+  BOOST_CHECK_LT(rows1[0].deltaBytesReceived, BIG);
+  BOOST_CHECK_LT(rows1[0].deltaMemByteSeconds, BIG);
+
+  peer.closeStream();
+}
+
 // 4. Eviction-on-tick: stop the test peer (channel disappears on
 //    server side via idle GC eventually, but for the test we trigger
 //    a tick after closing the stream + giving Rudp a moment to drop

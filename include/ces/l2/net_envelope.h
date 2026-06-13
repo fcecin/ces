@@ -160,6 +160,14 @@ constexpr size_t CES_PLEX_BIND_REQ_TAIL_SIZE =
 static_assert(CES_PLEX_BIND_REQ_TAIL_SIZE == 137,
               "bind request tail size diverged from documented layout");
 
+// Bind-request freshness window. The signed client_time_us is rejected if more
+// than CES_PLEX_BIND_MAX_AGE_US in the past or CES_PLEX_BIND_FUTURE_DRIFT_US in
+// the future. Without it a captured bind replays indefinitely on fresh channels,
+// each re-binding as the victim and accruing NetworkBilling against them. 5 min
+// each way absorbs clock skew while bounding replay.
+constexpr uint64_t CES_PLEX_BIND_MAX_AGE_US      = 300ULL * 1000000;
+constexpr uint64_t CES_PLEX_BIND_FUTURE_DRIFT_US = 300ULL * 1000000;
+
 // ---------------------------------------------------------------------------
 // BoundChannelContext — what CesPlex passes to a handler at handoff
 // ---------------------------------------------------------------------------

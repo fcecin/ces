@@ -94,6 +94,12 @@ public:
                         const std::string& destServer,
                         int64_t& newOriginBal);
 
+  // successfulCount sentinel for "outcome unknown" (a TIMEOUT: request sent,
+  // reply lost). Distinct from 0 (= none applied). Real counts are 0..MAX_ITEMS.
+  static constexpr uint8_t BULK_COUNT_UNKNOWN = 0xFF;
+
+  // successfulCount: on CES_OK the true number applied (partial possible); on
+  // CES_ERROR_TIMEOUT BULK_COUNT_UNKNOWN; on other errors 0.
   uint8_t bulkTransfer(const std::vector<BulkTransferItem>& transfers,
                        int64_t& newOriginBal, uint8_t& successfulCount);
 

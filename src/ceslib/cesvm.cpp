@@ -593,7 +593,7 @@ uint64_t CesVM::read(bool jumpSkipControl) {
     val = 0;
     // v comes from attacker bytecode (low 6 bits = 0..63). Reject
     // anything that wouldn't fit in a uint64_t — otherwise the memcpy
-    // below would scribble past `val` on the stack.
+    // below would write past `val` on the stack.
     if (v > sizeof(val)) {
       term_ = CESVM_OPCODE;
       return 0;
@@ -641,6 +641,14 @@ uint64_t CesVM::pop() {
 }
 
 bool CesVM::bill(uint64_t cost) {
+  // Overflow guard on cost * gasMult_, symmetric with billMul(). An absurd
+  // feeVmMult could otherwise wrap a real cost to a small value and underbill;
+  // on wrap, halt as budget-exhausted. (gasMult_ is forced >= 1 in execute().)
+  if (gasMult_ != 0 && cost > std::numeric_limits<uint64_t>::max() / gasMult_) {
+    term_ = CESVM_BUDGET;
+    io_[CESVM_IO_BUDGET_REMAINING] = 0;
+    return false;
+  }
   cost *= gasMult_;
   // Use cost <= budget_ - budgetUsed_ to avoid uint64_t overflow on the
   // sum. Equivalent to (budgetUsed_ + cost > budget_) when no wrap.

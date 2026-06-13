@@ -100,6 +100,20 @@ BOOST_AUTO_TEST_CASE(NopThenTerm) {
   BOOST_CHECK_EQUAL(result.opsExecuted, 4);
 }
 
+// bill() does cost *= gasMult_; an absurd gasMult must not wrap a real cost to a
+// small value and underbill. gasMult is chosen so COST_PER_OP * gasMult wraps
+// uint64 to a tiny value: unguarded, the wrapped cost slips under the budget and
+// the program runs free (CESVM_OK); guarded, the wrap halts it (CESVM_BUDGET).
+BOOST_AUTO_TEST_CASE(GasMultOverflowHaltsNotUnderbills) {
+  CesVM vm;
+  auto host = makeNullHost();
+  ces::Bytes code = {OP_NOP, OP_TERM};
+  const uint64_t hugeMult =
+    std::numeric_limits<uint64_t>::max() / CESVM_COST_PER_OP + 1;
+  auto result = vm.execute(code, host, /*budget=*/1'000'000'000, hugeMult);
+  BOOST_CHECK_EQUAL(result.error, CESVM_BUDGET);
+}
+
 // --- Arithmetic ---
 
 BOOST_AUTO_TEST_CASE(AddRegisters) {

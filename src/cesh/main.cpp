@@ -1390,8 +1390,7 @@ int main(int argc, char* argv[]) {
 
       // Sub-MB chunks: the server caps WRITE/READ at 1 MB, and RUDP's
       // per-channel reorder buffer is also 1 MB, so a 1 MB chunk leaves
-      // no headroom for retransmits. 512 KB keeps the pipeline
-      // comfortably within both limits.
+      // no headroom for retransmits. 512 KB stays within both limits.
       constexpr size_t kChunkSize = 512 * 1024;
 
       // ---- put ----

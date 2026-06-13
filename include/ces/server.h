@@ -590,28 +590,24 @@ public:
   // private state. Posts the work to logicStrand_ and fires `cb` on
   // `cbExecutor` with the resulting rc.
   //
-  // Semantics match existing signed NONCELESS ops (e.g. cross-
-  // transfer's arrival leg):
-  //   1. If reqNonce == CES_NONCELESS, dedup by sigHash. A hit
-  //      returns CES_OK (idempotent-retry contract) without
-  //      touching the account.
-  //   2. Call validateSpend(amount, errFee=feeQuery, reqNonce,
-  //      errFee). Handles all three nonce modes (NONCELESS,
-  //      sequential N, 0=reserved-internal) the same way asset
-  //      and transfer ops do.
-  //   3. On success: debit(amount). No credit to anyone — the
-  //      amount is burned. (Operator-as-CES-server doesn't need to
-  //      collect; it can mint.)
-  //
-  // All three stages run on the logic strand; callback hops to
-  // cbExecutor before firing.
+  // Dedup keyed on the committed event, not on first sight of the request:
+  //   1. NONCELESS + sigHash already recorded this window → cb(CES_OK,
+  //      duplicate=true); the caller must skip its side effect (replay a
+  //      correct-shape OK) so a resent envelope can't re-credit/re-debit.
+  //   2. Else validateSpend(amount, fee=0, reqNonce, feeQuery). On failure →
+  //      cb(rc, false), recording nothing (a failed op stays retryable).
+  //   3. On success → debit(amount), record the dedup (NONCELESS only) at this
+  //      commit point → cb(CES_OK, false). amount is burned. Check+debit+record
+  //      are one logic-strand task, so retries serialize and exactly one is
+  //      duplicate=false.
+  // All stages run on the logic strand; callback hops to cbExecutor.
   void _l2ValidateDedupAndDebit(
       const ces::PublicKey& signer,
       int64_t amount,
       uint32_t reqNonce,
       uint64_t timeUs,
       uint64_t sigHash,
-      std::function<void(uint8_t rc)> cb,
+      std::function<void(uint8_t rc, bool duplicate)> cb,
       boost::asio::any_io_executor cbExecutor);
 
   // Ledger credit — creates or credits the destination account.
@@ -1250,6 +1246,11 @@ private:
     minx::Hash ckey{};
     std::string declaredAddress;
     boost::asio::ip::address resolvedIP;
+    // Full endpoint the peer miner resolved off-strand, so
+    // getOrCreateSettlementClient never does a blocking getaddrinfo on the logic
+    // strand. Runtime-only; not persisted (re-resolved on the next probe).
+    boost::asio::ip::udp::endpoint resolvedEndpoint;
+    bool resolvedEndpointValid = false;
     uint64_t totalInboundPoW = 0;
     uint64_t totalOutboundPoW = 0;
     int64_t ourBalanceThere = -1;

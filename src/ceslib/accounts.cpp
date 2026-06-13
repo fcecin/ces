@@ -203,6 +203,14 @@ void Accounts::ActiveAccount::chargeError(int64_t errFee) {
     return;
 
   int64_t oldBal = balance();
+  // Payment accounts (balance < 0) hold no spendable credits. Charging an error
+  // fee gives b = oldBal - errFee <= 0, which would erase the account — so any
+  // failed signed op from the payee's key (e.g. a signed self-query) would
+  // destroy the pending payment. Skip the fee; it settles or expires via daily
+  // maintenance. (The negative balance is excluded from totalCredits_.)
+  if (oldBal < 0)
+    return;
+
   int64_t b = oldBal - errFee;
   if (b <= 0) {
     parent.totalCredits_ -= std::max<int64_t>(0, oldBal);

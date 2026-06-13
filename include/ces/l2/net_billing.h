@@ -103,6 +103,15 @@ public:
   // computation + debit + eviction without sleeping a minute.
   void _runTick();
 
+  // Test hook: force a tracked channel's last-seen counter baselines (the
+  // values the NEXT tick computes its deltas against). Used to simulate a
+  // reused (peer, channelId) whose stale baseline exceeds a fresh channel's
+  // smaller counters — the regression that would unsigned-underflow the delta.
+  // Blocks until applied. No-op if the channel isn't tracked.
+  void _testSetBaseline(const minx::SockAddr& peer, uint32_t channelId,
+                        uint64_t lastBytesSent, uint64_t lastBytesReceived,
+                        uint64_t lastMemByteSeconds);
+
 private:
   struct ChannelBill {
     std::string tag;

@@ -335,8 +335,8 @@ static constexpr uint64_t CESVM_MAX_HOSTV_ARGS = 16;
 //                   io[48..63] ── Free. Reserved for future conventions.
 //
 //                Programs that copy their inputs from io[CESVM_IO_INPUT]
-//                (the high region) down into this low band get the rest
-//                of the program for free at short-encoded cost.
+//                (the high region) down into this low band can then
+//                address them at short-encoded (1-byte) operand cost.
 //
 //   io[64..751] ── WIDE PROGRAM MEMORY (688 cells = 5504 bytes)
 //                 Readable and writable by the program, but every

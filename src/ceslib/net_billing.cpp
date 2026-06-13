@@ -43,6 +43,16 @@ bool isZeroPrefix(const HashPrefix& p) {
   return true;
 }
 
+// Per-tick delta from a monotonic cumulative counter, guarded against
+// regression. RUDP counters increase within a channel incarnation, but a
+// (peer, channelId) reused by a fresh channel before the stale ChannelBill is
+// evicted resets the counter to a small value — so `cur - last` would
+// unsigned-underflow to a near-2^64 delta (a huge spurious debit). Treat a
+// regression as a fresh incarnation: bill the new counter from zero.
+inline uint64_t guardedDelta(uint64_t cur, uint64_t last) {
+  return cur >= last ? cur - last : cur;
+}
+
 } // namespace
 
 NetworkBilling::NetworkBilling(minx::Rudp& rudp,
@@ -133,6 +143,25 @@ void NetworkBilling::_runTick() {
   fut.get();
 }
 
+void NetworkBilling::_testSetBaseline(const minx::SockAddr& peer,
+                                      uint32_t channelId,
+                                      uint64_t lastBytesSent,
+                                      uint64_t lastBytesReceived,
+                                      uint64_t lastMemByteSeconds) {
+  auto promise = std::make_shared<std::promise<void>>();
+  auto fut = promise->get_future();
+  boost::asio::post(io_, [=, this]() {
+    auto it = channels_.find(std::make_pair(peer, channelId));
+    if (it != channels_.end()) {
+      it->second.lastBytesSent      = lastBytesSent;
+      it->second.lastBytesReceived  = lastBytesReceived;
+      it->second.lastMemByteSeconds = lastMemByteSeconds;
+    }
+    promise->set_value();
+  });
+  fut.get();
+}
+
 void NetworkBilling::scheduleTick() {
   if (!timer_) return;
   timer_->expires_after(tickInterval_);
@@ -200,9 +229,11 @@ void NetworkBilling::doTick() {
       it = channels_.erase(it);
       continue;
     }
-    bill.deltaBytesSent       = m->bytesSent          - bill.lastBytesSent;
-    bill.deltaBytesReceived   = m->bytesReceived      - bill.lastBytesReceived;
-    bill.deltaMemByteSeconds  = m->memoryByteSeconds  - bill.lastMemByteSeconds;
+    bill.deltaBytesSent       = guardedDelta(m->bytesSent, bill.lastBytesSent);
+    bill.deltaBytesReceived   = guardedDelta(m->bytesReceived,
+                                             bill.lastBytesReceived);
+    bill.deltaMemByteSeconds  = guardedDelta(m->memoryByteSeconds,
+                                             bill.lastMemByteSeconds);
     bill.deltaAgeSec          = (now - bill.lastBilledAtUs) / kMicrosPerSecond;
     bill.deltaDebit           = computeDebit(bill, feeChanSec, feeMemDay,
                                               feeBSent, feeBRecv);

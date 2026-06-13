@@ -221,6 +221,19 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
       return;
     }
 
+    // Freshness gate: the signed client_time_us is otherwise unconstrained, and
+    // the request binds no channelId/sessionToken (assigned after bind), so a
+    // captured bind would replay on fresh channels. Reject stale/future ones.
+    const uint64_t nowUs = nowMicrosForCesplex();
+    if (clientTimeUs > nowUs + CES_PLEX_BIND_FUTURE_DRIFT_US ||
+        clientTimeUs + CES_PLEX_BIND_MAX_AGE_US < nowUs) {
+      LOGDEBUG << "CesPlex: stale bind time"
+               << SVAR(peer) << VAR(channelId)
+               << VAR(clientTimeUs) << VAR(nowUs);
+      sendNackAndDrop("stale bind time");
+      return;
+    }
+
     // Lookup handler.
     const std::string name(
       reinterpret_cast<const char*>(nameBuf.data()), nameBuf.size());
@@ -344,8 +357,8 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     // Graceful close: let the in-flight NACK (or whatever the caller
     // queued just before drop) drain into Rudp's sendBuf, then fire
     // HS_CLOSE within kRudpStreamCloseTimeout. Skipping shutdown()
-    // here would leave the channel alive until idle GC (60s) — fine
-    // semantically, brutal on dial-side UX.
+    // here would leave the channel alive until idle GC (60s) — correct,
+    // but a long stall for a waiting dial client.
     if (stream) {
       stream->shutdown(kRudpStreamCloseTimeout);
       stream.reset();

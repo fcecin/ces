@@ -135,7 +135,7 @@ void fileHandlerRegisterDeletionCallback(
 // DELETE refund) also land in sourceName's file_balance. This keeps
 // the program's credit exposure bounded by what the operator put
 // into the source file's file_balance at LAUNCH time and prevents
-// a running program from spamming the store for free.
+// a running program from writing to the store without being charged.
 //
 // Zone-ownership gate (/h/, /f/, /p/, /s/) still applies: a program
 // running under owner X can only CREATE in /h/<hex(X)>/ paths, /f/<n>

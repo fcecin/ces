@@ -1488,9 +1488,8 @@ int lua_ces_conn_set_listener(lua_State* L) {
   if (!lua_istable(L, 1)) {
     return luaL_error(L, "ces.conn.set_listener: expected table or nil");
   }
-  // Stash table in registry, with the conn function table installed
-  // alongside (so we can do conn:write style later via __index, but
-  // for v1 we just put the methods directly on each conn).
+  // Stash table in registry. A conn:write style via __index is possible
+  // later; for v1 the methods sit directly on each conn.
   lua_pushvalue(L, 1);
   lua_setfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
   // Make sure the live-conns table exists.
@@ -1798,8 +1797,8 @@ int main(int argc, char** argv) {
   load_safe_libs(L);
   install_ces_api(L);
 
-  // "t" = text only; refuses bytecode even if the leading-byte guard above
-  // is ever bypassed (belt-and-suspenders).
+  // "t" = text only: a second barrier that refuses bytecode even if the
+  // leading-byte guard above is bypassed.
   if (luaL_loadbufferx(L, src, src_len, "=program", "t") != 0) {
     std::fprintf(stderr, "cesluajitd: load failed: %s\n",
                  lua_tostring(L, -1));

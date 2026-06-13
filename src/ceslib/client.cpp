@@ -463,7 +463,6 @@ uint8_t CesClient::bulkTransfer(const std::vector<BulkTransferItem>& transfers,
     return CES_ERROR_INTERNAL;
 
   Hash myFullKey = keyPair_.getPublicKeyAsHash();
-  HashPrefix myId = Account::getMapKey(myFullKey);
 
   CesBulkTransfer req;
   req.originId = myFullKey;
@@ -483,16 +482,11 @@ uint8_t CesClient::bulkTransfer(const std::vector<BulkTransferItem>& transfers,
   if (rc == CES_ERROR_INTERNAL)
     return rc;
 
-  // Timeout fallback state check: if our nonce advanced, assume success.
-  int64_t finalBalance = 0;
-  uint32_t finalNonce = 0;
-  if (queryAccount(myId, finalBalance, finalNonce) == CES_OK) {
-    if (finalNonce >= reqNonce) {
-      newOriginBal = finalBalance;
-      successfulCount = transfers.size(); // Assumption on timeout recovery
-      return CES_OK;
-    }
-  }
+  // Reply lost: the outcome is unknown (a partial bulk advances the nonce too,
+  // so a nonce check can't distinguish full from partial). Report TIMEOUT with
+  // the explicit unknown sentinel rather than guessing a count; callers needing
+  // the result re-query the destinations.
+  successfulCount = BULK_COUNT_UNKNOWN;
   return CES_ERROR_TIMEOUT;
 }
 

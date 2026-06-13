@@ -260,7 +260,8 @@ public:
   SelectResult select(uint16_t targetPort, const std::string& protoName,
                       const ces::KeyPair& signer,
                       std::chrono::milliseconds timeout =
-                        std::chrono::milliseconds(3000)) {
+                        std::chrono::milliseconds(3000),
+                      uint64_t bindTimeOverrideUs = 0) {
     currentPeer_ = minx::SockAddr(
       boost::asio::ip::address_v6::loopback(), targetPort);
     currentChannel_ = 1;  // peer-chosen; arbitrary, unique within peer
@@ -271,7 +272,7 @@ public:
     auto cv = std::make_shared<std::condition_variable>();
 
     boost::asio::post(taskIO_,
-      [this, protoName, &signer, done, result, mu, cv]() {
+      [this, protoName, &signer, done, result, mu, cv, bindTimeOverrideUs]() {
       // Seed Rudp's clock before registerChannel (avoid idle-GC).
       rudp_->tick(nowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
@@ -283,7 +284,8 @@ public:
       }
 
       // Build signed bind preamble.
-      const uint64_t bindNowUs = nowMicros();
+      const uint64_t bindNowUs =
+        bindTimeOverrideUs ? bindTimeOverrideUs : nowMicros();
       auto bindReq = std::make_shared<minx::Bytes>(
         ces::buildBindRequest(protoName, bindNowUs, signer));
       const auto& pkArr = signer.getPublicKeyAsHash();
@@ -551,6 +553,27 @@ BOOST_AUTO_TEST_CASE(FileSelectAccepts) {
   auto r = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_CHECK_EQUAL(int(r.status), 0x01);
   BOOST_REQUIRE(r.stream != nullptr);
+}
+
+// A bind request carries a signed client_time_us but binds no
+// channelId/sessionToken; without a freshness check a captured bind replays on
+// fresh channels (re-binding as the victim, accruing NetworkBilling). A bind
+// whose timestamp is outside the freshness window must NACK. (Fresh binds still
+// succeed — see FileSelectAccepts above.)
+BOOST_AUTO_TEST_CASE(BindRejectsStaleTime) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  wait_net();
+  // Bind timestamp 10 minutes in the past — beyond CES_PLEX_BIND_MAX_AGE_US (5m).
+  const uint64_t staleUs =
+    ces::getMicrosSinceEpoch() - 10ull * 60 * 1'000'000;
+  auto r = peer.select(fx.rpcPort, "/ces/file/1", signer,
+                       std::chrono::milliseconds(3000), staleUs);
+  BOOST_CHECK_EQUAL(int(r.status), 0x00);   // NACK; pre-fix this was 0x01
+  BOOST_CHECK(r.stream == nullptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,6 +1330,62 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   auto st2 = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
   CES_CHECK_RC_EQ(st2.status, CES_OK);
   BOOST_CHECK_EQUAL(st2.fileBalance, 0u);
+}
+
+// A resent identical L2 file envelope must be deduplicated so its side effect
+// runs exactly once. If _l2ValidateDedupAndDebit returns CES_OK on a duplicate
+// without debiting while the verb handler still runs its credit, a resent
+// DEPOSIT credits the program account with no signer debit (conservation break).
+BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+
+  minx::Hash priv; priv.fill(0xD1);
+  ces::KeyPair signer(priv);
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  wait_net();
+
+  auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
+  BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+  BOOST_REQUIRE(sel.stream != nullptr);
+
+  const std::string name = "/p/dedup/deposit.txt";
+  const uint64_t size = 1024;
+  const uint64_t createDeposit = 1'000'000;
+  const uint64_t upfrontBurn = size * 1ull * 900 / 86400;  // fixture feeFileRent=1
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+                      CES_NONCELESS, size, /*pricePerKb=*/0, createDeposit,
+                      "text/plain", name);
+  CES_REQUIRE_RC_EQ(c.status, CES_OK);
+  const uint64_t postCreate = createDeposit - upfrontBurn;
+
+  // Build ONE deposit envelope and drive it TWICE — identical bytes ⇒ identical
+  // per-op salt ⇒ identical sigHash ⇒ the second send is a dedup duplicate.
+  const uint64_t amount = 500'000;
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, amount);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
+  pre.insert(pre.end(), name.begin(), name.end());
+  auto env = buildSignedEnvelope(signer, 0x05, pre, sel.sessionToken);
+
+  auto d1 = driveVerb(peer.taskIO(), sel.stream, 0x05, env, /*respPreambleLen=*/8);
+  CES_REQUIRE_RC_EQ(d1.status, CES_OK);
+  BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(d1.preamble.data()),
+                    postCreate + amount);
+
+  // Resend the SAME envelope. The dup must reply OK but NOT re-credit.
+  auto d2 = driveVerb(peer.taskIO(), sel.stream, 0x05, env, /*respPreambleLen=*/8);
+  CES_REQUIRE_RC_EQ(d2.status, CES_OK);
+  // Without dedup the resend would re-credit: postCreate + 2*amount.
+  BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(d2.preamble.data()),
+                    postCreate + amount);
+
+  // Cross-check via STAT: a single deposit applied.
+  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  CES_REQUIRE_RC_EQ(st.status, CES_OK);
+  BOOST_CHECK_EQUAL(st.fileBalance, postCreate + amount);
 }
 
 BOOST_AUTO_TEST_CASE(FileWriteRead) {

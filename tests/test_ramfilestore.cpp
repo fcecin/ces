@@ -160,6 +160,22 @@ BOOST_AUTO_TEST_CASE(ScanFilenameHexKey) {
   BOOST_CHECK(name.size() > 64); // hex key is 64 chars
 }
 
+// A short printable key is used verbatim as the scan filename, and
+// isReadableUTF8 accepts '/' and '.'. A key like "../../evil" must not yield a
+// path-traversing filename when the caller prepends a directory.
+BOOST_AUTO_TEST_CASE(ScanFilenameSanitizesTraversal) {
+  minx::Hash key{};
+  const std::string evil = "../../evil";
+  std::memcpy(key.data(), evil.data(), evil.size());
+  auto name = buildRamfileScanFilename(key, "host:1234");
+  BOOST_CHECK(name.find('/') == std::string::npos);   // no path separator
+  BOOST_CHECK(name.find('\\') == std::string::npos);
+  BOOST_REQUIRE(!name.empty());
+  BOOST_CHECK(name[0] != '.');                          // not '.', '..', dotfile
+  // Still carries the server suffix.
+  BOOST_CHECK(name.find("@host.1234.scan") != std::string::npos);
+}
+
 // --- Read / Write / Append ---
 
 BOOST_FIXTURE_TEST_CASE(ReadAtOffset, CesFixture) {

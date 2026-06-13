@@ -906,8 +906,24 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     auto after =
       [ctx, size, pricePerKb, initialDeposit, upfrontBurn,
        contentType, name]
-      (uint8_t rc) mutable {
+      (uint8_t rc, bool duplicate) mutable {
         if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+        // Concurrent duplicate CREATE (two identical envelopes racing past the
+        // existence precheck): re-running would truncate the file and mint a
+        // second program account. Replay the same response from the captured
+        // deposit, touching neither disk nor ledger (the sidecar may not exist
+        // yet — the first envelope's side effect is still in flight).
+        if (duplicate) {
+          uint64_t programAccountInitial = (initialDeposit > upfrontBurn)
+            ? (initialDeposit - upfrontBurn) : 0;
+          const auto& cfg = ctx->server->_config();
+          ces::Bytes pre;
+          ces::Buffer::put<uint64_t>(pre, programAccountInitial);
+          ces::Buffer::put<uint64_t>(pre, static_cast<uint64_t>(cfg.feeQuery) +
+            static_cast<uint64_t>(initialDeposit));
+          sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+          return;
+        }
         const auto& cfg = ctx->server->_config();
         auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
         auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
@@ -1078,20 +1094,34 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   state->contentHash = contentHash;
   state->name = name;
 
-  auto after = [ctx, state, writeCost, cPath, sPath](uint8_t rc) {
+  auto after = [ctx, state, writeCost, cPath, sPath](uint8_t rc, bool duplicate) {
     // Debit failed → body is still in flight. Close the channel.
     if (rc != CES_OK) { sendErrorAndClose(ctx, rc); return; }
-    // Stream body from wire.
+    // Stream the body even on a duplicate: the client is already sending
+    // `length` bytes; not consuming them desyncs the wire.
     state->body.resize(state->length);
     boost::asio::async_read(
       *ctx->stream, boost::asio::buffer(state->body),
-      [ctx, state, writeCost, cPath, sPath]
+      [ctx, state, writeCost, cPath, sPath, duplicate]
       (const boost::system::error_code& ec, std::size_t) {
         if (ec) return; // stream dead
         minx::Hash got = ces::sha256(
           state->body.data(), state->body.size());
         if (std::memcmp(got.data(), state->contentHash.data(), 32) != 0) {
           sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+        }
+        Sidecar sc{};
+        if (!readSidecar(sPath, sc)) {
+          sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+        }
+        // Duplicate: the bytes were already written and writeCost charged. Skip
+        // the disk write + debit; re-read the balance for the reply.
+        if (duplicate) {
+          ces::Bytes pre;
+          ces::Buffer::put<uint64_t>(
+            pre, readProgramAccountBalance(ctx->server, sc));
+          sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+          return;
         }
         FILE* fp = std::fopen(cPath.string().c_str(), "rb+");
         if (!fp) { sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return; }
@@ -1105,10 +1135,6 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         std::fflush(fp);
         std::fclose(fp);
         if (wrote != state->body.size()) {
-          sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
-        }
-        Sidecar sc{};
-        if (!readSidecar(sPath, sc)) {
           sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
         }
         uint64_t newBal = 0;
@@ -1211,7 +1237,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx, offset, length, name, readPrice, isOwner]
-    (uint8_t rc) mutable {
+    (uint8_t rc, bool duplicate) mutable {
       if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
       const auto& cfg = ctx->server->_config();
       auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
@@ -1225,8 +1251,10 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       if (f.gcount() != static_cast<std::streamsize>(length)) {
         sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
       }
-      // Credit the file's program account with readPrice (non-owner).
-      if (!isOwner && readPrice > 0) {
+      // Credit the file's program account with readPrice (non-owner). Skip on a
+      // duplicate: re-crediting would mint (the reader wasn't re-charged). The
+      // file is unchanged, so the re-read data below is still correct.
+      if (!isOwner && readPrice > 0 && !duplicate) {
         Sidecar sc{};
         if (readSidecar(sPath, sc)) {
           creditProgramAccount(ctx->server, sc, readPrice);
@@ -1282,7 +1310,7 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, amount, name](uint8_t rc) {
+  auto after = [ctx, amount, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     const auto& cfg = ctx->server->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
@@ -1290,10 +1318,14 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     if (!readSidecar(sPath, sc)) {
       sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
     }
-    creditProgramAccount(ctx->server, sc, amount);
-    sc.modified_us = getMicrosSinceEpoch();
-    if (!writeSidecar(sPath, sc)) {
-      sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+    // Duplicate: re-crediting would mint (the signer wasn't re-debited). Skip;
+    // the balance re-read below reflects the first deposit.
+    if (!duplicate) {
+      creditProgramAccount(ctx->server, sc, amount);
+      sc.modified_us = getMicrosSinceEpoch();
+      if (!writeSidecar(sPath, sc)) {
+        sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+      }
     }
     uint64_t newBal = readProgramAccountBalance(ctx->server, sc);
     ces::Bytes pre;
@@ -1350,13 +1382,22 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, amount, name](uint8_t rc) {
+  auto after = [ctx, amount, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     const auto& cfg = ctx->server->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
     Sidecar sc{};
     if (!readSidecar(sPath, sc)) {
       sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+    }
+    // Duplicate: re-running would double-pay the owner and drain the program
+    // account twice. Replay OK with the current balance, no re-debit/re-credit.
+    if (duplicate) {
+      uint64_t bal = readProgramAccountBalance(ctx->server, sc);
+      ces::Bytes pre;
+      ces::Buffer::put<uint64_t>(pre, bal);
+      sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+      return;
     }
     auto debit = debitProgramAccount(ctx->server, sc, amount);
     if (!debit.ok) {
@@ -1425,7 +1466,7 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, newPrice, name](uint8_t rc) {
+  auto after = [ctx, newPrice, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     const auto& cfg = ctx->server->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
@@ -1433,10 +1474,14 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     if (!readSidecar(sPath, sc)) {
       sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
     }
-    sc.price_per_kb = newPrice;
-    sc.modified_us = getMicrosSinceEpoch();
-    if (!writeSidecar(sPath, sc)) {
-      sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+    // Duplicate: the price was already set; skip the re-write + mtime bump. The
+    // read-back below reflects the first set.
+    if (!duplicate) {
+      sc.price_per_kb = newPrice;
+      sc.modified_us = getMicrosSinceEpoch();
+      if (!writeSidecar(sPath, sc)) {
+        sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+      }
     }
     ces::Bytes pre;
     ces::Buffer::put<uint64_t>(pre, sc.price_per_kb);
@@ -1488,8 +1533,9 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, sc](uint8_t rc) {
+  auto after = [ctx, sc](uint8_t rc, bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Read-only (the rent-roll ran before dedup); a duplicate just re-reads.
     // STAT response preamble:
     //   [u8[32] owner_pubkey][u64 file_balance][u64 price_per_kb]
     //   [u64 size][u16 ct_len][ct][u64 created_us][u64 modified_us]
@@ -1554,8 +1600,17 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, name, cPath, sPath, scSaved = sc](uint8_t rc) mutable {
+  auto after = [ctx, name, cPath, sPath, scSaved = sc](uint8_t rc,
+                                                       bool duplicate) mutable {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Duplicate: the delete + refund already committed. Replay OK with refund 0
+    // (re-refunding would mint; the sidecar is likely already gone).
+    if (duplicate) {
+      ces::Bytes pre;
+      ces::Buffer::put<uint64_t>(pre, uint64_t(0));
+      sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+      return;
+    }
     const auto& cfg = ctx->server->_config();
     // Re-read sidecar (race-free-ish: we're the only writer for this
     // op in practice; v1 accepts the dice roll).
@@ -1708,13 +1763,13 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   state->name = name;
 
   auto after = [ctx, state, writeCost, upfront, cPath, sPath]
-    (uint8_t rc) {
+    (uint8_t rc, bool duplicate) {
     // Debit failed → body in flight. Close the channel.
     if (rc != CES_OK) { sendErrorAndClose(ctx, rc); return; }
     state->body.resize(state->length);
     boost::asio::async_read(
       *ctx->stream, boost::asio::buffer(state->body),
-      [ctx, state, writeCost, upfront, cPath, sPath]
+      [ctx, state, writeCost, upfront, cPath, sPath, duplicate]
       (const boost::system::error_code& ec, std::size_t) {
         if (ec) return;
         minx::Hash got = ces::sha256(
@@ -1722,6 +1777,21 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         if (std::memcmp(got.data(),
                         state->contentHash.data(), 32) != 0) {
           sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+        }
+        Sidecar sc{};
+        if (!readSidecar(sPath, sc)) {
+          sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+        }
+        // Duplicate: re-running would double the file content (a resent APPEND
+        // re-reads the grown size as its offset) and double-bill. Skip the
+        // pwrite + debit; replay [balance][size] from current state.
+        if (duplicate) {
+          ces::Bytes pre;
+          ces::Buffer::put<uint64_t>(
+            pre, readProgramAccountBalance(ctx->server, sc));
+          ces::Buffer::put<uint64_t>(pre, sc.size);
+          sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+          return;
         }
         // pwrite at old end.
         FILE* fp = std::fopen(cPath.string().c_str(), "rb+");
@@ -1740,10 +1810,6 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         }
         // Update sidecar + store meta. Drain writeCost + upfront
         // together — upfront is a burn against new-byte anti-grief.
-        Sidecar sc{};
-        if (!readSidecar(sPath, sc)) {
-          sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
-        }
         uint64_t newBal = 0;
         uint64_t totalDebit = writeCost + upfront;
         if (totalDebit > 0) {
@@ -1859,8 +1925,20 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx, newSize, oldSize, bytesDelta, upfrontBurn, name,
-                cPath, sPath](uint8_t rc) {
+                cPath, sPath](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Duplicate: the resize already committed and the grow-rent burned;
+    // re-running would double-charge. Replay the current size, skip resize+debit.
+    if (duplicate) {
+      Sidecar sc{};
+      if (!readSidecar(sPath, sc)) {
+        sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+      }
+      ces::Bytes pre;
+      ces::Buffer::put<uint64_t>(pre, sc.size);
+      sendResponseAndLoop(ctx, CES_OK, std::move(pre));
+      return;
+    }
     // Truncate/extend the content file. resize_file handles both:
     // grow → sparse zeros (no disk use on Linux), shrink → truncate.
     std::error_code ec;
@@ -2754,10 +2832,9 @@ bool fileHandlerGetProgramHash(
   std::array<uint8_t, 32> digest{};
   hasher.Final(reinterpret_cast<CryptoPP::byte*>(digest.data()));
 
-  // Sanity: a SHA-256 of any non-trivial input is non-zero with
-  // overwhelming probability. If we ever produce an all-zero digest
-  // (cosmic ray, weird empty case), treat as failure rather than
-  // poisoning the "all-zero means uncomputed" sentinel.
+  // All-zero is the "uncomputed" sentinel. A real SHA-256 is non-zero with
+  // overwhelming probability; if one ever comes out all-zero, treat it as a
+  // failure rather than storing it as the sentinel.
   bool digestZero = true;
   for (auto b : digest) if (b != 0) { digestZero = false; break; }
   if (digestZero) return false;

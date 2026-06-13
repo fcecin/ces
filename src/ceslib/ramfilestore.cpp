@@ -15,8 +15,8 @@
 
 namespace ces {
 
-// Random 32-byte chunk keys collide vanishingly rarely, but a user who pins
-// their RNG or reuses the same seed could hit repeated ASSET_EXISTS rejections.
+// Random 32-byte chunk keys collide with negligible probability, but a user who
+// pins their RNG or reuses a seed could hit repeated ASSET_EXISTS rejections.
 // Retry this many times before surfacing the error.
 static constexpr int MAX_CHUNK_COLLISION_RETRIES = 10;
 
@@ -348,6 +348,12 @@ std::string buildRamfileScanFilename(const minx::Hash& headKey,
     size_t len = 0;
     for (size_t i = 0; i < headKey.size() && headKey[i]; ++i) len++;
     name = std::string(reinterpret_cast<const char*>(headKey.data()), len);
+    // isReadableUTF8 accepts the full printable-ASCII range, including '/' and
+    // '.', so a key like "../../evil" used verbatim would yield a traversing
+    // filename. Neutralize path separators and a leading dot so the name stays a
+    // single in-dir component.
+    for (auto& c : name) if (c == '/' || c == '\\') c = '_';
+    if (!name.empty() && name[0] == '.') name[0] = '_';
   } else {
     name = minx::hashToString(headKey);
   }

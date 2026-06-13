@@ -62,7 +62,7 @@ constexpr uint64_t POW_QUEUE_REFRESH_SECS = 3;
 constexpr uint64_t POW_REWARD_BASE = 1000;
 // Ceiling on the difficulty used for the mint reward. (1<<(D-1))*POW_REWARD_BASE
 // must not overflow uint64 (and the shift must stay < 64). With base≈2^10, D=54
-// gives (1<<53)*1000 ≈ 9.0e18, comfortably under 2^64; D≥56 overflows and D≥65
+// gives (1<<53)*1000 ≈ 9.0e18, well under 2^64; D≥56 overflows and D≥65
 // is shift UB. A higher-difficulty solution still mints — capped at this reward.
 // The exponential reward is bounded; the solution's validity is not.
 constexpr int MAX_POW_DIFFICULTY = 54;
@@ -107,6 +107,17 @@ static inline uint8_t checkAssetWriteAuth(const Asset& asset,
       return CES_ERROR_NOT_OWNER;
   }
   return CES_OK;
+}
+
+// Saturating credit: add `amount` to an int64 balance, clamping at INT64_MAX
+// instead of wrapping — matching the wire path's ActiveAccount::credit so the
+// VM-host and wire credit paths never diverge on overflow. Unreachable in
+// practice (total minted << INT64_MAX), but keeps the two paths symmetric.
+static inline int64_t saturatingAddBalance(int64_t cur, uint64_t amount) {
+  if (cur >= 0 &&
+      static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - cur) < amount)
+    return std::numeric_limits<int64_t>::max();
+  return cur + static_cast<int64_t>(amount);
 }
 
 // ===========================================================================
@@ -436,7 +447,7 @@ public:
     // Each VM syscall that mutates or reads the ledger debits the same fee
     // its UDP-equivalent would debit, on top of the gas cost — otherwise a
     // VM run would be a multi-thousand-x discount on every state operation
-    // and trivially sidestep the rent and tx-fee economics. Flat-discounted
+    // and bypass the rent and tx-fee economics. Flat-discounted
     // fees ship to the VM with the multiplier already applied; syscall
     // handlers bill them as-is.
     this->feeQuery   = server_.discountFee(FeeKind::Query,       server_.cfg_.feeQuery);
@@ -520,8 +531,8 @@ public:
     auto ownerIt = server_.accounts_->find(programOwnerPrefix_);
     if (ownerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
     maybeSaveAccount(programOwnerPrefix_);
-    ownerIt->second.setBalance(ownerIt->second.getBalance() +
-                               static_cast<int64_t>(amount));
+    ownerIt->second.setBalance(
+      saturatingAddBalance(ownerIt->second.getBalance(), amount));
     return CES_OK;
   }
 
@@ -533,8 +544,8 @@ public:
     auto callerIt = server_.accounts_->find(caller_);
     if (callerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
     maybeSaveAccount(caller_);
-    callerIt->second.setBalance(callerIt->second.getBalance() +
-                                static_cast<int64_t>(amount));
+    callerIt->second.setBalance(
+      saturatingAddBalance(callerIt->second.getBalance(), amount));
     return CES_OK;
   }
 
@@ -626,7 +637,8 @@ public:
     auto sellerIt = server_.accounts_->find(sellerId);
     if (sellerIt != server_.accounts_->end()) {
       maybeSaveAccount(sellerId);
-      sellerIt->second.setBalance(sellerIt->second.getBalance() + realPrice);
+      sellerIt->second.setBalance(
+        saturatingAddBalance(sellerIt->second.getBalance(), realPrice));
     }
     maybeSaveAsset(key);
     it->second.setOwnerId(caller_);
@@ -702,7 +714,7 @@ public:
     auto peerIt = server_.accounts_->find(peerPrefix);
     if (peerIt != server_.accounts_->end()) {
       peerIt->second.setBalance(
-        peerIt->second.getBalance() + static_cast<int64_t>(amount));
+        saturatingAddBalance(peerIt->second.getBalance(), amount));
     } else {
       Account newAcc(peerKey, static_cast<int64_t>(amount), 0);
       server_.accounts_->getObjects().emplace(peerPrefix, newAcc);
@@ -794,7 +806,8 @@ private:
     maybeSaveAccount(destPrefix);
     auto destIt = server_.accounts_->find(destPrefix);
     if (destIt != server_.accounts_->end()) {
-      destIt->second.setBalance(destIt->second.getBalance() + amount);
+      destIt->second.setBalance(
+        saturatingAddBalance(destIt->second.getBalance(), amount));
     } else {
       Account newAcc(dest, amount, 0);
       server_.accounts_->getObjects().emplace(destPrefix, newAcc);
@@ -921,9 +934,9 @@ CesServer::CesServer(const CesConfig& config)
   if (cfg_.feeNetByteSent == 0) {
     // Symmetric per-byte rate (sending and receiving cost the
     // same on the server side: NIC, kernel buffers, CPU per byte).
-    // Anchor to per-byte-day rent / 1024 ≈ "1 byte ≈ 1 KB-day rent" —
-    // small but non-zero, which is the right magnitude for transient
-    // network bytes vs. long-lived disk bytes.
+    // Anchor to per-byte-day rent / 1024 ≈ "1 byte ≈ 1 KB-day rent":
+    // small but non-zero, scaling transient network bytes below long-lived
+    // disk bytes.
     uint64_t v = static_cast<uint64_t>(cfg_.feeFileRent) / 1024;
     if (v == 0) v = 1;
     cfg_.feeNetByteSent = v;
@@ -1257,9 +1270,9 @@ uint16_t CesServer::start(uint16_t serverPort) {
 
       // Start the Rudp tick pulse. The timer schedules itself
       // recursively on rpcTaskIO_ until stop() cancels it.
-      // Indirection via shared_ptr<std::function> to dodge the
-      // self-capture ordering footgun of a locally-defined
-      // recursive std::function lambda.
+      // Indirection via shared_ptr<std::function> so the recursive lambda can
+      // reference itself: a locally-defined recursive std::function would be
+      // captured before it is assigned.
       rpcTickTimer_ = std::make_shared<boost::asio::steady_timer>(rpcTaskIO_);
       // Server-side rpcRudp tick cadence. baseTickInterval (set above
       // to 1 ms) rate-limits packet emission to 1000 pkt/sec/channel;
@@ -4056,37 +4069,42 @@ void CesServer::_l2ValidateDedupAndDebit(
     uint32_t reqNonce,
     uint64_t timeUs,
     uint64_t sigHash,
-    std::function<void(uint8_t rc)> cb,
+    std::function<void(uint8_t rc, bool duplicate)> cb,
     boost::asio::any_io_executor cbExecutor) {
   (void)timeUs; // reserved for future time-window enforcement beyond dedup
   auto self = this;
   postLogic(
     [self, signer, amount, reqNonce, sigHash, cb, cbExecutor]() {
-      // 1. NONCELESS dedup (idempotent-retry contract): if the
-      // same signed envelope has already been processed this window,
-      // return CES_OK without touching the account.
-      if (reqNonce == CES_NONCELESS) {
-        if (!self->checkAndInsertDedup(sigHash)) {
-          boost::asio::post(cbExecutor, [cb]() { cb(CES_OK); });
-          return;
-        }
+      // 1. NONCELESS dedup — CHECK ONLY (do NOT insert here). Keying the
+      // record on the committed debit below (step 3), not on first sight
+      // of the request, is what keeps a *failed* op retryable and stops a
+      // *committed* op from re-running its side effect. On a hit, signal
+      // the caller it's a duplicate so it skips the side effect.
+      if (reqNonce == CES_NONCELESS && self->isDuplicateDedup(sigHash)) {
+        boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/true); });
+        return;
       }
       // 2. validateSpend handles all three nonce modes. errFee is
-      // feeQuery (same as every other signed op).
+      // feeQuery (same as every other signed op). A failure records
+      // nothing → the op stays retryable.
       HashPrefix id = Account::getMapKey(signer.getHash());
       ActiveAccount acc = self->accounts_.get(id);
       const int64_t errFee = static_cast<int64_t>(self->cfg_.getFeeError());
       uint8_t rc = acc.validateSpend(
         static_cast<uint64_t>(amount), 0, reqNonce, errFee);
       if (rc != CES_OK) {
-        boost::asio::post(cbExecutor, [cb, rc]() { cb(rc); });
+        boost::asio::post(cbExecutor, [cb, rc]() { cb(rc, /*duplicate=*/false); });
         return;
       }
-      // 3. Debit. No credit — the amount is burned (operator IS the
-      // CES server; it mints what it needs, collection isn't the
-      // model at L2-builtin scale).
+      // 3. Debit (the committed ledger event). No credit — the amount is
+      // burned (operator IS the CES server; it mints what it needs).
+      // Record the dedup at THIS commit point (NONCELESS only): check +
+      // debit + record run as one logic-strand task, so two retries
+      // serialize and exactly one sees duplicate=false.
       acc.debit(static_cast<uint64_t>(amount));
-      boost::asio::post(cbExecutor, [cb]() { cb(CES_OK); });
+      if (reqNonce == CES_NONCELESS)
+        self->recordDedup(sigHash);
+      boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/false); });
     });
 }
 
@@ -4365,7 +4383,24 @@ CesClientAsync* CesServer::getOrCreateSettlementClient(
   if (it != settlementClients_.end())
     return it->second.get();
   try {
-    auto ep = Resolver::resolveUdp(address);
+    // Prefer the endpoint the peer miner already resolved off-strand. A
+    // cross-transfer only reaches here for a `reachable` peer, and the miner
+    // sets reachability and resolvedEndpoint together, so this avoids a blocking
+    // getaddrinfo on the logic strand (the ledger heartbeat). resolveUdp stays
+    // as a fallback for a reachable peer with no cached endpoint.
+    boost::asio::ip::udp::endpoint ep;
+    bool haveEp = false;
+    {
+      std::lock_guard lock(peerTableMutex_);
+      for (const auto& p : peerTable_) {
+        if (p.ckey == peerKey && p.resolvedEndpointValid) {
+          ep = p.resolvedEndpoint;
+          haveEp = true;
+          break;
+        }
+      }
+    }
+    if (!haveEp) ep = Resolver::resolveUdp(address);
     auto client = std::make_unique<CesClientAsync>(
       settlementIO_, ep, serverKeyPair_, peerKey,
       CesClientAsync::DEFAULT_CHANNELS, cfg_.settlementMaxRetries);
@@ -4604,6 +4639,10 @@ void CesServer::peerMinerLoop() {
         // Populate resolvedIP off-strand (here on the miner thread) — this is
         // the single source for it, feeding isConnected's peer-IP trust check.
         peer.resolvedIP = ep.address();
+        // And the full endpoint, so settlement dispatch never has to resolve
+        // DNS on the logic strand (see getOrCreateSettlementClient).
+        peer.resolvedEndpoint = ep;
+        peer.resolvedEndpointValid = true;
         CesClient client(ep, false);
         client.start(0);
         if (!client.connect()) {
@@ -4723,6 +4762,8 @@ void CesServer::peerMinerLoop() {
             p.pingFailures = c.pingFailures;
             p.lastCheckTime = c.lastCheckTime;
             p.resolvedIP = c.resolvedIP;
+            p.resolvedEndpoint = c.resolvedEndpoint;
+            p.resolvedEndpointValid = c.resolvedEndpointValid;
             break;
           }
         }
@@ -4994,10 +5035,9 @@ void CesServer::executeRpc(std::shared_ptr<PendingRpc> pending) {
   }
   minx::SockAddr peer(addr, pending->port);
   // Channel ID from the OS CSPRNG. rpcTaskIO_ is a single thread, so a
-  // function-local random_device is fine. Collisions within a live peer
-  // session map are astronomically unlikely and not a correctness issue
-  // (if one ever happened, the inserted session would stomp the older
-  // entry — acceptable per the design decision that drove this path).
+  // function-local random_device is fine. A collision within a live peer
+  // session map is negligibly unlikely and not a correctness issue: the
+  // inserted session would replace the older entry, which is acceptable here.
   std::random_device rd;
   const uint32_t channelId = static_cast<uint32_t>(rd());
 

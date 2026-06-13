@@ -516,7 +516,7 @@ void sampleInstanceProc(Instance& inst, uint64_t nowUs) {
   uint32_t bp = 0;
   if (deltaUs > 0) {
     // bp = deltaTicks * 10000 * 1e6 / (tps * deltaUs)
-    // 128-bit to dodge overflow on longer intervals.
+    // 128-bit to avoid overflow on longer intervals.
     __uint128_t num =
       static_cast<__uint128_t>(deltaTicks) * 10000ull * 1'000'000ull;
     __uint128_t den =
@@ -1613,8 +1613,11 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // check above and here, so the reservation reflects that decision.
   auto launchSlot = std::make_shared<LaunchSlot>();
 
-  auto after = [ctx, name, upfront, ownerPk, launchSlot](uint8_t rc) mutable {
+  auto after = [ctx, name, upfront, ownerPk, launchSlot](uint8_t rc,
+                                                         bool /*duplicate*/) mutable {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // LAUNCH passes reqNonce=0 (opted out of dedup) so `duplicate` is never
+    // true here; each call independently mints + charges a fresh instance.
 
     // Debit the 15-min upfront from the source file's file_balance.
     // This is a commitment the host honors by starting + monitoring
@@ -1670,8 +1673,11 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const auto& cfg = ctx->server->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, id](uint8_t rc) {
+  auto after = [ctx, id](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Duplicate (resent envelope): the kill already committed; don't re-run it
+    // (idempotent anyway), just reply OK so the wire shape matches.
+    if (duplicate) { sendResponseAndLoop(ctx, CES_OK, {}); return; }
     killInstanceById(id);
     sendResponseAndLoop(ctx, CES_OK, {});
   };
@@ -1690,8 +1696,9 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
   const auto& cfg = ctx->server->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx](uint8_t rc) {
+  auto after = [ctx](uint8_t rc, bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Read-only: a duplicate just re-reads current state — correct, no skip.
     ces::Bytes resp;
     uint32_t countOff = resp.size();
     ces::Buffer::put<uint32_t>(resp, 0); // placeholder
@@ -1761,8 +1768,10 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const auto& cfg = ctx->server->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, name, fileBalance, instanceId](uint8_t rc) {
+  auto after = [ctx, name, fileBalance, instanceId](uint8_t rc,
+                                                    bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Read-only: a duplicate just re-reads current state — correct, no skip.
     auto it = gInstances.find(instanceId);
     if (it == gInstances.end()) {
       sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
@@ -1812,8 +1821,9 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
   const auto& cfg = ctx->server->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, name](uint8_t rc) {
+  auto after = [ctx, name](uint8_t rc, bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Read-only: a duplicate just re-reads current state — correct, no skip.
     ces::Bytes resp;
     auto it = gByName.find(name);
     uint32_t count = (it == gByName.end())
@@ -1908,8 +1918,8 @@ void supervisorTick() {
     }
 
     __uint128_t total = slotDebit + rssDebit + cpuDebit + bucketDebit;
-    // Clamp to uint64 max (would indicate gross misconfiguration
-    // rather than real usage).
+    // Clamp to uint64 max (reaching it would mean a misconfigured rate, not
+    // real usage).
     uint64_t debit = (total > static_cast<__uint128_t>(UINT64_MAX))
       ? UINT64_MAX : static_cast<uint64_t>(total);
     if (debit == 0) continue;
