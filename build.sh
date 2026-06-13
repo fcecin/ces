@@ -72,12 +72,13 @@ build_one_config() {
         EXTRA_ARGS="-DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
     fi
 
-    if [ ! -d "$BUILD_DIR" ]; then
-        echo "Configuring ${BUILD_TYPE_CAMEL} build..."
-        cmake -S . -B "$BUILD_DIR" \
-            -DCMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}" \
-            $EXTRA_ARGS
-    fi
+    # Always reconfigure: the git hash baked into the version stamp is
+    # captured at configure time (CMakeLists.txt, git rev-parse HEAD), so
+    # skipping configure on an existing build dir leaves the stamp stale.
+    echo "Configuring ${BUILD_TYPE_CAMEL} build..."
+    cmake -S . -B "$BUILD_DIR" \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}" \
+        $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
     cmake --build "$BUILD_DIR" --parallel "$(nproc)"
