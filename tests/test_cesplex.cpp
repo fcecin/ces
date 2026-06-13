@@ -1840,6 +1840,8 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
     "/p",                         // no second component
     "/",                          // just root
     "/h/tooshort/x",              // /h/ second is not 64 hex
+    "/p/secret.sidecar.toml",     // reserved sidecar suffix — would alias a sidecar
+    "/p/d/inner.sidecar.toml",    // reserved suffix in a nested component
     nullComp,                     // NUL byte in a component
   };
 

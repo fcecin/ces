@@ -11,7 +11,9 @@
 //   * No filesystem API. No os, io, debug, package, require,
 //     loadfile, dofile, load, loadstring, ffi (no runtime code/bytecode
 //     loading — bytecode is unverified in LuaJIT and an escape vector).
-//   * No networking primitive beyond client↔program messaging.
+//   * Outbound CesClient (ces.remote_account_read / ces.remote_transfer)
+//     reaches other CES servers; no inbound network beyond client↔program
+//     messaging.
 //   * Lua stays in memory, with RLIMIT_AS as a hard ceiling.
 //
 // Invocation: cesluajitd <ipc_socket_path> [drop_to_user]
@@ -72,6 +74,13 @@ extern "C" {
 #include <lualib.h>
 #include <luajit.h>
 }
+
+#include <ces/account.h>
+#include <ces/client.h>
+#include <ces/keys.h>
+#include <ces/protocol.h>
+#include <ces/types.h>
+#include <ces/util/resolver.h>
 
 // ---------------------------------------------------------------------------
 // Minimal SHA-256 for ces.sha256. Self-contained, tiny, no crypto
@@ -196,6 +205,7 @@ constexpr uint16_t METHOD_FILE_DELETE      = 0x0107;
 constexpr uint16_t METHOD_FILE_APPEND      = 0x0108;
 constexpr uint16_t METHOD_FILE_RESIZE      = 0x0109;
 constexpr uint16_t METHOD_TRANSFER         = 0x0200;
+constexpr uint16_t METHOD_CROSS_TRANSFER   = 0x0201;
 constexpr uint16_t METHOD_RANDOM_BYTES     = 0x0202;
 constexpr uint16_t METHOD_ACCOUNT_READ     = 0x0203;
 constexpr uint16_t METHOD_BUCKET_NEW       = 0x0210;
@@ -421,7 +431,10 @@ void apply_rlimits(size_t mem_max_bytes) {
   rlimit r{};
   r.rlim_cur = r.rlim_max = mem_max_bytes;
   ::setrlimit(RLIMIT_AS, &r);
-  r.rlim_cur = r.rlim_max = 8;
+  // Descriptor ceiling: stdio, the host UDS, and the outbound CesClient's
+  // socket plus asio internals (epoll / eventfd / timerfd). Bounded, but
+  // above the original no-network ceiling.
+  r.rlim_cur = r.rlim_max = 64;
   ::setrlimit(RLIMIT_NOFILE, &r);
 }
 
@@ -503,9 +516,9 @@ uint8_t g_owner_pubkey[32] = {0};
 // Per-instance program-account pubkey, supplied by bootstrap. Surfaced
 // via ces.program_pubkey() — the account ces.transfer spends from, which
 // programs advertise as their receive address so deposits and payouts
-// share one pool. Falls back to the owner pubkey if all-zero (legacy
-// file with no program account).
+// share one pool.
 uint8_t g_program_pubkey[32] = {0};
+uint8_t g_program_privkey[32] = {0};
 // Per-instance birth wall-clock microseconds, supplied by bootstrap.
 // Surfaced via ces.start_time(). Programs use it as a replay-
 // protection anchor: any payment with lastXferTime ≤ start_time/1e6
@@ -652,15 +665,9 @@ int lua_ces_owner_pubkey(lua_State* L) {
 // ces.program_pubkey() → string(32) — the file's dedicated program
 // account: the pool ces.transfer spends from, and the address a program
 // should advertise to receive funds (a game's "house", a service's
-// wallet) so deposits and payouts share one pool. Falls back to the
-// owner pubkey for a legacy file with no program account, matching
-// ces.transfer's own fallback.
+// wallet) so deposits and payouts share one pool.
 int lua_ces_program_pubkey(lua_State* L) {
-  bool zero = true;
-  for (int i = 0; i < 32; ++i)
-    if (g_program_pubkey[i] != 0) { zero = false; break; }
-  lua_pushlstring(L, reinterpret_cast<const char*>(
-                       zero ? g_owner_pubkey : g_program_pubkey), 32);
+  lua_pushlstring(L, reinterpret_cast<const char*>(g_program_pubkey), 32);
   return 1;
 }
 
@@ -794,6 +801,237 @@ int lua_ces_transfer(lua_State* L) {
     return 2;
   }
   // Tail: [u64 BE new_origin_balance]
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
+    return push_file_err(L, STATUS_INTERNAL);
+  uint64_t newBal = get_u64(reply.body.data() + 1);
+  lua_pushboolean(L, 1);
+  lua_pushnumber(L, static_cast<lua_Number>(newBal));
+  return 2;
+}
+
+// ces.remote_account_read(addr:string, account_pubkey:string(32))
+//   → balance, nonce, last_xfer_dest(8B), last_xfer_amount, last_xfer_time
+//     | nil, err
+//
+// Resolves `addr` ("ip:port" or "host:port") and queries that account on
+// the remote server via the child's own CesClient. Unsigned query — needs
+// no key. Blocks the Lua VM for the round-trip (sync).
+int lua_ces_remote_account_read(lua_State* L) {
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 1, &addr_len);
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 2, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "account pubkey must be 32 bytes");
+    return 2;
+  }
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = ces::Resolver::resolveUdp(std::string(addr, addr_len));
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  ces::Hash pubkey{};
+  std::memcpy(pubkey.data(), pk, 32);
+  ces::HashPrefix mapKey = ces::Account::getMapKey(pubkey);
+
+  ces::CesClient client(ep, /*useDataset=*/false);
+  if (!client.start(0) || !client.connect()) {
+    lua_pushnil(L);
+    lua_pushinteger(L, STATUS_INTERNAL);
+    return 2;
+  }
+  int64_t balance = 0;
+  uint32_t nonce = 0;
+  ces::HashPrefix lastDest{};
+  uint64_t lastAmt = 0;
+  uint32_t lastTime = 0;
+  uint8_t rc = client.queryAccount(mapKey, balance, nonce,
+                                   lastDest, lastAmt, lastTime);
+  client.disconnect();
+  client.stop();
+  if (rc != ces::CES_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+  }
+  lua_pushnumber(L, static_cast<lua_Number>(balance));
+  lua_pushnumber(L, static_cast<lua_Number>(nonce));
+  lua_pushlstring(L, reinterpret_cast<const char*>(lastDest.data()),
+                  lastDest.size());
+  lua_pushnumber(L, static_cast<lua_Number>(lastAmt));
+  lua_pushnumber(L, static_cast<lua_Number>(lastTime));
+  return 5;
+}
+
+// ces.remote_transfer(addr:string, dest_pubkey:string(32), amount:number)
+//   → true, new_origin_balance | nil, err
+//
+// Resolves `addr` and signs a transfer from the program's own account on
+// that remote server with the program's private key.
+int lua_ces_remote_transfer(lua_State* L) {
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 1, &addr_len);
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 2, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "dest pubkey must be 32 bytes");
+    return 2;
+  }
+  lua_Number amt_n = luaL_checknumber(L, 3);
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L);
+    lua_pushstring(L, "amount out of range");
+    return 2;
+  }
+  uint64_t amount = static_cast<uint64_t>(amt_n);
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = ces::Resolver::resolveUdp(std::string(addr, addr_len));
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  ces::Hash priv{};
+  std::memcpy(priv.data(), g_program_privkey, 32);
+  ces::KeyPair kp(priv, ces::KeyAlgo::ED25519);
+  ces::Hash dest{};
+  std::memcpy(dest.data(), pk, 32);
+
+  ces::CesClient client(ep, /*useDataset=*/false);
+  client.setKey(kp);
+  if (!client.start(0) || !client.connect()) {
+    lua_pushnil(L);
+    lua_pushinteger(L, STATUS_INTERNAL);
+    return 2;
+  }
+  int64_t newBal = 0;
+  uint8_t rc = client.transfer(dest, amount, newBal);
+  client.disconnect();
+  client.stop();
+  if (rc != ces::CES_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  lua_pushnumber(L, static_cast<lua_Number>(newBal));
+  return 2;
+}
+
+// ces.remote_cross_transfer(addr:string, dest_pubkey:string(32),
+//                           amount:number, dest_server:string)
+//   → true, new_origin_balance | nil, err
+//
+// Asks the remote server at `addr` to cross-transfer the program's funds
+// held THERE to `dest_pubkey` on `dest_server` (a peer of `addr`). Signed
+// with the program's private key — the remote server is the cross originator.
+int lua_ces_remote_cross_transfer(lua_State* L) {
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 1, &addr_len);
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 2, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "dest pubkey must be 32 bytes");
+    return 2;
+  }
+  lua_Number amt_n = luaL_checknumber(L, 3);
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L);
+    lua_pushstring(L, "amount out of range");
+    return 2;
+  }
+  uint64_t amount = static_cast<uint64_t>(amt_n);
+  size_t dsrv_len = 0;
+  const char* dsrv = luaL_checklstring(L, 4, &dsrv_len);
+
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = ces::Resolver::resolveUdp(std::string(addr, addr_len));
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  ces::Hash priv{};
+  std::memcpy(priv.data(), g_program_privkey, 32);
+  ces::KeyPair kp(priv, ces::KeyAlgo::ED25519);
+  ces::Hash dest{};
+  std::memcpy(dest.data(), pk, 32);
+
+  ces::CesClient client(ep, /*useDataset=*/false);
+  client.setKey(kp);
+  if (!client.start(0) || !client.connect()) {
+    lua_pushnil(L);
+    lua_pushinteger(L, STATUS_INTERNAL);
+    return 2;
+  }
+  int64_t newBal = 0;
+  uint8_t rc = client.crossTransfer(dest, amount,
+                                    std::string(dsrv, dsrv_len), newBal);
+  client.disconnect();
+  client.stop();
+  if (rc != ces::CES_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  lua_pushnumber(L, static_cast<lua_Number>(newBal));
+  return 2;
+}
+
+// ces.cross_transfer(dest_pubkey:string(32), amount:number, dest_server:string)
+//   → true, new_origin_balance | nil, err_code
+//
+// Asks THIS server (home) to cross-transfer the program's funds here to
+// `dest_pubkey` on peer `dest_server`. Server-mediated (home is the
+// originator); no key needed — runs under owner/program authority like
+// ces.transfer.
+int lua_ces_cross_transfer(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "dest pubkey must be 32 bytes");
+    return 2;
+  }
+  lua_Number amt_n = luaL_checknumber(L, 2);
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L);
+    lua_pushstring(L, "amount out of range");
+    return 2;
+  }
+  uint64_t amount = static_cast<uint64_t>(amt_n);
+  size_t dsrv_len = 0;
+  const char* dsrv = luaL_checklstring(L, 3, &dsrv_len);
+  if (dsrv_len == 0 || dsrv_len > 255) {
+    lua_pushnil(L);
+    lua_pushstring(L, "dest_server length out of range");
+    return 2;
+  }
+
+  std::vector<uint8_t> args;
+  args.reserve(WIRE_KEY_LEN + sizeof(uint64_t) + 1 + dsrv_len);
+  put_bytes(args, pk, 32);
+  put_u64(args, amount);
+  args.push_back(static_cast<uint8_t>(dsrv_len));
+  put_bytes(args, dsrv, dsrv_len);
+
+  Frame reply;
+  if (!api_call(METHOD_CROSS_TRANSFER, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body[0];
+  if (st != STATUS_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, st);
+    return 2;
+  }
   if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
     return push_file_err(L, STATUS_INTERNAL);
   uint64_t newBal = get_u64(reply.body.data() + 1);
@@ -1703,6 +1941,14 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_file_delete);   lua_setfield(L, -2, "file_delete");
   lua_pushcfunction(L, lua_ces_file_append);   lua_setfield(L, -2, "file_append");
   lua_pushcfunction(L, lua_ces_file_resize);   lua_setfield(L, -2, "file_resize");
+  lua_pushcfunction(L, lua_ces_remote_account_read);
+  lua_setfield(L, -2, "remote_account_read");
+  lua_pushcfunction(L, lua_ces_remote_transfer);
+  lua_setfield(L, -2, "remote_transfer");
+  lua_pushcfunction(L, lua_ces_remote_cross_transfer);
+  lua_setfield(L, -2, "remote_cross_transfer");
+  lua_pushcfunction(L, lua_ces_cross_transfer);
+  lua_setfield(L, -2, "cross_transfer");
 
   // ces.conn — /ces/lua/1 connection routing.
   lua_newtable(L);
@@ -1748,7 +1994,7 @@ int main(int argc, char** argv) {
   // Read bootstrap frame. Body layout (must match
   // compute_handler.cpp::sendBootstrapFrame):
   //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
-  //   [8B start_time_us BE][u32 BE src_len][src bytes]
+  //   [32B program_privkey][8B start_time_us BE][u32 BE src_len][src bytes]
   Frame bs;
   if (!read_frame(bs) || bs.tag != TAG_BOOTSTRAP) {
     std::fprintf(stderr, "cesluajitd: bad bootstrap frame\n");
@@ -1759,16 +2005,18 @@ int main(int argc, char** argv) {
   constexpr size_t kOffPrefix  = 0;
   constexpr size_t kOffOwner   = kOffPrefix  + WIRE_PREFIX_LEN;
   constexpr size_t kOffProgram = kOffOwner   + WIRE_KEY_LEN;
-  constexpr size_t kOffStart   = kOffProgram + WIRE_KEY_LEN;
+  constexpr size_t kOffPrivkey = kOffProgram + WIRE_KEY_LEN;
+  constexpr size_t kOffStart   = kOffPrivkey + WIRE_KEY_LEN;
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
     std::fprintf(stderr, "cesluajitd: bootstrap too short\n");
     return 1;
   }
-  std::memcpy(g_prog_prefix,    bs.body.data() + kOffPrefix,  WIRE_PREFIX_LEN);
-  std::memcpy(g_owner_pubkey,   bs.body.data() + kOffOwner,   WIRE_KEY_LEN);
-  std::memcpy(g_program_pubkey, bs.body.data() + kOffProgram, WIRE_KEY_LEN);
+  std::memcpy(g_prog_prefix,     bs.body.data() + kOffPrefix,  WIRE_PREFIX_LEN);
+  std::memcpy(g_owner_pubkey,    bs.body.data() + kOffOwner,   WIRE_KEY_LEN);
+  std::memcpy(g_program_pubkey,  bs.body.data() + kOffProgram, WIRE_KEY_LEN);
+  std::memcpy(g_program_privkey, bs.body.data() + kOffPrivkey, WIRE_KEY_LEN);
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {

@@ -152,6 +152,7 @@ constexpr uint16_t kApiMethodFileResize   = 0x0109;
 //   RANDOM_BYTES — crypto-grade RNG, n ≤ 256.
 //   ACCOUNT_READ — unsigned account query, no fee.
 constexpr uint16_t kApiMethodTransfer     = 0x0200;
+constexpr uint16_t kApiMethodCrossTransfer = 0x0201;
 constexpr uint16_t kApiMethodRandomBytes  = 0x0202;
 constexpr uint16_t kApiMethodAccountRead  = 0x0203;
 // Per-instance rotating bucket cache (minx::BucketCache wrapper):
@@ -244,10 +245,11 @@ struct Instance : std::enable_shared_from_this<Instance> {
   uint64_t id = 0;
   std::string sourceName;
   std::array<uint8_t, 32> ownerPk{};
-  // Program account pubkey from the source file's sidecar. All-zero
-  // means "legacy file, no program account" — Lua API origin falls
-  // back to ownerPk in that case.
+  // Program account pubkey from the source file's sidecar.
   std::array<uint8_t, 32> programPubkey{};
+  // Program account ed25519 private half, copied to the child at bootstrap
+  // so it can sign its own remote ops.
+  std::array<uint8_t, 32> programPrivkey{};
   std::array<uint8_t, 8> progPrefix{};  // first 8B of sha256(sourceName)
   pid_t pid = -1;
   uint64_t startedAtUs = 0;
@@ -685,7 +687,7 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 
 // Send the bootstrap frame at LAUNCH time. Body layout:
 //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
-//   [8B start_time_us BE][u32 BE src_len][src bytes]
+//   [32B program_privkey][8B start_time_us BE][u32 BE src_len][src bytes]
 // - prog_prefix: first 8B of sha256(source path); used as the
 //   "prog_pfx" field on outbound CES_APP_COMPUTE_MSG packets so the
 //   remote CES client can demux by program.
@@ -695,8 +697,8 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 //   account — the pool ces.transfer spends from. Programs surface it
 //   via ces.program_pubkey() and advertise it as their receive address
 //   (e.g. a game's "house"), so deposits and payouts share one pool.
-//   All-zero for a legacy file with no program account; the child then
-//   falls back to owner_pubkey, matching ces.transfer's own fallback.
+// - program_privkey: the program account's ed25519 private half, so the
+//   program can sign its own remote ops.
 // - start_time_us: this instance's birth wall-clock micros (same
 //   value as inst->startedAtUs). Programs use it as a freshness
 //   anchor for replay protection — a payment whose lastXferTime is
@@ -705,14 +707,16 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
                         const uint8_t* src, size_t srcLen) {
   ces::Bytes body;
   body.reserve(sizeof(inst->progPrefix) + sizeof(inst->ownerPk)
-               + sizeof(inst->programPubkey) + sizeof(uint64_t)
-               + sizeof(uint32_t) + srcLen);
+               + sizeof(inst->programPubkey) + sizeof(inst->programPrivkey)
+               + sizeof(uint64_t) + sizeof(uint32_t) + srcLen);
   body.insert(body.end(),
               inst->progPrefix.begin(), inst->progPrefix.end());
   body.insert(body.end(),
               inst->ownerPk.begin(), inst->ownerPk.end());
   body.insert(body.end(),
               inst->programPubkey.begin(), inst->programPubkey.end());
+  body.insert(body.end(),
+              inst->programPrivkey.begin(), inst->programPrivkey.end());
   ces::Buffer::put<uint64_t>(body, inst->startedAtUs);
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(srcLen));
   if (srcLen > 0)
@@ -865,16 +869,49 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
-    // Origin = file's program account if migrated, else legacy
-    // owner-account fallback.
+    // Origin = the file's program account.
     minx::Hash origin{};
-    bool zero = true;
-    for (auto b : inst->programPubkey) if (b != 0) { zero = false; break; }
-    std::memcpy(origin.data(),
-                zero ? inst->ownerPk.data() : inst->programPubkey.data(),
-                32);
+    std::memcpy(origin.data(), inst->programPubkey.data(), 32);
     auto inst_cap = inst;
     server->_l2Transfer(origin, dest, amount,
+      [inst_cap, corr_id](uint8_t rc, int64_t newBal) {
+        ces::Bytes tail;
+        ces::Buffer::put<uint64_t>(tail, static_cast<uint64_t>(
+          newBal < 0 ? 0 : newBal));
+        sendApiReplyWithBody(inst_cap, corr_id, rc, tail);
+      },
+      inst->peer->get_executor());
+    return;
+  }
+
+  // ---- ces.cross_transfer(dest_pubkey, amount, dest_server). The home
+  // server is the cross-transfer originator: debit the program's account
+  // here, settle `amount` to `dest` on peer `dest_server`. Origin = the
+  // program account, same as ces.transfer.
+  // Args: [32B dest][u64 amount][u8 srv_len][srv]. Reply: [u8 status][u64 BE bal].
+  if (method == kApiMethodCrossTransfer) {
+    if (mlen < ces::KEY_SIZE + sizeof(uint64_t) + 1) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint8_t srvLen = mbody[ces::KEY_SIZE + sizeof(uint64_t)];
+    if (srvLen == 0 ||
+        mlen < ces::KEY_SIZE + sizeof(uint64_t) + 1 + srvLen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    minx::Hash dest{};
+    std::memcpy(dest.data(), mbody, 32);
+    uint64_t amount = ces::Buffer::peek<uint64_t>(mbody + 32);
+    std::string destServer(
+      reinterpret_cast<const char*>(mbody + ces::KEY_SIZE + sizeof(uint64_t) + 1),
+      srvLen);
+    CesServer* server = gServer.load();
+    if (!server) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    minx::Hash origin{};
+    std::memcpy(origin.data(), inst->programPubkey.data(), 32);
+    auto inst_cap = inst;
+    server->_l2CrossTransfer(origin, dest, amount, destServer,
       [inst_cap, corr_id](uint8_t rc, int64_t newBal) {
         ces::Bytes tail;
         ces::Buffer::put<uint64_t>(tail, static_cast<uint64_t>(
@@ -1087,15 +1124,9 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     uint16_t balance = assetBalance(days, /*priv=*/false, /*aowned=*/false,
                                     /*immutable=*/true);
 
-    // Origin = file's program account if migrated, else legacy
-    // owner-account fallback.
+    // Origin = the file's program account.
     minx::Hash origin{};
-    bool ppkZero = true;
-    for (auto b : inst->programPubkey)
-      if (b != 0) { ppkZero = false; break; }
-    std::memcpy(origin.data(),
-                ppkZero ? inst->ownerPk.data() : inst->programPubkey.data(),
-                32);
+    std::memcpy(origin.data(), inst->programPubkey.data(), 32);
     HashPrefix recipientPrefix = ces::Account::getMapKey(recipient);
 
     auto inst_cap = inst;
@@ -1429,11 +1460,11 @@ void allocateAndSpawnInstance(
   std::error_code ec;
   std::filesystem::create_directories(workDir, ec);
 
-  // Read the source's program-account pubkey from its sidecar. May
-  // be all-zero (legacy file pre-migration) — Lua API origin falls
-  // back to ownerPk in that case.
+  // Read the source's program-account keypair from its sidecar.
   std::array<uint8_t, 32> programPubkey{};
+  std::array<uint8_t, 32> programPrivkey{};
   fileHandlerReadProgramPubkey(name, programPubkey);
+  fileHandlerReadProgramPrivkey(name, programPrivkey);
 
   uint64_t id = gNextInstanceId++;
   auto inst = std::make_shared<Instance>();
@@ -1441,6 +1472,7 @@ void allocateAndSpawnInstance(
   inst->sourceName = name;
   inst->ownerPk = ownerPk;
   inst->programPubkey = programPubkey;
+  inst->programPrivkey = programPrivkey;
   inst->progPrefix = progPrefixOf(name);
   inst->socketPath = instanceSocketPath(cfg, id).string();
   inst->upfrontDeposit = upfront;

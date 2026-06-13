@@ -63,15 +63,19 @@ bool fileHandlerReadOwnerAndBalance(
     std::array<uint8_t, 32>& outOwnerPubkey,
     uint64_t& outFileBalance);
 
-// Read the file's program-account pubkey (the synthetic 32B pubkey
-// stored in the sidecar at CREATE time, identifying the in-RAM
-// Account that running instances of this program share). Returns
-// false if the file doesn't exist or the sidecar is unreadable.
-// All-zero on success means the file pre-dates the program-account
-// migration (legacy, fall back to owner-account behavior).
+// Read the file's program-account pubkey (the ed25519 public key stored
+// in the sidecar at CREATE time, identifying the ledger Account that
+// running instances of this program share). Returns false if the file
+// doesn't exist or the sidecar is unreadable.
 bool fileHandlerReadProgramPubkey(
     const std::string& name,
     std::array<uint8_t, 32>& outProgramPubkey);
+
+// Read the file's program-account ed25519 private key (sidecar). Returns
+// false if the file doesn't exist or the sidecar is unreadable.
+bool fileHandlerReadProgramPrivkey(
+    const std::string& name,
+    std::array<uint8_t, 32>& outProgramPrivkey);
 
 // Debit `amount` credits from the file's file_balance. Rolls rent
 // forward before the debit. If the post-roll balance cannot cover

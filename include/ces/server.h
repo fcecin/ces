@@ -654,27 +654,25 @@ public:
   //
   // Files in the L2 file store carry an associated "program account":
   // a regular ledger Account in accountStore_, identified by a 32B
-  // synthetic pubkey for which no private key exists. This is the
-  // unified balance pool that compute supervision, Lua-side
-  // ces.transfer / ces.authentic_asset_create, and file handler fee
-  // collection all debit. Inbound transfers (anyone → this account)
-  // work normally; outbound only happens via server-mediated paths
-  // that don't require a signature.
+  // ed25519 public key. This is the unified balance pool that compute
+  // supervision, Lua-side ces.transfer / ces.authentic_asset_create, and
+  // file handler fee collection all debit. Inbound transfers (anyone →
+  // this account) work normally; the program can also sign outbound ops
+  // with the account's private key (held in the sidecar).
   //
-  // The pubkey is allocated once at file CREATE and stored in the
-  // sidecar (program_pubkey field). All running instances of the
-  // same source file share the same program account.
+  // The keypair is allocated once at file CREATE and stored in the
+  // sidecar (program_pubkey / program_privkey). All running instances of
+  // the same source file share the same program account.
 
-  // Generate 32 random bytes (server PRNG) for use as the program
-  // account's synthetic pubkey, then on logicStrand_ create an
-  // Account with that pubkey and starting balance `initial`. The
-  // generated pubkey is returned via `cb`. If the account already
-  // existed (e.g., a recreated /s/ deployment recovering from rent
-  // exhaustion) the existing account is credited by `initial`
+  // Generate a fresh ed25519 keypair for the program account, then on
+  // logicStrand_ create an Account with that pubkey and starting balance
+  // `initial`. The pubkey and private key are returned via `cb`. If the
+  // account already existed (e.g., a recreated /s/ deployment recovering
+  // from rent exhaustion) the existing account is credited by `initial`
   // instead — same shape as _brr.
   void _l2CreateProgramAccount(
       int64_t initial,
-      std::function<void(minx::Hash newPubkey)> cb,
+      std::function<void(minx::Hash newPubkey, minx::Hash newPrivkey)> cb,
       boost::asio::any_io_executor cbExecutor);
 
   // Atomically debit `amount` from the program account at `pubkey`
@@ -696,9 +694,9 @@ public:
   // the caller wakes up. **Caller MUST NOT be running on
   // logicStrand_** (would deadlock).
   //
-  // Used as a transitional helper by sync legacy code (file handler
-  // CREDIT/DEBIT, compute supervisor tick) during the program-account
-  // migration. Slated for removal once those callers go fully async.
+  // Sync helper for callers that are not yet async (file handler
+  // CREDIT/DEBIT, compute supervisor tick). Slated for removal once
+  // those callers go fully async.
   struct ProgramAccountDebitResult {
     bool ok;
     int64_t newBalance;
@@ -721,6 +719,18 @@ public:
       const minx::Hash& originKey,
       const minx::Hash& destKey,
       uint64_t amount,
+      std::function<void(uint8_t rc, int64_t newOriginBalance)> cb,
+      boost::asio::any_io_executor cbExecutor);
+
+  // Program-initiated cross-transfer (home server is the originator).
+  // Wraps crossTransfer() onto logicStrand_ — debits origin here, credits
+  // the vostro for `destServer`, settles to destKey on that peer. Hops back
+  // to cbExecutor with the result code and origin's post-call balance.
+  void _l2CrossTransfer(
+      const minx::Hash& originKey,
+      const minx::Hash& destKey,
+      uint64_t amount,
+      const std::string& destServer,
       std::function<void(uint8_t rc, int64_t newOriginBalance)> cb,
       boost::asio::any_io_executor cbExecutor);
 

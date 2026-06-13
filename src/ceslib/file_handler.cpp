@@ -198,6 +198,7 @@ uint8_t validateCesFileName(const std::string& name) {
   size_t i = 1;
   size_t firstStart = 0, firstLen = 0;
   size_t secondStart = 0, secondLen = 0;
+  const size_t sidecarSuffixLen = std::strlen(kSidecarSuffix);
   while (i < n) {
     size_t start = i;
     while (i < n && name[i] != '/') {
@@ -210,6 +211,12 @@ uint8_t validateCesFileName(const std::string& name) {
     // Reject any component starting with '.' — one check covers ".", "..",
     // and dotfiles, blocking traversal and hidden entries.
     if (name[start] == '.') return CES_ERROR_BAD_NAME;
+    // ".sidecar.toml" is reserved: a component ending in it would map a
+    // content path onto a sidecar file on disk. Reject in any component.
+    if (len >= sidecarSuffixLen &&
+        name.compare(start + len - sidecarSuffixLen,
+                     sidecarSuffixLen, kSidecarSuffix) == 0)
+      return CES_ERROR_BAD_NAME;
     ++comp_count;
     if (comp_count > kMaxPathComponents) return CES_ERROR_BAD_NAME;
     if (comp_count == 1) { firstStart = start; firstLen = len; }
@@ -322,15 +329,15 @@ struct Sidecar {
   uint32_t version = kSidecarVersion;
   std::string name;
   std::array<uint8_t, 32> owner_pubkey{};
-  // 32-byte non-cryptographic public key identifying the file's
-  // "program account" in accountStore_. Allocated at CREATE,
-  // referenced by every running instance of this program. No
-  // private key exists — only server-mediated paths (LAUNCH,
-  // compute supervisor tick, Lua API debits, file-handler fee
-  // collection) can move credits out. Inbound transfers (anyone
-  // → this account) work normally; the account participates in
-  // daily account-rent maintenance just like a user account.
+  // The file's "program account" in accountStore_, allocated at CREATE and
+  // referenced by every running instance. Real ed25519 keypair: program_pubkey
+  // keys the account; program_privkey is the private half the program signs its
+  // own remote ops with. The private half lives only here on disk (server-side)
+  // — STAT never returns it (allowlist), and the sidecar is unreachable as
+  // content (.sidecar.toml is a reserved suffix). Inbound transfers work
+  // normally; the account pays daily rent like any account.
   std::array<uint8_t, 32> program_pubkey{};
+  std::array<uint8_t, 32> program_privkey{};
   uint64_t price_per_kb = 0;
   uint64_t size = 0;
   std::string content_type;
@@ -360,6 +367,8 @@ bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
                        hexOf(s.owner_pubkey.data(), s.owner_pubkey.size()));
   tbl.insert_or_assign("program_pubkey",
                        hexOf(s.program_pubkey.data(), s.program_pubkey.size()));
+  tbl.insert_or_assign("program_privkey",
+                       hexOf(s.program_privkey.data(), s.program_privkey.size()));
   tbl.insert_or_assign("price_per_kb", static_cast<int64_t>(s.price_per_kb));
   tbl.insert_or_assign("size", static_cast<int64_t>(s.size));
   tbl.insert_or_assign("content_type", s.content_type);
@@ -416,6 +425,11 @@ bool readSidecar(const std::filesystem::path& path, Sidecar& s) {
   if (!getStr("program_pubkey", progPubkeyHex)) return false;
   if (!hexTo(progPubkeyHex, s.program_pubkey.data(),
              s.program_pubkey.size()))
+    return false;
+  std::string progPrivkeyHex;
+  if (!getStr("program_privkey", progPrivkeyHex)) return false;
+  if (!hexTo(progPrivkeyHex, s.program_privkey.data(),
+             s.program_privkey.size()))
     return false;
   if (!getU64("price_per_kb", s.price_per_kb)) return false;
   if (!getU64("size", s.size)) return false;
@@ -552,8 +566,7 @@ uint64_t computeOwedRent(uint64_t size, int64_t feeRent,
 //   in-flight op.
 // - If owed is zero (same microsecond, free-tier, etc.): no-op,
 //   returns true. Caller may skip writing the sidecar.
-// True iff sc.program_pubkey is non-zero (file has been migrated to
-// the program-account model).
+// True iff sc.program_pubkey is non-zero (the file has a program account).
 bool sidecarHasProgramAccount(const Sidecar& sc) {
   for (auto b : sc.program_pubkey)
     if (b != 0) return true;
@@ -943,8 +956,8 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
         // The seed deposit minus the upfront-burn lands in the
         // file's program account (a fresh ledger Account allocated
-        // here). Allocate via _l2CreateProgramAccount, which hops
-        // to logicStrand_ to mint the synthetic-pubkey account.
+        // here). Allocate via _l2CreateProgramAccount, which mints a
+        // fresh ed25519 keypair and creates the account on logicStrand_.
         uint64_t programAccountInitial = (initialDeposit > upfrontBurn)
           ? (initialDeposit - upfrontBurn) : 0;
 
@@ -952,11 +965,8 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
           static_cast<int64_t>(programAccountInitial),
           [ctx, size, pricePerKb, initialDeposit, programAccountInitial,
            contentType, name, cPath, sPath]
-          (minx::Hash programPubkey) mutable {
+          (minx::Hash programPubkey, minx::Hash programPrivkey) mutable {
             std::error_code ec;
-            // Build sidecar. file_balance is kept as a transitional
-            // mirror of programAccountInitial during the staged
-            // migration; program_pubkey is the new authoritative ref.
             Sidecar s{};
             s.version = kSidecarVersion;
             s.name = name;
@@ -964,6 +974,8 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
                         ctx->bound.boundPubkey.getHash().data(), 32);
             std::memcpy(s.program_pubkey.data(),
                         programPubkey.data(), 32);
+            std::memcpy(s.program_privkey.data(),
+                        programPrivkey.data(), 32);
             s.price_per_kb = pricePerKb;
             s.size = size;
             s.content_type = contentType;
@@ -2683,11 +2695,17 @@ void execCreate(CesServer* server, FileExecReq req,
     uint64_t programAccountInitial = (initialDeposit > upfrontBurn)
       ? (initialDeposit - upfrontBurn) : 0;
     std::array<uint8_t, 32> programPubkey{};
+    std::array<uint8_t, 32> programPrivkey{};
     {
-      // Generate the synthetic pubkey here on rpcTaskIO_ before
-      // hopping to logicStrand_ to mint the account.
-      ces::getThreadLocalPRNG().GenerateBlock(
-        reinterpret_cast<CryptoPP::byte*>(programPubkey.data()), 32);
+      // Generate a real ed25519 keypair for the file's program account on
+      // rpcTaskIO_ before hopping to logicStrand_ to mint the account. The
+      // public half keys the account; the private half is stored in the sidecar
+      // so the program can sign its own remote ops.
+      ces::KeyPair kp = ces::KeyPair::generate();
+      const auto& pub = kp.getPublicKeyAsHash();
+      const auto& priv = kp.getPrivateKey();
+      std::memcpy(programPubkey.data(), pub.data(), 32);
+      std::memcpy(programPrivkey.data(), priv.data(), 32);
       minx::Hash pubkey{};
       std::memcpy(pubkey.data(), programPubkey.data(), 32);
       server->_l2CreditProgramAccountSync(
@@ -2698,6 +2716,7 @@ void execCreate(CesServer* server, FileExecReq req,
     s.name = req.name;
     std::memcpy(s.owner_pubkey.data(), req.ownerPubkey.data(), 32);
     s.program_pubkey = programPubkey;
+    s.program_privkey = programPrivkey;
     s.price_per_kb = req.pricePerKb;
     s.size = req.size;
     s.content_type = req.contentType;
@@ -2741,6 +2760,22 @@ bool fileHandlerReadProgramPubkey(
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return false;
   outProgramPubkey = sc.program_pubkey;
+  return true;
+}
+
+// Read the file's program-account ed25519 private key from its sidecar.
+// All-zero on success means the account has no signing key (no remote
+// signing). False if the sidecar is unreadable.
+bool fileHandlerReadProgramPrivkey(
+    const std::string& name,
+    std::array<uint8_t, 32>& outProgramPrivkey) {
+  CesServer* server = gServer.load();
+  if (!server) return false;
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return false;
+  outProgramPrivkey = sc.program_privkey;
   return true;
 }
 
@@ -2960,9 +2995,9 @@ constexpr int64_t kServerZoneProgramAccountTopUp = 10'000'000'000LL;
 // Already-correct sidecars are left alone (no atomic rewrite churn).
 //
 // Each /s/ file gets a dedicated program account in accountStore_, with a
-// fresh synthetic pubkey on first reconcile, preserved across reboots (the
-// pubkey stays in the sidecar). Every reconcile pass tops the program
-// account up to the default; the operator funds the program's bankroll.
+// fresh ed25519 keypair minted on first reconcile and preserved across
+// reboots (the keypair stays in the sidecar). Every reconcile pass tops the
+// program account up to the default; the operator funds the program's bankroll.
 void reconcileServerZone(CesServer* server, const std::string& dir) {
   namespace fs = std::filesystem;
   fs::path sRoot = fs::path(dir) / "s";
@@ -3004,13 +3039,16 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
     // already-minted assets stamped with that program identity stay
     // resolvable. Generate a fresh one only on first sight.
     std::array<uint8_t, 32> programPubkey{};
+    std::array<uint8_t, 32> programPrivkey{};
     bool existingHasPubkey = haveExisting &&
       sidecarHasProgramAccount(existing);
     if (existingHasPubkey) {
       programPubkey = existing.program_pubkey;
+      programPrivkey = existing.program_privkey;
     } else {
-      ces::getThreadLocalPRNG().GenerateBlock(
-        reinterpret_cast<CryptoPP::byte*>(programPubkey.data()), 32);
+      ces::KeyPair kp = ces::KeyPair::generate();
+      std::memcpy(programPubkey.data(), kp.getPublicKeyAsHash().data(), 32);
+      std::memcpy(programPrivkey.data(), kp.getPrivateKey().data(), 32);
     }
 
     bool sidecarOk = haveExisting &&
@@ -3025,6 +3063,7 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
       s.name = name;
       s.owner_pubkey = serverPk;
       s.program_pubkey = programPubkey;
+      s.program_privkey = programPrivkey;
       s.price_per_kb = 0;
       s.size = size;
       s.content_type = inferContentType(name);

@@ -4124,21 +4124,22 @@ void CesServer::_l2CreditAccount(
 
 void CesServer::_l2CreateProgramAccount(
     int64_t initial,
-    std::function<void(minx::Hash newPubkey)> cb,
+    std::function<void(minx::Hash newPubkey, minx::Hash newPrivkey)> cb,
     boost::asio::any_io_executor cbExecutor) {
-  // 1. Generate 32 random bytes for the synthetic pubkey. PRNG is
-  // thread-local; safe to call here on rpcTaskIO_ before posting.
-  minx::Hash pubkey{};
-  ces::getThreadLocalPRNG().GenerateBlock(
-    reinterpret_cast<CryptoPP::byte*>(pubkey.data()), 32);
+  // Generate the program account's ed25519 keypair. PRNG is thread-local;
+  // safe to call here on rpcTaskIO_ before posting.
+  ces::KeyPair kp = ces::KeyPair::generate();
+  minx::Hash pubkey = kp.getPublicKeyAsHash();
+  minx::Hash privkey = kp.getPrivateKey();
 
   auto self = this;
   postLogic(
-    [self, pubkey, initial, cb, cbExecutor]() {
+    [self, pubkey, privkey, initial, cb, cbExecutor]() {
       // _brrInner: credits if account exists, creates if missing.
       self->_brrInner(pubkey, initial);
       if (cb)
-        boost::asio::post(cbExecutor, [cb, pubkey]() { cb(pubkey); });
+        boost::asio::post(cbExecutor,
+          [cb, pubkey, privkey]() { cb(pubkey, privkey); });
     });
 }
 
@@ -4235,6 +4236,24 @@ void CesServer::_l2Transfer(
       uint8_t rc = self->transfer(originKey, destKey, amount,
                                   TransferMode::Open, 0,
                                   CES_NONCELESS, newBal);
+      boost::asio::post(cbExecutor,
+        [cb, rc, newBal]() { cb(rc, newBal); });
+    });
+}
+
+void CesServer::_l2CrossTransfer(
+    const minx::Hash& originKey,
+    const minx::Hash& destKey,
+    uint64_t amount,
+    const std::string& destServer,
+    std::function<void(uint8_t rc, int64_t newOriginBalance)> cb,
+    boost::asio::any_io_executor cbExecutor) {
+  auto self = this;
+  postLogic(
+    [self, originKey, destKey, amount, destServer, cb, cbExecutor]() {
+      int64_t newBal = 0;
+      uint8_t rc = self->crossTransfer(originKey, destKey, amount, destServer,
+                                       CES_NONCELESS, newBal);
       boost::asio::post(cbExecutor,
         [cb, rc, newBal]() { cb(rc, newBal); });
     });
