@@ -439,7 +439,7 @@ public:
   uint8_t scheduleRun(const HashPrefix& callerPrefix, const minx::Hash& assetId,
                       uint64_t budget, uint64_t allowance,
                       const ces::Bytes& input,
-                      uint64_t time_us);
+                      uint64_t time_us, bool prepaid = false);
 
   uint8_t crossTransfer(const minx::Hash& originKey,
                         const minx::Hash& destKey, uint64_t amount,
@@ -553,6 +553,18 @@ public:
   // Test hook: post runAutoexec() onto logicStrand_ and block until done.
   // Production callers go through the one-shot boot post in start().
   void _runAutoexecSync();
+
+  // Test hook: fire a scheduled (cron) VM run synchronously — build a
+  // ScheduledRun, post it onto logicStrand_, and block until it completes.
+  // Bypasses the cron timer so crash-recovery tests can drive the cron path
+  // deterministically. Returns executeScheduledRun's result.
+  bool _executeScheduledRunSync(const HashPrefix& callerPrefix,
+                                const minx::Hash& assetId, uint64_t budget,
+                                uint64_t allowance, const ces::Bytes& input);
+
+  // Test hook: number of pending scheduled (cron) runs. Used to assert that a
+  // VM abort rolls back a SYS_SCHEDULE enqueue.
+  size_t _scheduledRunCount() const { return scheduledRuns_.size(); }
 
   // Test hook: prime the presence cache (both directions) with a
   // (pubkey prefix, addr) pair. Normally presence is populated by
@@ -791,25 +803,31 @@ private:
     // Deferred side effects. Empty = side effect is discarded.
     std::function<void(const std::string&, uint16_t,
                        const uint8_t*, size_t)> sendUdpFn;
-    // Invoked by setupVmHost *after* the VM host lambda has already
-    // pre-validated the peer, checked settlement backpressure, debited the
-    // caller and credited the peer vostro (all via the undo log if one is
-    // installed). The caller chooses when to fire the async dispatch: the
-    // CES_RUN_ASSET path buffers and fires on commit so an aborted VM
-    // cleanly rolls everything back; the scheduled-run path fires
-    // immediately since it has no rollback mechanism. `peerKey` is the
-    // resolved peer public key (the settlement client key).
+    // Invoked by VmHost::crossTransfer *after* it has pre-validated the peer,
+    // checked settlement backpressure, and debited the caller + credited the
+    // peer vostro via the undo log. executeVmRun buffers the dispatch and
+    // fires it on commit, so an aborted VM cleanly rolls everything back. Both
+    // run paths (wire and cron) go through executeVmRun, so both are atomic.
+    // `peerKey` is the resolved peer public key (the settlement client key).
     std::function<void(const minx::Hash& dest, uint64_t amount,
                        const std::string& server,
                        const minx::Hash& peerKey)> crossTransferFn;
+
+    // Invoked by SYS_SCHEDULE. Enqueues a future VM run paid by `callerPrefix`
+    // and returns the schedule rc (CES_OK / QUEUE_FULL). executeVmRun records
+    // the enqueue in the undo log so a VM abort rolls it back — an aborted run
+    // must not leave a live scheduled run behind. Empty = syscall disabled.
+    std::function<uint8_t(const minx::Hash& assetId, uint64_t budget,
+                          uint64_t allowance, const ces::Bytes& input,
+                          uint64_t time_us)> scheduleFn;
 
     // true = real signature verification; false = always return false.
     bool enableVerifySig = false;
 
     // Per-run cap on caller-account debits inside the VM (transfers, asset
-    // purchases, protocol fees). UINT64_MAX = no enforcement. The CES_RUN_ASSET
-    // path forwards this from the wire field; the cron path passes UINT64_MAX
-    // — see the deferred-allowance TODO in executeScheduledRun.
+    // purchases, protocol fees). UINT64_MAX = no enforcement. Both run paths
+    // forward a per-run cap: the wire field on CES_RUN_ASSET, or the scheduled
+    // run's carried-over allowance.
     uint64_t allowance = std::numeric_limits<uint64_t>::max();
   };
 
@@ -826,6 +844,35 @@ private:
   // keep that function readable.
   void handleRunAsset(const CesRunAsset& req, const HashPrefix& originPrefix,
                       const SockAddr& addr, const MinxMessage& msg);
+
+  // The neutral VM-execution transaction core. Both run paths (CES_RUN_ASSET
+  // dispatch and executeScheduledRun) call this with the gas budget already
+  // debited from the caller. It owns the undo log, the deferred side effects,
+  // VM execution, commit-or-revert, the refund of unused budget, and the
+  // durability flush — so a scheduled run is atomic exactly like a wire run.
+  // Each caller keeps only what genuinely differs: gas reservation (nonce vs
+  // prepaid), program-not-found policy, and the after-step (signed reply vs
+  // schedule followup).
+  struct VmRunRequest {
+    HashPrefix callerPrefix;
+    minx::Hash callerKey;          // full pubkey, preloaded into VM io
+    minx::Hash selfAssetKey;       // the program's own asset key
+    HashPrefix programOwnerPrefix;
+    ces::Bytes code;               // program bytecode
+    ces::Bytes input;
+    uint64_t   budget = 0;         // already debited from the caller
+    uint64_t   allowance = std::numeric_limits<uint64_t>::max();
+    uint64_t   gasMult = 0;        // discounted (wire) or raw (cron)
+    bool       enableVerifySig = false;
+  };
+  struct VmRunResult {
+    uint8_t    rcode = 0;
+    uint64_t   vmError = 0;
+    uint64_t   budgetUsed = 0;
+    uint64_t   allowanceUsed = 0;
+    ces::Bytes output;
+  };
+  VmRunResult executeVmRun(const VmRunRequest& req);
 
   CesConfig cfg_;
 
@@ -917,9 +964,9 @@ private:
     uint32_t followupInputTag = 0;
 
     // Filled in by queueRpc before the call is posted to rpcTaskIO_.
-    // Step 3+: just the raw request body. The signed bind handshake
-    // happens once on the channel; the body itself is unwrapped (the
-    // bound channel authenticates the sender — no per-rpc envelope).
+    // Just the raw request body: the signed bind handshake happens once
+    // on the channel, so the body itself is unwrapped (the bound channel
+    // authenticates the sender — no per-rpc envelope).
     ces::Bytes requestBody;
   };
 
@@ -982,6 +1029,9 @@ private:
     uint64_t allowance =         // per-run caller-debit cap (default = none)
       std::numeric_limits<uint64_t>::max();
     ces::Bytes input;  // input data
+    // true = budget already debited at submission (future-time wire
+    // CES_RUN_ASSET); executeScheduledRun must not debit again.
+    bool prepaid = false;
   };
   // Map key: (timeUs, seq) tuple. `timeUs` sorts entries by their firing
   // deadline; `seq` is a monotonic tiebreaker so two runs scheduled for
@@ -994,6 +1044,15 @@ private:
   std::map<ScheduleKey, ScheduledRun> scheduledRuns_;
   uint64_t scheduledSeq_ = 0;   // monotonic sequence for insertion order
   std::shared_ptr<boost::asio::steady_timer> cronTimer_;
+
+  // scheduleRun's core, plus the inserted ScheduleKey so a VM transaction's
+  // undo log can erase the enqueue on abort. scheduleRun() is the thin wrapper
+  // that discards the key (for callers with no rollback context).
+  uint8_t scheduleRunUndoable(const HashPrefix& callerPrefix,
+                              const minx::Hash& assetId, uint64_t budget,
+                              uint64_t allowance, const ces::Bytes& input,
+                              uint64_t time_us, bool prepaid,
+                              ScheduleKey& outKey);
 
   // Presence cache: tracks last known address of authenticated clients
   // for unsolicited push (send()). Updated on every dispatchSigned.
@@ -1164,7 +1223,8 @@ private:
 
   template <typename ReqT, typename Fn>
   void dispatchSigned(const SockAddr& addr, const MinxMessage& msg,
-                      ReqT req, const Hash& keyField, Fn&& fn);
+                      ReqT req, const Hash& keyField, Fn&& fn,
+                      bool noncelessOk = false);
 
   int64_t resolveFee(int64_t passedFee, int64_t defaultFee) const;
   void checkAutoSnapshot();

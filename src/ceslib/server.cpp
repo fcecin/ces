@@ -28,7 +28,6 @@
 #include <boost/asio/read.hpp>
 #include <boost/asio/write.hpp>
 #include <boost/endian/conversion.hpp>
-#include <ces/ramfilestore.h>
 
 #include <logkv/serializer.h>
 #include <logkv/autoser.h>
@@ -423,6 +422,7 @@ public:
         saveAssetFn_(setup.saveAssetFn),
         udpSink_(setup.sendUdpFn),
         crossSink_(setup.crossTransferFn),
+        scheduleSink_(setup.scheduleFn),
         enableVerifySig_(setup.enableVerifySig) {
     this->allowance = setup.allowance;
     // Per-op fees mirror the protocol-side handlers (transfer/createAsset/...).
@@ -539,9 +539,11 @@ public:
     maybeSaveAsset(key);
     bool priv = isAssetPrivate(days);
     bool immut = isAssetImmutable(days);
-    uint16_t cleanDays = assetDays(days);
+    uint32_t storeDays = 1u + assetDays(days);
+    if (storeDays > 0x1FFF) storeDays = 0x1FFF;
     Asset newAsset(caller_, content,
-                   assetBalance(1 + cleanDays, priv, /*aowned=*/false, immut), 0);
+                   assetBalance(static_cast<uint16_t>(storeDays), priv,
+                                /*aowned=*/false, immut), 0);
     server_.assets_->getObjects().emplace(key, newAsset);
     return CES_OK;
   }
@@ -553,10 +555,12 @@ public:
     maybeSaveAsset(key);
     bool priv = isAssetPrivate(days);
     bool immut = isAssetImmutable(days);
-    uint16_t cleanDays = assetDays(days);
+    uint32_t storeDays = 1u + assetDays(days);
+    if (storeDays > 0x1FFF) storeDays = 0x1FFF;
     HashPrefix bootOwner = Account::getMapKey(this->selfAssetKey);
     Asset newAsset(bootOwner, content,
-                   assetBalance(1 + cleanDays, priv, /*aowned=*/true, immut), 0);
+                   assetBalance(static_cast<uint16_t>(storeDays), priv,
+                                /*aowned=*/true, immut), 0);
     server_.assets_->getObjects().emplace(key, newAsset);
     return CES_OK;
   }
@@ -710,8 +714,11 @@ public:
                    uint64_t allowance,
                    const uint8_t* input, size_t inputLen,
                    uint64_t time_us) override {
-    return server_.scheduleRun(caller_, assetId, budget, allowance,
-                               {input, input + inputLen}, time_us);
+    // Route through the sink so executeVmRun can undo the enqueue if the VM
+    // later aborts — an aborted run must not leave a scheduled run behind.
+    if (!scheduleSink_) return CES_ERROR_DISABLED;
+    return scheduleSink_(assetId, budget, allowance,
+                         {input, input + inputLen}, time_us);
   }
 
   uint8_t rpc(const std::string& host, uint16_t port,
@@ -762,6 +769,8 @@ private:
   std::function<void(const minx::Hash&, uint64_t,
                      const std::string&,
                      const minx::Hash&)>                 crossSink_;
+  std::function<uint8_t(const minx::Hash&, uint64_t, uint64_t,
+                        const ces::Bytes&, uint64_t)>    scheduleSink_;
   bool enableVerifySig_;
 
   void maybeSaveAccount(const HashPrefix& id) {
@@ -1038,6 +1047,8 @@ uint16_t CesServer::start(uint16_t serverPort) {
                                          serverPort, netIO_, taskIO_);
   if (boundPort == 0) {
     LOGDEBUG << "server failed to open socket";
+    receiving_ = false;
+    running_ = false;
     return 0;
   }
   boundPort_ = boundPort;
@@ -1319,6 +1330,10 @@ void CesServer::stop(bool flushEvents) {
     boost::system::error_code ec;
     replyTimer_->cancel(ec);
   }
+  if (cronTimer_) {
+    boost::system::error_code ec;
+    cronTimer_->cancel(ec);
+  }
   LOGDEBUG << "stop stopping IO contexts";
   netIO_.stop();
   taskIO_.stop();
@@ -1509,9 +1524,17 @@ void CesServer::sendUnsignedReply(const SockAddr& addr, const MinxMessage& msg,
 
 template <typename ReqT, typename Fn>
 void CesServer::dispatchSigned(const SockAddr& addr, const MinxMessage& msg,
-                               ReqT req, const Hash& keyField, Fn&& fn) {
+                               ReqT req, const Hash& keyField, Fn&& fn,
+                               bool noncelessOk) {
   if (!req.verifySignature(msg.data, PublicKey(keyField)))
     throw std::runtime_error("bad sig");
+
+  // NONCELESS is the time-boxed settlement / run-asset escape hatch — only
+  // the handlers that dedup it (OPEN_TRANSFER, RUN_ASSET) opt in. Any other
+  // signed op carrying it is misuse: drop it before it reaches validateSpend,
+  // which would otherwise skip the nonce check and let the op replay.
+  if (req.reqNonce == CES_NONCELESS && !noncelessOk)
+    return;
 
   // Verify server ID to prevent cross-server replay
   HashPrefix myId = Account::getMapKey(serverKeyPair_.getPublicKeyAsHash());
@@ -1987,9 +2010,11 @@ uint8_t CesServer::createAsset(const minx::Hash& originKey,
 
   bool priv = isAssetPrivate(balance);
   bool immut = isAssetImmutable(balance);
-  uint16_t days = assetDays(balance);
+  uint32_t storeDays = 1u + assetDays(balance);
+  if (storeDays > 0x1FFF) storeDays = 0x1FFF;
   Asset newAsset(ownerId, content,
-                 assetBalance(1 + days, priv, /*aowned=*/false, immut), 0);
+                 assetBalance(static_cast<uint16_t>(storeDays), priv,
+                              /*aowned=*/false, immut), 0);
   Asset::SerModeGuard guard(Asset::SerMode::Full);
   assets_->update(assetId, newAsset);
 
@@ -2148,8 +2173,11 @@ uint8_t CesServer::fundAsset(const minx::Hash& originKey,
   // close to full price for the trailing days.
   ActiveAsset asset = assets_.get(assetId);
   uint32_t held = asset.exists() ? assetDays(asset.getBalance()) : 0u;
+  // The day field caps at 0x1FFF, so bill only for the days actually
+  // added: funding past the cap grants fewer days than requested.
+  uint32_t granted = std::min<uint32_t>(0x1FFF, held + balance) - held;
   uint64_t rentCost = attenuatedFundCost(
-    FeeKind::AssetRent, rentFee, balance, held);
+    FeeKind::AssetRent, rentFee, granted, held);
   uint64_t totalCost = rentCost + fundFee;
 
   uint8_t rc = origin.validateSpend(0, totalCost, providedNonce, errFee);
@@ -2193,16 +2221,16 @@ uint8_t CesServer::buyAsset(const minx::Hash& originKey,
 
   ActiveAsset asset = assets_.get(assetId);
 
-  if (asset.getOwnerId() == buyer.id) {
-    buyer.chargeError(errFee);
-    LOGDEBUG << "buyAsset: buyer is already owner";
-    return CES_ERROR_INVALID_TARGET_ACCOUNT;
-  }
-
   if (!asset.exists()) {
     buyer.chargeError(errFee);
     LOGDEBUG << "buyAsset: not found";
     return CES_ERROR_ASSET_NOT_FOUND;
+  }
+
+  if (asset.getOwnerId() == buyer.id) {
+    buyer.chargeError(errFee);
+    LOGDEBUG << "buyAsset: buyer is already owner";
+    return CES_ERROR_INVALID_TARGET_ACCOUNT;
   }
 
   uint64_t price = storedToRealPrice(asset.getPrice());
@@ -2284,6 +2312,9 @@ uint8_t CesServer::queryAsset(const minx::Hash& originKey,
                               uint32_t providedNonce,
                               std::vector<AssetEntry>& outResults,
                               int64_t queryFee, int64_t errFee) {
+  if (items >= CesQueryAsset::MAX_ITEMS) {
+    throw std::runtime_error("too many items");
+  }
   queryFee = discountedFlatFee(queryFee, cfg_.feeQuery, FeeKind::Query);
   if (items > 0) {
     queryFee += (queryFee * (items + 1)) / CesQueryAsset::MAX_ITEMS;
@@ -2445,7 +2476,7 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           uint8_t rc = transfer(req.originId, req.destKey, req.amount,
                                 TransferMode::Open, 0, effectiveNonce, newBal);
           reply(effectiveNonce, newBal, rc);
-        });
+        }, /*noncelessOk=*/true);
       break;
     }
 
@@ -2812,7 +2843,7 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
         [this](const CesRunAsset& req, const HashPrefix& originPrefix,
                const SockAddr& addr, const MinxMessage& msg) {
           handleRunAsset(req, originPrefix, addr, msg);
-        });
+        }, /*noncelessOk=*/true);
       break;
     }
 
@@ -2829,10 +2860,250 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
 }
 
 // ----------------------------------------------------------------------------
+// executeVmRun
+// The neutral VM-execution transaction core, shared by the wire run path
+// (handleRunAsset) and the cron path (executeScheduledRun). Precondition:
+// the gas budget has already been debited from the caller. Owns the undo
+// log, deferred side effects, VM execution, commit-or-revert, the refund of
+// unused budget, and the durability flush. See the durability note at the
+// commit branch and the flush for why both are required (VM syscalls mutate
+// the in-memory store directly, bypassing the WAL).
+// ----------------------------------------------------------------------------
+
+CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
+  VmRunResult out;
+
+  // --- Atomic context: undo log + deferred effects ---
+  struct UndoEntry {
+    enum Kind { AccountEntry, AssetEntry, ScheduleEntry } kind;
+    HashPrefix accountKey;
+    Account oldAccount;
+    bool accountExisted;
+    minx::Hash assetKey;
+    Asset oldAsset;
+    bool assetExisted;
+    ScheduleKey scheduleKey;       // Schedule kind: the enqueued run to erase
+  };
+  std::vector<UndoEntry> undoLog;
+
+  struct DeferredUdp {
+    std::string addr;
+    uint16_t port;
+    ces::Bytes data;
+  };
+  struct DeferredCrossXfer {
+    minx::Hash dest;
+    uint64_t amount;
+    std::string server;
+    minx::Hash peerKey;
+  };
+  std::vector<DeferredUdp> deferredUdp;
+  std::vector<DeferredCrossXfer> deferredCrossXfers;
+
+  auto saveAccount = [&](const HashPrefix& id) {
+    auto it = accounts_->find(id);
+    UndoEntry e{};
+    e.kind = UndoEntry::AccountEntry;
+    e.accountKey = id;
+    if (it != accounts_->end()) {
+      e.oldAccount = it->second;
+      e.accountExisted = true;
+    } else {
+      e.accountExisted = false;
+    }
+    undoLog.push_back(std::move(e));
+  };
+  auto saveAsset = [&](const minx::Hash& id) {
+    auto it = assets_->find(id);
+    UndoEntry e{};
+    e.kind = UndoEntry::AssetEntry;
+    e.assetKey = id;
+    if (it != assets_->end()) {
+      e.oldAsset = it->second;
+      e.assetExisted = true;
+    } else {
+      e.assetExisted = false;
+    }
+    undoLog.push_back(std::move(e));
+  };
+  auto revert = [&]() {
+    for (auto it = undoLog.rbegin(); it != undoLog.rend(); ++it) {
+      if (it->kind == UndoEntry::AccountEntry) {
+        if (it->accountExisted) {
+          auto mapIt = accounts_->find(it->accountKey);
+          if (mapIt != accounts_->end())
+            mapIt->second = it->oldAccount;
+          else
+            accounts_->getObjects().emplace(it->accountKey, it->oldAccount);
+        } else {
+          accounts_->getObjects().erase(it->accountKey);
+        }
+      } else if (it->kind == UndoEntry::AssetEntry) {
+        if (it->assetExisted) {
+          auto mapIt = assets_->find(it->assetKey);
+          if (mapIt != assets_->end())
+            mapIt->second = it->oldAsset;
+          else
+            assets_->getObjects().emplace(it->assetKey, it->oldAsset);
+        } else {
+          assets_->getObjects().erase(it->assetKey);
+        }
+      } else { // Schedule: undo the SYS_SCHEDULE enqueue
+        scheduledRuns_.erase(it->scheduleKey);
+      }
+    }
+  };
+
+  // --- Wire CesVMHost (sinks buffer side effects until commit) ---
+  VmHostSetup setup;
+  setup.callerPrefix = req.callerPrefix;
+  setup.programOwnerPrefix = req.programOwnerPrefix;
+  setup.saveAccountFn = [&](const HashPrefix& id) { saveAccount(id); };
+  setup.saveAssetFn = [&](const minx::Hash& key) { saveAsset(key); };
+  setup.sendUdpFn = [&](const std::string& addr, uint16_t port,
+                        const uint8_t* data, size_t len) {
+    deferredUdp.push_back({addr, port, {data, data + len}});
+  };
+  setup.crossTransferFn = [&](const minx::Hash& dest, uint64_t amount,
+                               const std::string& server,
+                               const minx::Hash& peerKey) {
+    deferredCrossXfers.push_back({dest, amount, server, peerKey});
+  };
+  // SYS_SCHEDULE: enqueue synchronously (so the program sees the real
+  // QUEUE_FULL/OK rc) but record the enqueue in the undo log, so a later VM
+  // abort rolls it back. scheduledRuns_ is RAM-only, so commit needs no
+  // re-journal — only the abort path matters.
+  setup.scheduleFn = [&](const minx::Hash& assetId, uint64_t budget,
+                         uint64_t allowance, const ces::Bytes& input,
+                         uint64_t time_us) -> uint8_t {
+    ScheduleKey key;
+    uint8_t rc = scheduleRunUndoable(req.callerPrefix, assetId, budget,
+                                     allowance, input, time_us,
+                                     /*prepaid=*/false, key);
+    if (rc == CES_OK) {
+      UndoEntry e{};
+      e.kind = UndoEntry::ScheduleEntry;
+      e.scheduleKey = key;
+      undoLog.push_back(std::move(e));
+    }
+    return rc;
+  };
+  setup.enableVerifySig = req.enableVerifySig;
+  setup.allowance = req.allowance;
+
+  VmHost vmHost(*this, setup);
+  vmHost.callerKey    = req.callerKey;
+  vmHost.selfAssetKey = req.selfAssetKey;
+  vmHost.programOwner = req.programOwnerPrefix;
+  vmHost.input        = req.input;
+
+  // --- Execute VM ---
+  CesVM vm;
+  ces::Bytes code = req.code;
+  CesVMResult vmResult;
+  // Catch any exception that escapes the VM (host lambda throwing, logkv
+  // serialization error, std::bad_alloc, CryptoPP throw, etc.). A VM
+  // exception is a server-side failure, not client abuse.
+  try {
+    vmResult = vm.execute(code, vmHost, req.budget, req.gasMult);
+  } catch (...) {
+    vmResult.error = CESVM_HOST;
+  }
+
+  out.vmError = vmResult.error;
+  out.budgetUsed = vmResult.budgetUsed;
+  // Allowance consumed = initial cap minus what's left. The unlimited
+  // sentinel skips decrement entirely (see debitCaller), so it reports 0.
+  if (req.allowance != std::numeric_limits<uint64_t>::max() &&
+      vmHost.allowance <= req.allowance) {
+    out.allowanceUsed = req.allowance - vmHost.allowance;
+  } else {
+    out.allowanceUsed = 0;
+  }
+
+  if (vmResult.error == CESVM_OK) {
+    // Commit: fire deferred effects, output available.
+    out.rcode = CES_OK;
+    out.output = std::move(vmResult.output);
+    for (auto& udp : deferredUdp) {
+      try {
+        if (minx_) {
+          minx::Bytes payload;
+          ces::Buffer::putBytes(payload, std::span<const uint8_t>(udp.data));
+          minx_->sendApplication(
+            SockAddr(Resolver::parseIp(udp.addr), udp.port), payload);
+        }
+      } catch (...) {}
+    }
+    // Fire deferred cross-transfers (ledger legs already ran via the undo
+    // log; this only dispatches the wire-level settlement). Fire-and-forget.
+    for (auto& cx : deferredCrossXfers) {
+      auto* client = getOrCreateSettlementClient(cx.server, cx.peerKey);
+      if (client) {
+        client->openTransfer(cx.dest, cx.amount, [](uint8_t) {});
+      }
+    }
+    // Durably journal the VM's committed ledger mutations. VM syscalls mutate
+    // the in-memory store directly through the undo log (for atomic rollback),
+    // which bypasses the WAL — so without this the run's effects survive only
+    // to the next snapshot. Re-journal every touched cell at its final value
+    // (Full mode handles both modified and VM-created cells); the flush below
+    // makes the whole run (gas debit + these cells + refund) reach disk
+    // atomically, preserving conservation across a crash.
+    for (const auto& e : undoLog) {
+      if (e.kind == UndoEntry::AccountEntry) {
+        auto ait = accounts_->find(e.accountKey);
+        if (ait != accounts_->end()) {
+          Account::SerModeGuard guard(Account::SerMode::Full);
+          accounts_->persist(ait);
+        }
+      } else if (e.kind == UndoEntry::AssetEntry) {
+        auto sit = assets_->find(e.assetKey);
+        if (sit != assets_->end()) {
+          Asset::SerModeGuard guard(Asset::SerMode::Full);
+          assets_->persist(sit);
+        }
+      }
+      // Schedule entries: scheduledRuns_ is RAM-only, nothing to journal.
+    }
+  } else {
+    // Revert all atomic mutations.
+    revert();
+    out.rcode = CES_ERROR_VM_FAILED;
+  }
+
+  // Refund unused budget on every termination path. ABORT and OK get the full
+  // unused remainder; non-abort failures (crashes) eat a small crash fee.
+  uint64_t penalty = (vmResult.error == CESVM_OK ||
+                      vmResult.error == CESVM_ABORT)
+                       ? 0
+                       : CESVM_CRASH_FEE;
+  uint64_t spent = vmResult.budgetUsed + penalty;
+  if (spent < req.budget) {
+    auto caller = accounts_.get(req.callerPrefix);
+    if (caller.exists())
+      caller.credit(req.budget - spent);
+  }
+
+  // Flush the run's ledger events to the WAL. The gas refund just above and
+  // the VM-mutated cells re-journaled on commit are otherwise unflushed, while
+  // the pre-run gas debit already flushed — leaving a half-state on the WAL
+  // that breaks conservation on crash-recovery. Flushing here makes the run
+  // atomic with respect to durability.
+  if (!undoLog.empty() || spent < req.budget) {
+    accounts_->flush();
+    assets_->flush();
+  }
+
+  return out;
+}
+
+// ----------------------------------------------------------------------------
 // handleRunAsset
-// Invoked on logicStrand_ with an already-verified CesRunAsset. Manages
-// the dedup window, gas debit + refund, undo log, deferred side effects,
-// and VM execution.
+// Wire CES_RUN_ASSET path. Invoked on logicStrand_ with an already-verified
+// CesRunAsset. Handles the dedup window, the gas reservation, the future-time
+// scheduling fork, and the signed reply; the VM transaction itself runs in
+// executeVmRun.
 // ----------------------------------------------------------------------------
 
 void CesServer::handleRunAsset(const CesRunAsset& req,
@@ -2890,12 +3161,17 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
   if (req.time > 0 && req.reqNonce != CES_NONCELESS) {
     uint64_t now = getMicrosSinceEpoch();
     if (req.time > now) {
-      // Schedule for future execution — gas already debited.
-      // Allowance from the wire: an originally-signed runAsset with
-      // a future time queues a single delayed run; the cap travels
-      // verbatim into the eventual execution.
+      // Schedule for future execution. Gas was already debited above, so
+      // mark the run prepaid (executeScheduledRun must not debit again).
+      // The allowance cap travels verbatim into the eventual execution.
       res.rcode = scheduleRun(originPrefix, req.assetId, req.budget,
-                              req.allowance, req.input, req.time);
+                              req.allowance, req.input, req.time,
+                              /*prepaid=*/true);
+      if (res.rcode != CES_OK) {
+        // Nothing was queued — refund the upfront budget.
+        auto refund = accounts_.get(originPrefix);
+        if (refund.exists()) refund.credit(req.budget);
+      }
       sendSignedReply(addr, msg, std::move(res));
       return;
     }
@@ -2912,190 +3188,26 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
   HashPrefix programOwnerPrefix = programAsset.data().getOwnerId();
   AssetData programContent = programAsset.data().getContent();
 
-  // --- Atomic context: undo log + deferred effects ---
-  struct UndoEntry {
-    bool isAccount;
-    HashPrefix accountKey;
-    Account oldAccount;
-    bool accountExisted;
-    minx::Hash assetKey;
-    Asset oldAsset;
-    bool assetExisted;
-  };
-  std::vector<UndoEntry> undoLog;
+  // --- Run the VM transaction. executeVmRun owns the undo log, deferred
+  // effects, commit/abort, refund, and durability flush. ---
+  VmRunRequest vreq;
+  vreq.callerPrefix       = originPrefix;
+  vreq.callerKey          = req.originId;
+  vreq.selfAssetKey       = req.assetId;
+  vreq.programOwnerPrefix = programOwnerPrefix;
+  vreq.code               = ces::Bytes(programContent.begin(), programContent.end());
+  vreq.input              = req.input;
+  vreq.budget             = req.budget;
+  vreq.allowance          = req.allowance;
+  vreq.gasMult            = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
+  vreq.enableVerifySig    = true;
 
-  struct DeferredUdp {
-    std::string addr;
-    uint16_t port;
-    ces::Bytes data;
-  };
-  struct DeferredCrossXfer {
-    minx::Hash dest;
-    uint64_t amount;
-    std::string server;
-    minx::Hash peerKey; // resolved at syscall time by setupVmHost
-  };
-  std::vector<DeferredUdp> deferredUdp;
-  std::vector<DeferredCrossXfer> deferredCrossXfers;
-
-  // Helper: save account state before mutation
-  auto saveAccount = [&](const HashPrefix& id) {
-    auto it = accounts_->find(id);
-    UndoEntry e{};
-    e.isAccount = true;
-    e.accountKey = id;
-    if (it != accounts_->end()) {
-      e.oldAccount = it->second;
-      e.accountExisted = true;
-    } else {
-      e.accountExisted = false;
-    }
-    undoLog.push_back(std::move(e));
-  };
-
-  // Helper: save asset state before mutation
-  auto saveAsset = [&](const minx::Hash& id) {
-    auto it = assets_->find(id);
-    UndoEntry e{};
-    e.isAccount = false;
-    e.assetKey = id;
-    if (it != assets_->end()) {
-      e.oldAsset = it->second;
-      e.assetExisted = true;
-    } else {
-      e.assetExisted = false;
-    }
-    undoLog.push_back(std::move(e));
-  };
-
-  // Helper: revert all undo entries in reverse order
-  auto revert = [&]() {
-    for (auto it = undoLog.rbegin(); it != undoLog.rend(); ++it) {
-      if (it->isAccount) {
-        if (it->accountExisted) {
-          auto mapIt = accounts_->find(it->accountKey);
-          if (mapIt != accounts_->end())
-            mapIt->second = it->oldAccount;
-          else
-            accounts_->getObjects().emplace(it->accountKey, it->oldAccount);
-        } else {
-          accounts_->getObjects().erase(it->accountKey);
-        }
-      } else {
-        if (it->assetExisted) {
-          auto mapIt = assets_->find(it->assetKey);
-          if (mapIt != assets_->end())
-            mapIt->second = it->oldAsset;
-          else
-            assets_->getObjects().emplace(it->assetKey, it->oldAsset);
-        } else {
-          assets_->getObjects().erase(it->assetKey);
-        }
-      }
-    }
-  };
-
-  // --- Wire CesVMHost ---
-  VmHostSetup setup;
-  setup.callerPrefix = originPrefix;
-  setup.programOwnerPrefix = programOwnerPrefix;
-  setup.saveAccountFn = [&](const HashPrefix& id) { saveAccount(id); };
-  setup.saveAssetFn = [&](const minx::Hash& key) { saveAsset(key); };
-  setup.sendUdpFn = [&](const std::string& addr, uint16_t port,
-                        const uint8_t* data, size_t len) {
-    deferredUdp.push_back({addr, port, {data, data + len}});
-  };
-  setup.crossTransferFn = [&](const minx::Hash& dest, uint64_t amount,
-                               const std::string& server,
-                               const minx::Hash& peerKey) {
-    deferredCrossXfers.push_back({dest, amount, server, peerKey});
-  };
-  setup.enableVerifySig = true;
-  setup.allowance = req.allowance;
-
-  VmHost vmHost(*this, setup);
-  vmHost.callerKey    = req.originId;
-  vmHost.selfAssetKey = req.assetId;
-  vmHost.programOwner = programOwnerPrefix;
-  vmHost.input        = req.input;
-
-  // --- Execute VM ---
-  CesVM vm;
-  ces::Bytes code(programContent.begin(), programContent.end());
-  CesVMResult vmResult;
-  // Catch any exception that escapes the VM (host lambda throwing,
-  // logkv serialization error, std::bad_alloc, CryptoPP throw, etc.)
-  // so we don't fall through to incomingMessage's outer catch, which
-  // treats a throw as a malformed-packet signal and bans the sender's
-  // IP. A VM exception is a server-side failure, not client abuse.
-  try {
-    vmResult = vm.execute(code, vmHost, req.budget,
-                          discountFee(FeeKind::VMMult, cfg_.feeVmMult));
-  } catch (...) {
-    vmResult.error = CESVM_HOST;
-    // budgetUsed stays whatever the partial execution charged. The
-    // error branch below reverts side effects and refunds.
-  }
-
-  res.vmError = vmResult.error;
-  res.budgetUsed = vmResult.budgetUsed;
-  // Allowance consumed = initial cap minus what's left. The unlimited
-  // sentinel skips decrement entirely (see debitCaller in setupVmHost),
-  // so that case naturally reports 0.
-  if (req.allowance != std::numeric_limits<uint64_t>::max() &&
-      vmHost.allowance <= req.allowance) {
-    res.allowanceUsed = req.allowance - vmHost.allowance;
-  } else {
-    res.allowanceUsed = 0;
-  }
-
-  if (vmResult.error == CESVM_OK) {
-    // Commit: fire deferred effects, output available
-    res.rcode = CES_OK;
-    res.output = std::move(vmResult.output);
-    // Fire deferred UDP sends
-    for (auto& udp : deferredUdp) {
-      try {
-        if (minx_) {
-          minx::Bytes payload;
-          ces::Buffer::putBytes(payload,
-            std::span<const uint8_t>(udp.data));
-          minx_->sendApplication(
-            SockAddr(Resolver::parseIp(udp.addr), udp.port),
-            payload);
-        }
-      } catch (...) {}
-    }
-    // Fire deferred cross-transfers. The accounting (caller debit, peer
-    // vostro credit) already ran in the VM host lambda via the undo
-    // log, so all that remains is dispatching the wire-level settlement
-    // over CesClientAsync. Fire-and-forget: the VM already returned
-    // CES_OK for the syscall, we have no way to surface a late delivery
-    // failure back to the program.
-    for (auto& cx : deferredCrossXfers) {
-      auto* client = getOrCreateSettlementClient(cx.server, cx.peerKey);
-      if (client) {
-        client->openTransfer(cx.dest, cx.amount, [](uint8_t) {});
-      }
-    }
-  } else {
-    // Revert all atomic mutations
-    revert();
-    res.rcode = CES_ERROR_VM_FAILED;
-  }
-  // Refund unused budget on every termination path. ABORT and OK get
-  // the full unused remainder; non-abort failures (crashes) eat a
-  // small crash fee on top of budgetUsed.
-  uint64_t penalty = (vmResult.error == CESVM_OK ||
-                      vmResult.error == CESVM_ABORT)
-                       ? 0
-                       : CESVM_CRASH_FEE;
-  uint64_t spent = vmResult.budgetUsed + penalty;
-  if (spent < req.budget) {
-    auto caller = accounts_.get(originPrefix);
-    if (caller.exists())
-      caller.credit(req.budget - spent);
-  }
+  VmRunResult vres = executeVmRun(vreq);
+  res.rcode         = vres.rcode;
+  res.vmError       = vres.vmError;
+  res.budgetUsed    = vres.budgetUsed;
+  res.allowanceUsed = vres.allowanceUsed;
+  res.output        = std::move(vres.output);
 
   tpsInc();
   checkAutoSnapshot();
@@ -3165,6 +3277,12 @@ void CesServer::incomingProveWork(const SockAddr& addr,
                                   const MinxProveWork& msg,
                                   const int difficulty) {
   checkPause();
+  // Reject difficulty < 1: a difficulty-0 solution is ~free (≈half of all
+  // hashes) and would underflow the `1ULL << (difficulty - 1)` reward shift
+  // into an astronomical mint. min_difficulty should floor this, but guard
+  // the mint math directly so a 0 floor can never become a credit faucet.
+  if (difficulty < 1)
+    return;
   postLogic( [this, addr, msg, difficulty]() {
     minx::Hash actualBeneficiaryFullKey;
     HashPrefix mapKey = Account::getMapKey(msg.ckey);
@@ -3245,6 +3363,14 @@ void CesServer::incomingApplication(const SockAddr& addr, const uint8_t code,
       std::lock_guard lk(presenceReverseMutex_);
       auto it = presenceReverse_.find(addr);
       if (it != presenceReverse_.end()) senderPfx = it->second;
+    }
+    // presenceReverse_ entries never evict, so a stale (or spoofed-source)
+    // addr could stamp another client's prefix. Only trust it when the
+    // forward presence cache still maps that prefix back to this exact addr.
+    {
+      auto fwd = presence_.get(senderPfx);
+      if (!fwd || *fwd != addr)
+        senderPfx = {};
     }
     boost::asio::post(io, [buf, senderPfx]() {
       computeHandlerOnApplicationMsg(
@@ -4214,6 +4340,23 @@ void CesServer::_runAutoexecSync() {
   done.get_future().wait();
 }
 
+bool CesServer::_executeScheduledRunSync(const HashPrefix& callerPrefix,
+                                         const minx::Hash& assetId,
+                                         uint64_t budget, uint64_t allowance,
+                                         const ces::Bytes& input) {
+  std::promise<bool> done;
+  postLogic( [&]() {
+    ScheduledRun run;
+    run.callerPrefix = callerPrefix;
+    run.assetId      = assetId;
+    run.budget       = budget;
+    run.allowance    = allowance;
+    run.input        = input;
+    done.set_value(executeScheduledRun(run));
+  });
+  return done.get_future().get();
+}
+
 void CesServer::_primePresence(const HashPrefix& prefix,
                                const minx::SockAddr& addr) {
   presence_.put(prefix, addr);
@@ -4430,24 +4573,21 @@ void CesServer::peerMinerLoop() {
           if (peerDiff > maxDiff) {
             LOGDEBUG << "peer miner: skipping " << peer.declaredAddress
                      << " (diff " << (int)peerDiff << " > max " << (int)maxDiff << ")";
-            client.disconnect();
-            client.stop();
-            break;
-          }
-
-          std::map<std::string, std::string> appData;
-          appData["server"] = myServerAddr;
-
-          auto result = mineOnce(client, 1, appData);
-          if (result.success) {
-            LOGDEBUG << "peer miner: mined " << result.credit
-                     << " credits on " << peer.declaredAddress;
-            peer.totalOutboundPoW += result.credit;
-            if (peer.ourBalanceThere >= 0)
-              peer.ourBalanceThere += static_cast<int64_t>(result.credit);
           } else {
-            LOGDEBUG << "peer miner: mine failed on " << peer.declaredAddress
-                     << " status=" << result.status;
+            std::map<std::string, std::string> appData;
+            appData["server"] = myServerAddr;
+
+            auto result = mineOnce(client, 1, appData);
+            if (result.success) {
+              LOGDEBUG << "peer miner: mined " << result.credit
+                       << " credits on " << peer.declaredAddress;
+              peer.totalOutboundPoW += result.credit;
+              if (peer.ourBalanceThere >= 0)
+                peer.ourBalanceThere += static_cast<int64_t>(result.credit);
+            } else {
+              LOGDEBUG << "peer miner: mine failed on " << peer.declaredAddress
+                       << " status=" << result.status;
+            }
           }
           client.disconnect();
         }
@@ -4563,13 +4703,23 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
   // The caller is the account that scheduled it.
 
   auto origin = accounts_.get(run.callerPrefix);
-  if (!origin.exists() || origin.balance() < static_cast<int64_t>(run.budget))
+  if (!origin.exists())
     return false;
 
-  // Reserve the full budget upfront. Unused budget is refunded after
-  // the run (see below) — same policy as the CES_RUN_ASSET path.
-  origin.debit(run.budget);
-  accounts_.checkFlush(run.budget);
+  // Caller's full key (reconstructed from prefix + tail) for the VM io
+  // preload — captured before the gas debit, which can delete a just-emptied
+  // account and invalidate the accessor.
+  minx::Hash callerKey = origin.data().getKey(run.callerPrefix);
+
+  // Reserve the full budget upfront; unused is refunded inside executeVmRun.
+  // A prepaid run (future-time wire CES_RUN_ASSET) was already debited at
+  // submission — don't double-charge it.
+  if (!run.prepaid) {
+    if (origin.balance() < static_cast<int64_t>(run.budget))
+      return false;
+    origin.debit(run.budget);
+    accounts_.checkFlush(run.budget);
+  }
 
   // Load program
   auto programAsset = assets_.get(run.assetId);
@@ -4578,57 +4728,23 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
   HashPrefix programOwnerPrefix = programAsset.data().getOwnerId();
   AssetData programContent = programAsset.data().getContent();
 
-  // Wire host — scheduled runs use direct mutations (no undo log,
-  // no deferred side effects, no sig verification).
-  VmHostSetup setup;
-  setup.callerPrefix = run.callerPrefix;
-  setup.programOwnerPrefix = programOwnerPrefix;
-  // No undo log, no UDP buffering — scheduled runs mutate directly and
-  // have no rollback. Cross-transfer is still allowed: VmHost runs its
-  // pre-validation + ledger mutation inline, and this sink fires the
-  // wire-level dispatch immediately (no "commit" boundary exists).
-  setup.crossTransferFn = [this](const minx::Hash& dest, uint64_t amount,
-                                  const std::string& server,
-                                  const minx::Hash& peerKey) {
-    auto* client = getOrCreateSettlementClient(server, peerKey);
-    if (client) {
-      client->openTransfer(dest, amount, [](uint8_t) {});
-    }
-  };
-  setup.enableVerifySig = false;
-  // Carry-over allowance from the parent run (SYS_SCHEDULE followup, or
-  // the wire field on a future-time CES_RUN_ASSET / autoexec). UINT64_MAX
-  // = no enforcement, set explicitly by callers that don't want a cap.
-  setup.allowance = run.allowance;
-
-  VmHost vmHost(*this, setup);
-  vmHost.callerKey    = origin.data().getKey(run.callerPrefix);
-  vmHost.selfAssetKey = run.assetId;
-  vmHost.programOwner = programOwnerPrefix;
-  vmHost.input        = run.input;
-
-  CesVM vm;
-  ces::Bytes code(programContent.begin(), programContent.end());
-  // Scheduled / cron VM runs intentionally consume the raw gas
-  // multiplier — not the discounted one. SYS_SCHEDULE locked in a
-  // budget at raw rates when the run was scheduled; firing-time
-  // execution must consume that budget at the same rate to preserve
-  // the prepaid contract. Wire-path CES_RUN_ASSET (further up this
-  // file) discounts via FeeKind::VMMult because the caller spends a
-  // fresh budget at op time.
-  CesVMResult r = vm.execute(code, vmHost, run.budget, cfg_.feeVmMult);
-  // Mutations are direct (no undo on the cron path). Refund unused
-  // budget on every termination — same policy as the CES_RUN_ASSET
-  // path, with a CESVM_CRASH_FEE eaten on non-abort failures.
-  uint64_t penalty = (r.error == CESVM_OK || r.error == CESVM_ABORT)
-                       ? 0
-                       : CESVM_CRASH_FEE;
-  uint64_t spent = r.budgetUsed + penalty;
-  if (spent < run.budget) {
-    auto caller = accounts_.get(run.callerPrefix);
-    if (caller.exists())
-      caller.credit(run.budget - spent);
-  }
+  // Same transactional core as the wire path: a scheduled run is now atomic
+  // (undo-log rollback, durable re-journal, deferred cross-transfer) instead
+  // of mutating directly. The raw (undiscounted) gas multiplier preserves the
+  // prepaid budget contract locked in at schedule time; wire CES_RUN_ASSET
+  // discounts via FeeKind::VMMult because the caller spends a fresh budget.
+  VmRunRequest vreq;
+  vreq.callerPrefix       = run.callerPrefix;
+  vreq.callerKey          = callerKey;
+  vreq.selfAssetKey       = run.assetId;
+  vreq.programOwnerPrefix = programOwnerPrefix;
+  vreq.code               = ces::Bytes(programContent.begin(), programContent.end());
+  vreq.input              = run.input;
+  vreq.budget             = run.budget;
+  vreq.allowance          = run.allowance;
+  vreq.gasMult            = cfg_.feeVmMult;
+  vreq.enableVerifySig    = false;
+  executeVmRun(vreq);
 
   tpsInc();
   return true;
@@ -4639,15 +4755,27 @@ uint8_t CesServer::scheduleRun(const HashPrefix& callerPrefix,
                                 uint64_t budget,
                                 uint64_t allowance,
                                 const ces::Bytes& input,
-                                uint64_t time_us) {
+                                uint64_t time_us, bool prepaid) {
+  ScheduleKey key;
+  return scheduleRunUndoable(callerPrefix, assetId, budget, allowance, input,
+                             time_us, prepaid, key);
+}
+
+uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
+                                        const minx::Hash& assetId,
+                                        uint64_t budget, uint64_t allowance,
+                                        const ces::Bytes& input,
+                                        uint64_t time_us, bool prepaid,
+                                        ScheduleKey& outKey) {
   if (scheduledRuns_.size() >= cfg_.maxScheduledEntries)
     return CES_ERROR_QUEUE_FULL;
   if (time_us == 0) time_us = 1; // "next tick"
+  outKey = ScheduleKey{time_us, scheduledSeq_++};
   LOGTRACE << "scheduleRun" << VAR(time_us) << VAR(budget) << VAR(allowance)
            << VAR(scheduledRuns_.size());
   scheduledRuns_.emplace(
-    ScheduleKey{time_us, scheduledSeq_++},
-    ScheduledRun{callerPrefix, assetId, budget, allowance, input});
+    outKey,
+    ScheduledRun{callerPrefix, assetId, budget, allowance, input, prepaid});
   return CES_OK;
 }
 

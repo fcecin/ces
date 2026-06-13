@@ -19,6 +19,56 @@ BOOST_AUTO_TEST_CASE(Test06_CreateAndQueryAsset) {
   BOOST_CHECK_EQUAL(res[0].balance, 10 + 1);
 }
 
+// Regression (B1): createAsset stored `1 + days`; at the documented max
+// (8191 days) that is 8192, which the 13-bit day field truncates to 0
+// (8192 & 0x1FFF). A max-life asset was created with ZERO days — dead on
+// the next daily maintenance — even though the cost charged for ~8193 days.
+// The stored day count must clamp to the field max, never wrap to 0.
+BOOST_AUTO_TEST_CASE(CreateAssetMaxDaysDoesNotWrapToZero) {
+  minx::Hash aid = makeHash("MAX_DAYS_TOKEN");
+  AssetData data;
+  data.fill(0xCD);
+
+  // 8191 days of asset rent is ~8193 × feeAsset (~210B at stock fees);
+  // fund the client well past that so the create reaches the day-clamp.
+  server->_brr(clientKey.getPublicKeyAsHash(), 100'000'000'000'000LL);
+
+  uint8_t rc = client->createAsset(aid, data, 0x1FFF);  // 8191 = max days
+  CES_REQUIRE_OK(rc);
+
+  std::vector<AssetEntry> res;
+  rc = client->queryAssetSigned(aid, 0, res);
+  CES_REQUIRE_OK(rc);
+  BOOST_REQUIRE_EQUAL(res.size(), 1);
+  BOOST_CHECK_EQUAL((int)ces::assetDays(res[0].balance), 0x1FFF);
+}
+
+// Regression (BUG3): fundAsset billed for the full requested days, but the
+// day field caps at 0x1FFF — funding an asset already at the cap grants 0
+// days yet (pre-fix) charged thousands of days of rent. A fund that adds no
+// days must cost only the flat fund fee.
+BOOST_AUTO_TEST_CASE(FundAssetPastCapDoesNotOvercharge) {
+  server->_brr(clientKey.getPublicKeyAsHash(), 1'000'000'000'000LL);
+  minx::Hash aid = makeHash("FUND_CAP_TOKEN");
+  AssetData data;
+  data.fill(0x77);
+  CES_REQUIRE_OK(client->createAsset(aid, data, 8190));  // → stored at 0x1FFF cap
+
+  HashPrefix d{}; uint32_t n = 0, t = 0; uint64_t a = 0;
+  int64_t before = 0;
+  server->unsignedQueryAccount(getMyId(), before, n, d, a, t);
+
+  CES_REQUIRE_OK(client->fundAsset(aid, 8000));  // 0 days actually granted
+
+  int64_t after = 0;
+  server->unsignedQueryAccount(getMyId(), after, n, d, a, t);
+  int64_t fundCost = before - after;
+  // 8000 days of asset rent is ~200B; granting 0 days must cost ~0 (just the
+  // flat fund fee), far under 1B.
+  BOOST_CHECK_MESSAGE(fundCost < 1'000'000'000LL,
+    "fundAsset overcharged for ungranted days; cost=" << fundCost);
+}
+
 BOOST_AUTO_TEST_CASE(Test07_UpdateAsset) {
   LOGINFO << "TEST: Starting UpdateAsset";
   minx::Hash aid = makeHash("MUTABLE");

@@ -2,6 +2,36 @@
 
 BOOST_FIXTURE_TEST_SUITE(AccountTests, CesFixture)
 
+// Regression (BUG6): a signed CES_TRANSFER carrying reqNonce == CES_NONCELESS
+// reached validateSpend (which skips the nonce check) with no time-box and no
+// dedup, so it executed and would replay. NONCELESS is only legitimate on the
+// time-boxed OPEN_TRANSFER / RUN_ASSET; every other signed wire op must drop it
+// before it touches the ledger.
+BOOST_AUTO_TEST_CASE(NoncelessDroppedOnNonOpenTransfer) {
+  KeyPair dest(KeyAlgo::ED25519);
+  server->_brr(dest.getPublicKeyAsHash(), 1'000'000);  // create destination
+  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+  CesTransfer req;
+  req.originId = clientKey.getPublicKeyAsHash();
+  req.serverId = Account::getMapKey(server->_serverKeyPair().getPublicKeyAsHash());
+  req.reqNonce = CES_NONCELESS;
+  req.destKey  = dest.getPublicKeyAsHash();
+  req.amount   = 12345;
+  minx::Bytes signedBytes = req.toBytes(clientKey);
+
+  minx::SockAddr addr(boost::asio::ip::address_v6::loopback(), 40000);
+  server->incomingMessage(addr, minx::MinxMessage{0, 0, 0, signedBytes});
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  // The NONCELESS transfer must have been dropped — destination unchanged.
+  int64_t destBal = 0; uint32_t n = 0;
+  HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0;
+  server->unsignedQueryAccount(Account::getMapKey(dest.getPublicKeyAsHash()),
+                               destBal, n, xd, xa, xt);
+  BOOST_CHECK_EQUAL(destBal, 1'000'000);  // not 1'000'000 + 12345
+}
+
 BOOST_AUTO_TEST_CASE(Test01_BalanceQuery) {
   LOGINFO << "TEST: Starting BalanceQuery";
   int64_t bal = 0;

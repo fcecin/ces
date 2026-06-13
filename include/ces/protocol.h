@@ -234,7 +234,7 @@ struct CesRunAsset {
   // Per-run cap on caller-account debits (transfers, asset purchases, protocol
   // fees) inside the VM. UINT64_MAX = no enforcement (the default).
   uint64_t allowance = std::numeric_limits<uint64_t>::max();
-  uint64_t time = 0; // UTC epoch seconds (required for CES_NONCELESS dedup)
+  uint64_t time = 0; // UTC epoch microseconds (required for CES_NONCELESS dedup)
   ces::Bytes input; // up to 1024 bytes
   Signature sig{};
 

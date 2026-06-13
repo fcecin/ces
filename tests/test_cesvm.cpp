@@ -3110,4 +3110,62 @@ BOOST_FIXTURE_TEST_CASE(AllowanceCarriesIntoScheduledChild, CesFixture) {
     << destBBefore << " after=" << destBAfter << ")");
 }
 
+// SYS_SCHEDULE enqueues a future run; a VM abort must roll back that enqueue —
+// an aborted run must not leave a live scheduled run behind (otherwise it
+// fires later and charges the caller for work the rolled-back transaction
+// created). The enqueue is recorded in the undo log: commit keeps it, abort
+// erases it.
+BOOST_FIXTURE_TEST_CASE(ScheduleRollsBackOnAbort, CesFixture) {
+  server->_brr(clientKey.getPublicKeyAsHash(), 100'000'000'000LL);
+
+  minx::Hash target; // the asset the program "schedules" (need not exist)
+  target.fill(0x99);
+
+  // Fire 60s out (the cron ticks at 100ms, so a past/near deadline would run
+  // during the test). Computed here and passed in the input as 8 LE bytes; the
+  // hosting cost scales with duration, so 60s is cheap.
+  uint64_t nowUs = std::chrono::duration_cast<std::chrono::microseconds>(
+    std::chrono::system_clock::now().time_since_epoch()).count();
+  uint64_t fireTime = nowUs + 60'000'000;
+  ces::Bytes input(target.begin(), target.end());     // input bytes 0..31
+  ces::Buffer::putLE<uint64_t>(input, fireTime);       // input bytes 32..39
+
+  auto buildSchedProgram = [&](bool abort) {
+    VmProgram pgm;
+    Region keyReg = pgm.allocHash();
+    pgm.copyFromInput(keyReg, 0);          // target key (input cells 0..3)
+    Region timeReg = pgm.allocCell();
+    pgm.copyFromInput(timeReg, 4);         // fireTime value (input cell 4)
+    pgm.sysSchedule({keyReg, Imm(1'000'000), Imm(0), Imm(0), Imm(0),
+                     Ref(timeReg.cell)});  // io[9] = io[timeReg] = fireTime
+    if (abort) pgm.abort();
+    pgm.term();
+    return pgm.buildBootBlock();
+  };
+
+  // Abort variant: the schedule enqueue must be rolled back.
+  {
+    minx::Hash progId; progId.fill(0x71);
+    CES_REQUIRE_OK(client->createAsset(progId, buildSchedProgram(true), 30));
+    uint64_t vmError = 0, budgetUsed = 0;
+    ces::Bytes output;
+    client->runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
+    BOOST_CHECK_EQUAL(vmError, static_cast<uint64_t>(CESVM_ABORT));
+    wait_net();
+    BOOST_CHECK_EQUAL(server->_scheduledRunCount(), 0u);
+  }
+
+  // Commit variant: the schedule enqueue must persist.
+  {
+    minx::Hash progId; progId.fill(0x72);
+    CES_REQUIRE_OK(client->createAsset(progId, buildSchedProgram(false), 30));
+    uint64_t vmError = 0, budgetUsed = 0;
+    ces::Bytes output;
+    client->runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
+    BOOST_CHECK_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
+    wait_net();
+    BOOST_CHECK_EQUAL(server->_scheduledRunCount(), 1u);
+  }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
