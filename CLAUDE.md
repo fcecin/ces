@@ -429,7 +429,7 @@ Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `S
 - File paths must start with `/h/<64-hex>/`, `/f/<name>/`, `/p/`, or `/s/` — anything else → `BAD_NAME`.
 - **/s/ requires server's own private key as signer.** Only operator deploys; reads unmetered. `fileHandlerDebitBalance`/`CreditBalance` no-op on /s/ — file_balance is decorative there, never consulted by supervisor billing.
 - **Compute fees come out of source file's `file_balance`**, not launcher's account. Refunds also land back there. Bounds per-program credit exposure to operator funding.
-- **Server's own account is uncounted + bottomless.** Force-reset to exactly `2^60` every boot (far below `INT64_MAX`, so incoming transfers can't overflow; resets even a value corrupted or overgrown by an older build, not just topped up); excluded from `totalCredits_` and from cesnetbot's conservation sum (server-self cells skipped, vostro/reserve cells on peers still count). Anchors the "credits are not money" thesis structurally.
+- **Server's own account is uncounted + bottomless.** Force-reset to exactly `2^50` every boot (far below `INT64_MAX`, so incoming transfers can't overflow; resets even a value corrupted or overgrown by an older build, not just topped up); excluded from `totalCredits_` and from cesnetbot's conservation sum (server-self cells skipped, vostro/reserve cells on peers still count). Anchors the "credits are not money" thesis structurally.
 
 ## RandomX (via MINX)
 

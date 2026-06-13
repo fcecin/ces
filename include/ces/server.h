@@ -845,6 +845,16 @@ private:
   void handleRunAsset(const CesRunAsset& req, const HashPrefix& originPrefix,
                       const SockAddr& addr, const MinxMessage& msg);
 
+  // NONCELESS resolution, shared by the two time-boxed escape-hatch ops
+  // (CES_OPEN_TRANSFER and CES_RUN_ASSET). Validates the dedup time window +
+  // replay, then resolves the server-assigned nonce into `outNonce`. A non-
+  // NONCELESS reqNonce short-circuits to Proceed with outNonce = reqNonce.
+  // Callers map the verdict to their own reply shape.
+  enum class NoncelessResult { Proceed, Stale, Duplicate };
+  NoncelessResult resolveNonceless(uint64_t time, const Signature& sig,
+                                   const HashPrefix& originPrefix,
+                                   uint32_t reqNonce, uint32_t& outNonce);
+
   // The neutral VM-execution transaction core. Both run paths (CES_RUN_ASSET
   // dispatch and executeScheduledRun) call this with the gas budget already
   // debited from the caller. It owns the undo log, the deferred side effects,

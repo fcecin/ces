@@ -60,6 +60,12 @@ constexpr uint64_t POW_QUEUE_REFRESH_SECS = 3;
 
 // PoW mining reward base: amount = (1 << (difficulty - 1)) * POW_REWARD_BASE.
 constexpr uint64_t POW_REWARD_BASE = 1000;
+// Ceiling on the difficulty used for the mint reward. (1<<(D-1))*POW_REWARD_BASE
+// must not overflow uint64 (and the shift must stay < 64). With base≈2^10, D=54
+// gives (1<<53)*1000 ≈ 9.0e18, comfortably under 2^64; D≥56 overflows and D≥65
+// is shift UB. A higher-difficulty solution still mints — capped at this reward.
+// The exponential reward is bounded; the solution's validity is not.
+constexpr int MAX_POW_DIFFICULTY = 54;
 
 // Reply retransmission schedule (UDP loss recovery on server -> client).
 // Each delay is relative to the previous retransmission, not the original send.
@@ -81,9 +87,10 @@ constexpr const char* ACCOUNTS_DATA_SUBDIRECTORY = "accounts";
 constexpr const char* ASSETS_DATA_SUBDIRECTORY = "assets";
 
 // Shared write-auth check for VM host callbacks.
+// - Immutable assets: nobody may write.
 // - Asset-owned assets: only the executing boot asset itself can write.
 // - Account-owned assets: runner or program owner can write.
-// Returns CES_OK or CES_ERROR_NOT_OWNER.
+// Returns CES_OK, CES_ERROR_IMMUTABLE, or CES_ERROR_NOT_OWNER.
 static inline uint8_t checkAssetWriteAuth(const Asset& asset,
                                            const HashPrefix& caller,
                                            const HashPrefix& programOwner,
@@ -784,12 +791,11 @@ private:
   // ownerTransfer (programOwner-as-source) credit through here.
   void creditDest(const minx::Hash& dest, uint64_t amount) {
     HashPrefix destPrefix = Account::getMapKey(dest);
+    maybeSaveAccount(destPrefix);
     auto destIt = server_.accounts_->find(destPrefix);
     if (destIt != server_.accounts_->end()) {
-      maybeSaveAccount(destPrefix);
       destIt->second.setBalance(destIt->second.getBalance() + amount);
     } else {
-      maybeSaveAccount(destPrefix);
       Account newAcc(dest, amount, 0);
       server_.accounts_->getObjects().emplace(destPrefix, newAcc);
     }
@@ -1017,7 +1023,7 @@ CesServer::CesServer(const CesConfig& config)
         break;
       }
       ++shown;
-      minx::Hash fullKey = const_cast<Account&>(acc).getKey(prefix);
+      minx::Hash fullKey = acc.getKey(prefix);
       LOGDEBUG << "[" << std::setw(2) << shown << "] "
                << minx::hashToString(fullKey)
                << " | Balance: " << acc.getBalance()
@@ -1287,14 +1293,16 @@ void CesServer::stop(bool flushEvents) {
     return;
   LOGDEBUG << "stop flagging server for termination";
   receiving_ = false;
-  int mul = 1;
-  int ctrlCCount = ces::interruptCount();
-  int maxCtrlCCount = 5;
+  const int maxCtrlCCount = 5;
   LOGDEBUG << "stop checking that PoW queue is empty";
   while (true) {
     size_t powQueueSize = minx_->getVerifyPoWQueueSize();
     if (!powQueueSize)
       break;
+    // Re-read the interrupt count every iteration — capturing it once before
+    // the loop made the ctrl-C escape dead, so a stuck verify queue could
+    // hang shutdown with no way out.
+    int ctrlCCount = ces::interruptCount();
     if (ctrlCCount >= maxCtrlCCount) {
       LOGINFO << "stop interrupted waiting for PoW queue to empty out"
               << VAR(powQueueSize);
@@ -1302,7 +1310,7 @@ void CesServer::stop(bool flushEvents) {
     }
     LOGTRACE << "stop waiting for PoW queue to empty out" << VAR(powQueueSize)
              << VAR(ctrlCCount) << VAR(maxCtrlCCount);
-    ces::sleep(100 * mul);
+    ces::sleep(100);
   }
   running_ = false;
 
@@ -1561,6 +1569,24 @@ void CesServer::dispatchSigned(const SockAddr& addr, const MinxMessage& msg,
         return;
       fn(req, prefix, addr, msg);
     });
+}
+
+CesServer::NoncelessResult CesServer::resolveNonceless(
+    uint64_t time, const Signature& sig, const HashPrefix& originPrefix,
+    uint32_t reqNonce, uint32_t& outNonce) {
+  outNonce = reqNonce;
+  if (reqNonce != CES_NONCELESS)
+    return NoncelessResult::Proceed;
+  uint64_t now = getMicrosSinceEpoch();
+  if (time > now + DEDUP_FUTURE_DRIFT_US || time + DEDUP_WINDOW_US < now)
+    return NoncelessResult::Stale;
+  uint64_t sigHash;
+  std::memcpy(&sigHash, sig.data(), sizeof(sigHash));
+  if (!checkAndInsertDedup(sigHash))
+    return NoncelessResult::Duplicate;
+  auto acc = accounts_.get(originPrefix);
+  outNonce = acc.exists() ? acc.nonce() + 1 : 1;
+  return NoncelessResult::Proceed;
 }
 
 // ----------------------------------------------------------------------------
@@ -2456,20 +2482,15 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
             sendSignedReply(addr, msg, std::move(res));
           };
 
-          uint32_t effectiveNonce = req.reqNonce;
-          if (req.reqNonce == CES_NONCELESS) {
-            uint64_t now = getMicrosSinceEpoch();
-            if (req.time > now + DEDUP_FUTURE_DRIFT_US ||
-                req.time + DEDUP_WINDOW_US < now) {
+          uint32_t effectiveNonce;
+          switch (resolveNonceless(req.time, req.sig, originPrefix,
+                                   req.reqNonce, effectiveNonce)) {
+            case NoncelessResult::Stale:
               return reply(req.reqNonce, 0, CES_ERROR_WRONG_NONCE);
-            }
-            uint64_t sigHash;
-            std::memcpy(&sigHash, req.sig.data(), sizeof(sigHash));
-            if (!checkAndInsertDedup(sigHash)) {
+            case NoncelessResult::Duplicate:
               return reply(req.reqNonce, 0, CES_OK);
-            }
-            auto acc = accounts_.get(Account::getMapKey(req.originId));
-            effectiveNonce = acc.exists() ? acc.nonce() + 1 : 1;
+            case NoncelessResult::Proceed:
+              break;
           }
 
           int64_t newBal = 0;
@@ -2774,7 +2795,11 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
 
         unsignedQueryAsset(req.assetId, owner, content, balance, price);
 
-        // Check privacy: hide content from unsigned queries
+        // Privacy: hide CONTENT from unsigned queries. Metadata (owner, days,
+        // price) stays visible by design — a private asset is "content-private",
+        // not invisible (see PrivateAssetUnsignedQueryHidesContent). The signed
+        // path is stricter for non-owners (not-found), but that asymmetry is
+        // intentional.
         auto aa = assets_.get(req.assetId);
         if (aa.exists() && isAssetPrivate(aa.data().getBalance()))
           content = {};
@@ -3117,26 +3142,21 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
   res.allowanceUsed = 0;
 
   // --- Nonceless dedup ---
-  uint32_t effectiveNonce = req.reqNonce;
-  if (req.reqNonce == CES_NONCELESS) {
-    uint64_t now = getMicrosSinceEpoch();
-    if (req.time > now + DEDUP_FUTURE_DRIFT_US ||
-        req.time + DEDUP_WINDOW_US < now) {
+  uint32_t effectiveNonce;
+  switch (resolveNonceless(req.time, req.sig, originPrefix,
+                           req.reqNonce, effectiveNonce)) {
+    case NoncelessResult::Stale:
       res.reqNonce = req.reqNonce;
       res.rcode = CES_ERROR_WRONG_NONCE;
       sendSignedReply(addr, msg, std::move(res));
       return;
-    }
-    uint64_t sigHash;
-    std::memcpy(&sigHash, req.sig.data(), sizeof(sigHash));
-    if (!checkAndInsertDedup(sigHash)) {
+    case NoncelessResult::Duplicate:
       res.reqNonce = req.reqNonce;
       res.rcode = CES_OK; // already processed
       sendSignedReply(addr, msg, std::move(res));
       return;
-    }
-    auto acc = accounts_.get(originPrefix);
-    effectiveNonce = acc.exists() ? acc.nonce() + 1 : 1;
+    case NoncelessResult::Proceed:
+      break;
   }
   res.reqNonce = effectiveNonce;
 
@@ -3286,7 +3306,11 @@ void CesServer::incomingProveWork(const SockAddr& addr,
   postLogic( [this, addr, msg, difficulty]() {
     minx::Hash actualBeneficiaryFullKey;
     HashPrefix mapKey = Account::getMapKey(msg.ckey);
-    uint64_t generatedAmount = (1ULL << (difficulty - 1)) * POW_REWARD_BASE;
+    // Cap the difficulty used for the reward so the shift/multiply can't
+    // overflow (or become shift UB) on an extreme-difficulty solution.
+    int effDiff = (difficulty > MAX_POW_DIFFICULTY) ? MAX_POW_DIFFICULTY
+                                                    : difficulty;
+    uint64_t generatedAmount = (1ULL << (effDiff - 1)) * POW_REWARD_BASE;
     uint64_t creditAmount = generatedAmount;
 
     ActiveAccount acc = accounts_.get(mapKey);
@@ -4277,25 +4301,19 @@ CesClientAsync* CesServer::getOrCreateSettlementClient(
 // Peer Table
 // =============================================================================
 
-static boost::asio::ip::address resolveIP(const std::string& hostPort) {
-  if (hostPort.empty()) return {};
-  try {
-    auto ep = Resolver::resolveUdp(hostPort);
-    return ep.address();
-  } catch (...) {
-    return {};
-  }
-}
-
 void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
                             uint64_t inboundCredit) {
+  // NOTE: this runs on the logic strand (incomingProveWork posts here with an
+  // UNTRUSTED appData["server"] address). Do NOT resolve DNS here — a blocking
+  // getaddrinfo on a hostile hostname would stall the whole ledger thread.
+  // resolvedIP is populated off-strand by the peer miner when it probes the
+  // peer (which already resolves declaredAddress, and is cost-gated to the
+  // top peers by inbound PoW).
   std::lock_guard lock(peerTableMutex_);
   for (auto& p : peerTable_) {
     if (p.ckey == ckey) {
-      if (!address.empty()) {
+      if (!address.empty())
         p.declaredAddress = address;
-        p.resolvedIP = resolveIP(address);
-      }
       p.totalInboundPoW += inboundCredit;
       if (inboundCredit > 0) p.lastInboundTime = minx::getSecsSinceEpoch();
       return;
@@ -4305,7 +4323,6 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
   PeerEntry pe;
   pe.ckey = ckey;
   pe.declaredAddress = address;
-  pe.resolvedIP = resolveIP(address);
   pe.totalInboundPoW = inboundCredit;
   if (inboundCredit > 0) pe.lastInboundTime = minx::getSecsSinceEpoch();
   peerTable_.push_back(pe);
@@ -4377,7 +4394,8 @@ void CesServer::loadPeerData() {
           if (keyHex.empty()) continue;
           minx::stringToHash(pe.ckey, keyHex);
           pe.declaredAddress = (*t)["address"].value_or(std::string(""));
-          pe.resolvedIP = resolveIP(pe.declaredAddress);
+          // resolvedIP is left empty; the peer miner fills it on first probe
+          // (off-strand). Keeps DNS off any path that could be hit eagerly.
           pe.totalInboundPoW = static_cast<uint64_t>(
             (*t)["total_inbound_pow"].value_or(int64_t(0)));
           pe.totalOutboundPoW = static_cast<uint64_t>(
@@ -4501,6 +4519,9 @@ void CesServer::peerMinerLoop() {
       // Try to connect and query balance (this IS the verification)
       try {
         auto ep = Resolver::resolveUdp(peer.declaredAddress);
+        // Populate resolvedIP off-strand (here on the miner thread) — this is
+        // the single source for it, feeding isConnected's peer-IP trust check.
+        peer.resolvedIP = ep.address();
         CesClient client(ep, false);
         client.start(0);
         if (!client.connect()) {
@@ -4619,6 +4640,7 @@ void CesServer::peerMinerLoop() {
             p.verified = c.verified;
             p.pingFailures = c.pingFailures;
             p.lastCheckTime = c.lastCheckTime;
+            p.resolvedIP = c.resolvedIP;
             break;
           }
         }
@@ -4786,9 +4808,10 @@ uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
 // Three-stage flow, each stage on a specific thread:
 //
 //   1. queueRpc — LOGIC STRAND
-//      Validate destination + file auth, walk the chain to
-//      materialize request bytes, build the signed envelope
-//      (body + time + sender_key + sha256 + sig), post to rpcTaskIO_.
+//      Validate destination + file auth, walk the chain to materialize
+//      the raw request bytes, post to rpcTaskIO_. No per-op envelope —
+//      the signed bind contract authenticates the channel once at open,
+//      and the body flows raw on it.
 //
 //   2. executeRpc — rpcTaskIO_ THREAD
 //      Resolve (host, port) to a SockAddr (numeric IPs only for MVP),
@@ -4799,10 +4822,10 @@ uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
 //      Write response bytes into the same file chain, update
 //      header.fileSize, schedule the followup VM program.
 //
-// The RpcSession class and the envelope helpers live near the top
-// of this file (above CesServer::CesServer) because start()'s Rudp
-// receive callback demuxes to shared_ptr<RpcSession> and needs the
-// complete type at the point where the lambda is defined.
+// The RpcSession class lives near the top of this file (above
+// CesServer::CesServer) because start()'s Rudp receive callback demuxes
+// to shared_ptr<RpcSession> and needs the complete type at the point
+// where the lambda is defined.
 
 // ---------------------------------------------------------------------------
 // queueRpc (logic strand)

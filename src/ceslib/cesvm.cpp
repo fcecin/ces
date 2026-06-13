@@ -859,9 +859,14 @@ void CesVM::hostCall(CesVMHost& host) {
     HashPrefix _o; AssetData _c; uint16_t _bal = 0; uint32_t _p = 0;
     uint32_t held = host.readAsset(key, _o, _c, _bal, _p)
                       ? assetDays(_bal) : 0u;
+    // The day field caps at 0x1FFF, and VmHost::fundAsset clamps the grant
+    // to it — so bill only for the days actually granted, not the full
+    // request (mirrors the wire fundAsset fix; otherwise funding a near-cap
+    // asset overcharges for days it never receives).
+    uint32_t granted = std::min<uint32_t>(0x1FFF, held + days) - held;
     if (!billCredits(host.feeTx + computePrepayCost(host.feeAssetRaw,
                                              host.assetRentMultBp,
-                                             days, held))) return;
+                                             granted, held))) return;
     S() = host.fundAsset(key, days);
     break;
   }
@@ -1057,6 +1062,11 @@ void CesVM::hostCall(CesVMHost& host) {
     // remaining or this fails ALLOWANCE_EXCEEDED — and once we accept,
     // the parent loses that headroom for any subsequent SYS_SCHEDULE or
     // direct spend in this run.
+    //
+    // NOTE: allowance bounds caller-account *debits* (transfers/fees), NOT
+    // gas — childBudget is intentionally not carved here. See review F2: the
+    // lack of any spawned-gas exposure bound is a design gap, not bounded by
+    // conflating it with the debit allowance.
     if (host.allowance != std::numeric_limits<uint64_t>::max()) {
       if (childAllowance > host.allowance) {
         S() = CES_ERROR_ALLOWANCE_EXCEEDED;

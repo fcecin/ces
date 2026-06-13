@@ -40,6 +40,8 @@
 * include/ces/protocol.h
 * include/ces/types.h
 * src/cesbench/cesbench.cpp
+* include/ces/server.h
+* src/ceslib/server.cpp
 
 ## Review PASS 2
 
@@ -49,7 +51,6 @@
 
 * include/ces/client.h
 * include/ces/clientasync.h
-* include/ces/server.h
 * src/ces/main.cpp
 * src/cesh/main.cpp
 * src/cesqt/appmodel.h

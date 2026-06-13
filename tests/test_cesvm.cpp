@@ -3168,4 +3168,41 @@ BOOST_FIXTURE_TEST_CASE(ScheduleRollsBackOnAbort, CesFixture) {
   }
 }
 
+// F1: SYS_FUND_ASSET must bill for days actually GRANTED (clamped at 0x1FFF),
+// not the full request. Give the run a budget covering the granted-days rent
+// but NOT the full-request rent: with the fix it commits, without it (billing
+// the full request) it hits CESVM_BUDGET.
+BOOST_FIXTURE_TEST_CASE(VmFundAssetBillsGrantedNotRequested, CesFixture) {
+  server->_brr(clientKey.getPublicKeyAsHash(), 1'000'000'000'000LL); // 1T
+
+  // Asset already near the day cap.
+  minx::Hash target; target.fill(0x6F);
+  AssetData content; content.fill(0x01);
+  CES_REQUIRE_OK(client->createAsset(target, content, 8000));
+
+  // Program: SYS_FUND_ASSET(+1000 days). granted = 0x1FFF - 8001 = 190;
+  // full request would be 1000.
+  minx::Hash progId; progId.fill(0x6E);
+  VmProgram pgm;
+  Region keyReg = pgm.allocHash();
+  pgm.copyFromInput(keyReg, 0);
+  pgm.sysFundAsset({keyReg, Imm(1000)});
+  pgm.term();
+  CES_REQUIRE_OK(client->createAsset(progId, pgm.buildBootBlock(), 30));
+
+  ces::Bytes input(target.begin(), target.end());
+  uint64_t vmError = 0, budgetUsed = 0;
+  ces::Bytes output;
+  // ~190 days rent (≈4.9e9 at full price) fits in 1e10; 1000 days (≈2.56e10)
+  // would not. Fix → CESVM_OK; pre-fix → CESVM_BUDGET.
+  uint8_t rc = client->runAsset(progId, 10'000'000'000ULL, input, vmError,
+                                budgetUsed, output);
+  BOOST_REQUIRE_EQUAL(rc, CES_OK);
+  BOOST_CHECK_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
+
+  HashPrefix o; AssetData c; uint16_t days = 0; uint32_t p;
+  client->queryAsset(target, o, c, days, p);
+  BOOST_CHECK_EQUAL(days, 0x1FFF); // funded to the cap
+}
+
 BOOST_AUTO_TEST_SUITE_END()
