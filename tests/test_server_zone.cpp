@@ -18,7 +18,7 @@
 #include "test_common.h"
 
 #include <ces/l2/file_client.h>
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/server.h>
 
 #include <chrono>

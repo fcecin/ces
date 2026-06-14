@@ -8,7 +8,7 @@
 // a channel to the server's rpc port and speaks the select wire
 // protocol directly.
 //
-// Wire format (see include/ces/l2/net_multiplexer.h):
+// Wire format (see include/ces/cesplex/mux.h):
 //
 //   Client → Server: [u16 BE proto_name_len][proto_name_bytes]
 //   Server → Client: [u8 status]     0x01 = OK, 0x00 = NACK
@@ -24,11 +24,11 @@
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
 
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/server.h>
 
 #include <minx/minx.h>
@@ -551,7 +551,7 @@ BOOST_AUTO_TEST_CASE(FileSelectAccepts) {
 
 // A bind request carries a signed client_time_us but binds no
 // channelId/sessionToken; without a freshness check a captured bind replays on
-// fresh channels (re-binding as the victim, accruing NetworkBilling). A bind
+// fresh channels (re-binding as the victim, accruing ChannelMeter). A bind
 // whose timestamp is outside the freshness window must NACK. (Fresh binds still
 // succeed — see FileSelectAccepts above.)
 BOOST_AUTO_TEST_CASE(BindRejectsStaleTime) {

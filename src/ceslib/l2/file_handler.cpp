@@ -22,8 +22,8 @@
 // signer and file_balance, as each verb defines. STAT is free.
 //
 // Fee-discount policy. The per-channel RUDP rates that apply to a
-// bound CesPlex channel are discounted at the NetworkBilling tick
-// layer under FeeKind::Net (see net_billing.cpp). The per-verb
+// bound CesPlex channel are discounted at the ChannelMeter tick
+// layer under FeeKind::Net (see cesplex/meter.cpp). The per-verb
 // feeQuery debits dispatched here against the bound signer are
 // intentionally raw — they are the flat anti-spam toll on top of
 // the channel-level dynamic pricing. The compute handler discounts
@@ -32,8 +32,8 @@
 // bound-channel work whose dynamic component is already priced via
 // Net, so the per-verb toll stays flat by design.
 
-#include <ces/l2/net_multiplexer.h>
-#include <ces/l2/cesplex.h>
+#include <ces/cesplex/mux.h>
+#include <ces/cesplex/session.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
@@ -669,7 +669,7 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
 // ---------------------------------------------------------------------------
 
 // The signed-request loop lives in the CesPlex framework (cesPlexServe /
-// CesPlexRequest, see net_multiplexer.h). ReqCtx aliases the framework
+// CesPlexRequest, see cesplex/mux.h). ReqCtx aliases the framework
 // request so the dispatchers below need no changes; the thin senders
 // forward to its respond/error helpers. respond's `extraBody` streams a
 // READ payload after the envelope; errorAndClose drops the channel for a
@@ -677,6 +677,13 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
 // loop there would desync the stream).
 
 using ReqCtx = ces::CesPlexRequest;
+
+// The CesPlex bus is host-generic (it knows only CesPlexHost). builtin:file
+// is a CES core feature, so its host is always the CesServer — recover the
+// concrete server for the ledger-facing calls below.
+inline CesServer* reqServer(const std::shared_ptr<ReqCtx>& ctx) {
+  return static_cast<CesServer*>(ctx->host);
+}
 
 inline void sendResponseAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status,
                                 ces::Bytes preamble,
@@ -877,7 +884,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     (uint8_t zoneRc) mutable {
     if (zoneRc != CES_OK) { sendErrorAndLoop(ctx, zoneRc); return; }
 
-    const auto& cfg = ctx->server->_config();
+    const auto& cfg = reqServer(ctx)->_config();
     uint8_t rc = checkPathConflict(
       cfg.cesFileStoreDir, name, /*createMode=*/true);
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
@@ -929,7 +936,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         if (duplicate) {
           uint64_t programAccountInitial = (initialDeposit > upfrontBurn)
             ? (initialDeposit - upfrontBurn) : 0;
-          const auto& cfg = ctx->server->_config();
+          const auto& cfg = reqServer(ctx)->_config();
           ces::Bytes pre;
           ces::Buffer::put<uint64_t>(pre, programAccountInitial);
           ces::Buffer::put<uint64_t>(pre, static_cast<uint64_t>(cfg.feeQuery) +
@@ -937,7 +944,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
           sendResponseAndLoop(ctx, CES_OK, std::move(pre));
           return;
         }
-        const auto& cfg = ctx->server->_config();
+        const auto& cfg = reqServer(ctx)->_config();
         auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
         auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
 
@@ -961,7 +968,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         uint64_t programAccountInitial = (initialDeposit > upfrontBurn)
           ? (initialDeposit - upfrontBurn) : 0;
 
-        ctx->server->_l2CreateProgramAccount(
+        reqServer(ctx)->_l2CreateProgramAccount(
           static_cast<int64_t>(programAccountInitial),
           [ctx, size, pricePerKb, initialDeposit, programAccountInitial,
            contentType, name, cPath, sPath]
@@ -991,7 +998,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
             // Bump store meta (mutex). /s/ files live outside the
             // cap, so skip the meta update — reconcile would
             // subtract them back on next startup anyway.
-            const auto& cfg = ctx->server->_config();
+            const auto& cfg = reqServer(ctx)->_config();
             if (!isServerZone(name)) {
               std::lock_guard lk(gStoreMetaMutex);
               adjustStoreMeta(cfg.cesFileStoreDir, +1,
@@ -1010,7 +1017,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
           ctx->stream->get_executor());
       };
 
-    ctx->server->_l2ValidateDedupAndDebit(
+    reqServer(ctx)->_l2ValidateDedupAndDebit(
       signer, signerDebit, ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
       std::move(after), ctx->stream->get_executor());
   };  // end finishCreate lambda
@@ -1018,7 +1025,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // Kick off the zone check. /h/ and /p/ resolve synchronously;
   // /f/ hops to logicStrand_ to verify asset ownership.
   checkZoneOwnership(
-    ctx->server, name, ctx->bound.boundPubkey.getHash(),
+    reqServer(ctx), name, ctx->bound.boundPubkey.getHash(),
     ctx->stream->get_executor(), std::move(finishCreate));
 }
 
@@ -1069,7 +1076,7 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndClose(ctx, rc); return; }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1090,7 +1097,7 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint64_t writeCost = isServerZone(name)
     ? 0 : kbCeil(length) * uint64_t(cfg.feeFileWrite);
   if (writeCost > 0 &&
-      readProgramAccountBalance(ctx->server, sc) < writeCost) {
+      readProgramAccountBalance(reqServer(ctx), sc) < writeCost) {
     sendErrorAndClose(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
   }
   // Persist the rent-advanced sidecar before the body phase so that
@@ -1131,7 +1138,7 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         if (duplicate) {
           ces::Bytes pre;
           ces::Buffer::put<uint64_t>(
-            pre, readProgramAccountBalance(ctx->server, sc));
+            pre, readProgramAccountBalance(reqServer(ctx), sc));
           sendResponseAndLoop(ctx, CES_OK, std::move(pre));
           return;
         }
@@ -1152,14 +1159,14 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         uint64_t newBal = 0;
         if (writeCost > 0) {
           auto debit = debitProgramAccount(
-            ctx->server, sc, writeCost);
+            reqServer(ctx), sc, writeCost);
           if (!debit.ok) {
             sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE);
             return;
           }
           newBal = debit.newBalance;
         } else {
-          newBal = readProgramAccountBalance(ctx->server, sc);
+          newBal = readProgramAccountBalance(reqServer(ctx), sc);
         }
         sc.modified_us = getMicrosSinceEpoch();
         // Content changed → invalidate the lazily-cached program hash.
@@ -1173,7 +1180,7 @@ void dispatchWrite(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       });
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1208,7 +1215,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1251,7 +1258,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   auto after = [ctx, offset, length, name, readPrice, isOwner]
     (uint8_t rc, bool duplicate) mutable {
       if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-      const auto& cfg = ctx->server->_config();
+      const auto& cfg = reqServer(ctx)->_config();
       auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
       auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
       // Read range from disk.
@@ -1269,7 +1276,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       if (!isOwner && readPrice > 0 && !duplicate) {
         Sidecar sc{};
         if (readSidecar(sPath, sc)) {
-          creditProgramAccount(ctx->server, sc, readPrice);
+          creditProgramAccount(reqServer(ctx), sc, readPrice);
           sc.modified_us = getMicrosSinceEpoch();
           writeSidecar(sPath, sc);
         }
@@ -1282,7 +1289,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       sendResponseAndLoop(ctx, CES_OK, std::move(pre), std::move(data));
     };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, signerDebit, ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1310,7 +1317,7 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) {
@@ -1324,7 +1331,7 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   auto after = [ctx, amount, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-    const auto& cfg = ctx->server->_config();
+    const auto& cfg = reqServer(ctx)->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
     Sidecar sc{};
     if (!readSidecar(sPath, sc)) {
@@ -1333,19 +1340,19 @@ void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Duplicate: re-crediting would mint (the signer wasn't re-debited). Skip;
     // the balance re-read below reflects the first deposit.
     if (!duplicate) {
-      creditProgramAccount(ctx->server, sc, amount);
+      creditProgramAccount(reqServer(ctx), sc, amount);
       sc.modified_us = getMicrosSinceEpoch();
       if (!writeSidecar(sPath, sc)) {
         sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
       }
     }
-    uint64_t newBal = readProgramAccountBalance(ctx->server, sc);
+    uint64_t newBal = readProgramAccountBalance(reqServer(ctx), sc);
     ces::Bytes pre;
     ces::Buffer::put<uint64_t>(pre, newBal);
     sendResponseAndLoop(ctx, CES_OK, std::move(pre));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, signerDebit, ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1373,7 +1380,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1388,7 +1395,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   if (std::memcmp(sc.owner_pubkey.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
     sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
-  if (readProgramAccountBalance(ctx->server, sc) < amount) {
+  if (readProgramAccountBalance(reqServer(ctx), sc) < amount) {
     sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
   }
 
@@ -1396,7 +1403,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   auto after = [ctx, amount, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-    const auto& cfg = ctx->server->_config();
+    const auto& cfg = reqServer(ctx)->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
     Sidecar sc{};
     if (!readSidecar(sPath, sc)) {
@@ -1405,13 +1412,13 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Duplicate: re-running would double-pay the owner and drain the program
     // account twice. Replay OK with the current balance, no re-debit/re-credit.
     if (duplicate) {
-      uint64_t bal = readProgramAccountBalance(ctx->server, sc);
+      uint64_t bal = readProgramAccountBalance(reqServer(ctx), sc);
       ces::Bytes pre;
       ces::Buffer::put<uint64_t>(pre, bal);
       sendResponseAndLoop(ctx, CES_OK, std::move(pre));
       return;
     }
-    auto debit = debitProgramAccount(ctx->server, sc, amount);
+    auto debit = debitProgramAccount(reqServer(ctx), sc, amount);
     if (!debit.ok) {
       sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
     }
@@ -1421,7 +1428,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     }
     // Credit owner's account.
     ces::PublicKey ownerPk(sc.owner_pubkey);
-    ctx->server->_l2CreditAccount(
+    reqServer(ctx)->_l2CreditAccount(
       ownerPk, static_cast<int64_t>(amount),
       [ctx, balance = debit.newBalance]() {
         ces::Bytes pre;
@@ -1431,7 +1438,7 @@ void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       ctx->stream->get_executor());
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1460,7 +1467,7 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1480,7 +1487,7 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   auto after = [ctx, newPrice, name](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-    const auto& cfg = ctx->server->_config();
+    const auto& cfg = reqServer(ctx)->_config();
     auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
     Sidecar sc{};
     if (!readSidecar(sPath, sc)) {
@@ -1500,7 +1507,7 @@ void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, std::move(pre));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1530,7 +1537,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1552,7 +1559,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     //   [u8[32] owner_pubkey][u64 file_balance][u64 price_per_kb]
     //   [u64 size][u16 ct_len][ct][u64 created_us][u64 modified_us]
     // file_balance is now the file's program-account balance.
-    uint64_t fileBalance = readProgramAccountBalance(ctx->server, sc);
+    uint64_t fileBalance = readProgramAccountBalance(reqServer(ctx), sc);
     ces::Bytes resp;
     resp.insert(resp.end(),
                 sc.owner_pubkey.begin(), sc.owner_pubkey.end());
@@ -1567,7 +1574,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1594,7 +1601,7 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1623,7 +1630,7 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       sendResponseAndLoop(ctx, CES_OK, std::move(pre));
       return;
     }
-    const auto& cfg = ctx->server->_config();
+    const auto& cfg = reqServer(ctx)->_config();
     // Re-read sidecar (race-free-ish: we're the only writer for this
     // op in practice; v1 accepts the dice roll).
     Sidecar sc{};
@@ -1634,9 +1641,9 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // atomically. The account row stays (zero-balance accounts are
     // collected by daily maintenance later), but every credit is
     // moved out before the file goes away.
-    uint64_t refund = readProgramAccountBalance(ctx->server, sc);
+    uint64_t refund = readProgramAccountBalance(reqServer(ctx), sc);
     if (refund > 0) {
-      auto debit = debitProgramAccount(ctx->server, sc, refund);
+      auto debit = debitProgramAccount(reqServer(ctx), sc, refund);
       if (!debit.ok) refund = 0;
     }
     uint64_t size = sc.size;
@@ -1661,7 +1668,7 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     }
     ces::PublicKey ownerPk(scSaved.owner_pubkey);
     notifyDeletion(name);
-    ctx->server->_l2CreditAccount(
+    reqServer(ctx)->_l2CreditAccount(
       ownerPk, static_cast<int64_t>(refund),
       [ctx, refund]() {
         ces::Bytes pre;
@@ -1671,7 +1678,7 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       ctx->stream->get_executor());
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1720,7 +1727,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndClose(ctx, rc); return; }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1761,7 +1768,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint64_t upfront = serverZone
     ? 0 : computeOwedRent(length, cfg.feeFileRent, 0, kGcDebounceUs);
   if ((writeCost + upfront) > 0 &&
-      readProgramAccountBalance(ctx->server, sc) < writeCost + upfront) {
+      readProgramAccountBalance(reqServer(ctx), sc) < writeCost + upfront) {
     sendErrorAndClose(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
   }
 
@@ -1800,7 +1807,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         if (duplicate) {
           ces::Bytes pre;
           ces::Buffer::put<uint64_t>(
-            pre, readProgramAccountBalance(ctx->server, sc));
+            pre, readProgramAccountBalance(reqServer(ctx), sc));
           ces::Buffer::put<uint64_t>(pre, sc.size);
           sendResponseAndLoop(ctx, CES_OK, std::move(pre));
           return;
@@ -1826,14 +1833,14 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         uint64_t totalDebit = writeCost + upfront;
         if (totalDebit > 0) {
           auto debit = debitProgramAccount(
-            ctx->server, sc, totalDebit);
+            reqServer(ctx), sc, totalDebit);
           if (!debit.ok) {
             sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE);
             return;
           }
           newBal = debit.newBalance;
         } else {
-          newBal = readProgramAccountBalance(ctx->server, sc);
+          newBal = readProgramAccountBalance(reqServer(ctx), sc);
         }
         sc.size = state->oldSize + state->length;
         sc.modified_us = getMicrosSinceEpoch();
@@ -1844,7 +1851,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         }
         if (!isServerZone(sc.name)) {
           std::lock_guard lk(gStoreMetaMutex);
-          const auto& cfg = ctx->server->_config();
+          const auto& cfg = reqServer(ctx)->_config();
           adjustStoreMeta(cfg.cesFileStoreDir, 0,
                           static_cast<int64_t>(state->length));
         }
@@ -1855,7 +1862,7 @@ void dispatchAppend(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       });
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -1891,7 +1898,7 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
@@ -1929,7 +1936,7 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       static_cast<uint64_t>(bytesDelta), cfg.feeFileRent,
       0, kGcDebounceUs);
     if (upfrontBurn > 0 &&
-        readProgramAccountBalance(ctx->server, sc) < upfrontBurn) {
+        readProgramAccountBalance(reqServer(ctx), sc) < upfrontBurn) {
       sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
     }
   }
@@ -1965,7 +1972,7 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     }
     if (upfrontBurn > 0) {
       auto debit = debitProgramAccount(
-        ctx->server, sc, upfrontBurn);
+        reqServer(ctx), sc, upfrontBurn);
       if (!debit.ok) {
         sendErrorAndLoop(ctx, CES_ERROR_INSUFFICIENT_BALANCE); return;
       }
@@ -1980,7 +1987,7 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Store meta: bytes delta (either sign). /s/ is outside the cap.
     if (bytesDelta != 0 && !isServerZone(name)) {
       std::lock_guard lk(gStoreMetaMutex);
-      const auto& cfg = ctx->server->_config();
+      const auto& cfg = reqServer(ctx)->_config();
       adjustStoreMeta(cfg.cesFileStoreDir, 0, bytesDelta);
     }
     ces::Bytes pre;
@@ -1988,7 +1995,7 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, std::move(pre));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(cfg.feeQuery),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
@@ -3126,5 +3133,5 @@ void fileHandlerStartupReconcile() {
 
 REGISTER_CESPLEX_BUILTIN("file", ::ces::gFileHandler, FileHandler)
 
-// TU anchor — net_multiplexer.cpp references this via its anchor array.
+// TU anchor — cesplex/mux.cpp references this via its anchor array.
 extern "C" { int file_handler_anchor = 1; }

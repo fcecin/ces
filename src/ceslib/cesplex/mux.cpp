@@ -1,6 +1,6 @@
-// net_multiplexer.cpp — CesPlex implementation
+// mux.cpp — CesPlex implementation
 //
-// See include/ces/l2/net_multiplexer.h for the design. This file
+// See include/ces/cesplex/mux.h for the design. This file
 // implements:
 //
 //   - The process-wide builtin registry (Meyer-style static).
@@ -9,11 +9,10 @@
 //     wiring into Rudp's channel-opened + receive callbacks, and
 //     the hand-off to registered handlers on OK.
 
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
 
-#include <ces/l2/net_billing.h>
-#include <ces/server.h>
+#include <ces/cesplex/meter.h>
 #include <minx/blog.h>
 
 #include <boost/asio/buffer.hpp>
@@ -260,32 +259,24 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     reply.serverTimeUs = nowMicrosForCesplex();
     reply.channelSessionToken = bound.sessionToken;
     reply.serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
-    if (parent.server_) {
-      const auto& cfg = parent.server_->_config();
-      reply.feeNetChannelSec   = cfg.feeNetChannelSec;
-      reply.feeNetMemByteDay   = cfg.feeNetMemByteDay;
-      reply.feeNetByteSent     = cfg.feeNetByteSent;
-      reply.feeNetByteReceived = cfg.feeNetByteReceived;
-    }
     bound.serverBoundAtUs = reply.serverTimeUs;
 
-    // Sign the reply with the server's keypair.
-    if (!parent.server_) {
-      // No server (legacy test path) — can't sign. Drop.
-      LOGWARNING << "CesPlex: no server, cannot sign bind reply";
-      drop("no server keypair");
+    // Sign the reply with the host's keypair.
+    if (!parent.host_) {
+      // No host (test path) — can't sign. Drop.
+      LOGWARNING << "CesPlex: no host, cannot sign bind reply";
+      drop("no host keypair");
       return;
     }
     replyBuf = buildBindReply(
       reply,
       std::span<const uint8_t>(claimedSha.data(), claimedSha.size()),
-      parent.server_->_serverKeyPair());
+      parent.host_->cesplexSigningKey());
 
-    // Begin per-channel billing. The rates the per-tick debit uses
-    // are always live values from CesConfig — what we disclosed in
-    // the bind reply was a courtesy snapshot, not a contract.
-    if (parent.netBilling_) {
-      parent.netBilling_->track(
+    // Begin metering this channel. Each tick measures its resource deltas
+    // and reports them to the host, which prices them however it likes.
+    if (parent.channelMeter_) {
+      parent.channelMeter_->track(
         peer, channelId, "plex:" + name, bound.payerPfx);
     }
 
@@ -318,7 +309,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
   void sendNackAndDrop(const char* why) {
     LOGDEBUG << "CesPlex: sending NACK reply"
              << SVAR(peer) << VAR(channelId) << SVAR(why);
-    if (!parent.server_) {
+    if (!parent.host_) {
       // Can't sign — just drop without reply.
       drop(why);
       return;
@@ -328,7 +319,6 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     reply.serverTimeUs = nowMicrosForCesplex();
     reply.channelSessionToken = parent.rudp_.sessionToken(peer, channelId);
     reply.serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
-    // No rates on NACK — channel never bound.
 
     // Use the client's claimed sha256 if we got far enough to read
     // the tail; otherwise zero. Bind reply digest covers it either
@@ -342,7 +332,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     replyBuf = buildBindReply(
       reply,
       std::span<const uint8_t>(clientSha.data(), clientSha.size()),
-      parent.server_->_serverKeyPair());
+      parent.host_->cesplexSigningKey());
     auto self = shared_from_this();
     boost::asio::async_write(
       *stream, boost::asio::buffer(replyBuf),
@@ -380,9 +370,9 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
 CesPlex::CesPlex(const std::map<std::string, std::string>& mounts,
                  minx::Rudp& rudp,
                  boost::asio::io_context& io,
-                 CesServer* server,
-                 NetworkBilling* netBilling)
-  : rudp_(rudp), io_(io), server_(server), netBilling_(netBilling) {
+                 CesPlexHost* host,
+                 ChannelMeter* meter)
+  : rudp_(rudp), io_(io), host_(host), channelMeter_(meter) {
   // Resolve each mount's target string against the builtin registry.
   // Unresolvable targets are logged and skipped.
   for (const auto& [proto, target] : mounts) {

@@ -31,7 +31,7 @@ enum class FeeKind : uint8_t {
   ComputeCpu,        // feeComputeCpuSec — compute child CPU cost
   ComputeRss,        // feeComputeRssByteDay — compute child RSS rent
   BucketByteSec,     // feeBucketByteSec — Lua bucket capacity rent
-  Net,               // feeNet* — NetworkBilling per-channel RUDP rates
+  Net,               // feeNet* — ChannelMeter per-channel RUDP rates
   Count_             // sentinel for sizing
 };
 

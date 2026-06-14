@@ -10,7 +10,7 @@
 #define BOOST_TEST_DYN_LINK
 #include "test_e2e_common.h"
 
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/server.h>
 
 #include <fstream>

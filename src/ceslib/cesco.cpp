@@ -3,7 +3,7 @@
  */
 
 #include <ces/cesco.h>
-#include <ces/l2/net_billing.h>
+#include <ces/cesplex/meter.h>
 #include <ces/server.h>
 #include <minx/blog.h>
 
@@ -183,9 +183,9 @@ std::string CescoSession::dispatchCommand(const std::string& line) {
   }
 
   if (line == "netbill") {
-    auto* nb = server_._netBilling();
+    auto* nb = server_._channelMeter();
     if (!nb) {
-      return "netbill: NetworkBilling not active (rpc port disabled).\n";
+      return "netbill: ChannelMeter not active (rpc port disabled).\n";
     }
     auto rows = nb->snapshot();
     std::ostringstream oss;

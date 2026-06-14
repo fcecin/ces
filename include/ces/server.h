@@ -20,7 +20,8 @@
 #include <ces/feemult.h>
 #include <ces/keys.h>
 #include <ces/util/metrics.h>
-#include <ces/l2/net_billing.h>
+#include <ces/cesplex/meter.h>
+#include <ces/cesplex/mux.h>   // CesPlexHost (CesServer implements it)
 #include <ces/protocol.h>
 #include <minx/bucketcache.h>
 #include <minx/rudp/rudp.h>
@@ -29,7 +30,7 @@ using namespace minx;
 
 namespace ces {
 
-// Forward declaration — defined in ces/l2/net_multiplexer.h. CesServer holds
+// Forward declaration — defined in ces/cesplex/mux.h. CesServer holds
 // a unique_ptr to one; the full type is only needed in server.cpp.
 class CesPlex;
 
@@ -203,9 +204,11 @@ struct CesConfig {
   int64_t feeFileWrite  = 0;   // credits per KB — WRITE I/O
   int64_t feeFileRead   = 0;   // credits per KB — READ I/O
 
-  // --- RUDP-tier billing. The four rates below are advertised in each
-  //     channel's bind reply and frozen for that channel's lifetime
-  //     (grandfathered, irrevocable).
+  // --- RUDP-tier pricing. The server's own price per resource dimension
+  //     the CesPlex bus measures, applied live each ChannelMeter tick in
+  //     cesplexReportUsage — the bus reports raw counts, the server prices
+  //     them here. The bus never carries these on the wire; pricing is the
+  //     host's private concern, not part of the bind contract.
   //
   //   feeNetChannelSec    - per-second "channel is open" rate.
   //                         Pays for the supervisor + memory baseline
@@ -216,7 +219,7 @@ struct CesConfig {
   //   feeNetByteReceived  - per byte received client to server.
   //
   // Defaults: 0 (observability only); non-zero values bill per channel
-  // via NetworkBilling.
+  // via ChannelMeter.
   uint64_t feeNetChannelSec   = 0;
   uint64_t feeNetMemByteDay   = 0;
   uint64_t feeNetByteSent     = 0;
@@ -411,7 +414,7 @@ private:
   CesServer* owner_;
 };
 
-class CesServer : public minx::MinxListener {
+class CesServer : public minx::MinxListener, public CesPlexHost {
   friend class CesRpcRudpListener;
 public:
   using ActiveAccount = Accounts::ActiveAccount;
@@ -601,10 +604,10 @@ public:
   // bound to. Non-zero after start() when cfg_.rpcPort was non-zero.
   uint16_t _rpcBoundPort() const { return rpcBoundPort_; }
 
-  // NetworkBilling accessor — used by cesco for the `netbill`
+  // ChannelMeter accessor — used by cesco for the `netbill`
   // command and by tests. Returns nullptr when the rpc port is
-  // disabled (no rpcRudp_, no NetworkBilling).
-  NetworkBilling* _netBilling() { return netBilling_.get(); }
+  // disabled (no rpcRudp_, no ChannelMeter).
+  ChannelMeter* _channelMeter() { return channelMeter_.get(); }
 
   // ---- L2 handler support ----
   //
@@ -645,10 +648,10 @@ public:
       std::function<void()> cb,
       boost::asio::any_io_executor cbExecutor);
 
-  // NetworkBilling per-tick debit. Looks up the account
+  // ChannelMeter per-tick debit. Looks up the account
   // by `payerPfx`; if it exists AND has at least `amount` credits,
   // debits and calls cb(true). Otherwise leaves the account alone
-  // and calls cb(false) — the caller (NetworkBilling) responds by
+  // and calls cb(false) — the caller (ChannelMeter) responds by
   // closing the channel.
   //
   // No nonce, no dedup — billing is server-authoritative and the
@@ -795,6 +798,19 @@ public:
   // receipts that prove "the server committed this state at this
   // time." Cost covered by per-op fees.
   const ces::KeyPair& _serverKeyPair() const { return serverKeyPair_; }
+
+  // CesPlexHost — CesServer hosts the L2 bus on its rpc port. It signs
+  // bind replies / responses with its own key and prices the per-channel
+  // resource usage the bus measures.
+  const ces::KeyPair& cesplexSigningKey() const override {
+    return serverKeyPair_;
+  }
+  // The bus measures; the server prices. Charges `payer` for this tick's
+  // resource usage at the live discounted feeNet* rates and closes the
+  // channel if the payer can't cover it. Defined in server.cpp.
+  void cesplexReportUsage(const HashPrefix& payer,
+                          const minx::SockAddr& peer, uint32_t channelId,
+                          const CesPlexUsage& usage) override;
 
   // The rpcTaskIO executor — L2 handlers that need to post work onto
   // the CesPlex / handler strand (e.g. the compute supervisor tick,
@@ -959,7 +975,7 @@ private:
   // enabled. Bills per-channel byte/memory/age deltas against the bound
   // payer each tick; runs observability-only (delta tracking, no debits
   // or evictions) when the feeNet* rates are 0, the default.
-  std::unique_ptr<NetworkBilling> netBilling_;
+  std::unique_ptr<ChannelMeter> channelMeter_;
 
   // CesPlex — the L2 protocol multiplexer. Lives on rpcTaskIO_,
   // owns inbound-channel dispatch for the secondary port. Handed the
@@ -968,7 +984,7 @@ private:
   // constructing if nothing will ever be selectable). All callbacks
   // on rpcRudp_ that CesPlex installs run on rpcTaskIO_.
   //
-  // Forward-declared: defined in ces/l2/net_multiplexer.h — only included where
+  // Forward-declared: defined in ces/cesplex/mux.h — only included where
   // needed (server.cpp) to avoid pulling the rudp headers into every
   // consumer of server.h.
   std::unique_ptr<CesPlex> cesplex_;

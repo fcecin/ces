@@ -14,11 +14,11 @@
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/buffer.h>
 
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/ramfilestore.h>          // ces::sha256
 #include <ces/keys.h>
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/server.h>
 #include <ces/types.h>
 
@@ -406,5 +406,5 @@ void luaHandlerOnInstanceDying(uint64_t instId) {
 // Static registration.
 REGISTER_CESPLEX_BUILTIN("lua", ::ces::gLuaHandler, LuaHandler)
 
-// TU anchor — net_multiplexer.cpp references this via its anchor array.
+// TU anchor — cesplex/mux.cpp references this via its anchor array.
 extern "C" { int compute_lua_handler_anchor = 1; }

@@ -1,23 +1,21 @@
-// net_billing.h — per-channel RUDP billing
+// meter.h — per-channel RUDP resource meter (ChannelMeter)
 //
-// A 60s tick walks tracked channels, computes the per-tick debit from
-// four billable dimensions × the live rates from CesConfig, and
-// bills the bound payer on logicStrand_. Channels whose payer can't
-// cover the tick debit are evicted via Rudp::closeChannel.
+// A 60s tick walks tracked channels and measures each one's resource
+// deltas, then reports them to the host (CesPlexHost::cesplexReportUsage).
+// The meter does NOT price, charge, or evict — the host prices the usage
+// in its own units, charges the payer, and closes the channel if it can't
+// cover the tick. A channel the host closes simply vanishes from
+// metricsFor() on the next tick and is dropped here.
 //
-// Billable dimensions:
+// Measured dimensions (raw, no credits):
 //   - bytes sent / received   (wire bandwidth)
 //   - memory-byte-seconds     (RUDP buffer residency in RAM)
-//   - channel age in seconds  (the "channel is open" supervisor cost)
-//
-// Note on units: feeNetMemByteDay is a rate in credits per byte×day,
-// while the metric delta (deltaMemByteSeconds) is in byte×seconds.
-// computeDebit() converts.
+//   - channel age in seconds  (the "channel is open" duration)
 //
 // Known coverage gap: a channel that opens and closes within one tick
-// window (<= 60s) never participates in a tick, so its feeNetChannelSec
-// age accrual is zero. Sub-tick channels are effectively a free tier;
-// closing this would require flushing a partial tick on close.
+// window (<= 60s) never participates in a tick, so its age usage is
+// never reported. Sub-tick channels are effectively a free tier; closing
+// this would require flushing a partial tick on close.
 //
 // All public methods (track / snapshot / _runTick) post onto the
 // io_context they were constructed with — typically rpcTaskIO_, the
@@ -28,6 +26,7 @@
 
 #include <ces/keys.h>
 #include <ces/types.h>
+#include <ces/cesplex/mux.h>   // CesPlexHost (the host seam)
 #include <minx/rudp/rudp.h>
 
 #include <boost/asio/io_context.hpp>
@@ -42,25 +41,23 @@
 
 namespace ces {
 
-class CesServer;
-
-class NetworkBilling {
+class ChannelMeter {
 public:
-  // `server` is required for the per-tick debit hook: NetworkBilling
-  // reads the live feeNet* rates from server->_config() each tick and
-  // bills via server->_l2DebitNetworkBill on logicStrand_. Pass null
-  // for observability-only mode (delta tracking but no debits, no
-  // evictions) — used by tests.
-  NetworkBilling(minx::Rudp& rudp,
+  // Each tick the meter measures every tracked channel's resource deltas
+  // and reports them to `host` via host->cesplexReportUsage(); the host
+  // prices them, charges, and closes. Pass a null host for
+  // observability-only mode (delta tracking, nothing reported) — used by
+  // tests and by a host that wants the bus without metering.
+  ChannelMeter(minx::Rudp& rudp,
                  boost::asio::io_context& io,
-                 CesServer* server = nullptr,
+                 CesPlexHost* host = nullptr,
                  std::chrono::seconds tickInterval = std::chrono::seconds(60));
-  ~NetworkBilling();
+  ~ChannelMeter();
 
-  NetworkBilling(const NetworkBilling&) = delete;
-  NetworkBilling& operator=(const NetworkBilling&) = delete;
-  NetworkBilling(NetworkBilling&&) = delete;
-  NetworkBilling& operator=(NetworkBilling&&) = delete;
+  ChannelMeter(const ChannelMeter&) = delete;
+  ChannelMeter& operator=(const ChannelMeter&) = delete;
+  ChannelMeter(ChannelMeter&&) = delete;
+  ChannelMeter& operator=(ChannelMeter&&) = delete;
 
   // Begin tracking (peer, channelId). The framework calls track()
   // exactly once per channel after a successful bind, with the
@@ -68,8 +65,8 @@ public:
   // io_context; safe to call from any thread.
   //
   // payerPfx default = HashPrefix{} is for tests / observability paths
-  // where there's no payer to bill (server == nullptr or the operator
-  // wants delta tracking without billing).
+  // where there's no bound payer (no host, or the operator wants delta
+  // tracking without reporting usage).
   //
   // Idempotent: a second call with the same (peer, channelId) updates
   // tag/payer in place; counters and deltas keep accruing.
@@ -85,22 +82,19 @@ public:
     std::string tag;
     HashPrefix payerPfx{};
     minx::Rudp::ChannelMetrics metrics{};
-    // Last per-tick delta (zero before the first tick has run).
+    // Last per-tick resource delta (zero before the first tick has run).
+    // Credits are not here — the meter measures resources; the host prices
+    // them.
     uint64_t deltaBytesSent = 0;
     uint64_t deltaBytesReceived = 0;
     uint64_t deltaMemByteSeconds = 0;
     uint64_t deltaAgeSec = 0;
-    // Last per-tick debit. Zero if no tick has run yet, the server
-    // has zero rates configured, or no payer (server == nullptr).
-    uint64_t deltaDebit = 0;
-    // Total credits debited over this channel's lifetime.
-    uint64_t totalDebit = 0;
   };
   std::vector<ChannelSnapshot> snapshot() const;
 
   // Test hook: run one tick synchronously, blocking until done.
   // Real tick cadence is 60 s; tests use this to fast-forward delta
-  // computation + debit + eviction without sleeping a minute.
+  // computation + the usage report without sleeping a minute.
   void _runTick();
 
   // Test hook: force a tracked channel's last-seen counter baselines (the
@@ -113,44 +107,33 @@ public:
                         uint64_t lastMemByteSeconds);
 
 private:
-  struct ChannelBill {
+  struct MeteredChannel {
     std::string tag;
     HashPrefix payerPfx{};
     // Last-seen counter values (for delta computation).
     uint64_t lastBytesSent = 0;
     uint64_t lastBytesReceived = 0;
     uint64_t lastMemByteSeconds = 0;
-    uint64_t lastBilledAtUs = 0;
-    // Last per-tick delta.
+    uint64_t lastMeteredAtUs = 0;
+    // Last per-tick resource delta.
     uint64_t deltaBytesSent = 0;
     uint64_t deltaBytesReceived = 0;
     uint64_t deltaMemByteSeconds = 0;
     uint64_t deltaAgeSec = 0;
-    // Last per-tick debit + lifetime total.
-    uint64_t deltaDebit = 0;
-    uint64_t totalDebit = 0;
   };
 
   using ChannelKey = std::pair<minx::SockAddr, uint32_t>;
-
-  // Compute the per-tick debit from a channel's deltas × the four
-  // current rate values (read fresh from CesConfig each tick).
-  static uint64_t computeDebit(const ChannelBill& b,
-                                uint64_t feeNetChannelSec,
-                                uint64_t feeNetMemByteDay,
-                                uint64_t feeNetByteSent,
-                                uint64_t feeNetByteReceived);
 
   void scheduleTick();
   void doTick();
 
   minx::Rudp& rudp_;
   boost::asio::io_context& io_;
-  CesServer* server_;
+  CesPlexHost* host_;
   std::chrono::seconds tickInterval_;
   // Touched only on io_'s strand. No mutex needed if all access posts
   // through io_, which is the contract.
-  std::map<ChannelKey, ChannelBill> channels_;
+  std::map<ChannelKey, MeteredChannel> channels_;
   std::shared_ptr<boost::asio::steady_timer> timer_;
 };
 

@@ -30,10 +30,10 @@
 //           u16 path_len, path
 //
 // The signed-request loop (verb read, envelope verify, server-signed
-// response) is the shared cesPlexServe engine in cesplex.h.
+// response) is the shared cesPlexServe engine in cesplex/mux.h.
 
-#include <ces/l2/net_multiplexer.h>
-#include <ces/l2/cesplex.h>
+#include <ces/cesplex/mux.h>
+#include <ces/cesplex/session.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
@@ -1425,12 +1425,19 @@ ces::Bytes readSourceBytes(const CesConfig& cfg,
 
 // ---------------------------------------------------------------------------
 // Verb dispatch — the signed-request loop lives in the CesPlex framework
-// (cesPlexServe / CesPlexRequest, see net_multiplexer.h). ReqCtx aliases
+// (cesPlexServe / CesPlexRequest, see cesplex/mux.h). ReqCtx aliases
 // the framework request so the dispatchers below need no changes; the
 // thin senders forward to its respond/error helpers.
 // ---------------------------------------------------------------------------
 
 using ReqCtx = ces::CesPlexRequest;
+
+// The CesPlex bus is host-generic (it knows only CesPlexHost). builtin:compute
+// is a CES core feature, so its host is always the CesServer — recover the
+// concrete server for the ledger-facing calls below.
+inline CesServer* reqServer(const std::shared_ptr<ReqCtx>& ctx) {
+  return static_cast<CesServer*>(ctx->host);
+}
 
 inline void sendResponseAndLoop(std::shared_ptr<ReqCtx> ctx, uint8_t status,
                                 ces::Bytes preamble) {
@@ -1496,7 +1503,7 @@ struct LaunchAccept {
 //
 // The connect-back is awaited via async_accept bounded by a
 // kAcceptTimeoutMs timer — it must NEVER block rpcTaskIO_, which also
-// drives every other CesPlex channel, NetworkBilling, and the
+// drives every other CesPlex channel, ChannelMeter, and the
 // supervisor. (The old synchronous poll()-accept stalled all of them
 // for up to kAcceptTimeoutMs on every launch.)
 //
@@ -1673,7 +1680,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   }
   std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
 
   // Check instance cap against registered + in-flight launches. LAUNCH
   // always mints a fresh id; multiple instances of the same source path
@@ -1692,7 +1699,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
   // Discounted slot rate for the upfront commitment (LAUNCH-time price).
-  uint64_t slot = ctx->server->discountFee(
+  uint64_t slot = reqServer(ctx)->discountFee(
     FeeKind::ComputeSlot, slotFeePerSec(cfg));
   uint64_t upfront = slot * kUpfrontSeconds;
 
@@ -1733,7 +1740,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
     uint64_t now = getMicrosSinceEpoch();
     allocateAndSpawnInstance(
-      ctx->server, name, ownerPk, upfront, now, std::move(launchSlot),
+      reqServer(ctx), name, ownerPk, upfront, now, std::move(launchSlot),
       std::move(portLease),
       [ctx, now](uint64_t id) {
         if (id == 0) {
@@ -1752,8 +1759,8 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // the wire CES_NONCELESS. Every LAUNCH is then independently
   // fee-validated and spawns — a same-name relaunch is a real second
   // instance, charged, not a dedup-skipped freebie that still spawns.
-  ctx->server->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     /*reqNonce=*/0, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1776,7 +1783,7 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx, id](uint8_t rc, bool duplicate) {
@@ -1788,8 +1795,8 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, {});
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1799,7 +1806,7 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx](uint8_t rc, bool /*duplicate*/) {
@@ -1836,8 +1843,8 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1871,7 +1878,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx, name, fileBalance, instanceId](uint8_t rc,
@@ -1897,8 +1904,8 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -1924,7 +1931,7 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
   }
   std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
 
-  const auto& cfg = ctx->server->_config();
+  const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
   auto after = [ctx, name](uint8_t rc, bool /*duplicate*/) {
@@ -1945,8 +1952,8 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
-  ctx->server->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(ctx->server->discountFee(FeeKind::Query, cfg.feeQuery)),
+  reqServer(ctx)->_l2ValidateDedupAndDebit(
+    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
     std::move(after), ctx->stream->get_executor());
 }
@@ -2419,5 +2426,5 @@ void computeSendConnClosed(uint64_t instanceId, uint64_t connId,
 
 REGISTER_CESPLEX_BUILTIN("compute", ::ces::gComputeHandler, ComputeHandler)
 
-// TU anchor — net_multiplexer.cpp references this via its anchor array.
+// TU anchor — cesplex/mux.cpp references this via its anchor array.
 extern "C" { int compute_handler_anchor = 1; }

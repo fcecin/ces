@@ -1,11 +1,19 @@
-// net_multiplexer.h — CesPlex, the L2 protocol multiplexer
+// mux.h — CesPlex, the CES-protocol connection controller / multiplexer
 //
-// The CES server's secondary port (rpcMinx_ + rpcRudp_) is a generic
-// L2 bus. Every inbound RUDP channel speaks a SIGNED protocol-select
-// handshake (the bind contract — see net_envelope.h for the wire
-// format) before any protocol-specific bytes flow. On bind OK, the
-// handler registered under the requested protocol name takes over
-// the channel for the rest of its life. On NACK, the channel closes.
+// CesPlex is a Layer-1, general-purpose mechanism: it latches onto a MINX
+// engine that speaks CES and multiplexes it. It knows the CES protocol and
+// nothing about who hosts it (see CesPlexHost — the only seam: sign +
+// rate disclosure + a sink for measured resource usage). CesServer uses
+// one on its secondary port; a ledgerless host (the cesluajitd compute
+// child) can use one too. The L2 protocols
+// (file / compute / lua) are handlers that ride this bus — users of it,
+// not part of it.
+//
+// Every inbound RUDP channel speaks a SIGNED protocol-select handshake
+// (the bind contract — see cesplex/wire.h for the wire format) before any
+// protocol-specific bytes flow. On bind OK, the handler registered under
+// the requested name takes over the channel for its life and the channel
+// is metered against its bound payer. On NACK, the channel closes.
 //
 // Handler shape: statically-linked C++ handler, registered at program
 // load via a Meyer-style static init into a process-wide registry.
@@ -14,12 +22,11 @@
 // ceslib to add "rpc"). The protocol name "/ces/rpc/1" is reserved
 // but unhandled by CES core itself.
 //
-// Threading: CesPlex instances live on the CesServer's rpcTaskIO_
-// single thread. All of the acceptInbound / per-channel session
-// callbacks / handler.serve invocations run on that strand. A
+// Threading: a CesPlex instance lives on its host's single bus strand
+// (the CesServer's rpcTaskIO_). All of acceptInbound / per-channel
+// session callbacks / handler.serve invocations run on that strand. A
 // handler that wants to do anything long-running should hop off to
-// another executor; the framework keeps its own bookkeeping on
-// rpcTaskIO_.
+// another executor; the framework keeps its own bookkeeping on the strand.
 //
 // Extensibility: adding a new builtin handler is two files: the
 // handler class + its REGISTER_CESPLEX_BUILTIN line at namespace
@@ -27,7 +34,9 @@
 
 #pragma once
 
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
+#include <ces/keys.h>
+#include <ces/types.h>
 #include <minx/rudp/rudp.h>
 #include <minx/rudp/rudp_stream.h>
 #include <minx/types.h>
@@ -42,11 +51,53 @@
 #include <utility>
 
 namespace ces {
-class CesServer;
-class NetworkBilling;
+class ChannelMeter;
 }
 
 namespace ces {
+
+// -----------------------------------------------------------------------
+// Per-channel resource usage — what CesPlex measures, what the host prices
+// -----------------------------------------------------------------------
+//
+// CesPlex measures; it does not price. A tick reports each channel's raw
+// resource deltas to the host, which decides what they cost in its own
+// units. No credits here — just bytes and byte-time.
+struct CesPlexUsage {
+  uint64_t bytesSent = 0;        // wire bytes sent this tick
+  uint64_t bytesReceived = 0;    // wire bytes received this tick
+  uint64_t memByteSeconds = 0;   // RUDP buffer residency this tick (byte·s)
+  uint64_t ageSeconds = 0;       // wall seconds the channel lived this tick
+};
+
+// -----------------------------------------------------------------------
+// CesPlexHost — the host seam
+// -----------------------------------------------------------------------
+//
+// CesPlex is a general-purpose connection controller / multiplexer that
+// latches onto a MINX engine speaking CES. It is Layer 1: it knows the CES
+// protocol and measures its own memory + net resources, and nothing else.
+// It does NOT know credits, does NOT price usage, and does NOT decide when
+// a connection has "run out" — the host does all accounting and all
+// closing. The host supplies an identity (to sign) and a sink for measured
+// per-channel usage. CesServer implements this against its ledger; a
+// ledgerless host (e.g. the cesluajitd compute child) forwards usage to its
+// parent. No CesServer, no ledger, no L2 in here.
+struct CesPlexHost {
+  virtual ~CesPlexHost() = default;
+  // Signs the bind reply and every per-op response on this bus.
+  virtual const KeyPair& cesplexSigningKey() const = 0;
+  // Report one channel's measured resource usage for this tick. The host
+  // does ALL the accounting: it prices the usage in its own units, charges
+  // `payer`, and — if the payer can't cover it — closes (peer, channelId).
+  // Fire-and-forget from CesPlex's side: CesPlex never learns the cost and
+  // never closes a channel for non-payment; it only stops tracking a
+  // channel once the host has closed it (its metrics vanish).
+  virtual void cesplexReportUsage(const HashPrefix& payer,
+                                  const minx::SockAddr& peer,
+                                  uint32_t channelId,
+                                  const CesPlexUsage& usage) = 0;
+};
 
 // Graceful-close timeout for server-initiated channel teardown across
 // every CesPlex handler. Plumbed into RudpStream::shutdown(timeout) at
@@ -137,9 +188,9 @@ CesPlexHandler* findCesPlexBuiltin(const std::string& name);
 // CesPlex — the multiplexer
 // -----------------------------------------------------------------------
 //
-// One CesPlex instance per CesServer. Constructed when the server's
-// secondary port comes up; destroyed when it goes down. All methods
-// are expected to run on the server's rpcTaskIO_ thread.
+// One CesPlex instance per host bus. Constructed when the host's CES
+// port comes up; destroyed when it goes down. All methods are expected
+// to run on the host's single bus strand.
 
 class CesPlex {
 public:
@@ -152,27 +203,25 @@ public:
   // inbound channels through the bind handshake. `io` is the
   // io_context those callbacks run on (rpcTaskIO_).
   //
-  // `netBilling` is optional (may be null). When non-null, every
-  // inbound channel is registered with it post-bind so the tick
-  // can compute deltas + apply debits.
+  // `meter` is optional (may be null). When non-null, every
+  // inbound channel is registered with it post-bind so the tick can
+  // measure its resource deltas and report them to the host.
   //
-  // `server` provides the per-channel bind state — calls into
-  // server->_config() for the rate schedule that gets committed
-  // into the signed bind reply, and server->_serverKeyPair() to
-  // sign the reply. May be null only for tests that don't exercise
-  // the bind handshake.
+  // `host` supplies the bind-reply ingredients: cesplexSigningKey() to
+  // sign the reply. May be null only for tests that don't exercise the
+  // bind handshake.
   CesPlex(const std::map<std::string, std::string>& mounts,
           minx::Rudp& rudp,
           boost::asio::io_context& io,
-          CesServer* server,
-          NetworkBilling* netBilling = nullptr);
+          CesPlexHost* host,
+          ChannelMeter* meter = nullptr);
 
   ~CesPlex();
 
   CesPlex(const CesPlex&) = delete;
   CesPlex& operator=(const CesPlex&) = delete;
 
-  // Called by the CesServer's Rudp::Listener::onAccept hook for
+  // Called by the host's Rudp::Listener::onAccept hook for
   // every fresh inbound HS_OPEN. Constructs a per-channel
   // RudpStream + Session, kicks off the bind-handshake read, and
   // returns the stream as the channel handler for Rudp to wire.
@@ -203,8 +252,8 @@ private:
 
   minx::Rudp& rudp_;
   boost::asio::io_context& io_;
-  CesServer* server_;           // owns CesConfig + serverKeyPair
-  NetworkBilling* netBilling_;  // optional, may be null
+  CesPlexHost* host_;           // signs bind replies + supplies bind rates
+  ChannelMeter* channelMeter_;  // optional, may be null
 
   // Protocol-name → registered handler, resolved at ctor.
   std::map<std::string, CesPlexHandler*> bindings_;

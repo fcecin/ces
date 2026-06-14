@@ -2,7 +2,7 @@
 
 C++20 public token/credit ledger for resource accounting. Clients earn credits via RandomX PoW mining, spend on transfers/queries/assets. Each server is a sovereign ledger; servers peer via bilateral vostro/reserve settlement. No blockchain.
 
-On top of the ledger sits **CesPlex**, an L2 protocol bus on `rpc_port` that hands each signed-bound RUDP channel off to a named handler. Shipped in CES core: `builtin:file` (disk file storage), `builtin:compute` (instance lifecycle + Lua hosting), `builtin:lua` (channel attach into a running program). The protocol name `/ces/rpc/1` is reserved and CES ships the SYS_RPC *outbound* engine, but `builtin:rpc` is **not** registered by CES core — inbound RPC is L3 (downstream binaries link ceslib and register their own).
+On top of the ledger sits **CesPlex**, the L1 connection multiplexer on `rpc_port`: it runs the signed bind handshake, routes each bound RUDP channel to a named handler, and meters the channel's raw byte/time usage for the host to price — CesPlex itself knows no credits. The handlers riding it are L2. Shipped in CES core: `builtin:file` (disk file storage), `builtin:compute` (instance lifecycle + Lua hosting), `builtin:lua` (channel attach into a running program). The protocol name `/ces/rpc/1` is reserved and CES ships the SYS_RPC *outbound* engine, but `builtin:rpc` is **not** registered by CES core — inbound RPC is L3 (downstream binaries link ceslib and register their own).
 
 ## Coding practices
 
@@ -58,20 +58,31 @@ CMake fetches: MINX, logkv, secp256k1 v0.4.1, CLI11, tomlplusplus, libbacktrace.
 
 ```
 include/ces/        CES core (L1) — types, account/asset, keys, protocol,
-                    server/client, cesvm, vmprogram, ramfilestore, autoexec,
-                    cesco, wallet, cesproxy, utils, ctrlc, logutil
-include/ces/l2/     L2 protocols + the CesPlex bus framework. Three
-                    families, all flat:
-                      net_*      — bus framework: net_multiplexer,
-                                   net_envelope, net_billing
+                    server/client, clientasync, cesvm, ramfilestore,
+                    autoexec, cesco, cesproxy, feemult, buffer, persisted
+include/ces/cesplex/  CesPlex — the L1 connection multiplexer (moved out
+                    of l2/):
+                      mux     — bus core: bind handshake, channel routing,
+                                handler registry, CesPlexHost seam
+                      wire    — bind contract + per-op envelope wire format
+                      session — per-op serve loop + CesPlexClient (the L2
+                                verb SDK file/compute ride; lua bypasses it)
+                      meter   — ChannelMeter: per-channel byte/time meter
+                                (measures + reports; never prices or closes)
+include/ces/l2/     L2 protocols riding CesPlex. Two families:
                       file_*     — disk-backed file storage protocol
                       compute_*  — instance hosting (compute_handler) +
                                    channel-attach (compute_lua_handler) +
                                    client lib (compute_client)
-                    Every l2/<x>.h has a matching src/ceslib/<x>.cpp.
-src/ceslib/         static lib (flat) — server.cpp (incl. SYS_RPC outbound
-                    engine), cesvm.cpp, ramfilestore.cpp, the L2 set
-                    above, accounts/assets/wallet/cesco/utils
+include/ces/util/   shared helpers — ctrlc, fileperm, hash, hex, log,
+                    metrics, resolver, vmprogram, wallet
+                    Every include/ces/<group>/<x>.h has a matching
+                    src/ceslib/<group>/<x>.cpp (the src tree mirrors it).
+src/ceslib/         static lib mirroring the include tree — top-level
+                    server.cpp (incl. SYS_RPC outbound engine), cesvm.cpp,
+                    ramfilestore.cpp, accounts/assets/client/clientasync/
+                    cesco; subdirs cesplex/, l2/, util/; builtin_apps/
+                    holds operator-deployable app sources (dice.lua)
 src/ces/main.cpp    server CLI: config, key gen, ces credit/debit/snapshot
 src/cesh/           shell client (main.cpp + dial.cpp/h)
 src/cesluajitd/     compute child runtime (LuaJIT-hosted, default)
@@ -129,7 +140,7 @@ Wallet format: one key per line, `"00" + 64-hex` or `"01" + 64-hex`. Wallets val
 **APPLICATION lane (app_code_t)** — pushed over MINX's APPLICATION path (not signed-op path). Values 0x80+.
 - `CES_APP_COMPUTE_MSG` (0x81): client↔program message. Target/source = file_key prefix + payload (≤ 1 KB). Discarded silently if no instance matches.
 
-**Error codes**: `CES_OK`=0, `ORIGIN_NOT_FOUND`=1, `WRONG_NONCE`=2, `INSUFFICIENT_BALANCE`=3, `INSUFFICIENT_BALANCE_WITH_CREATE`=4, `INVALID_TARGET_ACCOUNT`=5, `WRONG_TARGET_ACCOUNT`=6, `WRONG_PAYMENT_AMOUNT`=7, `ASSET_EXISTS`=8, `ASSET_NOT_FOUND`=9, `NOT_OWNER`=0xa, `NOT_FOR_SALE`=0xb, `INSUFFICIENT_PAYMENT`=0xc, `TIMEOUT`=0xd, `INTERNAL`=0xe, `TARGET_NOT_FOUND`=0xf, `UNKNOWN_PEER`=0x10, `QUEUE_FULL`=0x11, `VM_FAILED`=0x12, `DISABLED`=0x13, `ALLOWANCE_EXCEEDED`=0x14, `PROTO_REJECTED`=0x15 (CesPlex NACK), `FILE_NOT_FOUND`=0x16, `FILE_EXISTS`=0x17, `BAD_NAME`=0x18, `PATH_CONFLICT`=0x19, `STORE_FULL`=0x1a, `COMPUTE_DISABLED`=0x1b, `COMPUTE_NO_FILE_HANDLER`=0x1c, `COMPUTE_FUND_TOO_LOW`=0x1d, `COMPUTE_INSTANCE_NOT_FOUND`=0x1e, `COMPUTE_MAX_INSTANCES`=0x1f, `NOT_LISTENING`=0x20, `IMMUTABLE`=0x21, `BAD_INPUT`=0x22.
+**Error codes**: `CES_OK`=0, `ORIGIN_NOT_FOUND`=1, `WRONG_NONCE`=2, `INSUFFICIENT_BALANCE`=3, `INSUFFICIENT_BALANCE_WITH_CREATE`=4, `INVALID_TARGET_ACCOUNT`=5, `WRONG_TARGET_ACCOUNT`=6, `WRONG_PAYMENT_AMOUNT`=7, `ASSET_EXISTS`=8, `ASSET_NOT_FOUND`=9, `NOT_OWNER`=0xa, `NOT_FOR_SALE`=0xb, `INSUFFICIENT_PAYMENT`=0xc, `TIMEOUT`=0xd, `INTERNAL`=0xe, `TARGET_NOT_FOUND`=0xf, `UNKNOWN_PEER`=0x10, `QUEUE_FULL`=0x11, `VM_FAILED`=0x12, `DISABLED`=0x13, `ALLOWANCE_EXCEEDED`=0x14, `PROTO_REJECTED`=0x15 (CesPlex NACK), `FILE_NOT_FOUND`=0x16, `FILE_EXISTS`=0x17, `BAD_NAME`=0x18, `PATH_CONFLICT`=0x19, `STORE_FULL`=0x1a, `COMPUTE_DISABLED`=0x1b, `COMPUTE_NO_FILE_HANDLER`=0x1c, `COMPUTE_FUND_TOO_LOW`=0x1d, `COMPUTE_INSTANCE_NOT_FOUND`=0x1e, `COMPUTE_MAX_INSTANCES`=0x1f, `NOT_LISTENING`=0x20, `IMMUTABLE`=0x21, `BAD_INPUT`=0x22, `COMPUTE_NO_PORT`=0x23.
 
 **Nonce modes**: `0` skip (internal); `CES_NONCELESS (UINT32_MAX)` server assigns (settlement pipelining); `N` must equal `nonce + 1`. Auto-nonce: signed ops carry timestamp; server rejects stale, dedups by sig-hash prefix. **Retried ops must reuse the same signed payload** so dedup returns OK without re-executing.
 
@@ -179,9 +190,9 @@ In-ledger files as linked asset chains. Head asset (magic 'F'): 1B magic + 8B si
 
 API: `ramfilePut`/`ramfileGet`/`ramfileFund`/`ramfileScan` + random-access `ramfileRead`/`Write`/`Append`/`Resize`/`Rehash`. Header struct `RamfileHeader`. VM-reachable via `SYS_LOAD_CODE`/`SYS_READ_ASSET`. cesh verb: `cesh ramfile`. For host-scale disk files, see L2 file handler (`cesh file`).
 
-## CesPlex — L2 protocol multiplexer (`l2/net_multiplexer.h`, `l2/net_envelope.h`)
+## CesPlex — L1 protocol multiplexer (`cesplex/mux.h`, `cesplex/wire.h`)
 
-Runs on `rpc_port`. Each inbound RUDP channel does a **signed bind contract**: client signs `(name + client_time + client_pubkey)`; server replies signed, committing server pubkey + per-channel `sessionToken` + four-knob NetworkBilling rate schedule **frozen for the channel's life** (grandfathered). Handler receives `BoundChannelContext` (pubkey, payerPfx, sessionToken, bound rates).
+Runs on `rpc_port`. Each inbound RUDP channel does a **signed bind contract**: client signs `(name + client_time + client_pubkey)`; server replies signed, committing server pubkey + per-channel `sessionToken`. The bind is **identity-only — no prices on the wire**. Handler receives `BoundChannelContext` (pubkey, payerPfx, sessionToken, bind time). CesPlex knows no credits: a `ChannelMeter` measures each channel's raw byte/time usage (`CesPlexUsage`) and reports it to the host (`CesPlexHost::cesplexReportUsage`); the host prices it, charges the payer, and closes the channel on non-payment.
 
 Per-op envelope: `[u8 verb][u32 BE preamble_len][preamble][65 sig over sha256(verb||preamble||sessionToken)]`. No per-op pubkey or timestamp — implicit on bound channel. Body-bearing verbs append bytes after sig, hashed against digest committed in preamble. Dedup key = first 8 sig bytes (per-channel-incarnation, no cross-channel collisions).
 
@@ -198,9 +209,9 @@ CES sets `rpcRudpMaxChannelsPerPeer = 2` so a long-lived `cesh dial` can coexist
 
 **`/ces/rpc/1` — protocol name reserved; CES core ships only the outbound engine.** SYS_RPC's outbound side (`RpcSession` + `queueRpc`/`executeRpc`/`completeRpc`) lives in `src/ceslib/server.cpp`; it dials peers, runs the signed bind, exchanges, writes the response into a ramfile, fires a follow-up VM run. There is **no `builtin:rpc` handler in CES core**. The inbound side is L3: downstream binaries (content-servers in C++/Go/JS/whatever) link ceslib and register their own `builtin:rpc`. The in-tree `MockRpcServer` in `tests/test_sysrpc.cpp` is the test fixture for this shape, not a production handler. The asymmetry is the architectural deal: **outbound from CES is one funnel (SYS_RPC); inbound to CES core is zero — the door opens outward, not inward.** A future CES 2.x feature could add a `builtin:rpc` that routes inbound requests into Lua-program providers registered under the compute family.
 
-## NetworkBilling (`l2/net_billing.h`)
+## ChannelMeter (`cesplex/meter.h`)
 
-Every bound channel tracked. 60s tick computes per-tick deltas across four billable dimensions (bytes sent, bytes received, memory-byte-seconds of RUDP buffer residency, channel age) × bound rate schedule, posts debit on `logicStrand_`, evicts via `Rudp::closeChannel` if payer can't cover the tick. Defaults of 0 = observability-only.
+Every bound channel tracked. 60s tick computes per-tick deltas across four measured dimensions (bytes sent, bytes received, memory-byte-seconds of RUDP buffer residency, channel age) and reports them as a `CesPlexUsage` to the host via `cesplexReportUsage`. The meter **measures and reports only** — it never prices, charges, or evicts. The host (CesServer) prices the usage at its live `feeNet*` rates, posts the debit on `logicStrand_`, and evicts via `Rudp::closeChannel` if the payer can't cover the tick. Host rates default to 0 = observability-only.
 
 ## L2 file storage — `builtin:file` (v2)
 
@@ -242,7 +253,9 @@ Five verbs: LAUNCH / KILL / LIST (per-signer) / STAT / INSTANCES (public — use
 
 Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser` resolvable.
 
-**cesluajitd**: one sandboxed LuaJIT VM per process — no `os`/`io`/`debug`/`package`/`require`/`loadfile`/`dofile`/`loadstring`/`ffi`. IPC framed `[u32 BE length][u8 tag][u16 BE corr_id][body]`. Bootstrap frame carries `[8B prog_pfx][32B owner_pubkey][32B program_pubkey][8B start_time_us BE][u32 BE src_len][src]`. Lua API: `ces.client_send`/`ces.client_recv` (CES_APP_COMPUTE_MSG), `ces.conn.set_listener`/`ces.conn.run` (accept gate for /ces/lua/1), `conn:write`/`conn:close`, `ces.file.*` (owner-authority, billed to source's file_balance), `ces.transfer(target, amount)` / `ces.account_read(pubkey)` / `ces.random_bytes(n)`, `ces.owner_pubkey()` (owner's wallet key) / `ces.program_pubkey()` (the file's dedicated program account, what `ces.transfer` spends from) / `ces.start_time()` / `ces.now()`, `ces.bucket_new(ttl_secs, max_entries, max_entry_bytes)` → `:put`/`:get` (capacity-billed via `feeBucketByteSec` summed into the supervisor tick).
+**Per-instance outbound port.** Each launched instance gets a CES client on a statically-allocated UDP port from `[computePortBase, computePortBase + computePortCount - 1]` (TOML `compute_port_base` / `compute_port_count`; flags `--computeportbase` / `--computeportcount`), leased RAII and released on instance death. A fixed, known source port is what makes real P2P work behind a firewall — open the range, not ephemeral egress. `computePortBase == 0` → no range: instances launch **local-only** and their `ces.transfer` / remote verbs return `networking disabled`. A LAUNCH that finds every port in the range leased fails `COMPUTE_NO_PORT` (0x23). The Lua program does **not** own the socket — the C++ host runs the packet processor; the program only receives its reserved port number in the bootstrap frame.
+
+**cesluajitd**: one sandboxed LuaJIT VM per process — no `os`/`io`/`debug`/`package`/`require`/`loadfile`/`dofile`/`loadstring`/`ffi`. IPC framed `[u32 BE length][u8 tag][u16 BE corr_id][body]`. Bootstrap frame carries `[8B prog_pfx][32B owner_pubkey][32B program_pubkey][32B program_privkey][2B client_port BE][8B start_time_us BE][u32 BE src_len][src]` (program_privkey lets the program sign its own remote ops; client_port is the server-reserved outbound UDP port, 0 = no network). Lua API: `ces.client_send`/`ces.client_recv` (CES_APP_COMPUTE_MSG), `ces.conn.set_listener`/`ces.conn.run` (accept gate for /ces/lua/1), `conn:write`/`conn:close`, `ces.file.*` (owner-authority, billed to source's file_balance), `ces.transfer(target, amount)` / `ces.account_read(pubkey)` / `ces.random_bytes(n)`, `ces.owner_pubkey()` (owner's wallet key) / `ces.program_pubkey()` (the file's dedicated program account, what `ces.transfer` spends from) / `ces.start_time()` / `ces.now()`, `ces.bucket_new(ttl_secs, max_entries, max_entry_bytes)` → `:put`/`:get` (capacity-billed via `feeBucketByteSec` summed into the supervisor tick).
 
 **[builtin_app]** auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchBuiltinApps` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is **operator-deployed, NOT embedded in the binary**: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source just logs a WRN and is skipped. Shipped: `dice` (`[builtin_app] dice = 1` / `--builtin-app-dice`) — fair-coin double-or-nothing whose house bankroll is the file's dedicated program account (`ces.program_pubkey()`), auto-funded on /s/ by the boot zone reconcile.
 
@@ -303,7 +316,7 @@ Five thread groups:
 2. **taskIO** (N, configurable): MINX dispatch + `logicStrand_` for all ledger mutations
 3. **verifyPoW** (1): RandomX verification
 4. **settlementIO** (1): CesClientAsync async I/O
-5. **rpcTaskIO** (1): rpc-port Minx + CesPlex sessions + handler `serve` + NetworkBilling tick + compute supervisor tick
+5. **rpcTaskIO** (1): rpc-port Minx + CesPlex sessions + handler `serve` + ChannelMeter tick + compute supervisor tick
 
 `logicStrand_` IS the lock. No ledger mutexes. Cross-handler primitives (e.g. `fileHandlerExec`) hop onto `logicStrand_` internally as needed. Replies retransmitted on a timer to paper over UDP loss.
 
@@ -321,7 +334,7 @@ BASE_FEE_QUERY       = 20'000         // per signed query / nonce-bearing op
 BASE_FEE_VM_MULT     = 50             // VM gas multiplier
 ```
 
-**Load-based fee discount (feemult).** Every named per-op fee (`feeTx`, `feeQuery`, VM gas, account/asset rent, compute slot/cpu/rss, bucket, NetworkBilling) is scaled by a per-FeeKind basis-points multiplier (0..10000) before it is charged. `feeDiscountEnabled` (compiled default `true`) drives each multiplier from a live load gauge measured against a lifetime throughput watermark: an idle server discounts toward 0 (an op can cost **literally 0** when its gauge genuinely reads idle), ramping to full fee as sustained load approaches the busiest the host has ever been. It is congestion pricing, not a fixed schedule. A gauge that is *undefined* (a required cap is 0, e.g. `maxAcc`/`maxAsset`/`netPeakBps`) snaps to full price, never 0, so a missing metric can never silently zero a fee. Disabled → all multipliers pinned at 10000 (full price). The anti-spam barrier is separate (MINX PoW tickets), so 0-fee at idle is not a spam hole.
+**Load-based fee discount (feemult).** Every named per-op fee (`feeTx`, `feeQuery`, VM gas, account/asset rent, compute slot/cpu/rss, bucket, net metering) is scaled by a per-FeeKind basis-points multiplier (0..10000) before it is charged. `feeDiscountEnabled` (compiled default `true`) drives each multiplier from a live load gauge measured against a lifetime throughput watermark: an idle server discounts toward 0 (an op can cost **literally 0** when its gauge genuinely reads idle), ramping to full fee as sustained load approaches the busiest the host has ever been. It is congestion pricing, not a fixed schedule. A gauge that is *undefined* (a required cap is 0, e.g. `maxAcc`/`maxAsset`/`netPeakBps`) snaps to full price, never 0, so a missing metric can never silently zero a fee. Disabled → all multipliers pinned at 10000 (full price). The anti-spam barrier is separate (MINX PoW tickets), so 0-fee at idle is not a spam hole.
 
 Key TOML:
 ```toml
@@ -334,9 +347,11 @@ max_log_size_gb = 100
 rpc_port        = 0          # CesPlex port (0 = disabled)
 admin_socket    = ""         # cesco UDS (empty = disabled)
 
-# fee_net_*           = 0    # NetworkBilling — 0 = observability-only
+# fee_net_*           = 0    # ChannelMeter rates — 0 = observability-only
 file_store_max_bytes  = 0    # 0 = file feature off
 compute_max_instances = 0    # 0 = compute feature off
+# compute_port_base   = 0    # 0 = instances local-only (no UDP egress)
+# compute_port_count  = 0    # size of the per-instance UDP port range
 # compute_process_mem_max  = 268435456    # 256 MB rlimit per child
 # compute_process_cpu_max  = 50           # cgroup cpu.max %
 # ces_compute_user         = "cesluad"
@@ -385,9 +400,9 @@ LOGDEBUG << "failed"  << VAR(rc) << SVAR(addr);
 LOGTRACE << "packet"  << BVAR(payload);
 ```
 
-Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `SVAR(x)` string-convertible, `BVAR(x)` bytes-as-hex. `blog::fast_min_level` is plain int — zero overhead for disabled levels. `blog::enable("module")`, `blog::set_level("module", blog::trace)`. `ces::setupLogger("debug")` is the shared CLI parser (`logutil.h`).
+Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `SVAR(x)` string-convertible, `BVAR(x)` bytes-as-hex. `blog::fast_min_level` is plain int — zero overhead for disabled levels. `blog::enable("module")`, `blog::set_level("module", blog::trace)`. `ces::setupLogger("debug")` is the shared CLI parser (`util/log.h`).
 
-**Module names**: `csv` server, `ccl` client, `acc` accounts, `ast` assets, `cesvm` VM, `cesco` admin, `ceslib` wallet, `plex` CesPlex+file/compute handlers, `lua` builtin:lua, `netbill` NetworkBilling, `cfc` CesFileClient, `ccc` CesComputeClient.
+**Module names**: `csv` server, `ccl` client, `acc` accounts, `ast` assets, `cesvm` VM, `cesco` admin, `ceslib` wallet, `plex` CesPlex+file/compute handlers, `lua` builtin:lua, `netbill` ChannelMeter, `cfc` CesFileClient, `ccc` CesComputeClient.
 
 **Production policy**: INFO = lifecycle only. DEBUG = failure conditions. TRACE = per-op firehose (NOT for production).
 
@@ -419,11 +434,11 @@ Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `S
 - Cross-transfers fire-and-forget — CES_OK to user before async delivery to peer
 - Payment account `nonce` is days-until-expiry, NOT replay counter
 - `isConnected()=true` bypasses spam filter AND tickets — only for authenticated peers
-- `rpc_port=0` disables SYS_RPC AND CesPlex entirely (VM gets `CES_ERROR_DISABLED`; no L2 binds; no NetworkBilling)
+- `rpc_port=0` disables SYS_RPC AND CesPlex entirely (VM gets `CES_ERROR_DISABLED`; no L2 binds; no ChannelMeter)
 - `cesFileStoreMaxBytes=0` disables file handler entirely; compute requires file
 - `computeMaxInstances=0` disables compute entirely
 - **CesPlex per-op verifies use sessionToken**, not per-op timestamp. Bound pubkey implicit. Dedup hash = first 8 sig bytes.
-- **CesPlex bound rates frozen for the channel's life** (grandfathered); config edits affect only newly-bound channels.
+- **CesPlex carries no prices.** The bus measures each channel's raw byte/time usage (`CesPlexUsage`) and reports it to the host, which prices at its live `feeNet*` rates and closes on non-payment. The bind contract is identity-only — no rate disclosure on the wire (a client wanting the schedule asks via `CES_QUERY_SERVER_INFO`).
 - **Most CesPlex handlers loop on their channel.** Exception: `builtin:lua` ATTACH is one-shot, converts channel into raw byte stream into instance.
 - File-store bytes need ≥ 15 min upfront rent at CREATE/APPEND/RESIZE-grow (`initial_deposit ≥ upfront(size)` or `INSUFFICIENT_BALANCE`). /s/ exempt.
 - File paths must start with `/h/<64-hex>/`, `/f/<name>/`, `/p/`, or `/s/` — anything else → `BAD_NAME`.

@@ -22,7 +22,7 @@
 //     [u32 BE body_len][body][137B footer]  response envelope
 //
 // CesPlex wraps the rpc protocol identically to any other protocol
-// on the secondary port — see include/ces/l2/net_multiplexer.h. A NACK (0x00)
+// on the secondary port — see include/ces/cesplex/mux.h. A NACK (0x00)
 // surfaces to the VM caller as CES_ERROR_PROTO_REJECTED; this is
 // the "calling a CES server that doesn't serve rpc" path (CES
 // servers are rpc clients, not rpc servers — per the asymmetric
@@ -55,7 +55,7 @@
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
 #include <ces/keys.h>
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/server.h>
 #include <ces/util/vmprogram.h>
 
@@ -201,7 +201,7 @@ private:
   // One inbound call. Wire shape:
   //   1. Read signed bind preamble (u16 name_len + name + 137-byte
   //      tail with time/pubkey/sha256/sig).
-  //   2. Send signed bind reply (status + 84-byte body + 32 sha256 +
+  //   2. Send signed bind reply (status + 52-byte body + 32 sha256 +
   //      65 sig). Mock signs with its own keypair.
   //   3. Read [u32 body_len][body bytes] (no per-rpc envelope).
   //   4. Apply transform_ to body, write [u32 len][body] back.

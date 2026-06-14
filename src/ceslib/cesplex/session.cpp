@@ -1,15 +1,14 @@
-// cesplex.cpp — the shared CesPlex engine (see cesplex.h).
+// session.cpp — the per-op CesPlex layer for handlers and clients (see mux.h).
 //
 // Two halves: the server-side signed-request loop (cesPlexServe /
 // CesPlexRequest) that builtin:file and builtin:compute drive their verb
 // streams through, and the client-side CesPlexClient that CesFileClient
 // and CesComputeClient are thin verb wrappers over.
 
-#include <ces/l2/cesplex.h>
-#include <ces/l2/net_multiplexer.h>   // kRudpStreamCloseTimeout
+#include <ces/cesplex/session.h>
+#include <ces/cesplex/mux.h>   // kRudpStreamCloseTimeout, CesPlexHost
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>         // ces::sha256
-#include <ces/server.h>
 #include <ces/types.h>
 
 #include <minx/blog.h>
@@ -48,7 +47,7 @@ namespace ces {
 namespace {
 
 void plexReadVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound, CesServer* server,
+                  BoundChannelContext bound, CesPlexHost* host,
                   std::shared_ptr<CesPlexProtocol> proto);
 
 // Read [u32 preamble_len][preamble][65 sig], verify, peel reqNonce,
@@ -111,14 +110,14 @@ void plexReadEnvelope(std::shared_ptr<CesPlexRequest> req) {
 // read its envelope. An unaccepted verb (unknown, or handler unbound —
 // accepts() folds in the bound check) ends the channel.
 void plexReadVerb(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound, CesServer* server,
+                  BoundChannelContext bound, CesPlexHost* host,
                   std::shared_ptr<CesPlexProtocol> proto) {
   auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();
   auto sharedStream = stream;
   auto sharedBound = std::make_shared<BoundChannelContext>(std::move(bound));
   boost::asio::async_read(
     *sharedStream, boost::asio::buffer(*verbBuf),
-    [verbBuf, sharedStream, server, sharedBound, proto]
+    [verbBuf, sharedStream, host, sharedBound, proto]
     (const boost::system::error_code& ec, std::size_t) {
       if (ec) return;
       uint8_t verb = (*verbBuf)[0];
@@ -129,7 +128,7 @@ void plexReadVerb(std::shared_ptr<minx::RudpStream> stream,
       }
       auto req = std::make_shared<CesPlexRequest>();
       req->stream = sharedStream;
-      req->server = server;
+      req->host = host;
       req->verb = verb;
       req->bound = *sharedBound;
       req->proto = proto;
@@ -140,9 +139,9 @@ void plexReadVerb(std::shared_ptr<minx::RudpStream> stream,
 } // namespace
 
 void cesPlexServe(std::shared_ptr<minx::RudpStream> stream,
-                  BoundChannelContext bound, CesServer* server,
+                  BoundChannelContext bound, CesPlexHost* host,
                   CesPlexProtocol proto) {
-  plexReadVerb(std::move(stream), std::move(bound), server,
+  plexReadVerb(std::move(stream), std::move(bound), host,
                std::make_shared<CesPlexProtocol>(std::move(proto)));
 }
 
@@ -150,27 +149,27 @@ void CesPlexRequest::respond(uint8_t status, ces::Bytes preamble,
                              ces::Bytes extraBody) {
   auto str = stream;
   auto bnd = bound;
-  auto srv = server;
+  auto h = host;
   auto prt = proto;
   auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(srv->_serverKeyPair(), verb, status,
+    buildPerOpResponse(h->cesplexSigningKey(), verb, status,
                        preamble, reqSigHash));
   auto body = std::make_shared<ces::Bytes>(std::move(extraBody));
   boost::asio::async_write(
     *str, boost::asio::buffer(*env),
-    [str, env, body, bnd, srv, prt]
+    [str, env, body, bnd, h, prt]
     (const boost::system::error_code& ec, std::size_t) mutable {
       if (ec) return;
       if (!body->empty()) {
         boost::asio::async_write(
           *str, boost::asio::buffer(*body),
-          [str, body, bnd, srv, prt]
+          [str, body, bnd, h, prt]
           (const boost::system::error_code& ec2, std::size_t) mutable {
             if (ec2) return;
-            plexReadVerb(str, std::move(bnd), srv, prt);
+            plexReadVerb(str, std::move(bnd), h, prt);
           });
       } else {
-        plexReadVerb(str, std::move(bnd), srv, prt);
+        plexReadVerb(str, std::move(bnd), h, prt);
       }
     });
 }
@@ -178,7 +177,7 @@ void CesPlexRequest::respond(uint8_t status, ces::Bytes preamble,
 void CesPlexRequest::respondAndClose(uint8_t status, ces::Bytes preamble) {
   auto str = stream;
   auto env = std::make_shared<ces::Bytes>(
-    buildPerOpResponse(server->_serverKeyPair(), verb, status,
+    buildPerOpResponse(host->cesplexSigningKey(), verb, status,
                        preamble, reqSigHash));
   boost::asio::async_write(
     *str, boost::asio::buffer(*env),

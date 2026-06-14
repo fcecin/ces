@@ -1,11 +1,11 @@
 // compute_client.cpp - CesComputeClient.
 //
-// A thin verb layer over CesPlexClient (see cesplex.h), which owns all the
+// A thin verb layer over CesPlexClient (see cesplex/mux.h), which owns all the
 // MINX/Rudp/threads/bind plumbing. Each method here is just the verb's
 // preamble building + response parsing; the shared client drives the wire.
 
 #include <ces/l2/compute_client.h>
-#include <ces/l2/cesplex.h>
+#include <ces/cesplex/session.h>
 #include <ces/buffer.h>
 #include <ces/types.h>
 

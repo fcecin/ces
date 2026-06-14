@@ -1,4 +1,4 @@
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
@@ -192,7 +192,7 @@ public:
              ces::Bytes requestBody,
              uint32_t responseTimeoutMs,
              size_t maxResponseBytes,
-             NetworkBilling* netBilling,
+             ChannelMeter* netBilling,
              const ces::KeyPair& serverKey,
              Callback cb)
     : io_(io),
@@ -203,7 +203,7 @@ public:
       requestBody_(std::move(requestBody)),
       responseTimeoutMs_(responseTimeoutMs),
       maxResponseBytes_(maxResponseBytes),
-      netBilling_(netBilling),
+      channelMeter_(netBilling),
       serverKey_(serverKey),
       cb_(std::move(cb)),
       timeoutTimer_(io) {}
@@ -216,7 +216,7 @@ public:
   //   1. Send CesPlex select header: [u16 BE 11]["/ces/rpc/1"]
   //      This commits the channel to the "rpc" protocol via CesPlex's
   //      multiplexer, so a single secondary port can carry multiple
-  //      protocols. (See include/ces/l2/net_multiplexer.h for the mux
+  //      protocols. (See include/ces/cesplex/mux.h for the mux
   //      wire format.)
   //
   //   2. Read back one status byte:
@@ -246,7 +246,7 @@ public:
       finish(CES_ERROR_INTERNAL, {});
       return;
     }
-    // NetworkBilling tracking happens AFTER the bind reply lands —
+    // ChannelMeter tracking happens AFTER the bind reply lands —
     // we need to know the bound rate schedule the remote committed
     // before we can bill against it. See trackOnBindOk().
     arm_timeout();
@@ -269,7 +269,7 @@ private:
   ces::Bytes requestBody_;
   uint32_t responseTimeoutMs_;
   size_t maxResponseBytes_;
-  NetworkBilling* netBilling_;
+  ChannelMeter* channelMeter_;
   const ces::KeyPair& serverKey_;
   Callback cb_;
   boost::asio::steady_timer timeoutTimer_;
@@ -333,17 +333,17 @@ private:
         // key the server presented; SYS_RPC callers don't pre-know
         // their target server's identity.)
         // Bind reply landed; register the outbound channel with the
-        // local NetworkBilling for delta tracking. Billing uses the
+        // local ChannelMeter for delta tracking. Billing uses the
         // local CesConfig rates (consistent with inbound channels)
         // and the local server's own pubkey as payer — which is the
         // bottomless server-self account, so the debit is effectively
         // observability. The remote's disclosed rates from the bind
         // reply are not enforced locally; the remote's own ledger
         // bills however it likes on its end.
-        if (self->netBilling_) {
+        if (self->channelMeter_) {
           std::ostringstream tag;
           tag << "rpc-out:" << self->peer_;
-          self->netBilling_->track(
+          self->channelMeter_->track(
             self->peer_, self->channelId_, tag.str(),
             getHashPrefix(self->serverKey_.getPublicKeyAsHash()));
         }
@@ -929,7 +929,7 @@ CesServer::CesServer(const CesConfig& config)
   // --- RUDP-tier billing rates ---
   // The bundled file/query fees implicitly priced networking; we
   // pull that share out and bill it explicitly per-byte/per-second
-  // here. NetworkBilling reads these into each channel's bound
+  // here. ChannelMeter reads these into each channel's bound
   // contract at bind time and debits the payer per tick.
   if (cfg_.feeNetByteSent == 0) {
     // Symmetric per-byte rate (sending and receiving cost the
@@ -1173,11 +1173,11 @@ uint16_t CesServer::start(uint16_t serverPort) {
     rpcRudp_ = std::make_unique<minx::Rudp>(
       &rpcRudpListener_, rudpCfg, rpcMinx_.get());
 
-    // NetworkBilling: per-channel billing tick that debits the bound
+    // ChannelMeter: per-channel billing tick that debits the bound
     // payer at the channel's bound rates. Constructed before CesPlex so
     // CesPlex's Session can call track() with the bound rate schedule
     // at acceptInbound time.
-    netBilling_ = std::make_unique<NetworkBilling>(
+    channelMeter_ = std::make_unique<ChannelMeter>(
       *rpcRudp_, rpcTaskIO_, this);
 
     // CesPlex — the L2 protocol multiplexer. Constructed iff the
@@ -1188,7 +1188,7 @@ uint16_t CesServer::start(uint16_t serverPort) {
     // sees a coherent CesPlex pointer before any packet can arrive.
     if (!cfg_.cesplexMounts.empty()) {
       cesplex_ = std::make_unique<CesPlex>(
-        cfg_.cesplexMounts, *rpcRudp_, rpcTaskIO_, this, netBilling_.get());
+        cfg_.cesplexMounts, *rpcRudp_, rpcTaskIO_, this, channelMeter_.get());
       if (!cesplex_->hasAnyBinding()) {
         // All mounts resolved to unknown targets — construction
         // succeeded but there's nothing to accept. Tear it down so
@@ -1254,13 +1254,13 @@ uint16_t CesServer::start(uint16_t serverPort) {
     if (rpcBoundPort_ == 0) {
       LOGDEBUG << "rpc: failed to open socket on" << VAR(cfg_.rpcPort);
       // Tear down in reverse construction order: CesPlex holds
-      // references into rpcRudp_ and must go first; netBilling_
+      // references into rpcRudp_ and must go first; channelMeter_
       // also references rpcRudp_.
       luaHandlerBind(nullptr);
       computeHandlerBind(nullptr);
       fileHandlerBind(nullptr);
       cesplex_.reset();
-      netBilling_.reset();
+      channelMeter_.reset();
       rpcMinx_.reset();
       rpcRudp_.reset();
     } else {
@@ -1417,7 +1417,7 @@ void CesServer::stop(bool flushEvents) {
     computeHandlerBind(nullptr);
     fileHandlerBind(nullptr);
     cesplex_.reset();
-    netBilling_.reset();
+    channelMeter_.reset();
     rpcRudp_.reset();
     rpcMinx_.reset();
     rpcBoundPort_ = 0;
@@ -4299,6 +4299,45 @@ void CesServer::_l2QueryAccount(
     });
 }
 
+void CesServer::cesplexReportUsage(const HashPrefix& payer,
+                                   const minx::SockAddr& peer,
+                                   uint32_t channelId,
+                                   const CesPlexUsage& usage) {
+  // The bus measured this channel's resource usage this tick; price it in
+  // credits at the live discounted feeNet* rates. mem-byte-seconds → the
+  // per-byte-DAY rate (divide by seconds/day); __uint128_t guards the
+  // conversion against overflow.
+  const uint64_t feeChanSec = discountFee(FeeKind::Net, cfg_.feeNetChannelSec);
+  const uint64_t feeMemDay  = discountFee(FeeKind::Net, cfg_.feeNetMemByteDay);
+  const uint64_t feeBSent   = discountFee(FeeKind::Net, cfg_.feeNetByteSent);
+  const uint64_t feeBRecv   = discountFee(FeeKind::Net, cfg_.feeNetByteReceived);
+
+  __uint128_t debit = 0;
+  debit += static_cast<__uint128_t>(usage.bytesSent)      * feeBSent;
+  debit += static_cast<__uint128_t>(usage.bytesReceived)  * feeBRecv;
+  debit += (static_cast<__uint128_t>(usage.memByteSeconds) * feeMemDay)
+           / SECS_PER_DAY;
+  debit += static_cast<__uint128_t>(usage.ageSeconds)     * feeChanSec;
+  if (debit == 0) return;  // free at current rates — nothing to charge
+  const uint64_t amount =
+    debit > std::numeric_limits<uint64_t>::max()
+      ? std::numeric_limits<uint64_t>::max()
+      : static_cast<uint64_t>(debit);
+
+  // Debit the payer on logicStrand; if it can't cover the tick, the host
+  // closes the channel (on the rpc strand). The bus never sees the cost
+  // and never evicts for non-payment.
+  _l2DebitNetworkBill(
+    payer, static_cast<int64_t>(amount),
+    [this, peer, channelId, amount](bool ok) {
+      if (ok) return;
+      LOGDEBUG << "netbill: insufficient funds → close"
+               << SVAR(peer) << VAR(channelId) << VAR(amount);
+      if (rpcRudp_) rpcRudp_->closeChannel(peer, channelId);
+    },
+    rpcTaskIO_.get_executor());
+}
+
 void CesServer::_l2DebitNetworkBill(
     const HashPrefix& payerPfx,
     int64_t amount,
@@ -4314,7 +4353,7 @@ void CesServer::_l2DebitNetworkBill(
         ok = true;
       }
       // Account already-not-exists OR balance < amount → leave alone,
-      // signal failure. NetworkBilling will closeChannel on the
+      // signal failure. ChannelMeter will closeChannel on the
       // callback hop.
       if (cb) boost::asio::post(cbExecutor, [cb, ok]() { cb(ok); });
     });
@@ -5065,7 +5104,7 @@ void CesServer::executeRpc(std::shared_ptr<PendingRpc> pending) {
     rpcTaskIO_, *rpcRudp_, peer, channelId,
     std::move(pending->requestBody),
     cfg_.rpcResponseTimeoutMs, cfg_.rpcMaxResponseBytes,
-    netBilling_.get(), serverKeyPair_,
+    channelMeter_.get(), serverKeyPair_,
     [self, pending, peer, channelId]
     (uint8_t rc, ces::Bytes body) {
       // Runs on rpcTaskIO_'s thread. Unregister the session from the

@@ -1,8 +1,8 @@
 // ===========================================================================
-// NetworkBilling tests
+// ChannelMeter tests
 // ===========================================================================
 //
-// NetworkBilling exercises track() / snapshot() / a tick that walks
+// ChannelMeter exercises track() / snapshot() / a tick that walks
 // channels and computes deltas. Verifies the bookkeeping layer end-
 // to-end against the live CesPlex echo handler, the in-memory
 // eviction-on-tick semantics, and rate-driven debiting +
@@ -11,10 +11,10 @@
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
 
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
-#include <ces/l2/net_billing.h>
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/meter.h>
+#include <ces/cesplex/wire.h>
 #include <ces/server.h>
 
 #include <minx/minx.h>
@@ -312,8 +312,8 @@ struct NetBillFixture {
     rpcPort = server->_rpcBoundPort();
     BOOST_REQUIRE_MESSAGE(rpcPort != 0,
       "CesServer failed to bind secondary port");
-    BOOST_REQUIRE_MESSAGE(server->_netBilling() != nullptr,
-      "NetworkBilling not constructed");
+    BOOST_REQUIRE_MESSAGE(server->_channelMeter() != nullptr,
+      "ChannelMeter not constructed");
 
     // Fund the bind signer so feeQuery isn't blocked by zero balance
     // when handlers (none here, but keep consistent) query.
@@ -329,7 +329,7 @@ struct NetBillFixture {
 
 } // namespace
 
-BOOST_AUTO_TEST_SUITE(NetworkBillingSuite)
+BOOST_AUTO_TEST_SUITE(ChannelMeterSuite)
 
 // 1. Plain happy path: open one channel via CesPlex select, run a
 //    round-trip, snapshot — entry exists, has the right tag, RUDP
@@ -344,7 +344,7 @@ BOOST_FIXTURE_TEST_CASE(TracksOneChannelAfterSelect, NetBillFixture) {
   auto reply = peer.echo(stream, std::string("hello-billing"));
   BOOST_REQUIRE_EQUAL(reply, "hello-billing");
 
-  auto rows = server->_netBilling()->snapshot();
+  auto rows = server->_channelMeter()->snapshot();
   BOOST_REQUIRE_EQUAL(rows.size(), 1u);
   BOOST_CHECK_EQUAL(rows[0].channelId, 1u);
   BOOST_CHECK_EQUAL(rows[0].tag, std::string("plex:/ces/test/echo/1"));
@@ -370,8 +370,8 @@ BOOST_FIXTURE_TEST_CASE(DeltasResetEachTick, NetBillFixture) {
   BOOST_REQUIRE_EQUAL(peer.echo(stream, std::string(64, 'a')),
                       std::string(64, 'a'));
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  server->_netBilling()->_runTick();
-  auto rows1 = server->_netBilling()->snapshot();
+  server->_channelMeter()->_runTick();
+  auto rows1 = server->_channelMeter()->snapshot();
   BOOST_REQUIRE_EQUAL(rows1.size(), 1u);
   BOOST_CHECK_GT(rows1[0].deltaBytesSent, 0u);
   BOOST_CHECK_GT(rows1[0].deltaBytesReceived, 0u);
@@ -382,8 +382,8 @@ BOOST_FIXTURE_TEST_CASE(DeltasResetEachTick, NetBillFixture) {
   // slightly from idle keep-alive ticks RUDP runs internally, but
   // deltas should be small relative to the first tick's measurement.
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  server->_netBilling()->_runTick();
-  auto rows2 = server->_netBilling()->snapshot();
+  server->_channelMeter()->_runTick();
+  auto rows2 = server->_channelMeter()->snapshot();
   BOOST_REQUIRE_EQUAL(rows2.size(), 1u);
   BOOST_CHECK_GE(rows2[0].metrics.bytesSent, bsAfterTick1);
   BOOST_CHECK_GE(rows2[0].metrics.bytesReceived, brAfterTick1);
@@ -395,7 +395,7 @@ BOOST_FIXTURE_TEST_CASE(DeltasResetEachTick, NetBillFixture) {
   peer.closeStream();
 }
 
-// A reused (peer, channelId) whose stale ChannelBill baseline exceeds a fresh
+// A reused (peer, channelId) whose stale MeteredChannel baseline exceeds a fresh
 // channel's smaller counters must not unsigned-underflow the per-tick byte delta
 // into a near-2^64 debit. _testSetBaseline forces the stale-high baseline;
 // doTick must clamp the delta (bill the fresh counter from zero), not wrap.
@@ -407,9 +407,9 @@ BOOST_FIXTURE_TEST_CASE(ReusedChannelDoesNotUnderflowDelta, NetBillFixture) {
   BOOST_REQUIRE_EQUAL(peer.echo(stream, std::string(64, 'a')),
                       std::string(64, 'a'));
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  server->_netBilling()->_runTick();
+  server->_channelMeter()->_runTick();
 
-  auto rows0 = server->_netBilling()->snapshot();
+  auto rows0 = server->_channelMeter()->snapshot();
   BOOST_REQUIRE_EQUAL(rows0.size(), 1u);
   const auto peerAddr = rows0[0].peer;
   const uint32_t cid = rows0[0].channelId;
@@ -417,11 +417,11 @@ BOOST_FIXTURE_TEST_CASE(ReusedChannelDoesNotUnderflowDelta, NetBillFixture) {
 
   // Simulate a reused channelId: stale baseline far above the fresh counter.
   const uint64_t BIG = 1'000'000'000ull;
-  server->_netBilling()->_testSetBaseline(peerAddr, cid,
+  server->_channelMeter()->_testSetBaseline(peerAddr, cid,
                                           cur + BIG, cur + BIG, BIG);
-  server->_netBilling()->_runTick();
+  server->_channelMeter()->_runTick();
 
-  auto rows1 = server->_netBilling()->snapshot();
+  auto rows1 = server->_channelMeter()->snapshot();
   BOOST_REQUIRE_EQUAL(rows1.size(), 1u);
   // Pre-fix: cur - (cur+BIG) wraps to ~2^64. Post-fix: clamped to the fresh
   // counter (a few KB). Either way, far below BIG.
@@ -450,7 +450,7 @@ BOOST_FIXTURE_TEST_CASE(EvictsAfterChannelDies, NetBillFixture) {
   BOOST_REQUIRE(stream != nullptr);
 
   // Confirm one tracked channel
-  BOOST_CHECK_EQUAL(server->_netBilling()->snapshot().size(), 1u);
+  BOOST_CHECK_EQUAL(server->_channelMeter()->snapshot().size(), 1u);
 
   // Close from the client side. close() emits HS_CLOSE → server's
   // RUDP marks channel PEER_CLOSED → drops state.
@@ -462,15 +462,15 @@ BOOST_FIXTURE_TEST_CASE(EvictsAfterChannelDies, NetBillFixture) {
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // Trigger a tick on the server's billing — it should evict.
-  server->_netBilling()->_runTick();
-  auto rows = server->_netBilling()->snapshot();
+  server->_channelMeter()->_runTick();
+  auto rows = server->_channelMeter()->snapshot();
   BOOST_CHECK_EQUAL(rows.size(), 0u);
 }
 
 // 5. Rate-driven debit + insufficient-funds eviction. Open a channel
 //    bound to a key whose account has been drained to ~zero, run
 //    a tick that incurs a small debit, observe the channel get
-//    closed by NetworkBilling because the debit failed.
+//    closed by ChannelMeter because the debit failed.
 BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   // Use a fresh key (NOT testKey, which the fixture funds heavily).
   ces::KeyPair brokeKey;
@@ -490,16 +490,16 @@ BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
   // Trigger a tick — debit will exceed the 100-credit balance, so
-  // NetworkBilling closeChannels the channel (the bound payer
+  // ChannelMeter closeChannels the channel (the bound payer
   // can't cover the per-tick cost).
-  server->_netBilling()->_runTick();
+  server->_channelMeter()->_runTick();
 
   // Give the closeChannel time to process + fire onClosed.
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
   // A second tick walks the bill map; the now-dead channel evicts.
-  server->_netBilling()->_runTick();
-  auto rows = server->_netBilling()->snapshot();
+  server->_channelMeter()->_runTick();
+  auto rows = server->_channelMeter()->snapshot();
   BOOST_CHECK_EQUAL(rows.size(), 0u);
 }
 

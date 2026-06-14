@@ -30,12 +30,12 @@
 #include <ces/l2/compute_client.h>
 #include <ces/buffer.h>
 #include <ces/l2/file_client.h>
-#include <ces/l2/net_multiplexer.h>
+#include <ces/cesplex/mux.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/ramfilestore.h>
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/server.h>
 #include <ces/types.h>
 

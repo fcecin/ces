@@ -9,7 +9,7 @@
 
 #include "dial.h"
 
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/buffer.h>
 #include <ces/types.h>
 

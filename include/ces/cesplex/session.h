@@ -1,8 +1,8 @@
-// cesplex.h — the shared CesPlex engine for handlers and clients.
+// session.h — the per-op CesPlex layer for handlers and clients.
 //
-// The pieces both sides of a CesPlex protocol build on, kept out of
-// net_envelope (low-level wire format) and net_multiplexer (the bus:
-// bind handshake + channel routing + handler registration):
+// The pieces both sides of a bound CesPlex channel build on, layered over
+// cesplex/wire.h (low-level wire format) and cesplex/mux.h (the bus: bind
+// handshake + channel routing + handler registration + metering):
 //
 //   * Server side — the signed-request loop. A handler's serve() calls
 //     cesPlexServe(); the framework reads [verb][envelope] ops, verifies
@@ -17,7 +17,8 @@
 
 #pragma once
 
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
+#include <ces/cesplex/mux.h>   // CesPlexHost, BoundChannelContext
 #include <ces/buffer.h>
 #include <ces/keys.h>
 #include <minx/rudp/rudp_stream.h>
@@ -31,8 +32,6 @@
 #include <string>
 
 namespace ces {
-
-class CesServer;
 
 // ===========================================================================
 // Server side — the signed-request loop
@@ -74,7 +73,7 @@ struct CesPlexProtocol {
 // ReqCtx structs they replace, so dispatchers need no edits.
 struct CesPlexRequest : std::enable_shared_from_this<CesPlexRequest> {
   std::shared_ptr<minx::RudpStream> stream;
-  CesServer* server = nullptr;
+  CesPlexHost* host = nullptr;        // signs responses; the host seam
   BoundChannelContext bound;
   uint8_t verb = 0;
   std::array<uint8_t, CES_PLEX_SIG_SIZE> sig{};
@@ -99,7 +98,7 @@ struct CesPlexRequest : std::enable_shared_from_this<CesPlexRequest> {
 // until the channel closes. Everything runs on the rpcTaskIO_ strand.
 void cesPlexServe(std::shared_ptr<minx::RudpStream> stream,
                   BoundChannelContext bound,
-                  CesServer* server,
+                  CesPlexHost* host,
                   CesPlexProtocol proto);
 
 // ===========================================================================

@@ -1,13 +1,13 @@
 // file_client.cpp - CesFileClient.
 //
-// A thin verb layer over CesPlexClient (see cesplex.h), which owns all the
+// A thin verb layer over CesPlexClient (see cesplex/mux.h), which owns all the
 // MINX/Rudp/threads/bind plumbing. Each method here is just the verb's
 // preamble building, optional streamed body, and response parsing; the
 // shared client drives the wire (including the per-op signed envelope and
 // the server-signed response trailer).
 
 #include <ces/l2/file_client.h>
-#include <ces/l2/cesplex.h>
+#include <ces/cesplex/session.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h> // ces::sha256
 #include <ces/types.h>

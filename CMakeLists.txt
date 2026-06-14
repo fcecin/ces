@@ -121,7 +121,9 @@ set_target_properties(libbacktrace PROPERTIES
 # 5. TARGETS
 # -----------------------------------------------------------------------------
 
-file(GLOB CESLIB_SOURCES "src/ceslib/*.cpp")
+# Recursive so ceslib's source tree mirrors the include tree: every
+# include/ces/<group>/<name>.h has its src/ceslib/<group>/<name>.cpp.
+file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
 add_library(ceslib STATIC ${CESLIB_SOURCES})
 
 target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY BOOST_STACKTRACE_USE_BACKTRACE)

@@ -1,4 +1,4 @@
-// net_envelope.h — wire format helpers for the CesPlex bind contract
+// wire.h — wire format helpers for the CesPlex bind contract
 // + per-op envelope.
 //
 //   1. The select handshake is a SIGNED bind contract. Both client and
@@ -16,13 +16,6 @@
 //        [8  channel_session_token]   (from RUDP, anchors per-op sigs;
 //                                      guaranteed non-zero in practice)
 //        [u32 BE server_proto_version]
-//        [u64 BE feeNetChannelSec ]   ┐
-//        [u64 BE feeNetMemByteDay]    │  current rate disclosure —
-//        [u64 BE feeNetByteSent  ]    │  informational only; server bills
-//        [u64 BE feeNetByteReceived]  ┘  at whatever rates are live at
-//                                       tick time. Client uses these to
-//                                       decide if prices are acceptable;
-//                                       hangs up if not.
 //        [32 sha256(status || client_sha256 || all-of-above)]
 //        [65 sig]
 //
@@ -44,9 +37,9 @@
 //      birthday horizon is ~2^32 ops, well beyond any practical
 //      channel lifetime.
 //
-//   3. The bound state (pubkey + sessionToken + rates + bind time)
-//      lives on a BoundChannelContext that the CesPlex Session passes
-//      to the application handler at handoff (CesPlexHandler::serve).
+//   3. The bound state (pubkey + sessionToken + bind time) lives on a
+//      BoundChannelContext that the CesPlex Session passes to the
+//      application handler at handoff (CesPlexHandler::serve).
 //
 // All multi-byte ints are big-endian on the wire.
 //
@@ -55,10 +48,10 @@
 // ParsedBindReply, so a parse failure or zeroed buffer reads as
 // "rejected" not "approved".
 //
-// The signing is anti-MITM only. Server sigs prove the bind reply and its
-// disclosed rates came from the intended server; client sigs prove each op
-// came from the bound principal. Neither constrains server behavior: the
-// server holds the ledger and bills whatever the live config says.
+// The signing is anti-MITM only. Server sigs prove the bind reply came from
+// the intended server; client sigs prove each op came from the bound
+// principal. The bus carries no prices — it measures bytes and time and
+// reports the counts to its host, which does all pricing and accounting.
 
 #pragma once
 
@@ -116,20 +109,16 @@ static_assert(sizeof(Signature) == CES_PLEX_SIG_SIZE,
 // + 32 server_pubkey         (= CES_PLEX_PUBKEY_SIZE)
 // + 8  channel_session_token
 // + 4  server_proto_version
-// + 8  feeNetChannelSec
-// + 8  feeNetMemByteDay
-// + 8  feeNetByteSent
-// + 8  feeNetByteReceived
-// = 84 bytes
+// = 52 bytes
 constexpr size_t CES_PLEX_BIND_REPLY_BODY_SIZE =
-    8 + CES_PLEX_PUBKEY_SIZE + 8 + 4 + 8 + 8 + 8 + 8;
-static_assert(CES_PLEX_BIND_REPLY_BODY_SIZE == 84,
+    8 + CES_PLEX_PUBKEY_SIZE + 8 + 4;
+static_assert(CES_PLEX_BIND_REPLY_BODY_SIZE == 52,
               "bind reply body size diverged from documented layout");
 
 // Total bind reply size = status + body + sha256 + sig.
 constexpr size_t CES_PLEX_BIND_REPLY_TOTAL_SIZE =
     1 + CES_PLEX_BIND_REPLY_BODY_SIZE + CES_PLEX_SHA256_SIZE + CES_PLEX_SIG_SIZE;
-static_assert(CES_PLEX_BIND_REPLY_TOTAL_SIZE == 182,
+static_assert(CES_PLEX_BIND_REPLY_TOTAL_SIZE == 150,
               "bind reply total size diverged");
 
 // Per-op request envelope header: [u8 verb][u32 BE preamble_len].
@@ -163,7 +152,7 @@ static_assert(CES_PLEX_BIND_REQ_TAIL_SIZE == 137,
 // Bind-request freshness window. The signed client_time_us is rejected if more
 // than CES_PLEX_BIND_MAX_AGE_US in the past or CES_PLEX_BIND_FUTURE_DRIFT_US in
 // the future. Without it a captured bind replays indefinitely on fresh channels,
-// each re-binding as the victim and accruing NetworkBilling against them. 5 min
+// each re-binding as the victim and accruing ChannelMeter against them. 5 min
 // each way absorbs clock skew while bounding replay.
 constexpr uint64_t CES_PLEX_BIND_MAX_AGE_US      = 300ULL * 1000000;
 constexpr uint64_t CES_PLEX_BIND_FUTURE_DRIFT_US = 300ULL * 1000000;
@@ -176,10 +165,9 @@ constexpr uint64_t CES_PLEX_BIND_FUTURE_DRIFT_US = 300ULL * 1000000;
 // Passed by value to CesPlexHandler::serve. Handlers store it on
 // their per-channel state struct and use it for every per-op verify.
 
-// What CesPlex passes to a server-side handler at bind handoff. No
-// rate fields here — handlers don't bill (NetworkBilling does that
-// directly against live config). Rates live only on the wire (the
-// disclosure to the client) via BindReplyFields / ParsedBindReply.
+// What CesPlex passes to a server-side handler at bind handoff. No rate
+// or price fields anywhere — the bus measures resource usage and reports
+// counts to its host; the host does all pricing and accounting.
 struct BoundChannelContext {
   // Identity
   PublicKey  boundPubkey;          // for sig verify
@@ -221,20 +209,13 @@ computeBindRequestDigest(std::span<const uint8_t> name,
 // Bind reply — server side
 // ---------------------------------------------------------------------------
 
-// Inputs the server gathers when building the reply. The four
-// feeNet* fields are a snapshot of current rates at bind time —
-// disclosed to the client so it can decide whether to proceed. They
-// don't constrain billing; the operator may change config at any
-// time and subsequent ticks bill at the live rates.
+// Inputs the server gathers when building the reply. Identity and
+// anchoring only — the bind contract carries no prices.
 struct BindReplyFields {
   uint8_t  status = CES_PLEX_OK;
   uint64_t serverTimeUs = 0;
   uint64_t channelSessionToken = 0;
   uint32_t serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
-  uint64_t feeNetChannelSec = 0;
-  uint64_t feeNetMemByteDay = 0;
-  uint64_t feeNetByteSent = 0;
-  uint64_t feeNetByteReceived = 0;
 };
 
 // Build the signed bind reply. `clientSha256` is the digest the
@@ -253,23 +234,19 @@ struct ParsedBindReply {
   std::array<uint8_t, CES_PLEX_PUBKEY_SIZE> serverPubkey{};
   uint64_t channelSessionToken = 0;
   uint32_t serverProtoVersion = 0;
-  uint64_t feeNetChannelSec = 0;
-  uint64_t feeNetMemByteDay = 0;
-  uint64_t feeNetByteSent = 0;
-  uint64_t feeNetByteReceived = 0;
   std::array<uint8_t, CES_PLEX_SHA256_SIZE> sha256{};
   std::array<uint8_t, CES_PLEX_SIG_SIZE> sig{};
 };
 
 // Compute the digest the server signs over and the client recomputes:
 // sha256(status || clientSha256 || serverTimeUs || serverPubkey ||
-//        channelSessionToken || serverProtoVersion || the 4 fee fields).
+//        channelSessionToken || serverProtoVersion).
 //
 // Reads only the input fields of `reply` (status / time / pubkey /
-// token / version / 4 rates). Ignores reply.sha256 and reply.sig
-// (those are the digest's *output*, populated by the signer). The
-// type is shared with parseBindReply for caller convenience; the
-// digest computation itself is symmetric on both sides.
+// token / version). Ignores reply.sha256 and reply.sig (those are the
+// digest's *output*, populated by the signer). The type is shared with
+// parseBindReply for caller convenience; the digest computation itself
+// is symmetric on both sides.
 std::array<uint8_t, CES_PLEX_SHA256_SIZE>
 computeBindReplyDigest(const ParsedBindReply& reply,
                        std::span<const uint8_t> clientSha256);

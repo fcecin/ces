@@ -1,10 +1,10 @@
-// net_envelope.cpp — implementation of the bind contract + per-op
-// envelope helpers. See include/ces/l2/net_envelope.h for the design.
+// wire.cpp — implementation of the bind contract + per-op
+// envelope helpers. See include/ces/cesplex/wire.h for the design.
 //
 // All wire serialization goes through ces::Buffer / minx::Buffer /
 // logkv::serializer — no hand-rolled BE shifts here.
 
-#include <ces/l2/net_envelope.h>
+#include <ces/cesplex/wire.h>
 #include <ces/buffer.h>
 #include <ces/util/hash.h>
 
@@ -65,18 +65,14 @@ namespace {
 
 // Build the bytes-to-be-hashed for the reply digest:
 // status || clientSha256 || serverTimeUs || serverPubkey ||
-// channelSessionToken || serverProtoVersion || 4 fee fields.
+// channelSessionToken || serverProtoVersion.
 std::array<uint8_t, CES_PLEX_SHA256_SIZE>
 computeBindReplyDigestRaw(uint8_t status,
                           std::span<const uint8_t> clientSha256,
                           uint64_t serverTimeUs,
                           std::span<const uint8_t> serverPubkey,
                           uint64_t channelSessionToken,
-                          uint32_t serverProtoVersion,
-                          uint64_t feeNetChannelSec,
-                          uint64_t feeNetMemByteDay,
-                          uint64_t feeNetByteSent,
-                          uint64_t feeNetByteReceived) {
+                          uint32_t serverProtoVersion) {
   CryptoPP::SHA256 h;
   h.Update(&status, 1);
   h.Update(clientSha256.data(), clientSha256.size());
@@ -84,10 +80,6 @@ computeBindReplyDigestRaw(uint8_t status,
   h.Update(serverPubkey.data(), serverPubkey.size());
   ces::shaUpdate(h, channelSessionToken);
   ces::shaUpdate(h, serverProtoVersion);
-  ces::shaUpdate(h, feeNetChannelSec);
-  ces::shaUpdate(h, feeNetMemByteDay);
-  ces::shaUpdate(h, feeNetByteSent);
-  ces::shaUpdate(h, feeNetByteReceived);
   std::array<uint8_t, CES_PLEX_SHA256_SIZE> out;
   h.Final(out.data());
   return out;
@@ -102,9 +94,7 @@ computeBindReplyDigest(const ParsedBindReply& reply,
     reply.serverPubkey.data(), reply.serverPubkey.size());
   return computeBindReplyDigestRaw(
     reply.status, clientSha256, reply.serverTimeUs, pkSpan,
-    reply.channelSessionToken, reply.serverProtoVersion,
-    reply.feeNetChannelSec, reply.feeNetMemByteDay,
-    reply.feeNetByteSent, reply.feeNetByteReceived);
+    reply.channelSessionToken, reply.serverProtoVersion);
 }
 
 minx::Bytes buildBindReply(const BindReplyFields& fields,
@@ -114,9 +104,7 @@ minx::Bytes buildBindReply(const BindReplyFields& fields,
   std::span<const uint8_t> pkSpan(pkArr.data(), pkArr.size());
   auto digest = computeBindReplyDigestRaw(
     fields.status, clientSha256, fields.serverTimeUs, pkSpan,
-    fields.channelSessionToken, fields.serverProtoVersion,
-    fields.feeNetChannelSec, fields.feeNetMemByteDay,
-    fields.feeNetByteSent, fields.feeNetByteReceived);
+    fields.channelSessionToken, fields.serverProtoVersion);
 
   Signature sig = serverKey.signData(
     std::span<const uint8_t>(digest.data(), digest.size()));
@@ -128,10 +116,6 @@ minx::Bytes buildBindReply(const BindReplyFields& fields,
   buf.put(pkArr);
   buf.put<uint64_t>(fields.channelSessionToken);
   buf.put<uint32_t>(fields.serverProtoVersion);
-  buf.put<uint64_t>(fields.feeNetChannelSec);
-  buf.put<uint64_t>(fields.feeNetMemByteDay);
-  buf.put<uint64_t>(fields.feeNetByteSent);
-  buf.put<uint64_t>(fields.feeNetByteReceived);
   buf.put(digest);
   buf.put(sig);
   return bytes;
@@ -147,10 +131,6 @@ ParsedBindReply parseBindReply(
   reader.get(r.serverPubkey);
   reader.get(r.channelSessionToken);
   reader.get(r.serverProtoVersion);
-  reader.get(r.feeNetChannelSec);
-  reader.get(r.feeNetMemByteDay);
-  reader.get(r.feeNetByteSent);
-  reader.get(r.feeNetByteReceived);
   reader.get(r.sha256);
   reader.get(r.sig);
   return r;
