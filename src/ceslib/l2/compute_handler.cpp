@@ -257,6 +257,10 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // no range configured (instance has no network). Handed to the child
   // in the bootstrap frame; freed back to the pool on death.
   uint16_t clientPort = 0;
+  // UDP port the server reserved for this instance's inbound CesPlex host
+  // (/ces/luarpc/1), from the same range. 0 = none. Independent of
+  // clientPort; freed back to the pool on death.
+  uint16_t rpcPort = 0;
   uint64_t startedAtUs = 0;
   uint64_t lastTickUs = 0;              // supervisor's last-charged wall time
   uint64_t upfrontDeposit = 0;
@@ -611,6 +615,7 @@ void killInstanceById(uint64_t id) {
   killAndReap(inst->pid);
   teardownInstance(*inst);
   releaseComputePort(inst->clientPort);
+  releaseComputePort(inst->rpcPort);
   gInstances.erase(it);
   if (auto pit = gByPrefix.find(inst->progPrefix); pit != gByPrefix.end()) {
     pit->second.erase(id);
@@ -736,8 +741,8 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 
 // Send the bootstrap frame at LAUNCH time. Body layout:
 //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
-//   [32B program_privkey][2B client_port BE][8B start_time_us BE]
-//   [u32 BE src_len][src bytes]
+//   [32B program_privkey][2B client_port BE][2B rpc_port BE]
+//   [8B start_time_us BE][u32 BE src_len][src bytes]
 // - prog_prefix: first 8B of sha256(source path); used as the
 //   "prog_pfx" field on outbound CES_APP_COMPUTE_MSG packets so the
 //   remote CES client can demux by program.
@@ -757,13 +762,16 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 //   outbound CES client (0 = no range → the instance has no network).
 //   The child binds its client to this port so it sends from a known,
 //   firewall-configurable source port.
+// - rpc_port: the UDP port the server reserved for this instance's inbound
+//   CesPlex host (/ces/luarpc/1). 0 = none → the instance hosts nothing.
+//   Independent of client_port: an instance may get one, both, or neither.
 void sendBootstrapFrame(std::shared_ptr<Instance> inst,
                         const uint8_t* src, size_t srcLen) {
   ces::Bytes body;
   body.reserve(sizeof(inst->progPrefix) + sizeof(inst->ownerPk)
                + sizeof(inst->programPubkey) + sizeof(inst->programPrivkey)
-               + sizeof(uint16_t) + sizeof(uint64_t) + sizeof(uint32_t)
-               + srcLen);
+               + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint64_t)
+               + sizeof(uint32_t) + srcLen);
   body.insert(body.end(),
               inst->progPrefix.begin(), inst->progPrefix.end());
   body.insert(body.end(),
@@ -773,6 +781,7 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
   body.insert(body.end(),
               inst->programPrivkey.begin(), inst->programPrivkey.end());
   ces::Buffer::put<uint16_t>(body, inst->clientPort);
+  ces::Buffer::put<uint16_t>(body, inst->rpcPort);
   ces::Buffer::put<uint64_t>(body, inst->startedAtUs);
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(srcLen));
   if (srcLen > 0)
@@ -1493,6 +1502,7 @@ struct LaunchAccept {
   bool finished = false;
   std::shared_ptr<LaunchSlot> slot;
   std::shared_ptr<PortLease> portLease;
+  std::shared_ptr<PortLease> rpcPortLease;
 };
 
 // Strand-only (rpcTaskIO_). Allocate a fresh instance, spawn the child
@@ -1518,6 +1528,7 @@ void allocateAndSpawnInstance(
     uint64_t upfront, uint64_t now,
     std::shared_ptr<LaunchSlot> slot,
     std::shared_ptr<PortLease> portLease,
+    std::shared_ptr<PortLease> rpcPortLease,
     std::function<void(uint64_t id)> done) {
   const auto& cfg = server->_config();
 
@@ -1587,6 +1598,7 @@ void allocateAndSpawnInstance(
   st->upfront = upfront;
   st->slot = std::move(slot);
   st->portLease = std::move(portLease);
+  st->rpcPortLease = std::move(rpcPortLease);
 
   // Adopt the listen fd into the acceptor — it now owns + closes it.
   boost::system::error_code aec;
@@ -1650,6 +1662,8 @@ void allocateAndSpawnInstance(
       // owns freeing it, so the lease must not also free it on drop.
       inst->clientPort = st->portLease->port;
       st->portLease->commit();
+      inst->rpcPort = st->rpcPortLease->port;
+      st->rpcPortLease->commit();
 
       gInstances[inst->id] = inst;
       gByPrefix[inst->progPrefix].insert(inst->id);
@@ -1720,13 +1734,20 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   allocateComputePort(cfg, clientPort);
   auto portLease = std::make_shared<PortLease>(clientPort);
 
+  // Second best-effort lease: the child's inbound CesPlex host port
+  // (/ces/luarpc/1). Independent of clientPort — exhaustion here leaves
+  // rpcPort 0 (the instance hosts nothing) without failing the launch.
+  uint16_t rpcPort = 0;
+  allocateComputePort(cfg, rpcPort);
+  auto rpcPortLease = std::make_shared<PortLease>(rpcPort);
+
   // Reserve a launch slot now and hold it across the async validate +
   // spawn chain (released when the instance registers or the launch
   // fails). Race-free: nothing else runs on this strand between the cap
   // check above and here, so the reservation reflects that decision.
   auto launchSlot = std::make_shared<LaunchSlot>();
 
-  auto after = [ctx, name, upfront, ownerPk, launchSlot, portLease](
+  auto after = [ctx, name, upfront, ownerPk, launchSlot, portLease, rpcPortLease](
                    uint8_t rc, bool /*duplicate*/) mutable {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     // LAUNCH passes reqNonce=0 (opted out of dedup) so `duplicate` is never
@@ -1742,7 +1763,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     uint64_t now = getMicrosSinceEpoch();
     allocateAndSpawnInstance(
       reqServer(ctx), name, ownerPk, upfront, now, std::move(launchSlot),
-      std::move(portLease),
+      std::move(portLease), std::move(rpcPortLease),
       [ctx, now](uint64_t id) {
         if (id == 0) {
           sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
@@ -2211,6 +2232,9 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   uint16_t clientPort = 0;
   allocateComputePort(cfg, clientPort);   // best-effort; 0 = local-only
   auto portLease = std::make_shared<PortLease>(clientPort);
+  uint16_t rpcPort = 0;
+  allocateComputePort(cfg, rpcPort);   // best-effort 2nd port (/ces/luarpc/1 host)
+  auto rpcPortLease = std::make_shared<PortLease>(rpcPort);
 
   // Source file must exist; ownership must be the server. /s/-zone
   // requirement is enforced at deploy time by
@@ -2239,7 +2263,7 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   // "validated + spawn started," not "child connected."
   uint64_t now = getMicrosSinceEpoch();
   allocateAndSpawnInstance(server, name, ownerPk, 0, now,
-    std::make_shared<LaunchSlot>(), std::move(portLease),
+    std::make_shared<LaunchSlot>(), std::move(portLease), std::move(rpcPortLease),
     [name](uint64_t id) {
       if (id == 0) {
         LOGWARNING << "builtin:compute internal launch spawn failed"
@@ -2350,6 +2374,27 @@ uint16_t _computeTestInstanceClientPort(uint64_t instanceId) {
   boost::asio::post(ex, [&]() {
     auto it = gInstances.find(instanceId);
     if (it != gInstances.end()) port = it->second->clientPort;
+    std::lock_guard lk(m);
+    done = true;
+    cv.notify_all();
+  });
+  std::unique_lock lk(m);
+  cv.wait(lk, [&]{ return done; });
+  return port;
+}
+
+uint16_t _computeTestInstanceRpcPort(uint64_t instanceId) {
+  CesServer* server = gServer.load();
+  if (!server) return 0;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return 0;
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  uint16_t port = 0;
+  boost::asio::post(ex, [&]() {
+    auto it = gInstances.find(instanceId);
+    if (it != gInstances.end()) port = it->second->rpcPort;
     std::lock_guard lk(m);
     done = true;
     cv.notify_all();

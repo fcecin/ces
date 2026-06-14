@@ -55,13 +55,22 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <array>
+#include <atomic>
 #include <deque>
+#include <limits>
+#include <map>
+#include <future>
+#include <memory>
+#include <mutex>
+#include <random>
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
 #include <pwd.h>
 #include <string>
 #include <sys/resource.h>
+#include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/un.h>
@@ -76,11 +85,17 @@ extern "C" {
 }
 
 #include <ces/account.h>
+#include <ces/cesplex/endpoint.h>
 #include <ces/client.h>
 #include <ces/keys.h>
 #include <ces/protocol.h>
 #include <ces/types.h>
 #include <ces/util/resolver.h>
+
+#include <boost/asio/buffer.hpp>
+#include <boost/asio/ip/address.hpp>
+#include <boost/asio/post.hpp>
+#include <boost/asio/write.hpp>
 
 // ---------------------------------------------------------------------------
 // Minimal SHA-256 for ces.sha256. Self-contained, tiny, no crypto
@@ -531,6 +546,305 @@ uint64_t g_start_time_us = 0;
 // network: the outbound remote_* verbs fail with "networking disabled"
 // rather than binding an unreachable ephemeral port.
 uint16_t g_program_port = 0;
+// The static UDP port reserved for this instance's inbound CesPlex host
+// (/ces/luarpc/1). 0 = none → the instance hosts nothing.
+uint16_t g_rpc_port = 0;
+
+// ---------------------------------------------------------------------------
+// /ces/luarpc/1 — the protocol this lua host SERVES (and, later, dials) on
+// its rpc port. A raw, opaque byte pipe: whatever bytes arrive are handed to
+// the program; whatever bytes the program writes are sent. No host framing,
+// batching, or buffering — any grammar lives in Lua.
+//
+// The endpoint runs on its own single strand; the Lua VM runs on main. The
+// bridge below crosses that boundary: inbound (endpoint → Lua) via a
+// mutex+condvar event queue drained by ces.luarpc.run(); outbound (Lua →
+// endpoint) via asio::post onto the endpoint strand, where the per-conn
+// RudpStreams live. Blocking here is fine — the compute child is sandboxed
+// and metered, so a stalled strand has no global consequence.
+//
+// All per-conn stream state (g_luarpc_conns, g_luarpc_next_id) is touched
+// ONLY on the endpoint strand: the handler runs there, and the Lua-side
+// write/close hop there via post. So no lock guards them. Only the inbound
+// event queue is cross-thread (mutex+condvar); the accept gate is atomic.
+// ---------------------------------------------------------------------------
+namespace {
+
+struct LuaRpcEvent {
+  enum class Type { Opened, Data, Closed } type;
+  uint64_t connId = 0;
+  std::array<uint8_t, 32> peer{};   // Opened
+  std::string bytes;                // Data
+};
+
+std::mutex               g_luarpc_mx;
+std::deque<LuaRpcEvent>  g_luarpc_inq;     // endpoint pushes, run() drains
+int                      g_luarpc_wakefd = -1;  // eventfd; nudges run()'s poll
+
+// Accept gate: set by ces.luarpc.set_listener (Lua), read by serve()
+// (endpoint). No listener → close-on-connect.
+std::atomic<bool> g_luarpc_listening{false};
+
+// The endpoint's task strand, armed in main once the endpoint is up. Null
+// until then (and forever if this instance got no rpc port).
+boost::asio::io_context* g_luarpc_io = nullptr;
+
+struct LuaRpcConn {
+  std::shared_ptr<minx::RudpStream> stream;
+  std::deque<std::string> writeQ;   // RudpStream forbids overlapping writes,
+  bool writing = false;             //   so we serialize: one in flight.
+  bool closing = false;
+  std::array<uint8_t, 4096> readBuf{};
+};
+std::map<uint64_t, std::shared_ptr<LuaRpcConn>> g_luarpc_conns;  // strand-only
+uint64_t g_luarpc_next_id = 1;                                   // strand-only
+
+void luarpc_push(LuaRpcEvent e) {
+  {
+    std::lock_guard<std::mutex> lk(g_luarpc_mx);
+    g_luarpc_inq.push_back(std::move(e));
+  }
+  // Nudge the unified run() poll on the Lua thread. The endpoint threads
+  // can't call into the single-threaded Lua VM, so they queue + wake; run()
+  // re-enters Lua to dispatch.
+  if (g_luarpc_wakefd >= 0) {
+    uint64_t one = 1;
+    ssize_t w = ::write(g_luarpc_wakefd, &one, sizeof(one));
+    (void)w;
+  }
+}
+
+// Endpoint strand: drain a conn's writeQ, one async_write at a time.
+void luarpc_drain_writes(uint64_t id, std::shared_ptr<LuaRpcConn> c) {
+  if (c->writing || c->closing || c->writeQ.empty()) return;
+  c->writing = true;
+  auto buf = std::make_shared<std::string>(std::move(c->writeQ.front()));
+  c->writeQ.pop_front();
+  boost::asio::async_write(*c->stream, boost::asio::buffer(*buf),
+    [id, c, buf](const boost::system::error_code& ec, std::size_t) {
+      c->writing = false;
+      if (ec) {
+        if (!c->closing) luarpc_push({LuaRpcEvent::Type::Closed, id, {}, {}});
+        g_luarpc_conns.erase(id);
+        return;
+      }
+      luarpc_drain_writes(id, c);
+    });
+}
+
+// Endpoint strand: read whatever arrives → push Data → repeat. A read error
+// (peer close / reset) → push Closed + drop the conn.
+void luarpc_start_read(uint64_t id, std::shared_ptr<LuaRpcConn> c) {
+  c->stream->async_read_some(
+    boost::asio::buffer(c->readBuf.data(), c->readBuf.size()),
+    [id, c](const boost::system::error_code& ec, std::size_t n) {
+      if (ec) {
+        if (!c->closing) luarpc_push({LuaRpcEvent::Type::Closed, id, {}, {}});
+        g_luarpc_conns.erase(id);
+        return;
+      }
+      LuaRpcEvent e{LuaRpcEvent::Type::Data, id, {}, {}};
+      e.bytes.assign(reinterpret_cast<const char*>(c->readBuf.data()), n);
+      luarpc_push(std::move(e));
+      luarpc_start_read(id, c);
+    });
+}
+
+// Called from Lua → hop to the endpoint strand to enqueue + send.
+void luarpc_conn_write(uint64_t id, std::string bytes) {
+  if (!g_luarpc_io) return;
+  boost::asio::post(*g_luarpc_io,
+    [id, bytes = std::move(bytes)]() mutable {
+      auto it = g_luarpc_conns.find(id);
+      if (it == g_luarpc_conns.end() || it->second->closing) return;
+      it->second->writeQ.push_back(std::move(bytes));
+      luarpc_drain_writes(id, it->second);
+    });
+}
+
+// Called from Lua → hop to the strand to gracefully close.
+void luarpc_conn_close(uint64_t id) {
+  if (!g_luarpc_io) return;
+  boost::asio::post(*g_luarpc_io, [id]() {
+    auto it = g_luarpc_conns.find(id);
+    if (it == g_luarpc_conns.end()) return;
+    it->second->closing = true;
+    it->second->stream->shutdown(ces::kRudpStreamCloseTimeout);
+    // The read completion (error after shutdown) erases the conn.
+  });
+}
+
+// Outbound dialing rides the SAME endpoint Rudp/socket as serving (the user's
+// "religiously the same socket"). Armed in main alongside g_luarpc_io.
+minx::Rudp*                   g_luarpc_rudp = nullptr;
+std::shared_ptr<ces::KeyPair> g_luarpc_signer;   // the program's keypair
+
+struct LuaRpcConnectResult {
+  uint8_t status = ces::CES_ERROR_INTERNAL;
+  uint64_t connId = 0;
+  std::array<uint8_t, 32> peer{};
+};
+
+// Endpoint strand: open an OUTBOUND /ces/luarpc/1 channel to `peer`, drive the
+// client bind (signed by the program key), verify the reply AND that the
+// server pubkey matches `expectPk` (the program knows who it dialed), and on
+// success register the bound stream as a raw conn + start pumping. Reports via
+// `pr`. Mirrors CesPlexClient::doSelect, but on the endpoint's own Rudp.
+void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
+                       std::shared_ptr<std::promise<LuaRpcConnectResult>> pr) {
+  if (!g_luarpc_rudp || !g_luarpc_signer || !g_luarpc_io) {
+    pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}});
+    return;
+  }
+  // Seed Rudp's clock so the fresh channel isn't idle-GC'd on the next tick.
+  g_luarpc_rudp->tick(ces::getMicrosSinceEpoch());
+  std::random_device rd;
+  uint32_t channel = static_cast<uint32_t>(rd());
+  auto stream = std::make_shared<minx::RudpStream>(g_luarpc_io->get_executor());
+  if (!g_luarpc_rudp->registerChannel(peer, channel, stream)) {
+    pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}});
+    return;
+  }
+
+  static const std::string kProto = "/ces/luarpc/1";
+  const uint64_t bindNowUs = ces::getMicrosSinceEpoch();
+  auto bindReq = std::make_shared<minx::Bytes>(
+    ces::buildBindRequest(kProto, bindNowUs, *g_luarpc_signer));
+  const auto& pkArr = g_luarpc_signer->getPublicKeyAsHash();
+  auto clientDigest =
+    std::make_shared<std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
+      ces::computeBindRequestDigest(
+        std::span<const uint8_t>(
+          reinterpret_cast<const uint8_t*>(kProto.data()), kProto.size()),
+        bindNowUs,
+        std::span<const uint8_t>(pkArr.data(), pkArr.size())));
+
+  boost::asio::async_write(*stream, boost::asio::buffer(*bindReq),
+    [stream, bindReq, clientDigest, pr, expectPk]
+    (const boost::system::error_code& ec, std::size_t) {
+      if (ec) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
+      auto reply = std::make_shared<
+        std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
+      boost::asio::async_read(*stream, boost::asio::buffer(*reply),
+        [stream, reply, clientDigest, pr, expectPk]
+        (const boost::system::error_code& ec2, std::size_t) {
+          if (ec2) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
+          ces::ParsedBindReply r = ces::parseBindReply(
+            std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
+              reply->data(), reply->size()));
+          const bool ok =
+            r.status == ces::CES_PLEX_OK &&
+            ces::verifyBindReply(r, std::span<const uint8_t>(
+              clientDigest->data(), clientDigest->size())) &&
+            std::memcmp(r.serverPubkey.data(), expectPk.data(), 32) == 0;
+          if (!ok) {
+            pr->set_value({ces::CES_ERROR_PROTO_REJECTED, 0, {}});
+            return;
+          }
+          uint64_t id = g_luarpc_next_id++;
+          auto c = std::make_shared<LuaRpcConn>();
+          c->stream = stream;
+          g_luarpc_conns[id] = c;
+          LuaRpcConnectResult res{ces::CES_OK, id, {}};
+          std::memcpy(res.peer.data(), r.serverPubkey.data(), 32);
+          luarpc_start_read(id, c);
+          pr->set_value(res);
+        });
+    });
+}
+
+// One serve() per inbound /ces/luarpc/1 channel, on the endpoint strand. No
+// Lua listener → close-on-connect (drop the stream). Else register the conn,
+// announce it (on_open), and start pumping bytes.
+class LuaRpcHandler : public ces::CesPlexHandler {
+public:
+  void serve(std::shared_ptr<minx::RudpStream> stream,
+             ces::BoundChannelContext bound) override {
+    if (!g_luarpc_listening.load(std::memory_order_relaxed)) {
+      (void)stream;   // dropped on return → channel closes
+      return;
+    }
+    uint64_t id = g_luarpc_next_id++;
+    auto c = std::make_shared<LuaRpcConn>();
+    c->stream = std::move(stream);
+    LuaRpcEvent opened{LuaRpcEvent::Type::Opened, id, {}, {}};
+    const ces::Hash& pk = bound.boundPubkey.getHash();
+    std::memcpy(opened.peer.data(), pk.data(), opened.peer.size());
+    g_luarpc_conns[id] = c;
+    luarpc_push(std::move(opened));
+    luarpc_start_read(id, c);
+  }
+};
+LuaRpcHandler g_luaRpcHandler;
+
+// CesPlexHost for this lua host's rpc endpoint: signs bind replies + per-op
+// responses with the program's own keypair. Usage reporting is a no-op for
+// now (future: forward to the parent server so it bills the source file's
+// file_balance).
+class LuaHostPlexHost : public ces::CesPlexHost {
+public:
+  explicit LuaHostPlexHost(const ces::KeyPair& key) : key_(key) {}
+  const ces::KeyPair& cesplexSigningKey() const override { return key_; }
+  void cesplexReportUsage(const ces::HashPrefix& /*payer*/,
+                          const minx::SockAddr& /*peer*/,
+                          uint32_t /*channelId*/,
+                          const ces::CesPlexUsage& /*usage*/) override {}
+private:
+  ces::KeyPair key_;
+};
+
+// The endpoint is opened LAZILY — the first time the program touches luarpc
+// (set_listener or connect). A program that never speaks luarpc opens no
+// socket and spawns no endpoint threads. Once up, it stays for the instance's
+// life. No-op if already up or if this instance got no rpc port.
+std::unique_ptr<LuaHostPlexHost>      g_luarpc_host;
+std::unique_ptr<ces::CesPlexEndpoint> g_luarpc_endpoint;
+
+void luarpc_ensure_endpoint() {
+  if (g_luarpc_endpoint || g_rpc_port == 0) return;
+  try {
+    ces::Hash priv{};
+    std::memcpy(priv.data(), g_program_privkey, 32);
+    g_luarpc_signer =
+        std::make_shared<ces::KeyPair>(priv, ces::KeyAlgo::ED25519);
+    g_luarpc_host = std::make_unique<LuaHostPlexHost>(*g_luarpc_signer);
+
+    // The eventfd the endpoint threads nudge so the unified run() poll wakes.
+    // Created before the endpoint so it exists before any thread can push.
+    if (g_luarpc_wakefd < 0)
+      g_luarpc_wakefd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+
+    minx::MinxConfig minxCfg{};
+    minxCfg.instanceName = "luarpc";
+    minxCfg.randomXVMsToKeep = 0;
+    minxCfg.randomXInitThreads = 0;
+    // No PoW engine + spam disabled → dialable without tickets, mirroring the
+    // server's own rpc port. (Anti-spam posture for a public luarpc port is a
+    // deliberate decision still owed — see the compute closure design doc.)
+    minxCfg.spamThreshold = std::numeric_limits<uint16_t>::max();
+    minxCfg.spamSampleRate = 512;
+    minxCfg.trustLoopback = true;
+
+    minx::RudpConfig rudpCfg{};
+    rudpCfg.baseTickInterval = std::chrono::milliseconds(1);
+
+    g_luarpc_endpoint = std::make_unique<ces::CesPlexEndpoint>(
+        g_rpc_port, g_luarpc_host.get(),
+        std::map<std::string, std::string>{
+            {"/ces/luarpc/1", "builtin:luarpc"}},
+        std::move(minxCfg), std::move(rudpCfg));
+    g_luarpc_io = &g_luarpc_endpoint->io();
+    g_luarpc_rudp = g_luarpc_endpoint->rudp();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "cesluajitd: rpc endpoint setup failed: %s\n",
+                 e.what());
+    g_luarpc_endpoint.reset();
+    g_luarpc_host.reset();
+    g_luarpc_signer.reset();
+  }
+}
+}  // namespace
+REGISTER_CESPLEX_BUILTIN("luarpc", g_luaRpcHandler, LuaRpcHandler)
 uint16_t g_next_corr_id = 1;
 
 int lua_ces_now(lua_State* L) {
@@ -1899,42 +2213,311 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
   return true;
 }
 
-// ces.conn.run() — event loop. Drains the IPC socket forever,
-// dispatching CONN_* frames to the listener, and DELIVER frames to
-// g_inbox (so legacy ces.client_recv still works alongside the
-// connection runtime). Returns when the socket dies.
-int lua_ces_conn_run(lua_State* L) {
+// Forward decl — the unified loop below dispatches luarpc bridge events whose
+// handler (dispatch_luarpc_event) is defined later in this file.
+void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e);
+
+// The UNIFIED event loop — ces.run() (also ces.conn.run / ces.luarpc.run).
+// Consumes the program: blocks OUTSIDE Lua on every event source at once —
+// the host IPC socket (/ces/lua/1 conn frames + client DELIVER) AND the
+// luarpc bridge (peer conns on our own rpc port) — and re-enters Lua to
+// dispatch each. Calling it is what turns a program into a server. Returns
+// only when the IPC socket dies. Pre-luarpc programs that call ces.conn.run
+// behave exactly as before (the bridge half just stays empty).
+int lua_ces_run(lua_State* L) {
   for (;;) {
-    // Drain any CONN_* frames queued by wait_for_reply (file ops
-    // inside an on_data / on_close callback can fire CONN_* frames
-    // arriving on the IPC socket while we're blocked on an API
-    // reply; route_to_queue parks them here).
+    // Drain everything already queued. CONN_* frames may have been parked by
+    // an API call's wait_for_reply; luarpc events are queued by the endpoint
+    // threads.
     while (!g_conn_q.empty()) {
       Frame qf = std::move(g_conn_q.front());
       g_conn_q.pop_front();
       if (!dispatch_conn_frame(L, std::move(qf))) return 0;
     }
-    Frame f;
-    if (!read_frame(f)) {
-      // Socket dead — supervisor about to SIGKILL us anyway.
+    for (;;) {
+      LuaRpcEvent e;
+      {
+        std::lock_guard<std::mutex> lk(g_luarpc_mx);
+        if (g_luarpc_inq.empty()) break;
+        e = std::move(g_luarpc_inq.front());
+        g_luarpc_inq.pop_front();
+      }
+      dispatch_luarpc_event(L, std::move(e));
+    }
+
+    // Block until the next event on either source.
+    pollfd pfds[2];
+    pfds[0].fd = g_sock_fd;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    int nfds = 1;
+    if (g_luarpc_wakefd >= 0) {
+      pfds[1].fd = g_luarpc_wakefd;
+      pfds[1].events = POLLIN;
+      pfds[1].revents = 0;
+      nfds = 2;
+    }
+    int pr = ::poll(pfds, nfds, -1);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
       return 0;
     }
-    if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
-        f.tag == TAG_CONN_CLOSED) {
-      if (!dispatch_conn_frame(L, std::move(f))) return 0;
-      continue;
+
+    // Bridge nudge → clear the eventfd; the next loop drains g_luarpc_inq.
+    if (nfds == 2 && (pfds[1].revents & POLLIN)) {
+      uint64_t v;
+      ssize_t r = ::read(g_luarpc_wakefd, &v, sizeof(v));
+      (void)r;
     }
-    if (f.tag == TAG_DELIVER) {
-      g_inbox.push_back(std::move(f));
-      continue;
+    // IPC frame ready → read + dispatch/route.
+    if (pfds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) return 0;
+    if (pfds[0].revents & POLLIN) {
+      Frame f;
+      if (!read_frame(f)) return 0;
+      if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
+          f.tag == TAG_CONN_CLOSED) {
+        if (!dispatch_conn_frame(L, std::move(f))) return 0;
+      } else {
+        route_to_queue(std::move(f));   // DELIVER → g_inbox, API_REPLY → reply_q
+      }
     }
-    if (f.tag == TAG_API_REPLY) {
-      g_reply_q.push_back(std::move(f));
-      continue;
-    }
-    // Other tags (BOOTSTRAP only at startup) — drop.
   }
+}
+
+// ---------------------------------------------------------------------------
+// ces.luarpc — the Lua API over the bridge above. set_listener flips the
+// accept gate + stores the {on_open,on_data,on_close} table; run() is the
+// event loop that blocks on the bridge queue and dispatches (mirrors
+// ces.conn). The conn object's write/close hop to the endpoint strand; peer
+// is the authenticated pubkey of the other end.
+// ---------------------------------------------------------------------------
+constexpr const char* kRegLuaRpcListener = "ces.luarpc.listener";
+constexpr const char* kRegLuaRpcConns    = "ces.luarpc.live";
+
+// conn:write(bytes) → true | false (false if the conn is already closed).
+int lua_ces_luarpc_conn_write(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 2, &n);
+  lua_getfield(L, 1, "closed");
+  bool closed = lua_toboolean(L, -1);
+  lua_pop(L, 1);
+  if (closed) { lua_pushboolean(L, 0); return 1; }
+  lua_getfield(L, 1, "id");
+  uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
+  lua_pop(L, 1);
+  luarpc_conn_write(id, std::string(s, n));
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// conn:close() — graceful close. Idempotent.
+int lua_ces_luarpc_conn_close(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  lua_getfield(L, 1, "id");
+  uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
+  lua_pop(L, 1);
+  lua_pushboolean(L, 1);
+  lua_setfield(L, 1, "closed");
+  // Drop it from the live registry now. The peer-close path does this in
+  // dispatch, but a program-initiated close sets closing=true on the endpoint
+  // side, which suppresses the Closed event — so without this the conn table
+  // would leak in kRegLuaRpcConns forever.
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
+  if (lua_istable(L, -1)) {
+    lua_pushnumber(L, static_cast<lua_Number>(id));
+    lua_pushnil(L);
+    lua_rawset(L, -3);
+  }
+  lua_pop(L, 1);
+  luarpc_conn_close(id);
   return 0;
+}
+
+// Build a conn table {id, peer(32B), closed, write, close}, register it in the
+// live table, and leave it on the stack top.
+void make_luarpc_conn(lua_State* L, uint64_t id, const uint8_t* peer) {
+  lua_newtable(L);
+  lua_pushnumber(L, static_cast<lua_Number>(id));
+  lua_setfield(L, -2, "id");
+  lua_pushlstring(L, reinterpret_cast<const char*>(peer), 32);
+  lua_setfield(L, -2, "peer");
+  lua_pushboolean(L, 0);
+  lua_setfield(L, -2, "closed");
+  lua_pushcfunction(L, lua_ces_luarpc_conn_write);
+  lua_setfield(L, -2, "write");
+  lua_pushcfunction(L, lua_ces_luarpc_conn_close);
+  lua_setfield(L, -2, "close");
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
+  if (lua_istable(L, -1)) {
+    lua_pushnumber(L, static_cast<lua_Number>(id));
+    lua_pushvalue(L, -3);  // the conn table
+    lua_rawset(L, -3);
+  }
+  lua_pop(L, 1);  // live table
+}
+
+// Push live-conn[id] (or nil) onto the stack.
+void push_luarpc_conn(lua_State* L, uint64_t id) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
+  if (!lua_istable(L, -1)) { lua_pop(L, 1); lua_pushnil(L); return; }
+  lua_pushnumber(L, static_cast<lua_Number>(id));
+  lua_rawget(L, -2);
+  lua_remove(L, -2);  // drop live table, leave conn-or-nil on top
+}
+
+// Dispatch one bridge event to the listener. Mirrors dispatch_conn_frame.
+void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
+  if (e.type == LuaRpcEvent::Type::Opened) {
+    lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    make_luarpc_conn(L, e.connId, e.peer.data());
+    lua_getfield(L, -2, "on_open");
+    if (lua_isfunction(L, -1)) {
+      lua_pushvalue(L, -2);  // conn
+      if (lua_pcall(L, 1, 0, 0) != 0) {
+        std::fprintf(stderr, "cesluajitd: luarpc on_open error: %s\n",
+                     lua_tostring(L, -1));
+        lua_pop(L, 1);
+      }
+    } else {
+      lua_pop(L, 1);  // non-function on_open
+    }
+    lua_pop(L, 2);  // conn + listener
+    return;
+  }
+  if (e.type == LuaRpcEvent::Type::Data) {
+    lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+    lua_getfield(L, -1, "on_data");
+    if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
+    push_luarpc_conn(L, e.connId);
+    if (lua_isnil(L, -1)) { lua_pop(L, 3); return; }
+    lua_pushlstring(L, e.bytes.data(), e.bytes.size());
+    if (lua_pcall(L, 2, 0, 0) != 0) {
+      std::fprintf(stderr, "cesluajitd: luarpc on_data error: %s\n",
+                   lua_tostring(L, -1));
+      lua_pop(L, 1);
+    }
+    lua_pop(L, 1);  // listener
+    return;
+  }
+  // Closed.
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+  if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
+  lua_getfield(L, -1, "on_close");
+  bool hasCb = lua_isfunction(L, -1);
+  if (!hasCb) lua_pop(L, 1);
+  push_luarpc_conn(L, e.connId);
+  if (lua_isnil(L, -1)) { lua_pop(L, hasCb ? 3 : 2); return; }
+  lua_pushboolean(L, 1);
+  lua_setfield(L, -2, "closed");
+  if (hasCb) {
+    if (lua_pcall(L, 1, 0, 0) != 0) {
+      std::fprintf(stderr, "cesluajitd: luarpc on_close error: %s\n",
+                   lua_tostring(L, -1));
+      lua_pop(L, 1);
+    }
+  } else {
+    lua_pop(L, 1);  // conn
+  }
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
+  if (lua_istable(L, -1)) {
+    lua_pushnumber(L, static_cast<lua_Number>(e.connId));
+    lua_pushnil(L);
+    lua_rawset(L, -3);
+  }
+  lua_pop(L, 1);  // live table
+  lua_pop(L, 1);  // listener
+}
+
+// ces.luarpc.run() — alias for the unified ces.run(); both run the one loop
+// that serves /ces/lua/1 and /ces/luarpc/1 together.
+int lua_ces_luarpc_run(lua_State* L) { return lua_ces_run(L); }
+
+// ces.luarpc.set_listener({on_open,on_data,on_close} | nil). Non-nil flips the
+// accept gate ON; nil flips it OFF (existing conns keep working).
+int lua_ces_luarpc_set_listener(lua_State* L) {
+  if (lua_isnil(L, 1)) {
+    lua_pushnil(L);
+    lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+    g_luarpc_listening.store(false, std::memory_order_relaxed);
+    return 0;
+  }
+  if (!lua_istable(L, 1)) {
+    return luaL_error(L, "ces.luarpc.set_listener: expected table or nil");
+  }
+  lua_pushvalue(L, 1);
+  lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+  g_luarpc_listening.store(true, std::memory_order_relaxed);
+  luarpc_ensure_endpoint();   // lazy-open the port now that we intend to serve
+  return 0;
+}
+
+// ces.luarpc.connect(addr, server_pubkey(32)) → conn | nil, err. Dials a
+// remote (or this) lua host's /ces/luarpc/1 out the SAME rpc socket. Blocks
+// on the bind; on success returns a conn whose inbound data flows to the
+// listener's on_data like any other.
+int lua_ces_luarpc_connect(lua_State* L) {
+  size_t alen = 0;
+  const char* addr = luaL_checklstring(L, 1, &alen);
+  size_t plen = 0;
+  const char* spk = luaL_checklstring(L, 2, &plen);
+  if (plen != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "server pubkey must be 32 bytes");
+    return 2;
+  }
+  luarpc_ensure_endpoint();   // lazy-open the port for dialing
+  if (!g_luarpc_io || !g_luarpc_rudp || !g_luarpc_signer) {
+    lua_pushnil(L);
+    lua_pushstring(L,
+      "networking permanently disabled (this instance has no rpc port)");
+    return 2;
+  }
+  minx::SockAddr peer;
+  try {
+    auto ep = ces::Resolver::resolveUdp(std::string(addr, alen));
+    auto a = ep.address();
+    if (a.is_v4()) {
+      a = boost::asio::ip::make_address_v6(
+            boost::asio::ip::v4_mapped, a.to_v4());
+    }
+    peer = minx::SockAddr(a, ep.port());
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  std::array<uint8_t, 32> expectPk{};
+  std::memcpy(expectPk.data(), spk, 32);
+
+  auto pr = std::make_shared<std::promise<LuaRpcConnectResult>>();
+  auto fut = pr->get_future();
+  boost::asio::post(*g_luarpc_io,
+    [peer, expectPk, pr]() { luarpc_do_connect(peer, expectPk, pr); });
+  if (fut.wait_for(std::chrono::seconds(15)) != std::future_status::ready) {
+    lua_pushnil(L);
+    lua_pushstring(L, "connect timeout");
+    return 2;
+  }
+  LuaRpcConnectResult res = fut.get();
+  if (res.status != ces::CES_OK) {
+    lua_pushnil(L);
+    lua_pushstring(L, res.status == ces::CES_ERROR_INTERNAL
+                        ? "connect failed (network)"
+                        : "bind rejected or wrong peer");
+    return 2;
+  }
+  make_luarpc_conn(L, res.connId, res.peer.data());
+  return 1;
+}
+
+// ces.rpc_port() → the UDP port this instance hosts /ces/luarpc/1 on (0 if it
+// got none). A serving program advertises (host, this port) so peers can dial.
+int lua_ces_rpc_port(lua_State* L) {
+  lua_pushnumber(L, static_cast<lua_Number>(g_rpc_port));
+  return 1;
 }
 
 void install_ces_api(lua_State* L) {
@@ -1946,6 +2529,7 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_prog_prefix);   lua_setfield(L, -2, "prog_prefix");
   lua_pushcfunction(L, lua_ces_owner_pubkey);  lua_setfield(L, -2, "owner_pubkey");
   lua_pushcfunction(L, lua_ces_program_pubkey);lua_setfield(L, -2, "program_pubkey");
+  lua_pushcfunction(L, lua_ces_rpc_port);      lua_setfield(L, -2, "rpc_port");
   lua_pushcfunction(L, lua_ces_start_time);    lua_setfield(L, -2, "start_time");
   lua_pushcfunction(L, lua_ces_transfer);      lua_setfield(L, -2, "transfer");
   lua_pushcfunction(L, lua_ces_random_bytes);  lua_setfield(L, -2, "random_bytes");
@@ -1976,9 +2560,28 @@ void install_ces_api(lua_State* L) {
   lua_newtable(L);
   lua_pushcfunction(L, lua_ces_conn_set_listener);
   lua_setfield(L, -2, "set_listener");
-  lua_pushcfunction(L, lua_ces_conn_run);
+  lua_pushcfunction(L, lua_ces_run);
   lua_setfield(L, -2, "run");
   lua_setfield(L, -2, "conn");
+
+  // ces.luarpc — raw byte-pipe protocol this host serves (and dials) on its
+  // rpc port. set_listener flips the accept gate; run() is the event loop.
+  lua_newtable(L);
+  lua_pushcfunction(L, lua_ces_luarpc_set_listener);
+  lua_setfield(L, -2, "set_listener");
+  lua_pushcfunction(L, lua_ces_luarpc_run);
+  lua_setfield(L, -2, "run");
+  lua_pushcfunction(L, lua_ces_luarpc_connect);
+  lua_setfield(L, -2, "connect");
+  lua_setfield(L, -2, "luarpc");
+
+  // luarpc live-conn registry (registry-keyed, like ces.conn's).
+  lua_newtable(L);
+  lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
+
+  // ces.run() — the unified event loop (ces.conn.run / ces.luarpc.run alias it).
+  lua_pushcfunction(L, lua_ces_run);
+  lua_setfield(L, -2, "run");
 
   lua_setglobal(L, "ces");
 }
@@ -2029,7 +2632,8 @@ int main(int argc, char** argv) {
   constexpr size_t kOffProgram = kOffOwner   + WIRE_KEY_LEN;
   constexpr size_t kOffPrivkey = kOffProgram + WIRE_KEY_LEN;
   constexpr size_t kOffPort    = kOffPrivkey + WIRE_KEY_LEN;
-  constexpr size_t kOffStart   = kOffPort    + sizeof(uint16_t);
+  constexpr size_t kOffRpcPort = kOffPort    + sizeof(uint16_t);
+  constexpr size_t kOffStart   = kOffRpcPort + sizeof(uint16_t);
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
@@ -2041,6 +2645,7 @@ int main(int argc, char** argv) {
   std::memcpy(g_program_pubkey,  bs.body.data() + kOffProgram, WIRE_KEY_LEN);
   std::memcpy(g_program_privkey, bs.body.data() + kOffPrivkey, WIRE_KEY_LEN);
   g_program_port  = get_u16(bs.body.data() + kOffPort);
+  g_rpc_port      = get_u16(bs.body.data() + kOffRpcPort);
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {
@@ -2068,6 +2673,10 @@ int main(int argc, char** argv) {
   }
   load_safe_libs(L);
   install_ces_api(L);
+
+  // The /ces/luarpc/1 endpoint opens LAZILY — on the program's first
+  // ces.luarpc.set_listener() or .connect() (see luarpc_ensure_endpoint). A
+  // program that never speaks luarpc opens no socket and spawns no threads.
 
   // "t" = text only: a second barrier that refuses bytecode even if the
   // leading-byte guard above is bypassed.

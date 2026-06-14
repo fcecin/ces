@@ -149,5 +149,7 @@ size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count);
 // instance is gone (or no static range was configured). Runs on the
 // CesPlex strand with a blocking post+wait.
 uint16_t _computeTestInstanceClientPort(uint64_t instanceId);
+// Same, for the instance's inbound CesPlex host port (Instance::rpcPort).
+uint16_t _computeTestInstanceRpcPort(uint64_t instanceId);
 
 } // namespace ces

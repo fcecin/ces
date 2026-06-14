@@ -673,33 +673,55 @@ struct PortServer {
 };
 } // namespace
 
-// Each launch claims the lowest free port in the range; KILL returns the
-// port to the pool and the next launch reuses it.
-BOOST_AUTO_TEST_CASE(StaticPortAllocationAndReuse) {
-  PortServer ps(/*base=*/41000, /*count=*/4, /*maxInst=*/8);
+// Two-port allocation: each launch leases TWO ports from the range — the
+// child's outbound CES-client port, then its inbound /ces/luarpc/1 host
+// port — lowest-free first. KILL returns both to the pool; the next launch
+// reuses the freed pair.
+BOOST_AUTO_TEST_CASE(TwoPortsAllocatedAndReused) {
+  PortServer ps(/*base=*/41000, /*count=*/6, /*maxInst=*/8);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
 
-  uint64_t a = 0, b = 0, cId = 0, d = 0, s = 0;
+  uint64_t a = 0, b = 0, d = 0, s = 0;
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));
   CES_REQUIRE_OK(cc.launch(ps.src, b, s));
-  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   41000);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   41001);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 41002);
+  // Both of a's ports allocated, distinct, lowest-first; b takes the next pair.
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    41001);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), 41002);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),    41003);
 
-  // Kill the middle instance → frees 41001; next launch reuses it.
-  CES_REQUIRE_OK(cc.kill(b));
+  // Kill a → frees 41000+41001; the next launch reuses the lowest free pair.
+  CES_REQUIRE_OK(cc.kill(a));
   CES_REQUIRE_OK(cc.launch(ps.src, d, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), 41001);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), 41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(d)),    41001);
 
   cc.disconnect();
 }
 
-// No configured range ⇒ instances launch but get port 0, which the child
-// reads as "no network" (its outbound remote_* verbs fail cleanly).
-BOOST_AUTO_TEST_CASE(NoRangeAssignsZeroPort) {
+// One port available ⇒ the CES port gets it, the rpc port misses (0). Both
+// leases are best-effort and independent, so a partial allocation still
+// launches.
+BOOST_AUTO_TEST_CASE(OnePortAllocated) {
+  PortServer ps(/*base=*/41000, /*count=*/1, /*maxInst=*/4);
+  CesComputeClient cc;
+  cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
+
+  uint64_t a = 0, s = 0;
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    0);
+
+  cc.disconnect();
+}
+
+// No configured range ⇒ both ports 0. The instance still launches (it stays
+// reachable via the server's own rpc port); the child reads 0 as "no
+// network" / "hosts nothing".
+BOOST_AUTO_TEST_CASE(ZeroPortsAllocated) {
   PortServer ps(/*base=*/0, /*count=*/0, /*maxInst=*/4);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
@@ -708,32 +730,31 @@ BOOST_AUTO_TEST_CASE(NoRangeAssignsZeroPort) {
   uint64_t a = 0, s = 0;
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));   // launch still succeeds
   BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 0);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    0);
 
   cc.disconnect();
 }
 
-// Port exhaustion is NOT a launch failure: when the range is spent the
-// instance still launches, it just gets port 0 (no outbound network). It
-// stays reachable via the server's own rpc port, so a portless instance is
-// useful and compute_port_count below the slot cap is fine.
-BOOST_AUTO_TEST_CASE(PortExhaustionLaunchesWithZeroPort) {
-  // 2 ports, 8 slots ⇒ the first two instances bind ports, the third
-  // exhausts the range but must still launch.
-  PortServer ps(/*base=*/41000, /*count=*/2, /*maxInst=*/8);
+// Draining the pool across instances is never a launch failure: as the
+// range empties, instances get 2 ports, then 1, then 0 — all launch.
+BOOST_AUTO_TEST_CASE(PortsDrainAcrossInstancesAllLaunch) {
+  // 3 ports, 8 slots ⇒ instance 1 takes 2, instance 2 takes 1, instance 3
+  // takes 0.
+  PortServer ps(/*base=*/41000, /*count=*/3, /*maxInst=*/8);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
 
   uint64_t a = 0, b = 0, cId = 0, s = 0;
-  CES_REQUIRE_OK(cc.launch(ps.src, a, s));
-  CES_REQUIRE_OK(cc.launch(ps.src, b, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), 41001);
-
-  // A slot is free (2 < 8) and the range is spent — the launch still
-  // succeeds; the instance just gets port 0 (local-only).
-  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));    // 41000 + 41001
+  CES_REQUIRE_OK(cc.launch(ps.src, b, s));    // 41002 + 0
+  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));  // 0 + 0
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),      41001);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   41002);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),      0);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 0);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(cId)),    0);
 
   cc.disconnect();
 }
