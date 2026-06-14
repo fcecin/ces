@@ -194,8 +194,8 @@ max_reorder_msgs_per_channel = -1
 # known ports). Base and count are independent of compute_max_instances;
 # open exactly [base, base+count-1] at the firewall to match. base = 0 =
 # no range: instances run local-only and their outbound network verbs
-# fail with "networking disabled". LAUNCH fails with
-# CES_ERROR_COMPUTE_NO_PORT when the range is exhausted.
+# fail with "networking disabled". An exhausted range is NOT a launch
+# failure — those instances just run local-only too.
 # compute_port_base        = 0
 # compute_port_count       = 0
 #

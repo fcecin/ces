@@ -826,7 +826,7 @@ int lua_ces_transfer(lua_State* L) {
 int lua_ces_remote_account_read(lua_State* L) {
   if (g_program_port == 0) {
     lua_pushnil(L);
-    lua_pushstring(L, "networking disabled (no compute port range)");
+    lua_pushstring(L, "networking permanently disabled (this instance has no compute port)");
     return 2;
   }
   size_t addr_len = 0;
@@ -887,7 +887,7 @@ int lua_ces_remote_account_read(lua_State* L) {
 int lua_ces_remote_transfer(lua_State* L) {
   if (g_program_port == 0) {
     lua_pushnil(L);
-    lua_pushstring(L, "networking disabled (no compute port range)");
+    lua_pushstring(L, "networking permanently disabled (this instance has no compute port)");
     return 2;
   }
   size_t addr_len = 0;
@@ -951,7 +951,7 @@ int lua_ces_remote_transfer(lua_State* L) {
 int lua_ces_remote_cross_transfer(lua_State* L) {
   if (g_program_port == 0) {
     lua_pushnil(L);
-    lua_pushstring(L, "networking disabled (no compute port range)");
+    lua_pushstring(L, "networking permanently disabled (this instance has no compute port)");
     return 2;
   }
   size_t addr_len = 0;

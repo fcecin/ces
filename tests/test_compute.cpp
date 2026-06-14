@@ -712,10 +712,13 @@ BOOST_AUTO_TEST_CASE(NoRangeAssignsZeroPort) {
   cc.disconnect();
 }
 
-// A port count below the slot cap makes port exhaustion — not the slot
-// cap — fail the launch with CES_ERROR_COMPUTE_NO_PORT.
-BOOST_AUTO_TEST_CASE(StaticPortExhaustion) {
-  // 2 ports, 8 slots ⇒ ports bind first.
+// Port exhaustion is NOT a launch failure: when the range is spent the
+// instance still launches, it just gets port 0 (no outbound network). It
+// stays reachable via the server's own rpc port, so a portless instance is
+// useful and compute_port_count below the slot cap is fine.
+BOOST_AUTO_TEST_CASE(PortExhaustionLaunchesWithZeroPort) {
+  // 2 ports, 8 slots ⇒ the first two instances bind ports, the third
+  // exhausts the range but must still launch.
   PortServer ps(/*base=*/41000, /*count=*/2, /*maxInst=*/8);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
@@ -727,10 +730,10 @@ BOOST_AUTO_TEST_CASE(StaticPortExhaustion) {
   BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), 41001);
 
-  // A slot is free (2 < 8) but no port remains.
-  uint8_t rc = cc.launch(ps.src, cId, s);
-  BOOST_CHECK_MESSAGE(rc == CES_ERROR_COMPUTE_NO_PORT,
-                      "expected COMPUTE_NO_PORT, got " << int(rc));
+  // A slot is free (2 < 8) and the range is spent — the launch still
+  // succeeds; the instance just gets port 0 (local-only).
+  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 0);
 
   cc.disconnect();
 }

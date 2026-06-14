@@ -1710,13 +1710,14 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // Compute dedup hash + signer for the _l2 call.
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  // Claim the child's outbound-client port from the configured range
-  // (0 = no range → the instance has no network). Done before reserving
-  // the launch slot so an exhausted range fails LAUNCH without spawning.
+  // Claim the child's outbound-client port from the configured range,
+  // best-effort. An exhausted (or zero) range leaves clientPort 0; the
+  // instance still launches — it stays reachable via the server's own rpc
+  // port (/ces/lua/1 ATTACH relay), so compute_port_count == 0 is a valid
+  // config. Only the child's OUTBOUND remote_* verbs go dark, and they
+  // error permanently on port 0.
   uint16_t clientPort = 0;
-  if (!allocateComputePort(cfg, clientPort)) {
-    sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_NO_PORT); return;
-  }
+  allocateComputePort(cfg, clientPort);
   auto portLease = std::make_shared<PortLease>(clientPort);
 
   // Reserve a launch slot now and hold it across the async validate +
@@ -2208,9 +2209,7 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
     return CES_ERROR_COMPUTE_MAX_INSTANCES;
   }
   uint16_t clientPort = 0;
-  if (!allocateComputePort(cfg, clientPort)) {
-    return CES_ERROR_COMPUTE_NO_PORT;
-  }
+  allocateComputePort(cfg, clientPort);   // best-effort; 0 = local-only
   auto portLease = std::make_shared<PortLease>(clientPort);
 
   // Source file must exist; ownership must be the server. /s/-zone

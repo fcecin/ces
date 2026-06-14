@@ -346,14 +346,15 @@ struct CesConfig {
   // only known ports, and an OS-assigned egress port is neither reachable
   // nor configurable. The server owns the whole lifecycle — it tracks
   // which ports are free, assigns one at LAUNCH, hands it to the child in
-  // the bootstrap frame, and frees it when the instance dies; LAUNCH fails
-  // CES_ERROR_COMPUTE_NO_PORT when the range is spent.
+  // the bootstrap frame, and frees it when the instance dies. Port
+  // allocation is best-effort: a spent range leaves the instance with port
+  // 0 (local-only), but the LAUNCH still succeeds — the instance stays
+  // reachable via the server's own rpc port (/ces/lua/1 relay).
   //
   // Base and count are independent of computeMaxInstances on purpose:
   // ports and instance slots are orthogonal resources. Size the range to
-  // your firewall opening; a count below computeMaxInstances simply makes
-  // ports the binding constraint (LAUNCH then fails COMPUTE_NO_PORT before
-  // the slot cap).
+  // your firewall opening; a count below computeMaxInstances simply means
+  // the instances past the range run local-only (no outbound network).
   //
   // computePortBase == 0 = no range: instances launch local-only — their
   // outbound network verbs (ces.remote_transfer / remote_account_read /
