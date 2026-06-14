@@ -1,10 +1,11 @@
 // file_client.cpp - CesFileClient.
 //
-// A thin verb layer over CesPlexClient (see cesplex/mux.h), which owns all the
-// MINX/Rudp/threads/bind plumbing. Each method here is just the verb's
+// A thin verb layer over a CesPlexChannel (see cesplex/session.h) — the
+// shared CesPlex client protocol. Each method here is just the verb's
 // preamble building, optional streamed body, and response parsing; the
-// shared client drives the wire (including the per-op signed envelope and
-// the server-signed response trailer).
+// channel drives the wire (the per-op signed envelope + the server-signed
+// response trailer) on whatever transport it was handed: a CesPlexClient's
+// owned socket via connect(), or an external endpoint via attach().
 
 #include <ces/l2/file_client.h>
 #include <ces/cesplex/session.h>
@@ -40,7 +41,12 @@ constexpr const char* kFileProto = "/ces/file/1";
 
 class CesFileClient::Impl {
 public:
-  CesPlexClient base;
+  // Owned transport, used by connect() (the cesh / test path). In attach()
+  // mode `owned` stays idle and `chan` points at a channel the caller owns
+  // (e.g. the compute child's CesPlex endpoint), so the verb codec below is
+  // one implementation regardless of who owns the socket.
+  CesPlexClient owned;
+  CesPlexChannel* chan = nullptr;
 };
 
 CesFileClient::CesFileClient() : impl_(std::make_unique<Impl>()) {}
@@ -48,13 +54,23 @@ CesFileClient::~CesFileClient() = default;
 
 uint8_t CesFileClient::connect(const std::string& host, uint16_t rpcPort,
                                const KeyPair& signerKey) {
-  return impl_->base.connect(host, rpcPort, kFileProto, signerKey);
+  uint8_t rc = impl_->owned.connect(host, rpcPort, kFileProto, signerKey);
+  if (rc == CES_OK) impl_->chan = impl_->owned.channel();
+  return rc;
 }
 
-void CesFileClient::disconnect() { impl_->base.disconnect(); }
+// Drive verbs over a channel the caller owns + has already select()ed (e.g.
+// the compute child's CesPlex endpoint). Mutually exclusive with connect().
+void CesFileClient::attach(CesPlexChannel& channel) { impl_->chan = &channel; }
+
+void CesFileClient::disconnect() {
+  impl_->owned.disconnect();
+  impl_->chan = nullptr;
+}
 
 void CesFileClient::setServerPubkey(const minx::Hash& pk) {
-  impl_->base.setServerPubkey(pk);
+  if (impl_->chan) impl_->chan->setServerPubkey(pk);
+  else impl_->owned.setServerPubkey(pk);
 }
 
 // ---- CREATE ----
@@ -72,10 +88,10 @@ uint8_t CesFileClient::create(
   pre.insert(pre.end(), contentType.begin(), contentType.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbCreate, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbCreate, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbCreate, env, /*fixedPre=*/16,
+  uint8_t rc = impl_->chan->driveVerb(kVerbCreate, env, /*fixedPre=*/16,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());
@@ -96,10 +112,10 @@ uint8_t CesFileClient::write(
   pre.insert(pre.end(), contentHash.begin(), contentHash.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbWrite, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbWrite, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbWrite, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbWrite, env, /*fixedPre=*/8,
                                      nullptr, nullptr, content, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());
@@ -117,10 +133,10 @@ uint8_t CesFileClient::read(
   ces::Buffer::put<uint32_t>(pre, length);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbRead, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbRead, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(
+  uint8_t rc = impl_->chan->driveVerb(
     kVerbRead, env,
     /*fixedPre=*/sizeof(uint64_t) + sizeof(minx::Hash),
     nullptr,
@@ -141,7 +157,7 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbStat, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbStat, pre);
 
   // STAT fixed preamble: owner_pubkey + file_balance + price_per_kb +
   // size + content_type_len; the variable hook pulls content_type + the
@@ -149,7 +165,7 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
   constexpr size_t kStatFixedPre =
       ces::KEY_SIZE + sizeof(uint64_t) * 3 + sizeof(uint16_t);
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(
+  uint8_t rc = impl_->chan->driveVerb(
     kVerbStat, env,
     /*fixedPre=*/kStatFixedPre,
     [this](ces::Bytes& p) -> bool {
@@ -157,11 +173,11 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
           p.data() + (kStatFixedPre - sizeof(uint16_t)));
       if (ctLen > 0) {
         ces::Bytes ct;
-        if (!impl_->base.readExact(ct, ctLen)) return false;
+        if (!impl_->chan->readExact(ct, ctLen)) return false;
         p.insert(p.end(), ct.begin(), ct.end());
       }
       ces::Bytes ts;
-      if (!impl_->base.readExact(ts, 16)) return false;
+      if (!impl_->chan->readExact(ts, 16)) return false;
       p.insert(p.end(), ts.begin(), ts.end());
       return true;
     },
@@ -192,10 +208,10 @@ uint8_t CesFileClient::deposit(const std::string& name,
   ces::Buffer::put<uint64_t>(pre, amount);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbDeposit, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbDeposit, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbDeposit, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbDeposit, env, /*fixedPre=*/8,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());
@@ -210,10 +226,10 @@ uint8_t CesFileClient::withdraw(const std::string& name,
   ces::Buffer::put<uint64_t>(pre, amount);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbWithdraw, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbWithdraw, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbWithdraw, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbWithdraw, env, /*fixedPre=*/8,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());
@@ -228,10 +244,10 @@ uint8_t CesFileClient::setPrice(const std::string& name,
   ces::Buffer::put<uint64_t>(pre, newPrice);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbSetPrice, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbSetPrice, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbSetPrice, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbSetPrice, env, /*fixedPre=*/8,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outPrice = ces::Buffer::peek<uint64_t>(resp.data());
@@ -245,10 +261,10 @@ uint8_t CesFileClient::deleteFile(const std::string& name,
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbDelete, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbDelete, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbDelete, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbDelete, env, /*fixedPre=*/8,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outRefunded = ces::Buffer::peek<uint64_t>(resp.data());
@@ -267,10 +283,10 @@ uint8_t CesFileClient::append(const std::string& name,
   pre.insert(pre.end(), contentHash.begin(), contentHash.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbAppend, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbAppend, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(
+  uint8_t rc = impl_->chan->driveVerb(
     kVerbAppend, env, /*fixedPre=*/sizeof(uint64_t) + sizeof(uint64_t),
     nullptr, nullptr, content, resp, body);
   if (rc != CES_OK) return rc;
@@ -287,10 +303,10 @@ uint8_t CesFileClient::resize(const std::string& name,
   ces::Buffer::put<uint64_t>(pre, newSize);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = impl_->base.buildEnvelope(kVerbResize, pre);
+  auto env = impl_->chan->buildEnvelope(kVerbResize, pre);
 
   ces::Bytes resp, body;
-  uint8_t rc = impl_->base.driveVerb(kVerbResize, env, /*fixedPre=*/8,
+  uint8_t rc = impl_->chan->driveVerb(kVerbResize, env, /*fixedPre=*/8,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outNewSize = ces::Buffer::peek<uint64_t>(resp.data());

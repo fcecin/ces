@@ -32,6 +32,8 @@
 
 namespace ces {
 
+class CesPlexChannel;
+
 class CesFileClient {
 public:
   // Data returned by STAT.
@@ -62,6 +64,12 @@ public:
   // signed NACK reply.
   uint8_t connect(const std::string& host, uint16_t rpcPort,
                   const KeyPair& signerKey);
+
+  // Drive verbs over a CesPlexChannel the caller owns and has already
+  // bound (select()ed) — e.g. the compute child driving /ces/file/1 over
+  // its own CesPlex endpoint, instead of opening a fresh socket. Mutually
+  // exclusive with connect(); the caller owns the channel's lifetime.
+  void attach(CesPlexChannel& channel);
 
   // Tear down the channel and I/O threads. Safe to call more than once.
   void disconnect();

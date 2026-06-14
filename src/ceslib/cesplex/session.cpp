@@ -2,8 +2,10 @@
 //
 // Two halves: the server-side signed-request loop (cesPlexServe /
 // CesPlexRequest) that builtin:file and builtin:compute drive their verb
-// streams through, and the client-side CesPlexClient that CesFileClient
-// and CesComputeClient are thin verb wrappers over.
+// streams through, and the client-side CesPlexChannel (the protocol, over an
+// injected transport) that CesPlexClient and the compute child's endpoint both
+// compose, and that CesFileClient / CesComputeClient are thin verb wrappers
+// over.
 
 #include <ces/cesplex/session.h>
 #include <ces/cesplex/mux.h>   // kRudpStreamCloseTimeout, CesPlexHost
@@ -189,7 +191,7 @@ void CesPlexRequest::respondAndClose(uint8_t status, ces::Bytes preamble) {
 }
 
 // ===========================================================================
-// Client side — CesPlexClient
+// Client side — CesPlexChannel (protocol) + CesPlexClient (owned transport)
 // ===========================================================================
 
 namespace {
@@ -225,103 +227,37 @@ private:
 
 } // namespace
 
-class CesPlexClient::Impl {
+// ---------------------------------------------------------------------------
+// CesPlexChannel::Impl — the per-channel CesPlex client PROTOCOL over an
+// INJECTED transport. Owns no mechanics: it borrows a task io_context (where
+// its async stream ops run) and a Rudp (where it opens its channel). The bind
+// handshake, per-op envelope signing, and the verb drive loop all live here,
+// once — so CesPlexClient (owned Minx/Rudp/threads) and the compute child's
+// CesPlex endpoint (an already-running Rudp) share one client codec.
+//
+// Threading: the borrowed taskIO_ must be run by some OTHER thread; every verb
+// posts its async I/O there and blocks the CALLING thread on a future (caller
+// thread must differ from the taskIO_ thread, else deadlock).
+// ---------------------------------------------------------------------------
+class CesPlexChannel::Impl {
 public:
-  Impl() : listener_(std::make_unique<NoopMinxListener>()) {}
-  ~Impl() { stop(); }
+  Impl(boost::asio::io_context& taskIO, minx::Rudp* rudp)
+    : taskIO_(taskIO), rudp_(rudp) {}
 
-  uint8_t connect(const std::string& host, uint16_t rpcPort,
-                  const std::string& protocol, const KeyPair& signerKey) {
+  // Open a fresh channel to `peer` and run the signed bind for `protocol`,
+  // signed by `signerKey` (also the per-op signer + billed principal).
+  uint8_t select(const minx::SockAddr& peer, const std::string& protocol,
+                 const KeyPair& signerKey) {
+    peer_ = peer;
     protocol_ = protocol;
     signerKey_ = std::make_unique<KeyPair>(signerKey);
-    boost::system::error_code ec;
-    boost::asio::io_context ioc;
-    boost::asio::ip::udp::resolver res(ioc);
-    boost::asio::ip::address addr;
-    auto results = res.resolve(host, std::to_string(rpcPort), ec);
-    if (ec || results.empty()) {
-      LOGERROR << "cesplexclient: resolve failed"
-               << SVAR(host) << SVAR(ec.message());
-      return CES_ERROR_INTERNAL;
-    }
-    addr = results.begin()->endpoint().address();
-    if (addr.is_v4()) {
-      // Normalize v4 to v4-mapped-v6 so the server's v6 SockAddr keys match.
-      addr = boost::asio::ip::make_address_v6(
-        boost::asio::ip::v4_mapped, addr.to_v4());
-    }
-    peer_ = minx::SockAddr(addr, rpcPort);
-
-    minx::MinxConfig mc{};
-    mc.instanceName = "plexc";
-    mc.randomXVMsToKeep = 0;
-    mc.randomXInitThreads = 0;
-    mc.trustLoopback = true;
-    minx_ = std::make_unique<minx::Minx>(listener_.get(), mc);
-
-    // Margin for reselect() racing an old channel's teardown; tight tick
-    // cadence (1 ms) so bulk WRITE/READ aren't throttled by RUDP's pulse.
-    minx::RudpConfig rcfg{};
-    rcfg.maxChannelsPerPeer = 8;
-    rcfg.baseTickInterval = std::chrono::milliseconds(1);
-    rudpListener_.setMinx(minx_.get());
-    rudp_ = std::make_unique<minx::Rudp>(&rudpListener_, rcfg);
-
-    {
-      minx::MinxStdExtensions stdExt;
-      stdExt.registerExtension(
-        minx::Rudp::KEY_V0,
-        [this](const minx::SockAddr& p, uint64_t key,
-               const minx::Bytes& payload) {
-          if (rudp_) rudp_->onPacket(p, key, payload, nowMicros());
-        });
-      minx_->setExtensionHandler(std::move(stdExt).build());
-    }
-
-    boundPort_ = minx_->openSocket(
-      boost::asio::ip::address_v6::any(), 0, netIO_, taskIO_);
-    if (boundPort_ == 0) {
-      LOGERROR << "cesplexclient: failed to open local UDP socket";
-      return CES_ERROR_INTERNAL;
-    }
-
-    netGuard_ = std::make_unique<WorkGuard>(netIO_.get_executor());
-    taskGuard_ = std::make_unique<WorkGuard>(taskIO_.get_executor());
-    netThread_ = std::thread([this]() { netIO_.run(); });
-    taskThread_ = std::thread([this]() { taskIO_.run(); });
-
-    tickTimer_ = std::make_shared<boost::asio::steady_timer>(taskIO_);
-    boost::asio::post(taskIO_, [this]() { scheduleTick(); });
-
     std::mt19937 rng(std::random_device{}());
     channel_ = 0;
     while (channel_ == 0) channel_ = rng();
-
     return doSelect();
   }
 
-  void stop() {
-    if (!minx_) return;
-    if (tickTimer_) {
-      boost::system::error_code ec;
-      tickTimer_->cancel(ec);
-    }
-    minx_->closeSocket(false);
-    if (netGuard_) netGuard_->reset();
-    if (taskGuard_) taskGuard_->reset();
-    netIO_.stop();
-    taskIO_.stop();
-    if (netThread_.joinable()) netThread_.join();
-    if (taskThread_.joinable()) taskThread_.join();
-    stream_.reset();
-    tickTimer_.reset();
-    rudp_.reset();
-    minx_.reset();
-    rudpListener_.setMinx(nullptr);
-    netGuard_.reset();
-    taskGuard_.reset();
-    boundPort_ = 0;
-  }
+  void reset() { stream_.reset(); }
 
   void setServerPubkey(const minx::Hash& pk) {
     serverPk_ = pk;
@@ -522,9 +458,6 @@ public:
   }
 
 private:
-  using WorkGuard = boost::asio::executor_work_guard<
-    boost::asio::io_context::executor_type>;
-
   bool writeAllImpl(std::shared_ptr<minx::Bytes> buf) {
     if (!stream_) return false;
     auto run = std::make_shared<std::promise<bool>>();
@@ -554,17 +487,6 @@ private:
     });
     if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
     return fut.get();
-  }
-
-  void scheduleTick() {
-    if (!tickTimer_ || !rudp_) return;
-    tickTimer_->expires_after(std::chrono::milliseconds(10));
-    tickTimer_->async_wait(
-      [this](const boost::system::error_code& ec) {
-        if (ec || !rudp_) return;
-        rudp_->tick(nowMicros());
-        scheduleTick();
-      });
   }
 
   // Parse + verify the signed bind reply. On OK, stash sessionToken and
@@ -648,18 +570,8 @@ private:
     return rc;
   }
 
-  std::unique_ptr<NoopMinxListener> listener_;
-  PlexClientRudpListener rudpListener_;
-  std::unique_ptr<minx::Minx> minx_;
-  std::unique_ptr<minx::Rudp> rudp_;
-  boost::asio::io_context netIO_;
-  boost::asio::io_context taskIO_;
-  std::unique_ptr<WorkGuard> netGuard_;
-  std::unique_ptr<WorkGuard> taskGuard_;
-  std::thread netThread_;
-  std::thread taskThread_;
-  std::shared_ptr<boost::asio::steady_timer> tickTimer_;
-  uint16_t boundPort_ = 0;
+  boost::asio::io_context& taskIO_;   // borrowed: run by another thread
+  minx::Rudp* rudp_;                  // borrowed: where we open our channel
 
   std::string protocol_;
   minx::SockAddr peer_;
@@ -676,6 +588,228 @@ private:
   bool streamDirty_ = false;
 };
 
+// ---- CesPlexChannel public forwards ----
+
+CesPlexChannel::CesPlexChannel(boost::asio::io_context& taskIO,
+                               minx::Rudp* rudp)
+  : impl_(std::make_unique<Impl>(taskIO, rudp)) {}
+CesPlexChannel::~CesPlexChannel() = default;
+
+uint8_t CesPlexChannel::select(const minx::SockAddr& peer,
+                               const std::string& protocol,
+                               const KeyPair& signerKey) {
+  return impl_->select(peer, protocol, signerKey);
+}
+
+void CesPlexChannel::reset() { impl_->reset(); }
+
+void CesPlexChannel::setServerPubkey(const minx::Hash& pk) {
+  impl_->setServerPubkey(pk);
+}
+
+uint64_t CesPlexChannel::boundSessionToken() const {
+  return impl_->boundSessionToken();
+}
+
+minx::Bytes CesPlexChannel::buildEnvelope(
+    uint8_t verb, std::span<const uint8_t> preamble) {
+  return impl_->buildEnvelope(verb, preamble);
+}
+
+uint8_t CesPlexChannel::driveVerb(
+    uint8_t verb,
+    const minx::Bytes& envelope,
+    size_t respFixedPreambleLen,
+    const std::function<bool(ces::Bytes&)>& readVariablePreamble,
+    const std::function<uint64_t(const ces::Bytes&)>& respBodyLen,
+    const ces::Bytes& extraBodyToSend,
+    ces::Bytes& outPreamble,
+    ces::Bytes& outBody) {
+  return impl_->driveVerb(verb, envelope, respFixedPreambleLen,
+                          readVariablePreamble, respBodyLen,
+                          extraBodyToSend, outPreamble, outBody);
+}
+
+uint8_t CesPlexChannel::driveVerb(
+    uint8_t verb,
+    const minx::Bytes& envelope,
+    size_t respFixedPreambleLen,
+    const std::function<bool(ces::Bytes&)>& readVariablePreamble,
+    ces::Bytes& outPreamble) {
+  ces::Bytes dummyBody;
+  return impl_->driveVerb(verb, envelope, respFixedPreambleLen,
+                          readVariablePreamble, nullptr, {}, outPreamble,
+                          dummyBody);
+}
+
+bool CesPlexChannel::readExact(ces::Bytes& out, size_t n) {
+  return impl_->readExact(out, n);
+}
+
+// ---------------------------------------------------------------------------
+// CesPlexClient::Impl — owned mechanics (Minx + Rudp + two io threads + tick)
+// composing one CesPlexChannel over them. This is cesh's / the tests' client;
+// a process that already runs a Rudp builds a CesPlexChannel directly instead.
+// ---------------------------------------------------------------------------
+class CesPlexClient::Impl {
+public:
+  Impl() : listener_(std::make_unique<NoopMinxListener>()) {}
+  ~Impl() { stop(); }
+
+  uint8_t connect(const std::string& host, uint16_t rpcPort,
+                  const std::string& protocol, const KeyPair& signerKey) {
+    boost::system::error_code ec;
+    boost::asio::io_context ioc;
+    boost::asio::ip::udp::resolver res(ioc);
+    boost::asio::ip::address addr;
+    auto results = res.resolve(host, std::to_string(rpcPort), ec);
+    if (ec || results.empty()) {
+      LOGERROR << "cesplexclient: resolve failed"
+               << SVAR(host) << SVAR(ec.message());
+      return CES_ERROR_INTERNAL;
+    }
+    addr = results.begin()->endpoint().address();
+    if (addr.is_v4()) {
+      // Normalize v4 to v4-mapped-v6 so the server's v6 SockAddr keys match.
+      addr = boost::asio::ip::make_address_v6(
+        boost::asio::ip::v4_mapped, addr.to_v4());
+    }
+    minx::SockAddr peer(addr, rpcPort);
+
+    minx::MinxConfig mc{};
+    mc.instanceName = "plexc";
+    mc.randomXVMsToKeep = 0;
+    mc.randomXInitThreads = 0;
+    mc.trustLoopback = true;
+    minx_ = std::make_unique<minx::Minx>(listener_.get(), mc);
+
+    // Margin for reselect() racing an old channel's teardown; tight tick
+    // cadence (1 ms) so bulk WRITE/READ aren't throttled by RUDP's pulse.
+    minx::RudpConfig rcfg{};
+    rcfg.maxChannelsPerPeer = 8;
+    rcfg.baseTickInterval = std::chrono::milliseconds(1);
+    rudpListener_.setMinx(minx_.get());
+    rudp_ = std::make_unique<minx::Rudp>(&rudpListener_, rcfg);
+
+    {
+      minx::MinxStdExtensions stdExt;
+      stdExt.registerExtension(
+        minx::Rudp::KEY_V0,
+        [this](const minx::SockAddr& p, uint64_t key,
+               const minx::Bytes& payload) {
+          if (rudp_) rudp_->onPacket(p, key, payload, nowMicros());
+        });
+      minx_->setExtensionHandler(std::move(stdExt).build());
+    }
+
+    boundPort_ = minx_->openSocket(
+      boost::asio::ip::address_v6::any(), 0, netIO_, taskIO_);
+    if (boundPort_ == 0) {
+      LOGERROR << "cesplexclient: failed to open local UDP socket";
+      return CES_ERROR_INTERNAL;
+    }
+
+    netGuard_ = std::make_unique<WorkGuard>(netIO_.get_executor());
+    taskGuard_ = std::make_unique<WorkGuard>(taskIO_.get_executor());
+    netThread_ = std::thread([this]() { netIO_.run(); });
+    taskThread_ = std::thread([this]() { taskIO_.run(); });
+
+    tickTimer_ = std::make_shared<boost::asio::steady_timer>(taskIO_);
+    boost::asio::post(taskIO_, [this]() { scheduleTick(); });
+
+    // The protocol driver rides our owned transport.
+    chan_ = std::make_unique<CesPlexChannel>(taskIO_, rudp_.get());
+    if (hasPendingServerPk_) chan_->setServerPubkey(pendingServerPk_);
+    return chan_->select(peer, protocol, signerKey);
+  }
+
+  void stop() {
+    if (!minx_) return;
+    if (tickTimer_) {
+      boost::system::error_code ec;
+      tickTimer_->cancel(ec);
+    }
+    minx_->closeSocket(false);
+    if (netGuard_) netGuard_->reset();
+    if (taskGuard_) taskGuard_->reset();
+    netIO_.stop();
+    taskIO_.stop();
+    if (netThread_.joinable()) netThread_.join();
+    if (taskThread_.joinable()) taskThread_.join();
+    chan_.reset();
+    tickTimer_.reset();
+    rudp_.reset();
+    minx_.reset();
+    rudpListener_.setMinx(nullptr);
+    netGuard_.reset();
+    taskGuard_.reset();
+    boundPort_ = 0;
+  }
+
+  CesPlexChannel* channel() { return chan_.get(); }
+
+  void setServerPubkey(const minx::Hash& pk) {
+    // Usually called BEFORE connect() — chan_ isn't built yet. Remember it
+    // and pin it onto the channel at connect time, so the bind reply is
+    // verified against the caller's expected pubkey instead of TOFU'd.
+    pendingServerPk_ = pk;
+    hasPendingServerPk_ = true;
+    if (chan_) chan_->setServerPubkey(pk);
+  }
+  minx::Bytes buildEnvelope(uint8_t verb, std::span<const uint8_t> preamble) {
+    return chan_ ? chan_->buildEnvelope(verb, preamble) : minx::Bytes{};
+  }
+  uint8_t driveVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      size_t respFixedPreambleLen,
+      const std::function<bool(ces::Bytes&)>& readVariablePreamble,
+      const std::function<uint64_t(const ces::Bytes&)>& respBodyLen,
+      const ces::Bytes& extraBodyToSend,
+      ces::Bytes& outPreamble,
+      ces::Bytes& outBody) {
+    if (!chan_) return CES_ERROR_INTERNAL;
+    return chan_->driveVerb(verb, envelope, respFixedPreambleLen,
+                            readVariablePreamble, respBodyLen,
+                            extraBodyToSend, outPreamble, outBody);
+  }
+  bool readExact(ces::Bytes& out, size_t n) {
+    return chan_ && chan_->readExact(out, n);
+  }
+
+private:
+  using WorkGuard = boost::asio::executor_work_guard<
+    boost::asio::io_context::executor_type>;
+
+  void scheduleTick() {
+    if (!tickTimer_ || !rudp_) return;
+    tickTimer_->expires_after(std::chrono::milliseconds(10));
+    tickTimer_->async_wait(
+      [this](const boost::system::error_code& ec) {
+        if (ec || !rudp_) return;
+        rudp_->tick(nowMicros());
+        scheduleTick();
+      });
+  }
+
+  std::unique_ptr<NoopMinxListener> listener_;
+  PlexClientRudpListener rudpListener_;
+  std::unique_ptr<minx::Minx> minx_;
+  std::unique_ptr<minx::Rudp> rudp_;
+  boost::asio::io_context netIO_;
+  boost::asio::io_context taskIO_;
+  std::unique_ptr<WorkGuard> netGuard_;
+  std::unique_ptr<WorkGuard> taskGuard_;
+  std::thread netThread_;
+  std::thread taskThread_;
+  std::shared_ptr<boost::asio::steady_timer> tickTimer_;
+  uint16_t boundPort_ = 0;
+  bool hasPendingServerPk_ = false;
+  minx::Hash pendingServerPk_{};
+  // Declared last → destroyed first, before the taskIO_/rudp_ it borrows.
+  std::unique_ptr<CesPlexChannel> chan_;
+};
+
 // ---- CesPlexClient public forwards ----
 
 CesPlexClient::CesPlexClient() : impl_(std::make_unique<Impl>()) {}
@@ -688,6 +822,8 @@ uint8_t CesPlexClient::connect(const std::string& host, uint16_t rpcPort,
 }
 
 void CesPlexClient::disconnect() { impl_->stop(); }
+
+CesPlexChannel* CesPlexClient::channel() { return impl_->channel(); }
 
 void CesPlexClient::setServerPubkey(const minx::Hash& pk) {
   impl_->setServerPubkey(pk);

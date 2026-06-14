@@ -31,6 +31,11 @@
 #include <span>
 #include <string>
 
+// Forward declarations for CesPlexChannel's injected-transport ctor — the
+// concrete types are only needed in session.cpp.
+namespace boost { namespace asio { class io_context; } }
+namespace minx { class Rudp; }
+
 namespace ces {
 
 // ===========================================================================
@@ -102,6 +107,76 @@ void cesPlexServe(std::shared_ptr<minx::RudpStream> stream,
                   CesPlexProtocol proto);
 
 // ===========================================================================
+// CesPlexChannel — the per-channel client protocol, over an injected transport
+// ===========================================================================
+//
+// The CesPlex client protocol — the signed bind handshake, per-op envelope
+// signing, and the blocking verb-drive loop — with NO owned mechanics. It
+// borrows a task io_context (where its async stream ops run) and a Rudp (where
+// it opens its channel), so the SAME client codec composes onto any transport:
+//
+//   * CesPlexClient owns a Minx/Rudp/threads and hands this its taskIO + Rudp.
+//   * a process already running a Rudp (the cesluajitd compute child's CesPlex
+//     endpoint) hands this that same Rudp.
+//
+// CesFileClient / CesComputeClient are verb wrappers over a CesPlexChannel, so
+// they have one implementation regardless of who owns the socket.
+//
+// Threading: the borrowed task io_context must be run by another thread; each
+// verb posts its I/O there and blocks the CALLING thread on a future (caller
+// thread must differ from the task io_context's thread).
+
+class CesPlexChannel {
+public:
+  CesPlexChannel(boost::asio::io_context& taskIO, minx::Rudp* rudp);
+  ~CesPlexChannel();
+  CesPlexChannel(const CesPlexChannel&) = delete;
+  CesPlexChannel& operator=(const CesPlexChannel&) = delete;
+
+  // Open a fresh channel to `peer` and run the signed bind for `protocol`,
+  // signed by `signerKey` (the per-op signer + billed principal).
+  uint8_t select(const minx::SockAddr& peer, const std::string& protocol,
+                 const KeyPair& signerKey);
+
+  // Drop the bound stream (teardown).
+  void reset();
+
+  // Provide the server pubkey so response signatures verify (else each
+  // response logs one LOGERROR and is treated as unverifiable).
+  void setServerPubkey(const minx::Hash& pk);
+
+  // See CesPlexClient::buildEnvelope.
+  minx::Bytes buildEnvelope(uint8_t verb, std::span<const uint8_t> preamble);
+
+  // See CesPlexClient::driveVerb (both overloads).
+  uint8_t driveVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      size_t respFixedPreambleLen,
+      const std::function<bool(ces::Bytes& preamble)>& readVariablePreamble,
+      const std::function<uint64_t(const ces::Bytes& preamble)>& respBodyLen,
+      const ces::Bytes& extraBodyToSend,
+      ces::Bytes& outPreamble,
+      ces::Bytes& outBody);
+
+  uint8_t driveVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      size_t respFixedPreambleLen,
+      const std::function<bool(ces::Bytes& preamble)>& readVariablePreamble,
+      ces::Bytes& outPreamble);
+
+  bool readExact(ces::Bytes& out, size_t n);
+
+  uint64_t boundSessionToken() const;
+
+  class Impl;
+
+private:
+  std::unique_ptr<Impl> impl_;
+};
+
+// ===========================================================================
 // Client side — the shared blocking client
 // ===========================================================================
 //
@@ -136,6 +211,10 @@ public:
   // Provide the server pubkey so response signatures verify (else each
   // response logs one LOGERROR and is treated as unverifiable).
   void setServerPubkey(const minx::Hash& pk);
+
+  // The bound channel (valid after connect()), so a verb client can ride
+  // this client's transport instead of opening its own.
+  CesPlexChannel* channel();
 
   // Build a signed per-op envelope [u32 len][salt+preamble][65 sig] for
   // this channel. An 8-byte per-op salt is prepended so identical

@@ -32,6 +32,8 @@
 
 namespace ces {
 
+class CesPlexChannel;
+
 class CesComputeClient {
 public:
   struct InstanceInfo {
@@ -58,6 +60,11 @@ public:
   // connection is signed by + bills against `signerKey.getPublicKeyAsHash()`.
   uint8_t connect(const std::string& host, uint16_t rpcPort,
                   const KeyPair& signerKey);
+
+  // Drive verbs over a CesPlexChannel the caller owns and has already
+  // bound — e.g. the compute child driving /ces/compute/1 over its own
+  // CesPlex endpoint. Mutually exclusive with connect().
+  void attach(CesPlexChannel& channel);
 
   // Tear down the channel and I/O threads. Safe to call more than once.
   void disconnect();
