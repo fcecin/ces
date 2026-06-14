@@ -144,4 +144,10 @@ void _computeTestForceTick();
 // handler is unbound or the instance is gone.
 size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count);
 
+// Test hook: returns the UDP port the server statically assigned the
+// given instance's outbound client (Instance::clientPort), or 0 if the
+// instance is gone (or no static range was configured). Runs on the
+// CesPlex strand with a blocking post+wait.
+uint16_t _computeTestInstanceClientPort(uint64_t instanceId);
+
 } // namespace ces

@@ -187,6 +187,18 @@ max_reorder_msgs_per_channel = -1
 # compute_max_instances    = 0       # 0 = OFF; caps child processes — the
 #                                    # whole admission bound (× mem cap = RAM)
 #
+# L2 compute program UDP port range: [compute_port_base,
+# compute_port_base + compute_port_count - 1]. Each instance binds its
+# outbound CES client to a server-assigned port from this range — the
+# child never picks an ephemeral port (a firewalled L2 host opens only
+# known ports). Base and count are independent of compute_max_instances;
+# open exactly [base, base+count-1] at the firewall to match. base = 0 =
+# no range: instances run local-only and their outbound network verbs
+# fail with "networking disabled". LAUNCH fails with
+# CES_ERROR_COMPUTE_NO_PORT when the range is exhausted.
+# compute_port_base        = 0
+# compute_port_count       = 0
+#
 # Per-process memory ceiling — RLIMIT_AS in the child (the kernel denies
 # allocations past it; OOM is an instant, machine-wide attack vector).
 # With compute_max_instances this bounds total compute memory. CPU is
@@ -308,6 +320,8 @@ int main(int argc, char* argv[]) {
   int64_t optFeeFileRead  = -1;
   // Compute feature (CesPlex builtin:compute).
   uint32_t optComputeMaxInstances    = 0;
+  uint16_t optComputePortBase        = 0;   // 0 = no range (network off)
+  uint16_t optComputePortCount       = 0;   // ports in the range
   uint64_t optComputeProcessMemMax   = 268435456; // 256 MB
   int64_t optFeeComputeCpuSec     = -1;
   int64_t optFeeComputeRssByteSec = -1;
@@ -464,6 +478,13 @@ int main(int argc, char* argv[]) {
     app.add_option("--computemaxinstances", optComputeMaxInstances,
       "Compute feature max concurrent instances "
       "(0 = feature off)")->default_val("0");
+    app.add_option("--computeportbase", optComputePortBase,
+      "Base UDP port for the L2 compute program range. 0 = ephemeral "
+      "(loopback dev only). Open [base, base+count-1] at the firewall "
+      "to match.")->default_val("0");
+    app.add_option("--computeportcount", optComputePortCount,
+      "Number of UDP ports in the L2 compute program range "
+      "(independent of computemaxinstances).")->default_val("0");
     app.add_option("--computeprocessmemmax", optComputeProcessMemMax,
       "Per-process memory ceiling in bytes (child RLIMIT_AS)")
       ->default_val(std::to_string(268435456ULL));
@@ -622,6 +643,10 @@ int main(int argc, char* argv[]) {
       // Compute feature knobs.
       applyIfDefault("compute_max_instances",    optComputeMaxInstances,
                      "--computemaxinstances");
+      applyIfDefault("compute_port_base",        optComputePortBase,
+                     "--computeportbase");
+      applyIfDefault("compute_port_count",       optComputePortCount,
+                     "--computeportcount");
       applyIfDefault("compute_process_mem_max",  optComputeProcessMemMax,
                      "--computeprocessmemmax");
       applyIfDefault("fee_compute_cpu_sec",      optFeeComputeCpuSec,
@@ -796,6 +821,8 @@ int main(int argc, char* argv[]) {
 
   // Compute feature config.
   config.computeMaxInstances   = optComputeMaxInstances;
+  config.computePortBase       = optComputePortBase;
+  config.computePortCount      = optComputePortCount;
   config.computeProcessMemMax  = optComputeProcessMemMax;
   if (optFeeComputeCpuSec     >= 0)
     config.feeComputeCpuSec     = optFeeComputeCpuSec;

@@ -13,6 +13,7 @@
 #include "test_e2e_common.h"
 
 #include <ces/l2/compute_client.h>
+#include <ces/l2/compute_handler.h>
 #include <ces/l2/file_client.h>
 #include <ces/l2/net_multiplexer.h>
 #include <ces/l2/file_handler.h>
@@ -605,4 +606,134 @@ BOOST_AUTO_TEST_CASE(LaunchIsNotDeduped) {
   boost::system::error_code ec;
   fs::remove_all(tmp, ec);
 }
+
+// ---------------------------------------------------------------------------
+// Static compute port range — allocation, free-on-kill reuse, exhaustion.
+// ---------------------------------------------------------------------------
+//
+// These exercise the server-side allocator only (mock children don't bind
+// the port). The instance's assigned port is read via the
+// _computeTestInstanceClientPort hook.
+
+BOOST_AUTO_TEST_SUITE(ComputePortTests)
+
+namespace {
+// A compute server with a configured static port range and one shared
+// source file. Instances launch from it, each claiming a server-assigned
+// port from [base, base + count - 1]. `count` is independent of the
+// instance cap `maxInst`.
+struct PortServer {
+  fs::path dir;
+  std::unique_ptr<CesServer> server;
+  uint16_t rpcPort = 0;
+  KeyPair ownerKey;
+  std::string src;
+
+  PortServer(uint16_t base, uint16_t count, uint32_t maxInst) {
+    blog::init();
+    blog::set_level(blog::fatal);
+    dir = makeUniqueTempDir("compute_port");
+    minx::Hash priv; priv.fill(0xC7);
+    CesConfig cfg = makeTestConfig(dir, priv,
+                                   std::numeric_limits<uint64_t>::max());
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
+    cfg.cesplexMounts = {
+      {"/ces/file/1",    "builtin:file"},
+      {"/ces/compute/1", "builtin:compute"},
+    };
+    cfg.cesFileStoreMaxBytes = 16ull * 1024 * 1024;
+    cfg.feeFileRent = 1;
+    cfg.computeMaxInstances = maxInst;
+    cfg.computePortBase = base;
+    cfg.computePortCount = count;
+    cfg.feeComputeSlotSec = 1;
+    cfg.cesComputeChildBinary = ces::e2e::findBinary("cescompmockd");
+    cfg.cesComputeWorkDir = (dir / "cescompute").string();
+    server = std::make_unique<CesServer>(cfg);
+    server->start(0);
+    rpcPort = server->_rpcBoundPort();
+    server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
+    src = "/h/" + ownerKey.getPublicKeyHexStr() + "/p.bin";
+    wait_net();
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
+    uint64_t b = 0, c = 0;
+    CES_REQUIRE_OK(fc.create(src, 1, 0, 1'000'000'000,
+                             "application/octet-stream", b, c));
+    fc.disconnect();
+  }
+  ~PortServer() {
+    if (server) server->stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    boost::system::error_code ec;
+    fs::remove_all(dir, ec);
+  }
+};
+} // namespace
+
+// Each launch claims the lowest free port in the range; KILL returns the
+// port to the pool and the next launch reuses it.
+BOOST_AUTO_TEST_CASE(StaticPortAllocationAndReuse) {
+  PortServer ps(/*base=*/41000, /*count=*/4, /*maxInst=*/8);
+  CesComputeClient cc;
+  cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
+
+  uint64_t a = 0, b = 0, cId = 0, d = 0, s = 0;
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));
+  CES_REQUIRE_OK(cc.launch(ps.src, b, s));
+  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   41001);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 41002);
+
+  // Kill the middle instance → frees 41001; next launch reuses it.
+  CES_REQUIRE_OK(cc.kill(b));
+  CES_REQUIRE_OK(cc.launch(ps.src, d, s));
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), 41001);
+
+  cc.disconnect();
+}
+
+// No configured range ⇒ instances launch but get port 0, which the child
+// reads as "no network" (its outbound remote_* verbs fail cleanly).
+BOOST_AUTO_TEST_CASE(NoRangeAssignsZeroPort) {
+  PortServer ps(/*base=*/0, /*count=*/0, /*maxInst=*/4);
+  CesComputeClient cc;
+  cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
+
+  uint64_t a = 0, s = 0;
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));   // launch still succeeds
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 0);
+
+  cc.disconnect();
+}
+
+// A port count below the slot cap makes port exhaustion — not the slot
+// cap — fail the launch with CES_ERROR_COMPUTE_NO_PORT.
+BOOST_AUTO_TEST_CASE(StaticPortExhaustion) {
+  // 2 ports, 8 slots ⇒ ports bind first.
+  PortServer ps(/*base=*/41000, /*count=*/2, /*maxInst=*/8);
+  CesComputeClient cc;
+  cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
+
+  uint64_t a = 0, b = 0, cId = 0, s = 0;
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));
+  CES_REQUIRE_OK(cc.launch(ps.src, b, s));
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), 41001);
+
+  // A slot is free (2 < 8) but no port remains.
+  uint8_t rc = cc.launch(ps.src, cId, s);
+  BOOST_CHECK_MESSAGE(rc == CES_ERROR_COMPUTE_NO_PORT,
+                      "expected COMPUTE_NO_PORT, got " << int(rc));
+
+  cc.disconnect();
+}
+
+BOOST_AUTO_TEST_SUITE_END()
 

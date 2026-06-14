@@ -153,7 +153,12 @@ enum error_code_t : uint8_t {
   // numeric argument). Distinct from CES_ERROR_INTERNAL: the server
   // is healthy, the *caller* sent something it shouldn't have.
   CES_ERROR_BAD_INPUT = 0x22,
-  CES_ERROR_LAST = CES_ERROR_BAD_INPUT
+  // Compute feature — LAUNCH could not allocate a UDP port for the
+  // child's outbound client from the configured compute port range
+  // (computePortBase .. computePortBase + computePortCount - 1): the
+  // range is fully spoken for.
+  CES_ERROR_COMPUTE_NO_PORT = 0x23,
+  CES_ERROR_LAST = CES_ERROR_COMPUTE_NO_PORT
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -255,6 +260,7 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_NOT_LISTENING:                    return "CES_ERROR_NOT_LISTENING";
   case CES_ERROR_IMMUTABLE:                        return "CES_ERROR_IMMUTABLE";
   case CES_ERROR_BAD_INPUT:                        return "CES_ERROR_BAD_INPUT";
+  case CES_ERROR_COMPUTE_NO_PORT:                  return "CES_ERROR_COMPUTE_NO_PORT";
   default:                                         return "UNKNOWN_ERROR";
   }
 }

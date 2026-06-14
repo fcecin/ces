@@ -336,6 +336,30 @@ struct CesConfig {
   // without pulling Lua into the mix.
   std::string cesComputeChildBinary = "cesluajitd";
 
+  // L2 compute program UDP port range: [computePortBase, computePortBase
+  // + computePortCount - 1]. Each launched child binds its outbound CES
+  // client to a port the server allocates statically from this range. The
+  // child never picks its own (ephemeral) port: a firewalled L2 host opens
+  // only known ports, and an OS-assigned egress port is neither reachable
+  // nor configurable. The server owns the whole lifecycle — it tracks
+  // which ports are free, assigns one at LAUNCH, hands it to the child in
+  // the bootstrap frame, and frees it when the instance dies; LAUNCH fails
+  // CES_ERROR_COMPUTE_NO_PORT when the range is spent.
+  //
+  // Base and count are independent of computeMaxInstances on purpose:
+  // ports and instance slots are orthogonal resources. Size the range to
+  // your firewall opening; a count below computeMaxInstances simply makes
+  // ports the binding constraint (LAUNCH then fails COMPUTE_NO_PORT before
+  // the slot cap).
+  //
+  // computePortBase == 0 = no range: instances launch local-only — their
+  // outbound network verbs (ces.remote_transfer / remote_account_read /
+  // remote_cross_transfer) fail cleanly with "networking disabled" rather
+  // than binding an unreachable ephemeral port. When set, open [base,
+  // base + count - 1]/udp at the firewall to match.
+  uint16_t computePortBase  = 0;
+  uint16_t computePortCount = 0;
+
   // --- /s/ builtin apps ---
   // Each name in `builtinApps` is the basename of a Lua program the
   // operator dropped into <storeDir>/s/ (e.g. "dice" → /s/dice.lua).

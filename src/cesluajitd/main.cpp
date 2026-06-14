@@ -524,6 +524,13 @@ uint8_t g_program_privkey[32] = {0};
 // protection anchor: any payment with lastXferTime ≤ start_time/1e6
 // cannot have been a fresh deposit aimed at THIS instance.
 uint64_t g_start_time_us = 0;
+// UDP port the server statically assigned this instance for its
+// outbound CES client, supplied by bootstrap. The client binds it so
+// every outbound op leaves from a known, firewall-configured source
+// port. 0 = no compute port range configured → this instance has no
+// network: the outbound remote_* verbs fail with "networking disabled"
+// rather than binding an unreachable ephemeral port.
+uint16_t g_program_port = 0;
 uint16_t g_next_corr_id = 1;
 
 int lua_ces_now(lua_State* L) {
@@ -817,6 +824,11 @@ int lua_ces_transfer(lua_State* L) {
 // the remote server via the child's own CesClient. Unsigned query — needs
 // no key. Blocks the Lua VM for the round-trip (sync).
 int lua_ces_remote_account_read(lua_State* L) {
+  if (g_program_port == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking disabled (no compute port range)");
+    return 2;
+  }
   size_t addr_len = 0;
   const char* addr = luaL_checklstring(L, 1, &addr_len);
   size_t pk_len = 0;
@@ -839,7 +851,7 @@ int lua_ces_remote_account_read(lua_State* L) {
   ces::HashPrefix mapKey = ces::Account::getMapKey(pubkey);
 
   ces::CesClient client(ep, /*useDataset=*/false);
-  if (!client.start(0) || !client.connect()) {
+  if (!client.start(g_program_port) || !client.connect()) {
     lua_pushnil(L);
     lua_pushinteger(L, STATUS_INTERNAL);
     return 2;
@@ -873,6 +885,11 @@ int lua_ces_remote_account_read(lua_State* L) {
 // Resolves `addr` and signs a transfer from the program's own account on
 // that remote server with the program's private key.
 int lua_ces_remote_transfer(lua_State* L) {
+  if (g_program_port == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking disabled (no compute port range)");
+    return 2;
+  }
   size_t addr_len = 0;
   const char* addr = luaL_checklstring(L, 1, &addr_len);
   size_t pk_len = 0;
@@ -905,7 +922,7 @@ int lua_ces_remote_transfer(lua_State* L) {
 
   ces::CesClient client(ep, /*useDataset=*/false);
   client.setKey(kp);
-  if (!client.start(0) || !client.connect()) {
+  if (!client.start(g_program_port) || !client.connect()) {
     lua_pushnil(L);
     lua_pushinteger(L, STATUS_INTERNAL);
     return 2;
@@ -932,6 +949,11 @@ int lua_ces_remote_transfer(lua_State* L) {
 // held THERE to `dest_pubkey` on `dest_server` (a peer of `addr`). Signed
 // with the program's private key — the remote server is the cross originator.
 int lua_ces_remote_cross_transfer(lua_State* L) {
+  if (g_program_port == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking disabled (no compute port range)");
+    return 2;
+  }
   size_t addr_len = 0;
   const char* addr = luaL_checklstring(L, 1, &addr_len);
   size_t pk_len = 0;
@@ -967,7 +989,7 @@ int lua_ces_remote_cross_transfer(lua_State* L) {
 
   ces::CesClient client(ep, /*useDataset=*/false);
   client.setKey(kp);
-  if (!client.start(0) || !client.connect()) {
+  if (!client.start(g_program_port) || !client.connect()) {
     lua_pushnil(L);
     lua_pushinteger(L, STATUS_INTERNAL);
     return 2;
@@ -2006,7 +2028,8 @@ int main(int argc, char** argv) {
   constexpr size_t kOffOwner   = kOffPrefix  + WIRE_PREFIX_LEN;
   constexpr size_t kOffProgram = kOffOwner   + WIRE_KEY_LEN;
   constexpr size_t kOffPrivkey = kOffProgram + WIRE_KEY_LEN;
-  constexpr size_t kOffStart   = kOffPrivkey + WIRE_KEY_LEN;
+  constexpr size_t kOffPort    = kOffPrivkey + WIRE_KEY_LEN;
+  constexpr size_t kOffStart   = kOffPort    + sizeof(uint16_t);
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
@@ -2017,6 +2040,7 @@ int main(int argc, char** argv) {
   std::memcpy(g_owner_pubkey,    bs.body.data() + kOffOwner,   WIRE_KEY_LEN);
   std::memcpy(g_program_pubkey,  bs.body.data() + kOffProgram, WIRE_KEY_LEN);
   std::memcpy(g_program_privkey, bs.body.data() + kOffPrivkey, WIRE_KEY_LEN);
+  g_program_port  = get_u16(bs.body.data() + kOffPort);
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {
