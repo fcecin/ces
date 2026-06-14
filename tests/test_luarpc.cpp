@@ -1,4 +1,5 @@
-// test_luarpc.cpp — end-to-end /ces/luarpc/1.
+// test_luarpc.cpp — end-to-end outbound from a lua program: /ces/luarpc/1
+// (peer) plus ces.file_client / ces.compute_client (verb clients).
 //
 // Spins up real cesluajitd instances (the existing compute tests use the
 // no-Lua cescompmockd, so they never exercise luarpc). One instance runs an
@@ -56,7 +57,7 @@ struct LuaRpcFixture {
   uint16_t rpcPort = 0;
   KeyPair ownerKey;
 
-  LuaRpcFixture() {
+  explicit LuaRpcFixture(uint16_t portCount = 16) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("luarpc");
@@ -74,7 +75,7 @@ struct LuaRpcFixture {
     cfg.feeFileRent = 1;
     cfg.computeMaxInstances = 8;
     cfg.computePortBase = 39200;
-    cfg.computePortCount = 16;
+    cfg.computePortCount = portCount;
     cfg.feeComputeSlotSec = 1;
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cesluajitd");
     cfg.cesComputeWorkDir = (dir / "cescompute").string();
@@ -137,6 +138,12 @@ struct LuaRpcFixture {
   }
 };
 
+// Same fixture, but with NO compute port range — instances get no rpc port, so
+// outbound clients must fail permanently.
+struct LuaNoPortFixture : LuaRpcFixture {
+  LuaNoPortFixture() : LuaRpcFixture(0) {}
+};
+
 }  // namespace
 
 BOOST_AUTO_TEST_SUITE(LuaRpcTests)
@@ -189,6 +196,174 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
     if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   BOOST_CHECK_EQUAL(bal, 8);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ===========================================================================
+// ces.file_client / ces.compute_client — outbound L2 verb clients driven from
+// a lua program, riding the instance's own CesPlex endpoint (the firewall-
+// correct socket) and reusing the same CesFileClient / CesComputeClient codec
+// cesh uses. Each test launches a program that dials ITS OWN server and, on a
+// successful round-trip, transfers a sentinel to a beacon the test polls.
+// ===========================================================================
+
+BOOST_AUTO_TEST_SUITE(LuaClientTests)
+
+// file_client: every verb over a PINNED channel. Staged codes localize a
+// failure; 77 = all verbs round-tripped.
+BOOST_FIXTURE_TEST_CASE(ProgramFileClient, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 77
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+  const auto serverPk = server->_serverKeyPair().getPublicKeyAsHash();
+
+  const std::string path = "/h/" + ownerHex + "/fcprog.bin";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "local fc = ces.file_client('127.0.0.1:" + rpc + "', '"
+      + luaBytes(serverPk.data(), 32) + "')\n"
+    "if not fc then ces.transfer(B, 2); return end\n"
+    "if not fc:create('/p/cov', 5, 0, 100000000, 'text/plain') then ces.transfer(B, 3); return end\n"
+    "if not fc:write('/p/cov', 0, 'hello') then ces.transfer(B, 4); return end\n"
+    "if fc:read('/p/cov', 0, 5) ~= 'hello' then ces.transfer(B, 5); return end\n"
+    "local st = fc:stat('/p/cov')\n"
+    "if not (st and st.size == 5 and st.content_type == 'text/plain') then ces.transfer(B, 6); return end\n"
+    "local ab, ns = fc:append('/p/cov', 'XYZ')\n"
+    "if not (ab and ns == 8) then ces.transfer(B, 7); return end\n"
+    "if fc:read('/p/cov', 0, 8) ~= 'helloXYZ' then ces.transfer(B, 8); return end\n"
+    "if fc:resize('/p/cov', 4) ~= 4 then ces.transfer(B, 9); return end\n"
+    "if not fc:deposit('/p/cov', 1000) then ces.transfer(B, 10); return end\n"
+    "if not fc:withdraw('/p/cov', 500) then ces.transfer(B, 11); return end\n"
+    "if fc:set_price('/p/cov', 42) ~= 42 then ces.transfer(B, 12); return end\n"
+    "if not fc:delete('/p/cov') then ces.transfer(B, 13); return end\n"
+    "fc:close()\n"
+    "ces.transfer(B, 77)\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);   // fund the program's own ops
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 78; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 78) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 78);
+}
+
+// compute_client: the program file_client-creates + funds a noop source it
+// owns, then exercises the full lifecycle on it — launch, stat, instances,
+// kill — and transfers the sentinel only if every step succeeded.
+BOOST_FIXTURE_TEST_CASE(ProgramComputeClient, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 9
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+
+  const std::string path = "/h/" + ownerHex + "/ccprog.bin";
+  // Staged beacon codes localize a failure: 2 no fc, 3 create, 4 no cc,
+  // 200+errcode launch, 300+errcode stat, 400+nins mismatch; 9 = full success.
+  const std::string src =
+    "local NOOP = 'ces.run()\\n'\n"
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "local fc = ces.file_client('127.0.0.1:" + rpc + "')\n"
+    "if not fc then ces.transfer(B, 2); return end\n"
+    "local cb = fc:create('/p/cl_noop', #NOOP, 0, 10000000000, 'text/x-lua')\n"
+    "if not cb then ces.transfer(B, 3); return end\n"
+    "fc:write('/p/cl_noop', 0, NOOP)\n"
+    "fc:close()\n"
+    "local cc = ces.compute_client('127.0.0.1:" + rpc + "')\n"
+    "if not cc then ces.transfer(B, 4); return end\n"
+    "local id, lerr = cc:launch('/p/cl_noop')\n"
+    "if not id then ces.transfer(B, 200 + (lerr or 0)); return end\n"
+    "local info, serr = cc:stat(id)\n"
+    "if not info then cc:kill(id); ces.transfer(B, 300 + (serr or 0)); return end\n"
+    "local ids = cc:instances('/p/cl_noop')\n"
+    "local mine = cc:list()\n"
+    "local ok = 0\n"
+    "if info.instance_id ~= id then ok = 410\n"
+    "elseif not (ids and #ids >= 1) then ok = 411\n"
+    "elseif not (mine and #mine >= 1) then ok = 412 end\n"
+    "cc:kill(id)\n"
+    "cc:close()\n"
+    "if ok == 0 then ces.transfer(B, 9) else ces.transfer(B, ok) end\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 300 && bal < 10; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 10) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 10);
+}
+
+// file_client error model: a wrong-pubkey pin must be rejected; a missing file
+// must yield ces.err.FILE_NOT_FOUND. 44 = both behaved.
+BOOST_FIXTURE_TEST_CASE(FileClientErrors, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 44
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+  KeyPair wrong;   // a pubkey that is NOT the server's
+  const auto wrongPk = wrong.getPublicKeyAsHash();
+
+  const std::string path = "/h/" + ownerHex + "/errprog.bin";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "local bad = ces.file_client('127.0.0.1:" + rpc + "', '"
+      + luaBytes(wrongPk.data(), 32) + "')\n"
+    "if bad ~= nil then ces.transfer(B, 91); return end\n"
+    "local fc = ces.file_client('127.0.0.1:" + rpc + "')\n"
+    "if not fc then ces.transfer(B, 2); return end\n"
+    "local d, err = fc:read('/p/nope', 0, 5)\n"
+    "fc:close()\n"
+    "if d ~= nil then ces.transfer(B, 92); return end\n"
+    "if err ~= ces.err.FILE_NOT_FOUND then ces.transfer(B, 93); return end\n"
+    "ces.transfer(B, 44)\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 45; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 45) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 45);
+}
+
+// Permanent-disable contract: no compute port range → no rpc endpoint → the
+// outbound file_client must fail (nil + string err), not hang or retry.
+BOOST_FIXTURE_TEST_CASE(FileClientNoRpcPort, LuaNoPortFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 66
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+
+  const std::string path = "/h/" + ownerHex + "/noport.bin";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "local fc, err = ces.file_client('127.0.0.1:" + rpc + "')\n"
+    "if fc ~= nil then ces.transfer(B, 91); return end\n"
+    "if type(err) ~= 'string' then ces.transfer(B, 92); return end\n"
+    "ces.transfer(B, 66)\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 67; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 67) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 67);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
