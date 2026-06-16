@@ -1810,6 +1810,8 @@ int main(int argc, char* argv[]) {
             print_field("FileBalance", e.fileBalance);
             print_field("CpuBp",       e.cpuBasisPoints);
             print_field("RssBytes",    e.rssBytes);
+            print_field("ClientPort",  e.clientPort);
+            print_field("RpcPort",     e.rpcPort);
             std::cout << "  --\n";
           }
         }
@@ -1831,21 +1833,23 @@ int main(int argc, char* argv[]) {
         print_field("FileBalance", info.fileBalance);
         print_field("CpuBp",       info.cpuBasisPoints);
         print_field("RssBytes",    info.rssBytes);
+        print_field("ClientPort",  info.clientPort);
+        print_field("RpcPort",     info.rpcPort);
         std::cout << std::endl;
         return 0;
       }
 
       if (cmd_cinst->parsed()) {
-        std::vector<uint64_t> ids;
+        std::vector<CesComputeClient::InstanceInfo> insts;
         std::string remote = normalizePath(compute_path_arg);
-        uint8_t src = cc2.instances(remote, ids);
+        uint8_t src = cc2.instances(remote, insts);
         if (src != CES_OK) {
           std::cerr << "INSTANCES Failed: " << errorString(src) << "\n";
           return 1;
         }
         // One id per line on stdout, no header — pipeable into
-        // `head -1 | xargs cesh dial`.
-        for (uint64_t id : ids) std::cout << id << "\n";
+        // `head -1 | xargs cesh dial`. (Ports are in `compute stat <id>`.)
+        for (auto& e : insts) std::cout << e.instanceId << "\n";
         return 0;
       }
 

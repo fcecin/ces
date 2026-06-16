@@ -302,6 +302,49 @@ BOOST_FIXTURE_TEST_CASE(ProgramComputeClient, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 10);
 }
 
+// STAT/INSTANCES are public and expose a live instance's REAL leased ports,
+// so anyone (not just the owner) can discover a running service and learn
+// where to dial it. This fixture runs real cesluajitd instances against a
+// configured port range, so the instance actually leases an inbound luarpc
+// host port — the thing a web gateway needs to find.
+BOOST_FIXTURE_TEST_CASE(PortsInspectableByStranger, LuaRpcFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/noop.lua";
+  deploy(path, "ces.run()\n");
+  uint64_t id = launch(path);
+  BOOST_REQUIRE(id != 0);
+
+  // A stranger — does not own `path` — inspects the instance.
+  KeyPair stranger;
+  server->_brr(stranger.getPublicKeyAsHash(), 100'000'000'000);
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, stranger));
+
+  CesComputeClient::InstanceInfo info;
+  CES_REQUIRE_OK(cc.stat(id, info));
+  BOOST_CHECK_EQUAL(info.instanceId, id);
+  // Port range is configured, so the instance leased a real inbound luarpc
+  // host port — and the stranger can see it.
+  BOOST_CHECK_MESSAGE(info.rpcPort != 0,
+    "stranger STAT must see the instance's leased luarpc port");
+
+  // INSTANCES (by path) reports the same port to the stranger.
+  std::vector<CesComputeClient::InstanceInfo> insts;
+  CES_REQUIRE_OK(cc.instances(path, insts));
+  BOOST_REQUIRE_EQUAL(insts.size(), 1u);
+  BOOST_CHECK_EQUAL(insts[0].instanceId, id);
+  BOOST_CHECK_EQUAL(insts[0].rpcPort, info.rpcPort);
+  cc.disconnect();
+
+  CesComputeClient kc;
+  kc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(kc.connect("localhost", rpcPort, ownerKey));
+  CES_REQUIRE_OK(kc.kill(id));
+  kc.disconnect();
+}
+
 // file_client error model: a wrong-pubkey pin must be rejected; a missing file
 // must yield ces.err.FILE_NOT_FOUND. 44 = both behaved.
 BOOST_FIXTURE_TEST_CASE(FileClientErrors, LuaRpcFixture) {

@@ -298,15 +298,16 @@ BOOST_AUTO_TEST_CASE(InstancesIsPublicAndEnumeratesIds) {
   ccStranger.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(ccStranger.connect("localhost", rpcPort, otherKey));
 
-  std::vector<uint64_t> ids;
+  std::vector<CesComputeClient::InstanceInfo> ids;
   CES_REQUIRE_OK(ccStranger.instances(ownerPath, ids));
   BOOST_REQUIRE_EQUAL(ids.size(), 2u);
-  std::set<uint64_t> got(ids.begin(), ids.end());
+  std::set<uint64_t> got;
+  for (auto& e : ids) got.insert(e.instanceId);
   BOOST_CHECK_EQUAL(got.count(a), 1u);
   BOOST_CHECK_EQUAL(got.count(b), 1u);
 
   // Empty path → empty list (no error).
-  std::vector<uint64_t> empty;
+  std::vector<CesComputeClient::InstanceInfo> empty;
   CES_REQUIRE_OK(ccStranger.instances(
     "/h/0123456789abcdef0123456789abcdef"
     "0123456789abcdef0123456789abcdef/nope.lua",
@@ -318,9 +319,39 @@ BOOST_AUTO_TEST_CASE(InstancesIsPublicAndEnumeratesIds) {
   ids.clear();
   CES_REQUIRE_OK(ccStranger.instances(ownerPath, ids));
   BOOST_REQUIRE_EQUAL(ids.size(), 1u);
-  BOOST_CHECK_EQUAL(ids[0], b);
+  BOOST_CHECK_EQUAL(ids[0].instanceId, b);
 
   CES_REQUIRE_OK(ccOwner.kill(b));
+  ccOwner.disconnect();
+  ccStranger.disconnect();
+}
+
+BOOST_AUTO_TEST_CASE(StatIsPublicAcrossSigners) {
+  // STAT is public: a signer who does NOT own the source file can still
+  // inspect a live instance (id, uptime, ports). This is the inspectability
+  // contract the web gateway relies on. (Ports are 0 here — the fixture
+  // configures no compute port range — but the record must come back OK.)
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 10'000'000));
+
+  CesComputeClient ccOwner;
+  ccOwner.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(ccOwner.connect("localhost", rpcPort, ownerKey));
+  uint64_t id = 0, startedAt = 0;
+  CES_REQUIRE_OK(ccOwner.launch(ownerPath, id, startedAt));
+  BOOST_REQUIRE(id != 0);
+
+  // A stranger (does not own ownerPath) stats it — must succeed.
+  CesComputeClient ccStranger;
+  ccStranger.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(ccStranger.connect("localhost", rpcPort, otherKey));
+
+  CesComputeClient::InstanceInfo info;
+  CES_REQUIRE_OK(ccStranger.stat(id, info));
+  BOOST_CHECK_EQUAL(info.instanceId, id);
+  BOOST_CHECK_EQUAL(info.sourceName, ownerPath);
+  BOOST_CHECK_EQUAL(info.startedAtUs, startedAt);
+
+  CES_REQUIRE_OK(ccOwner.kill(id));
   ccOwner.disconnect();
   ccStranger.disconnect();
 }
@@ -515,7 +546,7 @@ BOOST_AUTO_TEST_CASE(ComputeLaunchAcceptTimeoutIsClean) {
   CES_REQUIRE_OK(cc.list(insts));
   BOOST_CHECK_EQUAL(insts.size(), 0u);
 
-  std::vector<uint64_t> ids;
+  std::vector<CesComputeClient::InstanceInfo> ids;
   CES_REQUIRE_OK(cc.instances(ownerPath, ids));
   BOOST_CHECK_EQUAL(ids.size(), 0u);
 

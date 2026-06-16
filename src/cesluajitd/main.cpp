@@ -2853,6 +2853,10 @@ void push_instance_info(lua_State* L,
   lua_setfield(L, -2, "cpu_basis_points");
   lua_pushnumber(L, static_cast<lua_Number>(info.rssBytes));
   lua_setfield(L, -2, "rss_bytes");
+  lua_pushnumber(L, static_cast<lua_Number>(info.clientPort));
+  lua_setfield(L, -2, "client_port");
+  lua_pushnumber(L, static_cast<lua_Number>(info.rpcPort));
+  lua_setfield(L, -2, "rpc_port");
 }
 
 int lua_cc_launch(lua_State* L) {
@@ -2906,12 +2910,12 @@ int lua_cc_instances(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   size_t plen = 0; const char* path = luaL_checklstring(L, 2, &plen);
-  std::vector<uint64_t> ids;
-  uint8_t rc = e->cc->instances(std::string(path, plen), ids);
+  std::vector<ces::CesComputeClient::InstanceInfo> infos;
+  uint8_t rc = e->cc->instances(std::string(path, plen), infos);
   if (rc != ces::CES_OK) return client_push_err(L, rc);
   lua_newtable(L);
-  for (size_t i = 0; i < ids.size(); ++i) {
-    lua_pushnumber(L, static_cast<lua_Number>(ids[i]));
+  for (size_t i = 0; i < infos.size(); ++i) {
+    push_instance_info(L, infos[i]);
     lua_rawseti(L, -2, static_cast<int>(i + 1));
   }
   return 1;

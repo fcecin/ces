@@ -17,17 +17,27 @@
 //     resp: u64 instance_id, u64 started_at_us
 //   0x02 KILL    (owner): u64 instance_id
 //     resp: (empty)
-//   0x03 LIST    (any):   (no preamble beyond reqNonce)
+//   0x03 LIST    (any, scoped to signer's own): (no preamble beyond reqNonce)
 //     resp: u32 count, [u64 id, u16 path_len, path,
 //                       u64 started_at_us, u64 file_balance,
-//                       u32 cpu_bp, u64 rss_bytes]*
-//   0x05 INSTANCES (any): u16 path_len, path
-//     reply: u32 count, [u64 id]*count
-//   0x04 STAT    (owner): u8 kind (0 = path, 1 = id),
-//                         [u16 path_len, path | u64 instance_id]
-//     resp: u64 instance_id (0 = not running), u64 started_at_us,
-//           u64 file_balance, u32 cpu_bp, u64 rss_bytes,
+//                       u32 cpu_bp, u64 rss_bytes,
+//                       u16 client_port, u16 rpc_port]*
+//   0x04 STAT    (any): u64 instance_id
+//     resp: u64 instance_id, u64 started_at_us, u64 file_balance,
+//           u32 cpu_bp, u64 rss_bytes, u16 client_port, u16 rpc_port,
 //           u16 path_len, path
+//   0x05 INSTANCES (any): u16 path_len, path
+//     resp: u32 count, [u64 id, u64 started_at_us, u32 cpu_bp,
+//                       u64 rss_bytes, u16 client_port, u16 rpc_port]*
+//
+// Inspectability: STAT (by id) and INSTANCES (by source path) are public
+// to any signer and expose a live instance's leased ports, so anyone can
+// discover a running service and dial it — relayed via the server's own
+// rpc port (/ces/lua/1) or direct to the instance's own host port
+// (/ces/luarpc/1). A port reads 0 when the instance got no lease. Only
+// LAUNCH/KILL stay owner-gated (they mutate); LIST is scoped to the
+// signer's own instances. file_balance is funding info on a public
+// ledger (already readable via the file handler), so it rides along.
 //
 // The signed-request loop (verb read, envelope verify, server-signed
 // response) is the shared cesPlexServe engine in cesplex/mux.h.
@@ -1846,6 +1856,9 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
       // CPU basis points + RSS bytes from last supervisor sample.
       ces::Buffer::put<uint32_t>(resp, inst->cpuBasisPoints);
       ces::Buffer::put<uint64_t>(resp, inst->rssBytes);
+      // Leased ports (0 = none): outbound CES-client, inbound luarpc host.
+      ces::Buffer::put<uint16_t>(resp, inst->clientPort);
+      ces::Buffer::put<uint16_t>(resp, inst->rpcPort);
       count++;
     }
     // Patch count.
@@ -1864,8 +1877,11 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
 // ---------------------------------------------------------------------------
 
 void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  // Wire: [u64 instance_id]. ID is the only identity now — a path can
-  // refer to N instances, so name-keyed STAT is no longer well-defined.
+  // Wire: [u64 instance_id]. ID is the only identity — a path can refer
+  // to N instances, so name-keyed STAT is not well-defined (use INSTANCES).
+  // Public: any signer may inspect a live instance — its uptime, last
+  // cpu/rss sample, and leased ports — so a running service is discoverable
+  // and dialable by anyone. Only LAUNCH/KILL stay owner-gated.
   if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
   uint64_t instanceId = ces::Buffer::peek<uint64_t>(pre.data());
 
@@ -1875,18 +1891,12 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   }
   std::string name = it->second->sourceName;
 
-  // Owner check: signer must own the source file. Read the file
-  // sidecar (which also rolls rent). If file doesn't exist, that's
-  // FILE_NOT_FOUND — the instance will have been killed by the
-  // deletion callback anyway, but this is the authoritative answer.
+  // file_balance is best-effort: read the sidecar (which also rolls rent),
+  // but a missing source file (instance about to be reaped) is not fatal
+  // to inspection — report the live instance with balance 0.
   std::array<uint8_t, 32> ownerPk{};
   uint64_t fileBalance = 0;
-  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
-    sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
-  }
-  if (std::memcmp(ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
-    sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
-  }
+  fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance);
 
   const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
@@ -1906,6 +1916,9 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     ces::Buffer::put<uint64_t>(resp, fileBalance);
     ces::Buffer::put<uint32_t>(resp, inst.cpuBasisPoints);
     ces::Buffer::put<uint64_t>(resp, inst.rssBytes);
+    // Leased ports (0 = none): outbound CES-client, inbound luarpc host.
+    ces::Buffer::put<uint16_t>(resp, inst.clientPort);
+    ces::Buffer::put<uint16_t>(resp, inst.rpcPort);
     ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(name.size()));
     resp.insert(resp.end(),
                 reinterpret_cast<const uint8_t*>(name.data()),
@@ -1925,12 +1938,16 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 //
 // Wire in:    [u16 path_len][path]
-// Wire out:   [u32 count][u64 id]*count
+// Wire out:   [u32 count][u64 id, u64 started_at_us, u32 cpu_bp,
+//                         u64 rss_bytes, u16 client_port, u16 rpc_port]*
 //
 // No owner check, no file-existence check, no path validation beyond
 // the length cap. The path is just a key into gByName; absent → empty
 // list. Same per-op fee as STAT/LIST so signers can't free-flood the
-// lookup, but anyone with a credited account can ask.
+// lookup, but anyone with a credited account can ask. Each entry carries
+// the instance's leased ports so a single call discovers a service AND
+// where to dial it (the source path is the query key, so it isn't echoed
+// per entry).
 void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
                        ces::Bytes pre) {
   if (pre.size() < 2) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
@@ -1948,17 +1965,28 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     // Read-only: a duplicate just re-reads current state — correct, no skip.
     ces::Bytes resp;
+    uint32_t countOff = resp.size();
+    ces::Buffer::put<uint32_t>(resp, 0); // placeholder, patched below
+    uint32_t count = 0;
     auto it = gByName.find(name);
-    uint32_t count = (it == gByName.end())
-                       ? 0
-                       : static_cast<uint32_t>(it->second.size());
-    ces::Buffer::put<uint32_t>(resp, count);
     if (it != gByName.end()) {
       // std::set ⇒ ascending iteration; clients shouldn't depend on
       // the order. Two clients querying the same path back-to-back
       // see the same list as long as no LAUNCH/KILL hit in between.
-      for (uint64_t id : it->second) ces::Buffer::put<uint64_t>(resp, id);
+      for (uint64_t id : it->second) {
+        auto iit = gInstances.find(id);
+        if (iit == gInstances.end()) continue;  // index/registry skew
+        auto& inst = *iit->second;
+        ces::Buffer::put<uint64_t>(resp, inst.id);
+        ces::Buffer::put<uint64_t>(resp, inst.startedAtUs);
+        ces::Buffer::put<uint32_t>(resp, inst.cpuBasisPoints);
+        ces::Buffer::put<uint64_t>(resp, inst.rssBytes);
+        ces::Buffer::put<uint16_t>(resp, inst.clientPort);
+        ces::Buffer::put<uint16_t>(resp, inst.rpcPort);
+        count++;
+      }
     }
+    ces::Buffer::poke<uint32_t>(resp.data() + countOff, count);
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
