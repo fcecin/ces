@@ -32,16 +32,66 @@ constexpr uint16_t CESH_LOCAL_PORT = 0;
 // HELPER: Formatting (CLI-only)
 // =============================================================================
 
+// Silent/pipe mode (-q/--quiet): stdout carries DATA ONLY — raw bytes for
+// content fetches, JSON for structured results — with zero human chrome.
+// Human messages and errors go to stderr (errors always do, both modes).
+// The two human-output helpers below become no-ops in quiet mode, so the
+// per-command quiet branches own everything that reaches stdout.
+bool g_quiet = false;
+
 void print_header(const std::string& title) {
+  if (g_quiet) return;
   std::cout << "\n=== " << title << " ===\n";
 }
 
 void print_field(const std::string& key, const std::string& val) {
+  if (g_quiet) return;
   std::cout << std::left << std::setw(16) << (key + ":") << val << "\n";
 }
 
 void print_field(const std::string& key, uint64_t val) {
   print_field(key, std::to_string(val));
+}
+
+// Minimal JSON string escaper for --quiet structured output. cesh has no
+// JSON dependency and these objects are tiny, so we hand-roll.
+std::string jesc(const std::string& s) {
+  std::string o;
+  o.reserve(s.size() + 2);
+  for (unsigned char c : s) {
+    switch (c) {
+      case '"':  o += "\\\""; break;
+      case '\\': o += "\\\\"; break;
+      case '\n': o += "\\n";  break;
+      case '\r': o += "\\r";  break;
+      case '\t': o += "\\t";  break;
+      default:
+        if (c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof buf, "\\u%04x", c);
+          o += buf;
+        } else {
+          o += static_cast<char>(c);
+        }
+    }
+  }
+  return o;
+}
+
+// One compute instance as a JSON object (shared by compute ps/stat/instances
+// in --quiet mode).
+std::string instanceJson(const ces::CesComputeClient::InstanceInfo& e) {
+  std::string o = "{";
+  o += "\"instanceId\":"     + std::to_string(e.instanceId);
+  o += ",\"sourceName\":\""  + jesc(e.sourceName) + "\"";
+  o += ",\"startedAtUs\":"   + std::to_string(e.startedAtUs);
+  o += ",\"fileBalance\":"   + std::to_string(e.fileBalance);
+  o += ",\"cpuBasisPoints\":"+ std::to_string(e.cpuBasisPoints);
+  o += ",\"rssBytes\":"      + std::to_string(e.rssBytes);
+  o += ",\"clientPort\":"    + std::to_string(e.clientPort);
+  o += ",\"rpcPort\":"       + std::to_string(e.rpcPort);
+  o += "}";
+  return o;
 }
 
 // Log level parsing lives in ces/logutil.h (setupLogger).
@@ -118,6 +168,10 @@ int main(int argc, char* argv[]) {
   app.add_flag("--secp", opt_secp, "Use secp256k1 for key gen/import");
 
   app.add_flag("-c,--cache-only", cacheOnly, "Lightweight PoW engine (slow)");
+
+  app.add_flag("-q,--quiet", g_quiet,
+               "Silent/pipe mode: stdout is data only (raw bytes or JSON), "
+               "no human messages; errors still go to stderr");
 
   // ---- Subcommand: keys ----
 
@@ -415,8 +469,8 @@ int main(int argc, char* argv[]) {
 
   auto* cmd_dfg = cmd_dfile->add_subcommand("get", "Download a file");
   cmd_dfg->add_option("remote", df_remote_arg, "Remote path")->required();
-  cmd_dfg->add_option("local", df_local_arg, "Local destination path")
-    ->required();
+  cmd_dfg->add_option("local", df_local_arg,
+                      "Local destination path ('-' or omit = stdout)");
 
   auto* cmd_dfs = cmd_dfile->add_subcommand("stat", "Show file metadata");
   cmd_dfs->add_option("remote", df_remote_arg, "Remote path")->required();
@@ -741,14 +795,22 @@ int main(int argc, char* argv[]) {
       uint64_t xa = 0;
       uint32_t xt = 0;
       if (cc.queryAccount(Account::getMapKey(h), b, n, xd, xa, xt) == CES_OK) {
-        print_header("Account (Unsigned)");
-        print_field("Key", hex);
-        print_field("Balance", b);
-        print_field("Nonce", n);
-        print_field("LastXferDest", hashPrefixToString(xd));
-        print_field("LastXferAmount", xa);
-        print_field("LastXferTime", xt);
-        std::cout << std::endl;
+        if (g_quiet) {
+          std::cout << "{\"key\":\"" << jesc(hex) << "\",\"balance\":" << b
+                    << ",\"nonce\":" << n
+                    << ",\"lastXferDest\":\"" << jesc(hashPrefixToString(xd))
+                    << "\",\"lastXferAmount\":" << xa
+                    << ",\"lastXferTime\":" << xt << "}\n";
+        } else {
+          print_header("Account (Unsigned)");
+          print_field("Key", hex);
+          print_field("Balance", b);
+          print_field("Nonce", n);
+          print_field("LastXferDest", hashPrefixToString(xd));
+          print_field("LastXferAmount", xa);
+          print_field("LastXferTime", xt);
+          std::cout << std::endl;
+        }
       } else {
         std::cerr << "Query failed (check logs)\n";
         return 1;
@@ -766,19 +828,37 @@ int main(int argc, char* argv[]) {
     try {
       auto sess = makeSession();
       auto& cc = sess->client();
-      std::cout << "status=ok\n"
-                << "server_key=" << minx::hashToString(cc.getServerKey())
-                << "\n"
-                << "server_id=" << hashPrefixToString(cc.getServerId()) << "\n"
-                << "min_difficulty="
-                << static_cast<unsigned>(cc.getMinDifficulty()) << "\n"
-                << "min_secs_pow="
-                << static_cast<unsigned>(cc.getMinSecsPoW()) << "\n"
-                << "pending_pows=" << cc.getPendingPoWs() << "\n"
-                << "tps=" << cc.getTps() << "\n"
-                << "rpc_port=" << cc.getServerRpcPort() << "\n";
+      if (g_quiet) {
+        std::cout << "{\"status\":\"ok\""
+                  << ",\"serverPublicKey\":\""
+                  << minx::hashToString(cc.getServerKey())
+                  << "\",\"serverId\":\"" << hashPrefixToString(cc.getServerId())
+                  << "\",\"minDifficulty\":"
+                  << static_cast<unsigned>(cc.getMinDifficulty())
+                  << ",\"minSecsPoW\":"
+                  << static_cast<unsigned>(cc.getMinSecsPoW())
+                  << ",\"pendingPoWs\":" << cc.getPendingPoWs()
+                  << ",\"tps\":" << cc.getTps()
+                  << ",\"rpcPort\":" << cc.getServerRpcPort() << "}\n";
+      } else {
+        std::cout << "status=ok\n"
+                  << "server_key=" << minx::hashToString(cc.getServerKey())
+                  << "\n"
+                  << "server_id=" << hashPrefixToString(cc.getServerId()) << "\n"
+                  << "min_difficulty="
+                  << static_cast<unsigned>(cc.getMinDifficulty()) << "\n"
+                  << "min_secs_pow="
+                  << static_cast<unsigned>(cc.getMinSecsPoW()) << "\n"
+                  << "pending_pows=" << cc.getPendingPoWs() << "\n"
+                  << "tps=" << cc.getTps() << "\n"
+                  << "rpc_port=" << cc.getServerRpcPort() << "\n";
+      }
     } catch (std::exception& e) {
-      std::cout << "status=error\nerror=" << e.what() << "\n";
+      if (g_quiet)
+        std::cerr << "{\"status\":\"error\",\"error\":\"" << jesc(e.what())
+                  << "\"}\n";
+      else
+        std::cout << "status=error\nerror=" << e.what() << "\n";
       return 1;
     }
     return 0;
@@ -803,18 +883,34 @@ int main(int argc, char* argv[]) {
           std::cerr << "Asset not found.\n";
           return 1;
         }
-        std::string flagsStr;
-        if (isAssetPrivate(balance))   flagsStr += " private";
-        if (isAssetOwned(balance))     flagsStr += " asset-owned";
-        if (isAssetImmutable(balance)) flagsStr += " immutable";
-        print_header("Asset (Unsigned)");
-        print_field("Query ID", asset_id_arg);
-        print_field("Owner ID", hashPrefixToString(owner));
-        print_field("Balance", std::to_string(assetDays(balance)) + " days" + flagsStr);
-        print_field("Price", price == 0 ? std::string("not for sale")
-                                        : std::to_string(price) + " credits");
-        print_field("Content", contentToDisplayString(content));
-        std::cout << std::endl;
+        if (g_quiet) {
+          std::cout << "{\"queryId\":\"" << jesc(asset_id_arg)
+                    << "\",\"owner\":\"" << jesc(hashPrefixToString(owner))
+                    << "\",\"days\":" << assetDays(balance)
+                    << ",\"private\":"
+                    << (isAssetPrivate(balance) ? "true" : "false")
+                    << ",\"assetOwned\":"
+                    << (isAssetOwned(balance) ? "true" : "false")
+                    << ",\"immutable\":"
+                    << (isAssetImmutable(balance) ? "true" : "false")
+                    << ",\"price\":" << price
+                    << ",\"contentHex\":\"" << ces::bytesToHex(content)
+                    << "\"}\n";
+        } else {
+          std::string flagsStr;
+          if (isAssetPrivate(balance))   flagsStr += " private";
+          if (isAssetOwned(balance))     flagsStr += " asset-owned";
+          if (isAssetImmutable(balance)) flagsStr += " immutable";
+          print_header("Asset (Unsigned)");
+          print_field("Query ID", asset_id_arg);
+          print_field("Owner ID", hashPrefixToString(owner));
+          print_field("Balance",
+                      std::to_string(assetDays(balance)) + " days" + flagsStr);
+          print_field("Price", price == 0 ? std::string("not for sale")
+                                          : std::to_string(price) + " credits");
+          print_field("Content", contentToDisplayString(content));
+          std::cout << std::endl;
+        }
       } else {
         std::cerr << "Query Failed: " << errorString(rc) << "\n";
         return 1;
@@ -1609,6 +1705,15 @@ int main(int argc, char* argv[]) {
           offset += chunk.size();
         }
 
+        // No local path (or "-") → stream raw bytes to stdout (the data-pipe
+        // form). A real path → write the file + human summary.
+        if (df_local_arg.empty() || df_local_arg == "-") {
+          std::cout.write(reinterpret_cast<const char*>(all.data()),
+                          all.size());
+          std::cout.flush();
+          return 0;
+        }
+
         std::ofstream out(df_local_arg, std::ios::binary | std::ios::trunc);
         if (!out) {
           std::cerr << "Error: cannot open local destination: "
@@ -1635,6 +1740,16 @@ int main(int argc, char* argv[]) {
         if (srcRc != CES_OK) {
           std::cerr << "STAT Failed: " << errorString(srcRc) << "\n";
           return 1;
+        }
+        if (g_quiet) {
+          std::cout << "{\"remote\":\"" << jesc(remote)
+                    << "\",\"owner\":\"" << minx::hashToString(info.ownerPubkey)
+                    << "\",\"size\":" << info.size
+                    << ",\"balance\":" << info.fileBalance
+                    << ",\"pricePerKb\":" << info.pricePerKb
+                    << ",\"createdUs\":" << info.createdUs
+                    << ",\"modifiedUs\":" << info.modifiedUs << "}\n";
+          return 0;
         }
         print_header("File Info");
         print_field("Remote", remote);
@@ -1772,6 +1887,11 @@ int main(int argc, char* argv[]) {
           std::cerr << "LAUNCH Failed: " << errorString(lrc) << "\n";
           return 1;
         }
+        if (g_quiet) {
+          std::cout << "{\"instanceId\":" << id
+                    << ",\"startedAtUs\":" << startedAt << "}\n";
+          return 0;
+        }
         print_header("Compute Launched");
         print_field("Remote", remote);
         print_field("Instance", id);
@@ -1786,6 +1906,11 @@ int main(int argc, char* argv[]) {
           std::cerr << "KILL Failed: " << errorString(krc) << "\n";
           return 1;
         }
+        if (g_quiet) {
+          std::cout << "{\"instanceId\":" << compute_id_arg
+                    << ",\"killed\":true}\n";
+          return 0;
+        }
         print_header("Compute Killed");
         print_field("Instance", compute_id_arg);
         std::cout << std::endl;
@@ -1798,6 +1923,13 @@ int main(int argc, char* argv[]) {
         if (prc != CES_OK) {
           std::cerr << "LIST Failed: " << errorString(prc) << "\n";
           return 1;
+        }
+        if (g_quiet) {
+          std::cout << "[";
+          for (size_t i = 0; i < list.size(); ++i)
+            std::cout << (i ? "," : "") << instanceJson(list[i]);
+          std::cout << "]\n";
+          return 0;
         }
         print_header("Compute Instances");
         if (list.empty()) {
@@ -1826,6 +1958,10 @@ int main(int argc, char* argv[]) {
           std::cerr << "STAT Failed: " << errorString(src) << "\n";
           return 1;
         }
+        if (g_quiet) {
+          std::cout << instanceJson(info) << "\n";
+          return 0;
+        }
         print_header("Compute Status");
         print_field("Instance",    info.instanceId);
         print_field("Remote",      info.sourceName);
@@ -1847,8 +1983,16 @@ int main(int argc, char* argv[]) {
           std::cerr << "INSTANCES Failed: " << errorString(src) << "\n";
           return 1;
         }
-        // One id per line on stdout, no header — pipeable into
-        // `head -1 | xargs cesh dial`. (Ports are in `compute stat <id>`.)
+        if (g_quiet) {
+          // JSON array with ports — the form the web gateway consumes.
+          std::cout << "[";
+          for (size_t i = 0; i < insts.size(); ++i)
+            std::cout << (i ? "," : "") << instanceJson(insts[i]);
+          std::cout << "]\n";
+          return 0;
+        }
+        // Human mode: one id per line, no header — pipeable into
+        // `head -1 | xargs cesh dial`. (Ports are in the -q JSON or stat.)
         for (auto& e : insts) std::cout << e.instanceId << "\n";
         return 0;
       }
@@ -1983,10 +2127,18 @@ int main(int argc, char* argv[]) {
       std::vector<ServerInfoEntry> entries;
       uint8_t rc = cc.queryServerInfo(entries);
       if (rc == CES_OK) {
-        print_header("Server Info");
-        for (const auto& e : entries)
-          print_field(e.key, e.value);
-        std::cout << std::endl;
+        if (g_quiet) {
+          std::cout << "{";
+          for (size_t i = 0; i < entries.size(); ++i)
+            std::cout << (i ? "," : "") << "\"" << jesc(entries[i].key)
+                      << "\":\"" << jesc(entries[i].value) << "\"";
+          std::cout << "}\n";
+        } else {
+          print_header("Server Info");
+          for (const auto& e : entries)
+            print_field(e.key, e.value);
+          std::cout << std::endl;
+        }
       } else {
         std::cerr << "Server Info Failed: " << errorString(rc) << "\n";
         return 1;

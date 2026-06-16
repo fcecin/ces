@@ -288,6 +288,35 @@ BOOST_AUTO_TEST_CASE(QueryNonexistentAccount) {
   assertContains(r.out, "0");
 }
 
+// --- Silent/pipe mode (-q): stdout is data only (JSON), no human chrome. ---
+
+BOOST_AUTO_TEST_CASE(QuietQueryIsJsonOnly) {
+  auto r = run(cmd("-q query " + fundedPubHex()));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "\"balance\":10000000000");
+  assertContains(r.out, "\"nonce\":");
+  // No human chrome on stdout.
+  assertNotContains(r.out, "===", "quiet stdout must carry no header chrome");
+  assertNotContains(r.out, "Account (Unsigned)", "no human title in quiet mode");
+}
+
+BOOST_AUTO_TEST_CASE(QuietServerInfoAdvertisesRpcPort) {
+  auto r = run(cmd("-q server-info"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  // The omission we just fixed: rpcPort is in the paid KV, and as JSON here.
+  assertContains(r.out, "\"rpcPort\":");
+  assertContains(r.out, "\"serverPublicKey\":");
+  assertNotContains(r.out, "===", "quiet stdout must carry no header chrome");
+}
+
+BOOST_AUTO_TEST_CASE(QuietPingHasRpcPort) {
+  auto r = run(cmd("-q ping"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "\"status\":\"ok\"");
+  assertContains(r.out, "\"rpcPort\":");
+  assertNotContains(r.out, "status=ok", "quiet ping must be JSON, not key=value");
+}
+
 BOOST_AUTO_TEST_CASE(QueryViaWalletIndex) {
   // Query @0 (the funded key) via wallet index
   auto r = run(cmd("query @0"));
@@ -1468,6 +1497,96 @@ BOOST_AUTO_TEST_CASE(CescoLiveSnapshot) {
 
   boost::system::error_code ec2;
   fs::remove_all(tempDir, ec2);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ===========================================================================
+// L2 file data-pipe (CesPlex + file store enabled): the file-scope gateway
+// path — `file get` streams raw bytes to stdout, `-q file stat` is JSON only.
+// ===========================================================================
+
+struct RpcFileE2EFixture {
+  std::unique_ptr<CesServer> server;
+  fs::path tempDir;
+  uint16_t serverPort = 0;
+  uint16_t rpcPort = 0;
+  std::string ceshBin;
+  KeyPair fundedKey;
+  std::string fundedWalletHex;
+
+  RpcFileE2EFixture() {
+    blog::init();
+    blog::set_level(blog::fatal);
+    tempDir = makeUniqueTempDir("cesh_file_e2e");
+    minx::Hash serverPriv;
+    serverPriv.fill(0xEE);
+    CesConfig cfg = makeTestConfig(tempDir, serverPriv,
+                                   std::numeric_limits<uint64_t>::max());
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
+    cfg.cesplexMounts = {{"/ces/file/1", "builtin:file"}};
+    cfg.cesFileStoreMaxBytes = 16ull * 1024 * 1024;
+    cfg.feeFileRent = 1;
+    server = std::make_unique<CesServer>(cfg);
+    serverPort = server->start(0);
+    BOOST_REQUIRE_MESSAGE(serverPort > 0, "server bind failed");
+    rpcPort = server->_rpcBoundPort();
+    BOOST_REQUIRE_MESSAGE(rpcPort > 0, "rpc bind failed");
+    ceshBin = findCeshBinary();
+    fundedWalletHex = "00" + fundedKey.getPrivateKeyHexStr();
+    server->_brr(fundedKey.getPublicKeyAsHash(), 10'000'000'000);
+    wait_net();
+  }
+
+  ~RpcFileE2EFixture() {
+    if (server) server->stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    boost::system::error_code ec;
+    fs::remove_all(tempDir, ec);
+  }
+
+  std::string cmd(const std::string& args) const {
+    return "cd " + tempDir.string() + " && " +
+           ceshCmd(serverPort, fundedWalletHex, ceshBin) +
+           " --rpc-port " + std::to_string(rpcPort) + " " + args;
+  }
+};
+
+BOOST_FIXTURE_TEST_SUITE(CeshFilePipeE2E, RpcFileE2EFixture)
+
+BOOST_AUTO_TEST_CASE(FileGetStreamsRawBytesToStdout) {
+  const std::string body = "<html><body>hi ces</body></html>";
+  {
+    std::ofstream f((tempDir / "src.html").string(), std::ios::binary);
+    f << body;
+  }
+  auto put = run(cmd("file put src.html /p/test.html --deposit 1000000"));
+  BOOST_REQUIRE_MESSAGE(put.exitCode == 0, "put failed: " << put.out);
+
+  // No local path → raw bytes to stdout, and ONLY those bytes (no chrome).
+  auto get = run(cmd("file get /p/test.html"));
+  BOOST_CHECK_EQUAL(get.exitCode, 0);
+  BOOST_CHECK_EQUAL(get.out.size(), body.size());
+  assertContains(get.out, body);
+  assertNotContains(get.out, "===", "file get to stdout must be data-only");
+  assertNotContains(get.out, "Downloaded", "no human chrome on stdout");
+}
+
+BOOST_AUTO_TEST_CASE(FileStatQuietIsJsonOnly) {
+  const std::string body = "abcdef";
+  {
+    std::ofstream f((tempDir / "s.bin").string(), std::ios::binary);
+    f << body;
+  }
+  BOOST_REQUIRE_EQUAL(
+    run(cmd("file put s.bin /p/s.bin --deposit 1000000")).exitCode, 0);
+
+  auto st = run(cmd("-q file stat /p/s.bin"));
+  BOOST_CHECK_EQUAL(st.exitCode, 0);
+  assertContains(st.out, "\"size\":6");
+  assertContains(st.out, "\"pricePerKb\":");
+  assertNotContains(st.out, "===", "quiet stat must be JSON only");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
