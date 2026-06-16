@@ -42,6 +42,7 @@ constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
 constexpr uint64_t DEFAULT_FLUSH_VALUE     = 0;
 constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB     = 100;
 constexpr uint64_t DEFAULT_PEER_TARGET         = 0;
+constexpr uint64_t DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS = 0;
 
 void dumpKeyPair(const KeyPair& keyPair) {
   std::cout << "Private Key: " << keyPair.getPrivateKeyHexStr() << std::endl;
@@ -119,6 +120,11 @@ max_log_size_gb = )" << DEFAULT_MAX_LOG_SIZE_GB << R"(
 
 # Peering: target credit balance to maintain on each peer server
 peer_target = )" << DEFAULT_PEER_TARGET << R"(
+
+# Inbound PoW reciprocation (basis points): outbound PoW we mine per unit of
+# inbound PoW a peer mines on us. 0 = off (never mine on inbound-only peers).
+# 10000 = 1:1, 20000 = 2x, 5000 = half. Outbound peers ignore this.
+peer_pow_inbound_reciprocation_bps = )" << DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS << R"(
 
 # Async settlement max retries per operation (1 = no retries, for testing)
 settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
@@ -309,6 +315,7 @@ int main(int argc, char* argv[]) {
   std::string optConfigFile;
   std::string optServerName;
   uint64_t optPeerTarget = 0;
+  uint64_t optPeerPowInboundReciprocationBps = 0;
   int optPeerMinerInterval = 60;
   int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
   std::string optAdminSocket;
@@ -423,6 +430,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--peertarget", optPeerTarget,
       "Credit target on each peer server")
       ->default_val(std::to_string(DEFAULT_PEER_TARGET));
+    app.add_option("--peerpowinboundreciprocationbps",
+      optPeerPowInboundReciprocationBps,
+      "Inbound PoW reciprocation, basis points (0=off, 10000=1:1)")
+      ->default_val(std::to_string(DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS));
     app.add_option("--peerminerinterval", optPeerMinerInterval,
       "Seconds between peer miner cycles (default 60; lower for local/dev)")
       ->default_val("60");
@@ -618,6 +629,9 @@ int main(int argc, char* argv[]) {
       applyIfDefault("max_log_size_gb", optMaxLogSizeGB, "--maxlogsize");
       applyIfDefault("server_name", optServerName, "--servername");
       applyIfDefault("peer_target", optPeerTarget, "--peertarget");
+      applyIfDefault("peer_pow_inbound_reciprocation_bps",
+                     optPeerPowInboundReciprocationBps,
+                     "--peerpowinboundreciprocationbps");
       applyIfDefault("peer_miner_interval", optPeerMinerInterval,
                      "--peerminerinterval");
       applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
@@ -824,6 +838,7 @@ int main(int argc, char* argv[]) {
     config.serverName = s;
   }
   config.peerTarget = optPeerTarget;
+  config.peerPowInboundReciprocationBps = optPeerPowInboundReciprocationBps;
   config.peerMinerIntervalSecs = optPeerMinerInterval;
   config.settlementMaxRetries = optSettlementMaxRetries;
   config.adminSocket = optAdminSocket;
@@ -916,6 +931,7 @@ int main(int argc, char* argv[]) {
           << VAR(config.minAsset) << VAR(config.maxAsset)
           << VAR(config.flushValue) << VAR(config.maxLogBytes)
           << VAR(config.serverName) << VAR(config.peerTarget)
+          << VAR(config.peerPowInboundReciprocationBps)
           << VAR(config.settlementMaxRetries)
           << VAR(config.rpcPort)
           << VAR(config.cesFileStoreMaxBytes)

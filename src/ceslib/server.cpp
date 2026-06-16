@@ -5296,10 +5296,31 @@ void CesServer::peerMinerLoop() {
       });
     if (candidates.size() > MAX_PERSISTED_PEERS) candidates.resize(MAX_PERSISTED_PEERS);
 
-    // Find the best candidate: lowest ourBalanceThere below target
-    // among reachable peers (or untested peers for first check)
+    // Two disjoint mining modes, selected by peer.outbound:
+    //   outbound (trusted): maintain a CREDIT LEVEL — target = peerTarget,
+    //     progress = our queried reserve there (ourBalanceThere).
+    //   inbound (untrusted): pure PoW reciprocation — target = H_in * bps /
+    //     10000, progress = our self-counted lifetime PoW on them
+    //     (totalOutboundPoW). Never trusts a remote balance reading. bps =
+    //     peerPowInboundReciprocationBps (0 = off); for bps <= 10000 our total
+    //     mined stays <= their proven work, for any number of hosts.
+    const uint64_t inboundBps = cfg_.peerPowInboundReciprocationBps;
+    auto mineTarget = [&](const PeerEntry& p) -> int64_t {
+      if (p.outbound) return static_cast<int64_t>(peerTarget_.load());
+      if (inboundBps == 0) return 0;
+      // H_in * bps / 10000, split so it stays within uint64 for realistic H_in.
+      const uint64_t hin = p.totalInboundPoW;
+      return static_cast<int64_t>((hin / 10000) * inboundBps
+                                  + (hin % 10000) * inboundBps / 10000);
+    };
+    auto mineProgress = [](const PeerEntry& p) -> int64_t {
+      return p.outbound ? p.ourBalanceThere
+                        : static_cast<int64_t>(p.totalOutboundPoW);
+    };
+
+    // Pick the neediest reachable peer: largest positive gap (target - progress).
     int bestIdx = -1;
-    int64_t bestBalance = static_cast<int64_t>(peerTarget_.load());
+    int64_t bestGap = 0;
 
     for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
       auto& peer = candidates[i];
@@ -5374,14 +5395,11 @@ void CesServer::peerMinerLoop() {
         continue;
       }
 
-      // Compute target for this peer
-      int64_t pt = static_cast<int64_t>(
-        peer.outbound ? peerTarget_.load()
-                      : std::min(peerTarget_.load(), peer.totalInboundPoW));
-
-      if (peer.ourBalanceThere >= 0 && peer.ourBalanceThere < pt &&
-          peer.ourBalanceThere < bestBalance) {
-        bestBalance = peer.ourBalanceThere;
+      // Outbound needs a valid reserve reading; inbound is self-measured.
+      if (peer.outbound && peer.ourBalanceThere < 0) continue;
+      int64_t gap = mineTarget(peer) - mineProgress(peer);
+      if (gap > bestGap) {
+        bestGap = gap;
         bestIdx = i;
       }
     }
@@ -5389,10 +5407,8 @@ void CesServer::peerMinerLoop() {
     if (bestIdx >= 0) {
       auto& peer = candidates[bestIdx];
       LOGDEBUG << "peer miner: mining on " << peer.declaredAddress
-               << " (bal=" << peer.ourBalanceThere
-               << " target=" << (peer.outbound ? peerTarget_.load()
-                                               : std::min(peerTarget_.load(), peer.totalInboundPoW))
-               << ")";
+               << " (" << (peer.outbound ? "outbound R=" : "inbound Hout=")
+               << mineProgress(peer) << " target=" << mineTarget(peer) << ")";
 
       try {
         auto ep = Resolver::resolveUdp(peer.declaredAddress);
@@ -5436,11 +5452,7 @@ void CesServer::peerMinerLoop() {
             // work stays a small multiple of what this peer expects — the cycle
             // returns quickly and the miner round-robins quotas across all peers
             // instead of locking for hours on one oversized solution.
-            int64_t pt = peer.outbound
-                ? static_cast<int64_t>(peerTarget_.load())
-                : static_cast<int64_t>(
-                      std::min(peerTarget_.load(), peer.totalInboundPoW));
-            int64_t gap = pt - peer.ourBalanceThere;
+            int64_t gap = mineTarget(peer) - mineProgress(peer);
             uint8_t mineCap = peerDiff + PEER_MINER_MAX_DIFF_ABOVE;
             uint8_t mineDiff = peerDiff;
             while (mineDiff < mineCap &&

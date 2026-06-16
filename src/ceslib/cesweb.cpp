@@ -1611,7 +1611,7 @@ async function loadPeers(){
   };
   $('#peerSummary').innerHTML=`<span class="feat on">${cOut} outbound</span><span class="feat ${cIn?'on':''}">${cIn} inbound</span><span class="feat ${cRch?'on':''}">${cRch} reachable</span>`;
   const dir=p=>{let b='';if(p.outbound)b+='<span class="badge out">OUT</span> ';if(p.inbound)b+='<span class="badge in">IN</span>';return b||'<span class="muted">—</span>';};
-  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th>their PoW (cr)</th><th>last check</th><th>fails</th><th></th></tr>`+
+  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th></th></tr>`+
     (d.peers.length?d.peers.map(p=>`<tr>
       <td>${dir(p)}</td>
       <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${esc(p.key)}','${esc(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
@@ -1619,11 +1619,12 @@ async function loadPeers(){
       <td>${reachCell(p)}</td>
       <td class="num">${p.ourBalanceThere<0?'<span class="muted">?</span>':fmtCredits(p.ourBalanceThere)}</td>
       <td class="num">${fmtCredits(p.theirBalanceHere)}</td>
+      <td class="num">${fmtCredits(p.totalOutboundPoW)}</td>
       <td class="num">${fmtCredits(p.totalInboundPoW)}</td>
       <td class="muted">${ago(p.lastCheckTime)}</td>
       <td class="num">${p.pingFailures||0}</td>
       <td><button class="danger sm" onclick="rmPeer('${esc(p.key)}')">remove</button></td></tr>`).join('')
-     :`<tr><td colspan="10" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
+     :`<tr><td colspan="11" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
 }
 async function setTarget(){
   const credits=parseFloat($('#peerTarget').value||'0');

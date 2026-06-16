@@ -95,6 +95,9 @@ struct CesConfig {
     std::string address;   // host:port
   };
   uint64_t peerTarget = 0;       // credit target on each peer (0 = no peering)
+  // Inbound PoW reciprocation, basis points: outbound PoW we mine per inbound
+  // PoW received. 0 = off. 10000 = 1:1. Outbound peers ignore it (use peerTarget).
+  uint64_t peerPowInboundReciprocationBps = 0;
   int peerMinerIntervalSecs = 60;   // seconds between miner cycles (lower for testing)
   std::vector<PeerConfig> peers;
   int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
