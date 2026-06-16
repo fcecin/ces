@@ -110,7 +110,7 @@ struct LuaRpcFixture {
     CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
     uint64_t fb = 0, cost = 0;
     CES_REQUIRE_OK(fc.create(path, src.size(), 0, 10'000'000'000,
-                             "text/x-lua", fb, cost));
+                             fb, cost));
     ces::Bytes content(src.begin(), src.end());
     CES_REQUIRE_OK(fc.write(path, 0, content, fb));
     fc.disconnect();
@@ -226,11 +226,11 @@ BOOST_FIXTURE_TEST_CASE(ProgramFileClient, LuaRpcFixture) {
     "local fc = ces.file_client('127.0.0.1:" + rpc + "', '"
       + luaBytes(serverPk.data(), 32) + "')\n"
     "if not fc then ces.transfer(B, 2); return end\n"
-    "if not fc:create('/p/cov', 5, 0, 100000000, 'text/plain') then ces.transfer(B, 3); return end\n"
+    "if not fc:create('/p/cov', 5, 0, 100000000) then ces.transfer(B, 3); return end\n"
     "if not fc:write('/p/cov', 0, 'hello') then ces.transfer(B, 4); return end\n"
     "if fc:read('/p/cov', 0, 5) ~= 'hello' then ces.transfer(B, 5); return end\n"
     "local st = fc:stat('/p/cov')\n"
-    "if not (st and st.size == 5 and st.content_type == 'text/plain') then ces.transfer(B, 6); return end\n"
+    "if not (st and st.size == 5) then ces.transfer(B, 6); return end\n"
     "local ab, ns = fc:append('/p/cov', 'XYZ')\n"
     "if not (ab and ns == 8) then ces.transfer(B, 7); return end\n"
     "if fc:read('/p/cov', 0, 8) ~= 'helloXYZ' then ces.transfer(B, 8); return end\n"

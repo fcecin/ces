@@ -180,6 +180,14 @@ public:
                      AssetData& outContent, uint16_t& outBalance,
                      uint32_t& outPrice);
 
+  /**
+   * Query a peer-table slot (Unsigned/Public) for discovery.
+   * @return CES_OK (outFound says whether the slot held a peer) or
+   *   CES_ERROR_TIMEOUT.
+   */
+  uint8_t queryPeerInfo(uint16_t index, uint16_t& outCount, bool& outFound,
+                    Hash& outPubkey, std::string& outAddress);
+
 
   /**
    * Query extended server info (Signed/Paid).
@@ -373,6 +381,13 @@ private:
   uint32_t assetUnsignedQueryPrice_ = 0;
   uint8_t assetUnsignedQueryResultCode_ = 0;
   std::atomic<uint64_t> assetUnsignedQueryGen_ = 0;
+
+  uint16_t peerQueryIndex_ = 0;
+  uint16_t peerQueryCount_ = 0;
+  uint8_t peerQueryFound_ = 0;
+  Hash peerQueryPubkey_{};
+  PeerAddr peerQueryAddress_{};
+  std::atomic<uint64_t> peerQueryGen_ = 0;
 
 
   HashPrefix serverInfoExtOriginId_;

@@ -792,6 +792,23 @@ struct CesUnsignedQueryAssetResult {
   CES_INJECT_UNSIGNED_METHODS(CES_UNSIGNED_QUERY_ASSET_RESULT)
 };
 
+// --- CES_QUERY_PEER_INFO (Unsigned/Public): peer-table slot lookup for discovery ---
+#define CES_UNSIGNED_QUERY_PEER_INFO_FIELDS(X) X(uint16_t, index)
+struct CesUnsignedQueryPeerInfo {
+  CES_DECLARE_FIELDS(CES_UNSIGNED_QUERY_PEER_INFO_FIELDS)
+  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_UNSIGNED_QUERY_PEER_INFO_FIELDS)
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_PEER_INFO)
+};
+
+#define CES_UNSIGNED_QUERY_PEER_INFO_RESULT_FIELDS(X)                               \
+  X(uint16_t, index) X(uint16_t, peerCount) X(uint8_t, found)                  \
+  X(Hash, pubkey) X(PeerAddr, address)
+struct CesUnsignedQueryPeerInfoResult {
+  CES_DECLARE_FIELDS(CES_UNSIGNED_QUERY_PEER_INFO_RESULT_FIELDS)
+  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_UNSIGNED_QUERY_PEER_INFO_RESULT_FIELDS)
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_PEER_INFO_RESULT)
+};
+
 // --- CES_QUERY_SERVER_INFO (Signed, self-describing KV response) ---
 #define CES_QUERY_SERVER_INFO_FIELDS(X)                                        \
   X(Hash, originId) X(HashPrefix, serverId) X(uint32_t, reqNonce)

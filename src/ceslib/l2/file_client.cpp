@@ -77,15 +77,12 @@ void CesFileClient::setServerPubkey(const minx::Hash& pk) {
 uint8_t CesFileClient::create(
     const std::string& name,
     uint64_t size, uint64_t pricePerKb, uint64_t initialDeposit,
-    const std::string& contentType,
     uint64_t& outFileBalance, uint64_t& outCostDebited) {
   ces::Bytes pre;
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
   ces::Buffer::put<uint64_t>(pre, size);
   ces::Buffer::put<uint64_t>(pre, pricePerKb);
   ces::Buffer::put<uint64_t>(pre, initialDeposit);
-  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(contentType.size()));
-  pre.insert(pre.end(), contentType.begin(), contentType.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
   auto env = impl_->chan->buildEnvelope(kVerbCreate, pre);
@@ -160,22 +157,14 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
   auto env = impl_->chan->buildEnvelope(kVerbStat, pre);
 
   // STAT fixed preamble: owner_pubkey + file_balance + price_per_kb +
-  // size + content_type_len; the variable hook pulls content_type + the
-  // two timestamps.
+  // size; the variable hook pulls the two timestamps.
   constexpr size_t kStatFixedPre =
-      ces::KEY_SIZE + sizeof(uint64_t) * 3 + sizeof(uint16_t);
+      ces::KEY_SIZE + sizeof(uint64_t) * 3;
   ces::Bytes resp, body;
   uint8_t rc = impl_->chan->driveVerb(
     kVerbStat, env,
     /*fixedPre=*/kStatFixedPre,
     [this](ces::Bytes& p) -> bool {
-      uint16_t ctLen = ces::Buffer::peek<uint16_t>(
-          p.data() + (kStatFixedPre - sizeof(uint16_t)));
-      if (ctLen > 0) {
-        ces::Bytes ct;
-        if (!impl_->chan->readExact(ct, ctLen)) return false;
-        p.insert(p.end(), ct.begin(), ct.end());
-      }
       ces::Bytes ts;
       if (!impl_->chan->readExact(ts, 16)) return false;
       p.insert(p.end(), ts.begin(), ts.end());
@@ -190,8 +179,6 @@ uint8_t CesFileClient::stat(const std::string& name, StatInfo& outInfo) {
     outInfo.fileBalance = buf.get<uint64_t>();
     outInfo.pricePerKb = buf.get<uint64_t>();
     outInfo.size = buf.get<uint64_t>();
-    uint16_t ctLen = buf.get<uint16_t>();
-    outInfo.contentType = buf.getBytes<std::string>(ctLen);
     outInfo.createdUs = buf.get<uint64_t>();
     outInfo.modifiedUs = buf.get<uint64_t>();
   } catch (const std::out_of_range&) {

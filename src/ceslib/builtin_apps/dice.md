@@ -48,8 +48,8 @@ cp src/ceslib/builtin_apps/dice.lua <data_dir>/cesfilestore/s/dice.lua
 `<storeDir>` is `file_store_dir` if set, otherwise
 `<data_dir>/cesfilestore`. At boot the file handler walks `s/`,
 sees an /s/dice.lua content file with no sidecar, and auto-generates
-one (owner = server pubkey, file_balance = 0, content_type inferred
-from the .lua extension). Then the autolaunch path picks it up.
+one (owner = server pubkey, file_balance = 0). Then the autolaunch
+path picks it up.
 Look for these lines in the log:
 
 ```

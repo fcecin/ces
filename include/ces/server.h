@@ -95,7 +95,6 @@ struct CesConfig {
     std::string address;   // host:port
   };
   uint64_t peerTarget = 0;       // credit target on each peer (0 = no peering)
-  bool peerMiningFullDataset = true; // false = cache-only (for testing)
   int peerMinerIntervalSecs = 60;   // seconds between miner cycles (lower for testing)
   std::vector<PeerConfig> peers;
   int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
@@ -115,6 +114,14 @@ struct CesConfig {
 
   // Cesco admin console (Unix domain socket). Empty = disabled.
   std::string adminSocket;
+
+  // Web dashboard — an HTTP admin UI embedded in the server, bound to
+  // loopback only. There is NO authentication: reach it by SSH-tunneling
+  // to the host. 0 = disabled (default). The bind address is loopback by
+  // design (127.0.0.1); an operator who fronts it with their own auth
+  // proxy can repoint it, and gets a warning if it isn't a loopback IP.
+  uint16_t webPort = 0;
+  std::string webBind = "127.0.0.1";
 
   // Dedicated MINX/RUDP port for the SYS_RPC syscall. This is a SECOND
   // Minx instance bound to a separate UDP port, held
@@ -558,6 +565,11 @@ public:
 
   void _brr(const minx::Hash& accountKey, int64_t amount);
   void _burn(const minx::Hash& accountKey, int64_t amount);
+  // Operator wallet send: transfer `amount` from the server's own (bottomless)
+  // account to `destKey`, creating dest if missing. Debits the server exactly
+  // and credits dest — net totalCredits unchanged. Returns false if the server
+  // balance can't cover it (a guard against driving its account negative).
+  bool _walletSend(const minx::Hash& destKey, uint64_t amount);
   void _save();
 
   // Credits in circulation: the raw account tally minus the server's own
@@ -609,6 +621,181 @@ public:
   // command and by tests. Returns nullptr when the rpc port is
   // disabled (no rpcRudp_, no ChannelMeter).
   ChannelMeter* _channelMeter() { return channelMeter_.get(); }
+
+  // ---------------------------------------------------------------------------
+  // Dashboard / admin surface (web dashboard, cesco)
+  // ---------------------------------------------------------------------------
+  // Read-only, lock-free getters (atomics / set-once boot state).
+  uint16_t _boundPort() const { return boundPort_; }
+  uint16_t getTps() const { return tpsCurrent_.load(); }
+
+  // Ledger-derived stats. The account/asset stores are logicStrand-only,
+  // so these hop onto the strand and block the caller on a future. The
+  // caller MUST NOT be the logic strand (the web/cesco threads aren't).
+  struct AdminStats {
+    int64_t  circulating = 0;  // credits in circulation (server-self excluded)
+    uint64_t accounts = 0;
+    uint64_t assets = 0;
+    uint64_t txCount = 0;
+  };
+  AdminStats _adminStats();
+
+  // Read-only account lookup (strand-hopped). `exists` distinguishes a
+  // missing account from a zero-balance one.
+  struct AdminAccount {
+    bool exists = false;
+    // The 8-byte map-key prefix is occupied, but by a DIFFERENT full key (the
+    // stored 24-byte keyTail doesn't match the queried one) — a prefix
+    // collision. The queried account does NOT exist; creating it would clash.
+    bool prefixTaken = false;
+    int64_t balance = 0;
+    uint32_t nonce = 0;
+    HashPrefix lastXferDest{};
+    uint64_t lastXferAmount = 0;
+    uint32_t lastXferTime = 0;
+  };
+  AdminAccount _adminQueryAccount(const minx::Hash& accountKey);
+
+  // Read-only asset lookup (strand-hopped). Returns the raw 16-bit balance
+  // word (days + flag bits); the dashboard masks/labels it.
+  struct AdminAsset {
+    bool exists = false;
+    HashPrefix owner{};
+    uint16_t balance = 0;
+    uint32_t price = 0;
+    AssetData content{};
+  };
+  AdminAsset _adminQueryAsset(const minx::Hash& assetId);
+
+  // L2 file STAT for the dashboard's file lookup. Public/unsigned (no signer).
+  // `enabled` is false when the file feature is off; `found` false when the
+  // path has no file. Rolls rent forward like a real STAT (a rent-dead file
+  // reports not-found).
+  struct FileStat {
+    bool enabled = false;
+    bool found = false;
+    std::array<uint8_t, 32> ownerPubkey{};
+    uint64_t fileBalance = 0;
+    uint64_t size = 0;
+    uint64_t pricePerKb = 0;
+    uint64_t createdUs = 0;
+    uint64_t modifiedUs = 0;
+  };
+  FileStat _fileStat(const std::string& path);
+
+  // Peer table, flattened for display. `inbound` is derived (the peer has
+  // submitted PoW to us); `outbound` means we mine/settle to them.
+  struct PeerInfo {
+    minx::Hash ckey{};
+    std::string declaredAddress;
+    std::string resolvedIP;
+    bool outbound = false;
+    bool inbound = false;
+    bool reachable = false;
+    bool verified = false;
+    int64_t ourBalanceThere = -1;
+    uint64_t totalInboundPoW = 0;
+    uint64_t totalOutboundPoW = 0;
+    uint64_t lastInboundTime = 0;
+    uint64_t lastCheckTime = 0;
+    uint32_t pingFailures = 0;
+  };
+  std::vector<PeerInfo> _peerSnapshot();
+  // Vostro balances: for each peer pubkey, the balance of THAT peer's account on
+  // THIS server (what we owe them) — the other half of the nostro/vostro pair
+  // (PeerInfo.ourBalanceThere is our reserve on them, what they owe us). Lives in
+  // the ledger, not the peer table, so it's looked up on logicStrand_. Aligned
+  // with `keys`; a peer with no local account reads 0.
+  std::vector<int64_t> _peerVostroBalances(const std::vector<minx::Hash>& keys);
+
+  // Add (or upgrade an existing entry to) an outbound peer — one we mine to
+  // peerTarget and can cross-transfer through. Persists immediately so it
+  // survives restart even if the miner hasn't ticked yet.
+  void _addOutboundPeer(const minx::Hash& ckey, const std::string& address);
+  // Remove a peer entirely. Returns true if an entry was erased.
+  bool _removePeer(const minx::Hash& ckey);
+
+  // Runtime peer-credit target. Reading/writing goes through an atomic the
+  // miner consults each cycle; setting it >0 starts the miner if it wasn't
+  // already running (e.g. a server that booted with target 0). Note: this
+  // is runtime-only — it does not rewrite the TOML, so it resets on restart.
+  uint64_t _peerTarget() const { return peerTarget_.load(); }
+  void _setPeerTarget(uint64_t target);
+  bool _peerMinerRunning() const { return peerMinerRunning_.load(); }
+  // Peer miner heartbeat for the dashboard: unix seconds of the last completed
+  // cycle (0 = never), and a cumulative cycle count.
+  uint64_t _peerMinerLastCycle() const { return lastPeerMinerCycle_.load(); }
+  uint64_t _peerMinerCycles() const { return peerMinerCycles_.load(); }
+  // What the miner is doing RIGHT NOW: `mining` is true only while actually
+  // computing a PoW solution (not merely looping/probing). When true, `peer`
+  // and `difficulty` say where and at what target difficulty.
+  struct PeerMinerActivity {
+    bool mining = false;
+    std::string peer;
+    uint8_t difficulty = 0;
+  };
+  PeerMinerActivity _peerMinerActivity() const {
+    std::lock_guard<std::mutex> lock(peerMinerActivityMutex_);
+    return {peerMinerMining_, peerMinerMiningPeer_, peerMinerMiningDiff_};
+  }
+
+  // Export the current effective server config (knobs, with the LIVE runtime
+  // peer target) as a TOML config file written to <data_dir>/ces.toml — the
+  // resolution to the "config is a boot snapshot but the dashboard mutates it"
+  // paradox: change values live, then export and feed the file back on the
+  // next boot. Deliberately excludes the peer table (own peerdata.toml) and
+  // the hello banner (own hello.txt), which already persist themselves.
+  // Returns the absolute path written, or empty string on failure.
+  std::string _exportConfig(std::string* errReason = nullptr);
+
+  // Set a runtime-editable config knob live (mutated on logicStrand_, where it
+  // is read; the export reads cfg_ so the change persists on the next export).
+  // Supported keys: fee_account, fee_asset, fee_tx, fee_query, fee_vm_mult,
+  // fee_discount_enabled (0/1). Returns false for an unknown/non-editable key.
+  bool _setConfigKnob(const std::string& key, uint64_t value);
+
+  // Inspect a remote server by address. Runs a blocking CesClient handshake
+  // on the CALLER's thread (never the logic strand) — discovers the peer's
+  // pubkey + min-difficulty + reachability for free off the MINX handshake.
+  // If `fetchPaidInfo` and we already hold a balance there, also pulls the
+  // paid CES_QUERY_SERVER_INFO KV map (empty otherwise). This is how the
+  // dashboard discovers a server before adding it as a peer.
+  struct RemoteServerInfo {
+    bool reachable = false;
+    minx::Hash serverKey{};
+    uint8_t minDifficulty = 0;
+    std::vector<ServerInfoEntry> entries;  // paid KV info, may be empty
+  };
+  RemoteServerInfo _inspectRemoteServer(const std::string& address,
+                                        bool fetchPaidInfo);
+
+  // Mine `count` solutions on a remote server (our key is the beneficiary) —
+  // the way to bootstrap a reserve balance on a server before peering with
+  // it. Blocking, on the caller's thread; reuses the same path as the peer
+  // miner. RandomX makes this slow, so callers run it off the I/O thread.
+  struct RemoteMineResult {
+    bool ok = false;
+    uint64_t credit = 0;
+    int status = 0;
+    std::string error;
+  };
+  RemoteMineResult _mineRemoteServer(const std::string& address, int count);
+
+  // Operator "hello" banner — a UTF-8 string served in CES_QUERY_SERVER_INFO
+  // as the "hello" field. Capped at HELLO_MAX_BYTES of UTF-8, trimmed on a
+  // codepoint boundary (never mid-sequence). Seeded at boot from
+  // <dataDir>/hello.txt if present; the only other way it changes is the
+  // dashboard's save (_setHello, which also rewrites the file).
+  static constexpr size_t HELLO_MAX_BYTES = 160;
+  std::string _getHello();
+  // Normalize `raw` (strip trailing newlines, cap to HELLO_MAX_BYTES on a
+  // codepoint boundary), write it to <dataDir>/hello.txt (creating the file
+  // if absent), set it as the served hello, and return the normalized value.
+  std::string _setHello(const std::string& raw);
+  // Read <dataDir>/hello.txt and return its normalized contents (for the
+  // dashboard's "load" button). Does NOT change the served hello; `existed`
+  // reports whether the file was present.
+  std::string _loadHelloFile(bool& existed);
 
   // ---- L2 handler support ----
   //
@@ -1049,6 +1236,13 @@ private:
 
   KeyPair serverKeyPair_;
 
+  // Operator hello banner (see _getHello/_setHello). Guarded by its own
+  // mutex: read on the logic strand by queryServerInfo, written by the
+  // dashboard's web thread.
+  std::mutex helloMutex_;
+  std::string helloMessage_;
+  void loadHelloFromFile();  // boot seed from <dataDir>/hello.txt
+
   std::atomic<uint64_t> lastTimePoWQueueSizeUpdated_ = 0;
   std::atomic<uint16_t> powQueueSize_ = 0;
 
@@ -1323,6 +1517,7 @@ private:
   static constexpr uint64_t DEDUP_FUTURE_DRIFT_US = 300ULL * 1000000;
 
   static constexpr size_t MAX_PERSISTED_PEERS = 100;
+  static constexpr size_t MAX_INMEM_PEERS = 2 * MAX_PERSISTED_PEERS;
   static constexpr uint32_t PEER_EVICTION_THRESHOLD = 5000;
 
   // Peer management
@@ -1330,7 +1525,31 @@ private:
   void savePeerData();
   std::thread peerMinerThread_;
   std::atomic<bool> peerMinerRunning_{false};
+  // Serializes ensurePeerMinerStarted()'s spawn against stop()'s join decision.
+  std::mutex peerMinerLifecycleMutex_;
   void peerMinerLoop();
+
+  // Runtime peer-credit target. Seeded from cfg_.peerTarget in the ctor and
+  // read by the miner each cycle; the dashboard can change it live (CesConfig
+  // is copyable, so its field can't itself be atomic). `peerMinerRunning_`
+  // doubles as the spawn guard: ensurePeerMinerStarted() compare-exchanges it
+  // so the miner thread is created exactly once even if peering is turned on
+  // at runtime from a server that booted with target 0.
+  std::atomic<uint64_t> peerTarget_{0};
+  void ensurePeerMinerStarted();
+
+  // Peer miner heartbeat — unix seconds of the last completed cycle and a
+  // cumulative cycle count, surfaced to the dashboard so the operator can see
+  // that the otherwise-opaque peering thread is alive and working.
+  std::atomic<uint64_t> lastPeerMinerCycle_{0};
+  std::atomic<uint64_t> peerMinerCycles_{0};
+  // Live "actively mining" state (vs. just looping/probing) for the dashboard —
+  // set only around the mineOnce() call. Guarded by its own mutex (the string
+  // can't be atomic); read off-thread by the web layer via _peerMinerActivity().
+  mutable std::mutex peerMinerActivityMutex_;
+  bool peerMinerMining_ = false;
+  std::string peerMinerMiningPeer_;
+  uint8_t peerMinerMiningDiff_ = 0;
 
   // Auto-nonce dedup table
   std::mutex dedupMutex_;

@@ -15,6 +15,16 @@ CesClientAsync::CesClientAsync(boost::asio::io_context& io,
       peerServerKey_(peerServerKey), maxRetries_(maxRetries) {
   boost::system::error_code ec;
   socket_.set_option(boost::asio::ip::v6_only(false), ec);
+  // The socket is v6 dual-stack; a plain-IPv4 destination endpoint can't be sent
+  // on it (the AF_INET sockaddr is rejected). Normalize a v4 endpoint to
+  // v4-mapped-v6 (::ffff:a.b.c.d) so a peer whose address resolves to plain IPv4
+  // — a v4 literal or a v4-first DNS result — is actually reachable. The CesPlex
+  // session path already does this; settlement was the outbound path missing it.
+  if (serverEp_.address().is_v4())
+    serverEp_ = boost::asio::ip::udp::endpoint(
+      boost::asio::ip::make_address_v6(boost::asio::ip::v4_mapped,
+                                       serverEp_.address().to_v4()),
+      serverEp_.port());
   channels_.resize(numChannels);
   LOGDEBUG << "CesClientAsync: " << numChannels << " channels to " << serverEp_;
   startReceive();

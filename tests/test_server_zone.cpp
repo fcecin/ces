@@ -103,7 +103,7 @@ BOOST_AUTO_TEST_CASE(NonServerKeyCannotCreateInS) {
   uint64_t bal = 0, cost = 0;
   uint8_t rc = fc->create("/s/oops.bin",
                           /*size=*/1024, /*price=*/0,
-                          /*deposit=*/0, "application/octet-stream",
+                          /*deposit=*/0,
                           bal, cost);
   CES_CHECK_RC_EQ(rc, CES_ERROR_NOT_OWNER);
 }
@@ -113,7 +113,7 @@ BOOST_AUTO_TEST_CASE(ServerKeyCanCreateInSWithZeroDeposit) {
   uint64_t bal = 0, cost = 0;
   uint8_t rc = fc->create("/s/hello.bin",
                           /*size=*/64, /*price=*/0,
-                          /*deposit=*/0, "application/octet-stream",
+                          /*deposit=*/0,
                           bal, cost);
   CES_REQUIRE_OK(rc);
   // deposit forced to 0 by the server for /s/.
@@ -130,12 +130,12 @@ BOOST_AUTO_TEST_CASE(ServerZoneBypassesCap) {
 
   uint8_t rc = fcServer->create("/s/big.bin",
                                 /*size=*/2048, /*price=*/0, /*deposit=*/0,
-                                "application/octet-stream", bal, cost);
+                                bal, cost);
   CES_REQUIRE_OK(rc);
 
   uint8_t rc2 = fcOther->create("/p/should_fail.bin",
                                 /*size=*/2048, /*price=*/0, /*deposit=*/0,
-                                "application/octet-stream", bal, cost);
+                                bal, cost);
   CES_CHECK_RC_EQ(rc2, CES_ERROR_STORE_FULL);
 }
 
@@ -148,7 +148,7 @@ BOOST_AUTO_TEST_CASE(ServerZoneWriteReadRoundTrip) {
   uint64_t bal = 0, cost = 0;
   uint8_t rc = fcServer->create("/s/data.bin",
                                 /*size=*/8, /*price=*/999,   // ignored on /s/
-                                /*deposit=*/0, "application/octet-stream",
+                                /*deposit=*/0,
                                 bal, cost);
   CES_REQUIRE_OK(rc);
 
@@ -176,7 +176,7 @@ BOOST_AUTO_TEST_CASE(ServerZoneNameValidationRejectsJustSlashS) {
   uint64_t bal = 0, cost = 0;
   uint8_t rc = fc->create("/s/",
                           /*size=*/1, /*price=*/0, /*deposit=*/0,
-                          "application/octet-stream", bal, cost);
+                          bal, cost);
   CES_CHECK_RC_EQ(rc, CES_ERROR_BAD_NAME);
 }
 

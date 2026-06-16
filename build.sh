@@ -192,14 +192,17 @@ case "$ACTION" in
                 fi
                 echo "--- Running $LABEL ---"
                 set +e
-                "$BIN" $BOOST_ARGS
-                rc=$?
+                "$BIN" $BOOST_ARGS 2>&1 | tee /tmp/cestests_last.log
+                rc=${PIPESTATUS[0]}
                 set -e
+                # Surface the Boost.Test tally explicitly — never drive by the
+                # exit code alone (a wrapping command can mask it).
+                tally=$(grep -aoE '\*\*\* [0-9]+ failures? (are|is) detected|No errors detected' /tmp/cestests_last.log | tail -1)
                 if [ $rc -ne 0 ]; then
-                    echo "❌ $LABEL FAILED (exit code $rc)"
+                    echo "❌ $LABEL FAILED (exit code $rc) — ${tally:-see output above}"
                     exit 1
                 else
-                    echo "✅ $LABEL passed."
+                    echo "✅ $LABEL passed — ${tally:-No errors detected}"
                 fi
             else
                 echo "⚠️  cestests not found: $BIN"

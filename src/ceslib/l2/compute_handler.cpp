@@ -1292,20 +1292,12 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       break;
     }
     case kApiMethodFileCreate: {
-      if (mlen < sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t)
-                   + sizeof(uint16_t)) {
+      if (mlen < sizeof(uint64_t) + sizeof(uint64_t) + sizeof(uint64_t)) {
         sendApiReply(inst, corr_id, kApiStatusInternal); return;
       }
       req.size           = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
       req.pricePerKb     = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
       req.initialDeposit = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
-      uint16_t ctLen = ces::Buffer::peek<uint16_t>(mbody + off); off += 2;
-      if (off + ctLen > mlen) {
-        sendApiReply(inst, corr_id, kApiStatusInternal); return;
-      }
-      req.contentType.assign(
-        reinterpret_cast<const char*>(mbody + off), ctLen);
-      off += ctLen;
       if (!parseName(mbody, mlen, off, req.name)) {
         sendApiReply(inst, corr_id, kApiStatusInternal); return;
       }
@@ -1376,10 +1368,6 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
           ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
           ces::Buffer::put<uint64_t>(tail, resp.pricePerKb);
           ces::Buffer::put<uint64_t>(tail, resp.size);
-          ces::Buffer::put<uint16_t>(tail,
-            static_cast<uint16_t>(resp.contentType.size()));
-          tail.insert(tail.end(),
-            resp.contentType.begin(), resp.contentType.end());
           ces::Buffer::put<uint64_t>(tail, resp.createdUs);
           ces::Buffer::put<uint64_t>(tail, resp.modifiedUs);
           break;
@@ -2411,6 +2399,40 @@ uint16_t _computeTestInstanceRpcPort(uint64_t instanceId) {
 
 bool computeInstanceExists(uint64_t instanceId) {
   return gInstances.find(instanceId) != gInstances.end();
+}
+
+std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
+  std::vector<ComputeInstanceStat> out;
+  CesServer* server = gServer.load();
+  if (!server) return out;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return out;
+  uint64_t nowUs = getMicrosSinceEpoch();
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  boost::asio::post(ex, [&]() {
+    out.reserve(gInstances.size());
+    for (auto& [id, inst] : gInstances) {
+      ComputeInstanceStat s;
+      s.id = inst->id;
+      s.source = inst->sourceName;
+      s.cpuBasisPoints = inst->cpuBasisPoints;
+      s.rssBytes = inst->rssBytes;
+      s.uptimeSecs = (inst->startedAtUs && nowUs > inst->startedAtUs)
+                       ? (nowUs - inst->startedAtUs) / 1000000ULL
+                       : 0;
+      s.clientPort = inst->clientPort;
+      s.rpcPort = inst->rpcPort;
+      out.push_back(std::move(s));
+    }
+    std::lock_guard lk(m);
+    done = true;
+    cv.notify_all();
+  });
+  std::unique_lock lk(m);
+  cv.wait(lk, [&] { return done; });
+  return out;
 }
 
 bool computeInstanceAcceptsConnections(uint64_t instanceId) {

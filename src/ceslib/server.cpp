@@ -5,6 +5,7 @@
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/cesvm.h>
 #include <ces/util/ctrlc.h>
+#include <ces/util/helpers.h>
 #include <ces/ramfilestore.h>
 #include <ces/protocol.h>
 #include <ces/server.h>
@@ -12,6 +13,8 @@
 #include <ces/util/vmprogram.h>
 #include <ces/util/wallet.h>
 
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -40,10 +43,10 @@ namespace ces {
 
 constexpr size_t RANDOMX_VMS_TO_KEEP = 256;
 
-// MinxConfig tuning for CesServer:
-//   SPAM_SAMPLE_RATE * SPAM_THRESHOLD = ~33.5M packets/hour per /24 prefix
-//   before the count-min sketch starts rejecting.
-constexpr uint16_t SPAM_THRESHOLD_DISABLED = std::numeric_limits<uint16_t>::max();
+// Spam filter (MINX count-min sketch, bucketed per /24 or /56). Servers run the
+// max threshold; with 1-in-SPAM_SAMPLE_RATE sampling on handshaked packets that
+// is a ~33.5M packets/window budget — the server-grade setting. (P2P nodes use a
+// far lower threshold; MINX treats threshold 0 as disabled.)
 constexpr uint16_t SPAM_SAMPLE_RATE = 512;
 
 // Upper bound on `taskThreads` config value (sanity check).
@@ -82,6 +85,16 @@ constexpr uint64_t DAILY_MAINTENANCE_HOUR_UTC = 9;
 // minDifficulty by more than MARGIN, or whose absolute difficulty exceeds MAX.
 constexpr uint8_t PEER_MINER_DIFF_MARGIN = 6;
 constexpr uint8_t PEER_MINER_DIFF_MAX    = 24;
+// How many difficulty levels above a peer's own minimum the smart-difficulty
+// miner may scale UP to when sizing a single solution to the remaining credit
+// gap. This bound is RELATIVE to the peer's floor, not absolute, on purpose: a
+// solution N levels up costs 2^N times the per-solution RandomX work the peer's
+// network is calibrated for, so an absolute cap would let a low-minDiff peer
+// pull the miner into a solution thousands of times too large — locking the
+// thread for hours/days on one peer and starving every other peer of its
+// reserve top-up. Bounding it at +5 keeps each solution cheap enough that the
+// cycle returns quickly and the miner fills every peer's quota round-robin.
+constexpr uint8_t PEER_MINER_MAX_DIFF_ABOVE = 5;
 
 constexpr const char* ACCOUNTS_DATA_SUBDIRECTORY = "accounts";
 constexpr const char* ASSETS_DATA_SUBDIRECTORY = "assets";
@@ -862,6 +875,21 @@ CesRpcRudpListener::onAccept(const minx::SockAddr& peer,
   return owner_->cesplex_->acceptInbound(peer, channelId);
 }
 
+// Normalize the operator hello banner: strip trailing CR/LF, then cap the
+// UTF-8 encoding at HELLO_MAX_BYTES, backing up off any continuation byte so
+// a multi-byte codepoint is never split.
+static std::string normalizeHello(std::string s) {
+  while (!s.empty() && (s.back() == '\n' || s.back() == '\r'))
+    s.pop_back();
+  if (s.size() > CesServer::HELLO_MAX_BYTES) {
+    size_t cut = CesServer::HELLO_MAX_BYTES;
+    while (cut > 0 && (static_cast<unsigned char>(s[cut]) & 0xC0) == 0x80)
+      --cut;
+    s.resize(cut);
+  }
+  return s;
+}
+
 CesServer::CesServer(const CesConfig& config)
     : cfg_(config),
       logicStrand_(boost::asio::make_strand(taskIO_)),
@@ -877,6 +905,10 @@ CesServer::CesServer(const CesConfig& config)
   // mapped to — but only when feeDiscountEnabled is true.
   for (auto& m : feeMult_)
     m.store(10000, std::memory_order_relaxed);
+
+  // Seed the runtime peer target from config. The miner reads this atomic
+  // (not cfg_.peerTarget) so the dashboard can change it live.
+  peerTarget_.store(cfg_.peerTarget, std::memory_order_relaxed);
   minx_ = std::make_unique<minx::Minx>(
     this, minx::MinxConfig{
       .instanceName = "sv",
@@ -884,7 +916,7 @@ CesServer::CesServer(const CesConfig& config)
       .spendSlotSize = cfg_.spendSlotSize,
       .randomXVMsToKeep = RANDOMX_VMS_TO_KEEP,
       .randomXInitThreads = 0,
-      .spamThreshold = SPAM_THRESHOLD_DISABLED,
+      .spamThreshold = minx::MinxConfig::MAX_SPAM_THRESHOLD,
       .spamSampleRate = SPAM_SAMPLE_RATE,
       .trustLoopback = true,
       .recvBuffersSize = cfg_.recvBuffersSize});
@@ -1007,6 +1039,7 @@ CesServer::CesServer(const CesConfig& config)
 
   // Load persisted peer data, then seed with outbound config peers
   loadPeerData();
+  loadHelloFromFile();
   for (auto& pc : cfg_.peers) {
     minx::Hash key;
     minx::stringToHash(key, pc.pubKeyHex);
@@ -1073,14 +1106,23 @@ uint16_t CesServer::start(uint16_t serverPort) {
   boundPort_ = boundPort;
   LOGDEBUG << "server opened socket" << VAR(boundPort);
   LOGDEBUG << "starting IO threads" << VAR(cfg_.taskThreads);
-  netIOThread_ = std::thread([this]() { netIO_.run(); });
+  netIOThread_ =
+    std::thread([this]() { runGuardedThread([this]{ netIO_.run(); }, "netIO"); });
   for (int i = 0; i < cfg_.taskThreads; ++i) {
-    taskIOThreads_.emplace_back([this]() { taskIO_.run(); });
+    taskIOThreads_.emplace_back(
+      [this]() { runGuardedThread([this]{ taskIO_.run(); }, "taskIO"); });
   }
   LOGDEBUG << "starting verifyPoW thread";
   verifyPoWThread_ = std::thread([this]() {
     while (running_) {
-      minx_->verifyPoWs();
+      try {
+        minx_->verifyPoWs();
+      } catch (const std::exception& e) {
+        LOGERROR << "verifyPoW handler escaped an exception; continuing"
+                 << SVAR(e.what());
+      } catch (...) {
+        LOGERROR << "verifyPoW handler escaped an unknown exception; continuing";
+      }
       ces::sleep(100);
     }
   });
@@ -1104,7 +1146,8 @@ uint16_t CesServer::start(uint16_t serverPort) {
   settlementWorkGuard_ = std::make_unique<
     boost::asio::executor_work_guard<IOContext::executor_type>>(
     settlementIO_.get_executor());
-  settlementThread_ = std::thread([this]() { settlementIO_.run(); });
+  settlementThread_ = std::thread(
+    [this]() { runGuardedThread([this]{ settlementIO_.run(); }, "settlementIO"); });
 
   // SYS_RPC bridge: if the operator configured a dedicated RPC UDP
   // port (cfg_.rpcPort != 0), bind a second Minx instance on it with
@@ -1142,7 +1185,7 @@ uint16_t CesServer::start(uint16_t serverPort) {
         .spendSlotSize = cfg_.spendSlotSize,
         .randomXVMsToKeep = 0,           // no PoW engine on the RPC port
         .randomXInitThreads = 0,
-        .spamThreshold = SPAM_THRESHOLD_DISABLED,
+        .spamThreshold = minx::MinxConfig::MAX_SPAM_THRESHOLD,
         .spamSampleRate = SPAM_SAMPLE_RATE,
         .trustLoopback = true,
         .recvBuffersSize = cfg_.recvBuffersSize});
@@ -1265,8 +1308,10 @@ uint16_t CesServer::start(uint16_t serverPort) {
       rpcRudp_.reset();
     } else {
       LOGINFO << "rpc: MINX/RUDP port listening" << VAR(rpcBoundPort_);
-      rpcNetIOThread_ = std::thread([this]() { rpcNetIO_.run(); });
-      rpcTaskIOThread_ = std::thread([this]() { rpcTaskIO_.run(); });
+      rpcNetIOThread_ = std::thread(
+        [this]() { runGuardedThread([this]{ rpcNetIO_.run(); }, "rpcNetIO"); });
+      rpcTaskIOThread_ = std::thread(
+        [this]() { runGuardedThread([this]{ rpcTaskIO_.run(); }, "rpcTaskIO"); });
 
       // Start the Rudp tick pulse. The timer schedules itself
       // recursively on rpcTaskIO_ until stop() cancels it.
@@ -1327,12 +1372,16 @@ void CesServer::stop(bool flushEvents) {
   }
   running_ = false;
 
-  // Stop peer miner if running
-  if (peerMinerRunning_) {
-    LOGDEBUG << "stop stopping peer miner";
+  // Stop peer miner if running. Flip the run flag under the lifecycle lock so a
+  // concurrent ensurePeerMinerStarted() either already spawned (joined below) or
+  // now sees running_==false and won't spawn — no thread can appear past here.
+  {
+    std::lock_guard lock(peerMinerLifecycleMutex_);
     peerMinerRunning_ = false;
-    if (peerMinerThread_.joinable())
-      peerMinerThread_.join();
+  }
+  if (peerMinerThread_.joinable()) {
+    LOGDEBUG << "stop stopping peer miner";
+    peerMinerThread_.join();
     LOGDEBUG << "stop peer miner stopped";
   }
 
@@ -1461,7 +1510,44 @@ void CesServer::checkPause() {
 
 uint64_t CesServer::getTxCount() { return txCount_.load(); }
 
+// Smallest PoW difficulty D whose mint, (1<<(D-1))*POW_REWARD_BASE, can cover
+// account creation (one fee_account). Below this, a freshly-mined account
+// can't be created and the solution is dropped. Uses the file-local mint
+// constants POW_REWARD_BASE / MAX_POW_DIFFICULTY defined above.
+static uint8_t minViableDifficulty(uint64_t feeAccount) {
+  if (feeAccount <= POW_REWARD_BASE) return 1;
+  uint64_t need = (feeAccount + POW_REWARD_BASE - 1) / POW_REWARD_BASE;  // ceil
+  uint8_t d = 1;
+  while (d < MAX_POW_DIFFICULTY && (1ULL << (d - 1)) < need) ++d;
+  return d;
+}
+
 void CesServer::createPoWEngine(bool fullMem) {
+  // Config sanity, loud at boot: can a minimum-difficulty PoW solution actually
+  // pay for account creation? A solution at difficulty D mints
+  // (2^(D-1))*POW_REWARD_BASE; creating a new (mined) account requires that mint
+  // be >= fee_account (server.cpp incomingProveWork: `if (creditAmount <
+  // feeAccount) return;`). If min_difficulty is below that, freshly-mined
+  // accounts CANNOT be created — incoming PoW is silently dropped (clients see
+  // MINX_SOLUTION_UNKNOWN) and the server mints nothing despite looking healthy.
+  // This is precisely the trap a peer miner falls into.
+  uint8_t needed = minViableDifficulty(cfg_.feeAccount);
+  if (cfg_.minDiff < needed) {
+    uint64_t mintAtMin =
+      (cfg_.minDiff >= 1 && cfg_.minDiff <= MAX_POW_DIFFICULTY)
+        ? (1ULL << (cfg_.minDiff - 1)) * POW_REWARD_BASE
+        : 0;
+    LOGWARNING << "PoW min_difficulty too low to mint: a freshly mined account"
+                  " cannot pay its own creation fee, so solutions are dropped"
+                  " (clients see MINX_SOLUTION_UNKNOWN) and the server mints"
+                  " nothing despite looking healthy"
+               << VAR(static_cast<int>(cfg_.minDiff)) << VAR(cfg_.feeAccount)
+               << "; mint(D)=(2^(D-1))*" << POW_REWARD_BASE
+               << ", a new account needs mint(D)>=fee_account, but at this"
+                  " difficulty mint=" << mintAtMin << " < fee_account="
+               << cfg_.feeAccount << "; FIX: set min_difficulty>="
+               << static_cast<int>(needed) << " or fee_account<=" << mintAtMin;
+  }
   minx_->setUseDataset(fullMem);
   minx_->createPoWEngine(serverKeyPair_.getPublicKeyAsHash());
 }
@@ -1943,6 +2029,9 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
     kv("serverName", cfg_.serverName);
   if (!cfg_.version.empty())
     kv("version", cfg_.version);
+  // Always emit hello, even when empty — an inspector wants to see that the
+  // field exists and the server simply has no banner set, not have it vanish.
+  kv("hello", _getHello());
 
   return CES_OK;
 }
@@ -2861,6 +2950,30 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
       break;
     }
 
+    case CES_QUERY_PEER_INFO: {
+      CesUnsignedQueryPeerInfo req;
+      req.fromBytes(msg.data);
+      CesUnsignedQueryPeerInfoResult res;
+      res.index = req.index;
+      res.found = 0;
+      res.pubkey = {};
+      res.address = {};
+      {
+        std::lock_guard lock(peerTableMutex_);
+        res.peerCount =
+          static_cast<uint16_t>(std::min<size_t>(peerTable_.size(), 0xFFFFu));
+        if (req.index < peerTable_.size()) {
+          const auto& pe = peerTable_[req.index];
+          res.found = 1;
+          res.pubkey = pe.ckey;
+          size_t n = std::min(pe.declaredAddress.size(), res.address.size());
+          std::memcpy(res.address.data(), pe.declaredAddress.data(), n);
+        }
+      }
+      sendUnsignedReply(addr, msg, std::move(res));
+      break;
+    }
+
     case CES_QUERY_SERVER_INFO: {
       CesQueryServerInfo req;
       req.fromBytes(msg.data);
@@ -3426,6 +3539,12 @@ void CesServer::incomingProveWork(const SockAddr& addr,
         auto it = appData.find("server");
         if (it != appData.end() && !it->second.empty()) {
           upsertPeer(msg.ckey, it->second, creditAmount);
+          // Start the peer miner (idempotent) so the discovered inbound peer is
+          // probed for reachability and the table is persisted each cycle. A
+          // pure-receiver node (peer_target 0) otherwise never runs the miner,
+          // so every inbound discovery is in-memory only and lost on restart —
+          // making the dashboard's inbound list look dead once mining stops.
+          ensurePeerMinerStarted();
           LOGDEBUG << "inbound peer PoW: " << it->second
                    << " credited " << creditAmount;
         }
@@ -4052,6 +4171,27 @@ void CesServer::_burn(const minx::Hash& accountKey, int64_t amount) {
   }
 }
 
+bool CesServer::_walletSend(const minx::Hash& destKey, uint64_t amount) {
+  bool ok = false;
+  std::promise<void> done;
+  postLogic([&]() {
+    // One strand task so the balance check and the two ledger moves are atomic.
+    ActiveAccount sacc = accounts_.get(serverKeyPair_.getPublicKeyAsHash());
+    if (amount > 0 && sacc.exists() && sacc.balance() >= 0 &&
+        static_cast<uint64_t>(sacc.balance()) >= amount) {
+      // balance >= amount, so _burnInner debits exactly `amount` (its min() is
+      // a no-op here); _brrInner credits/creates dest. Tally nets to zero.
+      _burnInner(serverKeyPair_.getPublicKeyAsHash(), static_cast<int64_t>(amount));
+      _brrInner(destKey, static_cast<int64_t>(amount));
+      ok = true;
+      LOGINFO << "wallet send from server account" << VAR(amount);
+    }
+    done.set_value();
+  });
+  done.get_future().get();
+  return ok;
+}
+
 void CesServer::_burnInner(const minx::Hash& accountKey, int64_t amount) {
   HashPrefix id = Account::getMapKey(accountKey);
   ActiveAccount acc = accounts_.get(id);
@@ -4494,7 +4634,29 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
       return;
     }
   }
-  // New entry
+  // New entry. Bound the in-memory table so sustained inbound PoW from many
+  // distinct keys can't grow it without limit between restarts (persistence and
+  // the miner already keep only the top MAX_PERSISTED_PEERS). Operator/server
+  // adds pass inboundCredit == 0 (configured peers, outbound adds, reachability
+  // probes) and are always admitted; only the untrusted inbound-discovery path
+  // (inboundCredit > 0) is capped. When full, make room by evicting the weakest
+  // non-outbound resident (lowest accumulated inbound PoW) — NOT by refusing the
+  // newcomer: a fresh peer always arrives with just one solution's credit, so
+  // comparing that against residents' accumulated PoW would lock every new peer
+  // out forever. Outbound (operator-pinned) peers are never evicted; if every
+  // slot is one, drop the newcomer.
+  if (inboundCredit > 0 && peerTable_.size() >= MAX_INMEM_PEERS) {
+    auto victim = peerTable_.end();
+    for (auto it = peerTable_.begin(); it != peerTable_.end(); ++it) {
+      if (it->outbound) continue;
+      if (victim == peerTable_.end() ||
+          it->totalInboundPoW < victim->totalInboundPoW)
+        victim = it;
+    }
+    if (victim == peerTable_.end())
+      return;  // every slot is an operator-pinned outbound peer
+    peerTable_.erase(victim);
+  }
   PeerEntry pe;
   pe.ckey = ckey;
   pe.declaredAddress = address;
@@ -4521,6 +4683,442 @@ bool CesServer::_isPeerReachable(const minx::Hash& ckey) {
     if (p.ckey == ckey) return p.reachable;
   }
   return false;
+}
+
+// =============================================================================
+// Dashboard / admin surface
+// =============================================================================
+
+CesServer::AdminStats CesServer::_adminStats() {
+  std::promise<AdminStats> pr;
+  postLogic([&]() {
+    AdminStats s;
+    s.circulating = circulatingCredits();
+    s.accounts = accounts_->getObjects().size();
+    s.assets = assets_->getObjects().size();
+    s.txCount = txCount_.load();
+    pr.set_value(s);
+  });
+  return pr.get_future().get();
+}
+
+std::vector<int64_t> CesServer::_peerVostroBalances(
+    const std::vector<minx::Hash>& keys) {
+  std::promise<std::vector<int64_t>> pr;
+  postLogic([&]() {
+    std::vector<int64_t> out;
+    out.reserve(keys.size());
+    for (const auto& k : keys) {
+      ActiveAccount acc = accounts_.get(Account::getMapKey(k));
+      out.push_back(acc.exists() ? acc.data().getBalance() : 0);
+    }
+    pr.set_value(std::move(out));
+  });
+  return pr.get_future().get();
+}
+
+CesServer::AdminAccount CesServer::_adminQueryAccount(
+    const minx::Hash& accountKey) {
+  std::promise<AdminAccount> pr;
+  postLogic([&]() {
+    AdminAccount a;
+    ActiveAccount acc = accounts_.get(Account::getMapKey(accountKey));
+    if (acc.exists()) {
+      const Account& d = acc.data();
+      // The map is keyed by the 8-byte prefix only; confirm the full 32-byte
+      // identity by matching the stored 24-byte keyTail. A mismatch means a
+      // DIFFERENT account occupies this prefix (collision), not the one asked
+      // for — so the queried account does not exist.
+      if (d.getKeyTail() == getHashTail(accountKey)) {
+        a.exists = true;
+        a.balance = d.getBalance();
+        a.nonce = d.getNonce();
+        a.lastXferDest = d.getLastXferDest();
+        a.lastXferAmount = d.getLastXferAmount();
+        a.lastXferTime = d.getLastXferTime();
+      } else {
+        a.prefixTaken = true;
+      }
+    }
+    pr.set_value(a);
+  });
+  return pr.get_future().get();
+}
+
+CesServer::AdminAsset CesServer::_adminQueryAsset(const minx::Hash& assetId) {
+  std::promise<AdminAsset> pr;
+  postLogic([&]() {
+    AdminAsset a;
+    ActiveAsset as = assets_.get(assetId);
+    if (as.exists()) {
+      a.exists = true;
+      a.owner = as.getOwnerId();
+      a.balance = as.getBalance();
+      a.price = as.getPrice();
+      a.content = as.getContent();
+    }
+    pr.set_value(a);
+  });
+  return pr.get_future().get();
+}
+
+CesServer::FileStat CesServer::_fileStat(const std::string& path) {
+  FileStat out;
+  // File feature needs the cap and CesPlex actually up; gate on the BOUND rpc
+  // port (cfg_.rpcPort may be 0 under auto-port) so we never post to a dead IO.
+  if (cfg_.cesFileStoreMaxBytes == 0 || _rpcBoundPort() == 0) return out;
+  out.enabled = true;
+  FileExecReq req;
+  req.verb = 0x04;  // kVerbStat — public, no signer/owner required
+  req.name = path;
+  std::promise<FileExecResp> pr;
+  // fileHandlerExec runs the verb body (sidecar read-modify-write + lazy rent)
+  // on the CALLER thread; only the callback is posted to the executor. Run the
+  // whole call on rpcTaskIO so it stays serialized with the handler's other
+  // verbs instead of racing them from this web thread, then block on the future.
+  boost::asio::post(_rpcTaskIOExecutor(), [this, &req, &pr]() {
+    fileHandlerExec(req, [&pr](FileExecResp r) { pr.set_value(std::move(r)); },
+                    _rpcTaskIOExecutor());
+  });
+  FileExecResp r = pr.get_future().get();
+  if (r.status == CES_OK) {
+    out.found = true;
+    out.ownerPubkey = r.ownerPubkey;
+    out.fileBalance = r.fileBalance;
+    out.size = r.size;
+    out.pricePerKb = r.pricePerKb;
+    out.createdUs = r.createdUs;
+    out.modifiedUs = r.modifiedUs;
+  }
+  return out;
+}
+
+std::vector<CesServer::PeerInfo> CesServer::_peerSnapshot() {
+  std::vector<PeerInfo> out;
+  std::lock_guard lock(peerTableMutex_);
+  out.reserve(peerTable_.size());
+  for (const auto& p : peerTable_) {
+    PeerInfo pi;
+    pi.ckey = p.ckey;
+    pi.declaredAddress = p.declaredAddress;
+    if (!p.resolvedIP.is_unspecified())
+      pi.resolvedIP = p.resolvedIP.to_string();
+    pi.outbound = p.outbound;
+    pi.inbound = (p.totalInboundPoW > 0);
+    pi.reachable = p.reachable;
+    pi.verified = p.verified;
+    pi.ourBalanceThere = p.ourBalanceThere;
+    pi.totalInboundPoW = p.totalInboundPoW;
+    pi.totalOutboundPoW = p.totalOutboundPoW;
+    pi.lastInboundTime = p.lastInboundTime;
+    pi.lastCheckTime = p.lastCheckTime;
+    pi.pingFailures = p.pingFailures;
+    out.push_back(std::move(pi));
+  }
+  return out;
+}
+
+void CesServer::_addOutboundPeer(const minx::Hash& ckey,
+                                 const std::string& address) {
+  upsertPeer(ckey, address, 0);  // locks peerTableMutex_ internally
+  {
+    std::lock_guard lock(peerTableMutex_);
+    for (auto& p : peerTable_) {
+      if (p.ckey == ckey) {
+        p.outbound = true;
+        if (!address.empty()) p.declaredAddress = address;
+        break;
+      }
+    }
+  }
+  // Persist now so a dashboard-added peer survives restart even if the
+  // miner (which also persists each cycle) hasn't ticked yet.
+  savePeerData();
+  LOGINFO << "peer added via admin" << SVAR(address);
+  // Start the probe/mine thread if it wasn't running — so the new peer gets
+  // its reachability checked right away, even at target 0.
+  ensurePeerMinerStarted();
+}
+
+bool CesServer::_removePeer(const minx::Hash& ckey) {
+  bool removed = false;
+  {
+    std::lock_guard lock(peerTableMutex_);
+    auto it = std::remove_if(peerTable_.begin(), peerTable_.end(),
+      [&](const PeerEntry& p) { return p.ckey == ckey; });
+    if (it != peerTable_.end()) {
+      peerTable_.erase(it, peerTable_.end());
+      removed = true;
+    }
+  }
+  if (removed) {
+    savePeerData();
+    LOGINFO << "peer removed via admin" << SVAR(minx::hashToString(ckey));
+  }
+  return removed;
+}
+
+void CesServer::_setPeerTarget(uint64_t target) {
+  peerTarget_.store(target);
+  LOGINFO << "peer target set via admin" << VAR(target);
+  if (target > 0) ensurePeerMinerStarted();
+}
+
+CesServer::RemoteServerInfo CesServer::_inspectRemoteServer(
+    const std::string& address, bool fetchPaidInfo) {
+  RemoteServerInfo out;
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = Resolver::resolveUdp(address);
+  } catch (std::exception& e) {
+    LOGDEBUG << "inspect: resolve failed" << SVAR(address) << SVAR(e.what());
+    return out;
+  }
+  try {
+    // No RandomX dataset — this is a handshake/query probe, not mining.
+    CesClient client(ep, false);
+    client.setKey(serverKeyPair_);
+    client.start(0);
+    // Snappy interactive probe: an unreachable host should fail fast (a few
+    // seconds), not the default nested-retry handshake (tens of seconds).
+    client.setTries(2);
+    if (client.connect()) {
+      out.reachable = true;
+      out.serverKey = client.getServerKey();
+      out.minDifficulty = client.getMinDifficulty();
+      // The paid KV info needs a funded account on the peer; if we have
+      // none the query just errors and entries stays empty.
+      if (fetchPaidInfo) {
+        std::vector<ServerInfoEntry> entries;
+        if (client.queryServerInfo(entries) == CES_OK)
+          out.entries = std::move(entries);
+      }
+      client.disconnect();
+    }
+    client.stop();
+  } catch (std::exception& e) {
+    LOGDEBUG << "inspect: client error" << SVAR(address) << SVAR(e.what());
+  }
+  return out;
+}
+
+CesServer::RemoteMineResult CesServer::_mineRemoteServer(
+    const std::string& address, int count) {
+  RemoteMineResult r;
+  if (count < 1) count = 1;
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = Resolver::resolveUdp(address);
+  } catch (std::exception& e) {
+    r.error = std::string("resolve: ") + e.what();
+    return r;
+  }
+  try {
+    // Cache-only RandomX: an occasional dashboard bootstrap mine doesn't
+    // justify a fresh ~2 GB dataset (the server already holds one for
+    // verification — a second would risk OOM). Slower per hash, but this is
+    // a few solutions, not the continuous peer miner.
+    CesClient client(ep, false);
+    client.setKey(serverKeyPair_);
+    client.start(0);
+    if (!client.connect()) {
+      r.error = "unreachable";
+      client.stop();
+      return r;
+    }
+    std::map<std::string, std::string> appData;
+    appData["server"] = cfg_.serverName.empty()
+      ? (":" + std::to_string(boundPort_)) : cfg_.serverName;
+    for (int i = 0; i < count && ces::notInterrupted(); ++i) {
+      auto m = mineOnce(client, 1, appData);
+      if (m.success) { r.ok = true; r.credit += m.credit; }
+      else { r.status = m.status; break; }
+    }
+    client.disconnect();
+    client.stop();
+  } catch (std::exception& e) {
+    r.error = e.what();
+  }
+  return r;
+}
+
+void CesServer::loadHelloFromFile() {
+  auto path = (cfg_.dataDir / "hello.txt").string();
+  std::error_code ec;
+  if (!std::filesystem::exists(path, ec)) return;
+  try {
+    std::ifstream f(path, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    std::lock_guard lock(helloMutex_);
+    helloMessage_ = normalizeHello(ss.str());
+    LOGINFO << "loaded hello banner" << VAR(helloMessage_.size());
+  } catch (std::exception& e) {
+    LOGWARNING << "failed to read hello.txt" << SVAR(e.what());
+  }
+}
+
+std::string CesServer::_getHello() {
+  std::lock_guard lock(helloMutex_);
+  return helloMessage_;
+}
+
+std::string CesServer::_setHello(const std::string& raw) {
+  std::string norm = normalizeHello(raw);
+  auto path = (cfg_.dataDir / "hello.txt").string();
+  {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f << norm;
+  }
+  {
+    std::lock_guard lock(helloMutex_);
+    helloMessage_ = norm;
+  }
+  LOGINFO << "hello banner set via admin" << VAR(norm.size());
+  return norm;
+}
+
+std::string CesServer::_loadHelloFile(bool& existed) {
+  auto path = (cfg_.dataDir / "hello.txt").string();
+  std::error_code ec;
+  existed = std::filesystem::exists(path, ec);
+  if (!existed) return std::string();
+  std::ifstream f(path, std::ios::binary);
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return normalizeHello(ss.str());
+}
+
+bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
+  // Mutate on logicStrand_. Base fees (account/asset/tx/query/vm) are also read
+  // there during charging, so they are race-free. The L2/net fee and cap fields
+  // are read off-strand (meter, compute supervisor, file handler, dashboard), so
+  // those reads formally race this write; being aligned word-size scalars they
+  // can only read the old or new value, never a torn one, taking effect next
+  // tick (benign in practice). The fully race-free form would publish the config
+  // as an immutable shared_ptr<const CesConfig> snapshot (RCU) loaded atomically,
+  // skipped here as the only writer is this rare operator action.
+  bool ok = false;
+  std::promise<void> done;
+  postLogic([&]() {
+    if      (key == "fee_account")  { cfg_.feeAccount = value; ok = true; }
+    else if (key == "fee_asset")    { cfg_.feeAsset   = value; ok = true; }
+    else if (key == "fee_tx")       { cfg_.feeTx      = value; ok = true; }
+    else if (key == "fee_query")    { cfg_.feeQuery   = value; ok = true; }
+    else if (key == "fee_vm_mult")  { cfg_.feeVmMult  = value; ok = true; }
+    // L2 file-store fees (per byte-day / per KB), live per-op like the base fees.
+    else if (key == "fee_file_rent")  { cfg_.feeFileRent  = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_file_write") { cfg_.feeFileWrite = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_file_read")  { cfg_.feeFileRead  = static_cast<int64_t>(value); ok = true; }
+    // L2 compute fees, live on the supervisor tick.
+    else if (key == "fee_compute_slot")    { cfg_.feeComputeSlotSec    = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_compute_cpu")     { cfg_.feeComputeCpuSec     = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_compute_rss")     { cfg_.feeComputeRssByteDay = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_bucket_bytesec")  { cfg_.feeBucketByteSec     = static_cast<int64_t>(value); ok = true; }
+    // ChannelMeter (net metering) rates, live on the meter tick.
+    else if (key == "fee_net_byte_sent")     { cfg_.feeNetByteSent     = value; ok = true; }
+    else if (key == "fee_net_byte_received") { cfg_.feeNetByteReceived = value; ok = true; }
+    else if (key == "fee_net_channel_sec")   { cfg_.feeNetChannelSec   = value; ok = true; }
+    else if (key == "fee_net_mem_byte_day")  { cfg_.feeNetMemByteDay   = value; ok = true; }
+    // Feature caps: the value is read live (file GC / compute LAUNCH admission),
+    // but the handler binds/unbinds only at boot, so the 0 boundary is frozen in
+    // both directions — a feature off at boot can't be enabled live, and an
+    // enabled one can't be zeroed live. The `current != 0 && value != 0` guard
+    // enforces exactly that; crossing 0 needs a config edit + restart.
+    else if (key == "file_store_max_bytes") {
+      if (cfg_.cesFileStoreMaxBytes != 0 && value != 0) { cfg_.cesFileStoreMaxBytes = value; ok = true; }
+    }
+    else if (key == "compute_max_instances") {
+      if (cfg_.computeMaxInstances != 0 && value != 0) { cfg_.computeMaxInstances = static_cast<uint32_t>(value); ok = true; }
+    }
+    else if (key == "fee_discount_enabled") {
+      cfg_.feeDiscountEnabled = (value != 0); ok = true;
+    }
+    else if (key == "min_difficulty") {
+      // The PoW floor is not swallowed on construction: minx_ reads its minDiff_
+      // live on every solution (filterPoW), and cfg_.minDiff is read live when we
+      // advertise server-info, so updating both here takes effect immediately. We
+      // only gate the main minting port; rpcMinx_ has no minting floor.
+      if (value >= 1 && value <= static_cast<uint64_t>(MAX_POW_DIFFICULTY)) {
+        cfg_.minDiff = static_cast<uint8_t>(value);
+        if (minx_) minx_->setMinimumDifficulty(cfg_.minDiff);
+        ok = true;
+      }
+    }
+    if (ok) { LOGINFO << "config knob set via admin" << SVAR(key) << VAR(value); }
+    done.set_value();
+  });
+  done.get_future().get();
+  return ok;
+}
+
+std::string CesServer::_exportConfig(std::string* errReason) {
+  auto path = (cfg_.dataDir / "ces.toml").string();
+  try {
+    std::ostringstream o;
+    o << "# CES server config — exported live from the running server.\n"
+      << "# Feed it back on the next boot with:  ces --config " << path << "\n"
+      << "# Peers persist in peerdata.toml and the hello banner in hello.txt;\n"
+      << "# both load automatically and are intentionally NOT duplicated here.\n\n";
+
+    o << "data_dir = \"" << cfg_.dataDir.string() << "\"\n";
+    o << "port = " << boundPort_ << "\n";
+    o << "# server_key is the 32-byte private key (same identity on re-feed).\n";
+    o << "server_key = \"" << minx::hashToString(cfg_.serverPrivKey) << "\"\n";
+    if (!cfg_.serverName.empty())
+      o << "server_name = \"" << cfg_.serverName << "\"\n";
+    o << "min_difficulty = " << static_cast<int>(cfg_.minDiff) << "\n";
+    o << "spend_slot_size = " << cfg_.spendSlotSize << "\n";
+    o << "threads = " << cfg_.taskThreads << "\n";
+    o << "min_accounts = " << cfg_.minAcc << "\n";
+    o << "max_accounts = " << cfg_.maxAcc << "\n";
+    o << "min_assets = " << cfg_.minAsset << "\n";
+    o << "max_assets = " << cfg_.maxAsset << "\n";
+    o << "flush_value = " << cfg_.flushValue << "\n";
+    o << "max_log_size_gb = "
+      << (cfg_.maxLogBytes / (1024ULL * 1024 * 1024)) << "\n";
+    o << "fee_account = " << cfg_.feeAccount << "\n";
+    o << "fee_asset = " << cfg_.feeAsset << "\n";
+    o << "fee_tx = " << cfg_.feeTx << "\n";
+    o << "fee_query = " << cfg_.feeQuery << "\n";
+    o << "fee_vm_mult = " << cfg_.feeVmMult << "\n\n";
+
+    o << "# Peering — peer_target is the LIVE runtime value (the dashboard's\n";
+    o << "# edits land here on export).\n";
+    o << "peer_target = " << peerTarget_.load() << "\n";
+    o << "peer_miner_interval = " << cfg_.peerMinerIntervalSecs << "\n";
+    o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n\n";
+
+    o << "# Interfaces\n";
+    if (!cfg_.adminSocket.empty())
+      o << "admin_socket = \"" << cfg_.adminSocket << "\"\n";
+    o << "web_port = " << cfg_.webPort << "\n";
+    o << "web_bind = \"" << cfg_.webBind << "\"\n";
+    o << "rpc_port = " << cfg_.rpcPort << "\n\n";
+
+    o << "# File store / compute\n";
+    o << "file_store_max_bytes = " << cfg_.cesFileStoreMaxBytes << "\n";
+    if (!cfg_.cesFileStoreDir.empty())
+      o << "file_store_dir = \"" << cfg_.cesFileStoreDir << "\"\n";
+    o << "compute_max_instances = " << cfg_.computeMaxInstances << "\n";
+    o << "compute_port_base = " << cfg_.computePortBase << "\n";
+    o << "compute_port_count = " << cfg_.computePortCount << "\n";
+
+    std::ofstream f(path, std::ios::trunc);
+    f << o.str();
+    if (!f) {
+      std::string why = std::strerror(errno);
+      LOGWARNING << "config export: write failed" << SVAR(path) << SVAR(why);
+      if (errReason) *errReason = "write to " + path + " failed: " + why;
+      return "";
+    }
+    LOGINFO << "config exported via admin" << SVAR(path);
+    return path;
+  } catch (std::exception& e) {
+    LOGWARNING << "config export failed" << SVAR(e.what());
+    if (errReason) *errReason = e.what();
+    return "";
+  }
 }
 
 void CesServer::_runAutoexecSync() {
@@ -4633,11 +5231,31 @@ void CesServer::savePeerData() {
 // Peer Miner (unified: outbound + inbound autopeering)
 // =============================================================================
 
+void CesServer::ensurePeerMinerStarted() {
+  // Hold the lifecycle lock across the running_ check + CAS + thread assign so
+  // it's atomic w.r.t. stop() flipping peerMinerRunning_ and deciding whether to
+  // join — a solution arriving at shutdown can't spawn a thread after stop() has
+  // already passed the join.
+  std::lock_guard lock(peerMinerLifecycleMutex_);
+  if (!running_) return;
+  // peerMinerRunning_ is both the loop's run flag and the one-shot spawn
+  // guard: only the thread that flips it false→true creates the miner.
+  bool expected = false;
+  if (peerMinerRunning_.compare_exchange_strong(expected, true))
+    peerMinerThread_ = std::thread(&CesServer::peerMinerLoop, this);
+}
+
 void CesServer::startPeerMiner() {
-  if (cfg_.peerTarget == 0) return;
-  LOGINFO << "starting peer miner thread, target=" << cfg_.peerTarget;
-  peerMinerRunning_ = true;
-  peerMinerThread_ = std::thread(&CesServer::peerMinerLoop, this);
+  bool havePeers;
+  { std::lock_guard lock(peerTableMutex_); havePeers = !peerTable_.empty(); }
+  // Run the miner whenever there's something to do: a target to mine toward,
+  // OR peers whose reachability/verification we want kept fresh (the dashboard
+  // and settlement both want live peer state, even at target 0 — mining itself
+  // stays gated on the target inside the loop).
+  if (peerTarget_.load() == 0 && !havePeers) return;
+  LOGINFO << "starting peer miner thread" << VAR(peerTarget_.load())
+          << VAR(havePeers);
+  ensurePeerMinerStarted();
 }
 
 void CesServer::peerMinerLoop() {
@@ -4651,6 +5269,9 @@ void CesServer::peerMinerLoop() {
     : cfg_.serverName;
 
   while (peerMinerRunning_) {
+   // A background maintenance thread must never take the process down: any
+   // error in a cycle is logged and the loop keeps going (next cycle retries).
+   try {
     // Evict peers with too many consecutive ping failures
     {
       std::lock_guard lock(peerTableMutex_);
@@ -4678,18 +5299,20 @@ void CesServer::peerMinerLoop() {
     // Find the best candidate: lowest ourBalanceThere below target
     // among reachable peers (or untested peers for first check)
     int bestIdx = -1;
-    int64_t bestBalance = static_cast<int64_t>(cfg_.peerTarget);
+    int64_t bestBalance = static_cast<int64_t>(peerTarget_.load());
 
     for (int i = 0; i < static_cast<int>(candidates.size()); ++i) {
       auto& peer = candidates[i];
       if (peer.declaredAddress.empty()) continue;
 
-      // Outbound peers: mine up to peerTarget unconditionally.
-      // Inbound peers: mine up to min(peerTarget, totalInboundPoW).
-      int64_t peerLimit = static_cast<int64_t>(
-        peer.outbound ? cfg_.peerTarget
-                      : std::min(cfg_.peerTarget, peer.totalInboundPoW));
-      if (peerLimit <= 0) continue;
+      // Always probe every peer for reachability — a free connect + handshake
+      // + unsigned balance query, independent of whether we'll mine it. Mining
+      // is gated separately below on the credit target, so a peer with target 0
+      // still reports accurate reachability/verification (e.g. to the
+      // dashboard). Reachability TRANSITIONS log at INFO (a lifecycle event);
+      // steady-state re-checks stay at DEBUG so a 60 s probe loop isn't spam.
+      bool wasReachable = peer.reachable;
+      bool everChecked = (peer.lastCheckTime != 0);
 
       // Try to connect and query balance (this IS the verification)
       try {
@@ -4707,8 +5330,12 @@ void CesServer::peerMinerLoop() {
           peer.reachable = false;
           peer.pingFailures++;
           peer.lastCheckTime = minx::getSecsSinceEpoch();
-          LOGDEBUG << "peer miner: unreachable " << peer.declaredAddress
-                   << " failures=" << peer.pingFailures;
+          if (wasReachable || !everChecked)
+            LOGINFO << "peer miner: unreachable " << peer.declaredAddress
+                    << " failures=" << peer.pingFailures;
+          else
+            LOGDEBUG << "peer miner: unreachable " << peer.declaredAddress
+                     << " failures=" << peer.pingFailures;
           client.stop();
           continue;
         }
@@ -4718,6 +5345,10 @@ void CesServer::peerMinerLoop() {
         peer.verified = (client.getServerKey() == peer.ckey);
         peer.pingFailures = 0;
         peer.lastCheckTime = minx::getSecsSinceEpoch();
+        if (!wasReachable || !everChecked) {
+          LOGINFO << "peer miner: reachable " << peer.declaredAddress
+                  << " verified=" << peer.verified;
+        }
 
         int64_t balance = 0;
         uint32_t nonce = 0;
@@ -4734,15 +5365,19 @@ void CesServer::peerMinerLoop() {
         peer.reachable = false;
         peer.pingFailures++;
         peer.lastCheckTime = minx::getSecsSinceEpoch();
-        LOGDEBUG << "peer miner: error checking " << peer.declaredAddress
-                 << " " << e.what() << " failures=" << peer.pingFailures;
+        if (wasReachable || !everChecked)
+          LOGINFO << "peer miner: error checking " << peer.declaredAddress
+                  << " " << e.what();
+        else
+          LOGDEBUG << "peer miner: error checking " << peer.declaredAddress
+                   << " " << e.what() << " failures=" << peer.pingFailures;
         continue;
       }
 
       // Compute target for this peer
       int64_t pt = static_cast<int64_t>(
-        peer.outbound ? cfg_.peerTarget
-                      : std::min(cfg_.peerTarget, peer.totalInboundPoW));
+        peer.outbound ? peerTarget_.load()
+                      : std::min(peerTarget_.load(), peer.totalInboundPoW));
 
       if (peer.ourBalanceThere >= 0 && peer.ourBalanceThere < pt &&
           peer.ourBalanceThere < bestBalance) {
@@ -4755,13 +5390,22 @@ void CesServer::peerMinerLoop() {
       auto& peer = candidates[bestIdx];
       LOGDEBUG << "peer miner: mining on " << peer.declaredAddress
                << " (bal=" << peer.ourBalanceThere
-               << " target=" << (peer.outbound ? cfg_.peerTarget
-                                               : std::min(cfg_.peerTarget, peer.totalInboundPoW))
+               << " target=" << (peer.outbound ? peerTarget_.load()
+                                               : std::min(peerTarget_.load(), peer.totalInboundPoW))
                << ")";
 
       try {
         auto ep = Resolver::resolveUdp(peer.declaredAddress);
-        CesClient client(ep, cfg_.peerMiningFullDataset);
+        // The peer miner ALWAYS uses the full RandomX dataset.
+        //
+        // TOMBSTONE — do NOT "upgrade" this to a cache-only / light-mode option
+        // (a previous one was deliberately removed). It buys nothing: the miner
+        // holds exactly ONE dataset at a time (it mines a single peer per cycle),
+        // so there is no memory to save — while cache mode cripples the hash rate
+        // so badly that reaching any real credit target crawls. If you want cheap
+        // PoW for simulations or tests, MOCK the proofs; never run real mining in
+        // cache mode. Full dataset, always.
+        CesClient client(ep, /*useFullDataset=*/true);
         client.setKey(serverKeyPair_);
         client.start(0);
 
@@ -4777,7 +5421,50 @@ void CesServer::peerMinerLoop() {
             std::map<std::string, std::string> appData;
             appData["server"] = myServerAddr;
 
-            auto result = mineOnce(client, 1, appData);
+            // Smart difficulty: scale UP from the peer's floor toward the
+            // remaining credit gap, so a large target is reached in a few big
+            // solutions instead of thousands of tiny ones. The hash cost per
+            // credit is constant regardless of difficulty, so only the
+            // per-solution network/cycle overhead differs — fewer, bigger
+            // solutions amortize it. mint(D) = 2^(D-1) * POW_REWARD_BASE; grow D
+            // while the next solution's mint still fits the gap. Floor = peerDiff
+            // (never below: a fresh reserve account needs mint(D) >= the peer's
+            // feeAccount, which a correctly configured peer keeps below
+            // mint(peerDiff); and a missing account makes gap == full target, so
+            // the floor is moot — the gap forces a high difficulty anyway). Cap
+            // RELATIVE to peerDiff (PEER_MINER_MAX_DIFF_ABOVE) so one solution's
+            // work stays a small multiple of what this peer expects — the cycle
+            // returns quickly and the miner round-robins quotas across all peers
+            // instead of locking for hours on one oversized solution.
+            int64_t pt = peer.outbound
+                ? static_cast<int64_t>(peerTarget_.load())
+                : static_cast<int64_t>(
+                      std::min(peerTarget_.load(), peer.totalInboundPoW));
+            int64_t gap = pt - peer.ourBalanceThere;
+            uint8_t mineCap = peerDiff + PEER_MINER_MAX_DIFF_ABOVE;
+            uint8_t mineDiff = peerDiff;
+            while (mineDiff < mineCap &&
+                   (uint64_t(1) << mineDiff) * POW_REWARD_BASE <=
+                       static_cast<uint64_t>(std::max<int64_t>(gap, 0)))
+              ++mineDiff;
+            LOGDEBUG << "peer miner: mining " << peer.declaredAddress
+                     << " at difficulty " << static_cast<int>(mineDiff)
+                     << " (peerMin=" << static_cast<int>(peerDiff)
+                     << " gap=" << gap << ")";
+
+            // Mark "actively mining" only around the real PoW work, so the
+            // dashboard can distinguish hashing from a merely-looping thread.
+            {
+              std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
+              peerMinerMining_ = true;
+              peerMinerMiningPeer_ = peer.declaredAddress;
+              peerMinerMiningDiff_ = mineDiff;
+            }
+            auto result = mineOnce(client, mineDiff - peerDiff, appData);
+            {
+              std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
+              peerMinerMining_ = false;
+            }
             if (result.success) {
               LOGDEBUG << "peer miner: mined " << result.credit
                        << " credits on " << peer.declaredAddress;
@@ -4793,6 +5480,10 @@ void CesServer::peerMinerLoop() {
         }
         client.stop();
       } catch (std::exception& e) {
+        {  // mineOnce may have thrown mid-hash — don't leave "mining" stuck on.
+          std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
+          peerMinerMining_ = false;
+        }
         LOGDEBUG << "peer miner: mining error " << peer.declaredAddress
                  << " " << e.what();
       }
@@ -4828,6 +5519,17 @@ void CesServer::peerMinerLoop() {
       }
     }
     savePeerData();
+
+    // Heartbeat — a visible "the thread is alive and just cycled" signal for
+    // the dashboard, so peering isn't an opaque background process.
+    lastPeerMinerCycle_.store(minx::getSecsSinceEpoch(),
+                              std::memory_order_relaxed);
+    peerMinerCycles_.fetch_add(1, std::memory_order_relaxed);
+   } catch (const std::exception& e) {
+     LOGWARNING << "peer miner: cycle error (continuing): " << e.what();
+   } catch (...) {
+     LOGWARNING << "peer miner: unknown cycle error (continuing)";
+   }
 
     // Sleep between cycles
     for (int i = 0; i < cfg_.peerMinerIntervalSecs && peerMinerRunning_; ++i)

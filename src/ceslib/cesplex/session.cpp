@@ -12,6 +12,7 @@
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>         // ces::sha256
 #include <ces/types.h>
+#include <ces/util/helpers.h>         // runGuardedThread
 
 #include <minx/blog.h>
 #include <minx/minx.h>
@@ -711,8 +712,10 @@ public:
 
     netGuard_ = std::make_unique<WorkGuard>(netIO_.get_executor());
     taskGuard_ = std::make_unique<WorkGuard>(taskIO_.get_executor());
-    netThread_ = std::thread([this]() { netIO_.run(); });
-    taskThread_ = std::thread([this]() { taskIO_.run(); });
+    netThread_ = std::thread(
+      [this]() { runGuardedThread([this]{ netIO_.run(); }, "cesplexClientNetIO"); });
+    taskThread_ = std::thread(
+      [this]() { runGuardedThread([this]{ taskIO_.run(); }, "cesplexClientTaskIO"); });
 
     tickTimer_ = std::make_shared<boost::asio::steady_timer>(taskIO_);
     boost::asio::post(taskIO_, [this]() { scheduleTick(); });

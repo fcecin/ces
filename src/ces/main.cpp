@@ -15,8 +15,10 @@
 #include <toml++/toml.hpp>
 
 #include <ces/cesco.h>
+#include <ces/cesweb.h>
 #include <ces/util/ctrlc.h>
 #include <ces/util/log.h>
+#include <ces/util/helpers.h>
 #include <ces/server.h>
 
 #include <minx/blog.h>
@@ -123,6 +125,13 @@ settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
 
 # Admin console (Unix domain socket). Empty or omitted = disabled.
 # admin_socket = "./admin.sock"
+
+# Web dashboard (HTTP). Loopback only, NO authentication — reach it by
+# SSH-tunneling to the host (e.g. ssh -L 8080:127.0.0.1:8080 host). The
+# operator's control panel: peering, minting, lookups, billing, live log
+# tail, and the server-info "hello" banner. 0 = disabled (default).
+# web_port = 0
+# web_bind = "127.0.0.1"
 
 # Dedicated MINX/RUDP UDP port for the SYS_RPC syscall. 0 = disabled
 # (no second Minx instance, SYS_RPC returns CES_ERROR_DISABLED). When
@@ -300,8 +309,11 @@ int main(int argc, char* argv[]) {
   std::string optConfigFile;
   std::string optServerName;
   uint64_t optPeerTarget = 0;
+  int optPeerMinerInterval = 60;
   int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
   std::string optAdminSocket;
+  uint16_t optWebPort = 0;
+  std::string optWebBind = "127.0.0.1";
   uint16_t optRpcPort = 0;
   uint32_t optRpcMaxPending        = 1000;
   uint64_t optRpcMaxRequestBytes   = 64 * 1024;
@@ -411,11 +423,20 @@ int main(int argc, char* argv[]) {
     app.add_option("--peertarget", optPeerTarget,
       "Credit target on each peer server")
       ->default_val(std::to_string(DEFAULT_PEER_TARGET));
+    app.add_option("--peerminerinterval", optPeerMinerInterval,
+      "Seconds between peer miner cycles (default 60; lower for local/dev)")
+      ->default_val("60");
     app.add_option("--settlementretries", optSettlementMaxRetries,
       "Async settlement max retries (1 = no retries)")
       ->default_val(std::to_string(CesClientAsync::DEFAULT_MAX_RETRIES));
     app.add_option("--adminsocket", optAdminSocket,
       "Admin console Unix socket path (empty = disabled)")->default_val("");
+    app.add_option("--webport", optWebPort,
+      "Web dashboard port (0 = disabled). Loopback only, no auth — "
+      "reach it via SSH tunnel.")->default_val("0");
+    app.add_option("--webbind", optWebBind,
+      "Web dashboard bind address (loopback by design)")
+      ->default_val("127.0.0.1");
     app.add_option("--rpcport", optRpcPort,
       "Dedicated MINX/RUDP UDP port for the SYS_RPC syscall "
       "(0 = disabled)")->default_val("0");
@@ -597,8 +618,12 @@ int main(int argc, char* argv[]) {
       applyIfDefault("max_log_size_gb", optMaxLogSizeGB, "--maxlogsize");
       applyIfDefault("server_name", optServerName, "--servername");
       applyIfDefault("peer_target", optPeerTarget, "--peertarget");
+      applyIfDefault("peer_miner_interval", optPeerMinerInterval,
+                     "--peerminerinterval");
       applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
       applyIfDefault("admin_socket", optAdminSocket, "--adminsocket");
+      applyIfDefault("web_port", optWebPort, "--webport");
+      applyIfDefault("web_bind", optWebBind, "--webbind");
       applyIfDefault("rpc_port", optRpcPort, "--rpcport");
       applyIfDefault("rpc_max_pending", optRpcMaxPending, "--rpcmaxpending");
       applyIfDefault("rpc_max_request_bytes", optRpcMaxRequestBytes, "--rpcmaxreqbytes");
@@ -799,8 +824,11 @@ int main(int argc, char* argv[]) {
     config.serverName = s;
   }
   config.peerTarget = optPeerTarget;
+  config.peerMinerIntervalSecs = optPeerMinerInterval;
   config.settlementMaxRetries = optSettlementMaxRetries;
   config.adminSocket = optAdminSocket;
+  config.webPort = optWebPort;
+  config.webBind = optWebBind;
   config.rpcPort = optRpcPort;
   config.rpcMaxPending        = optRpcMaxPending;
   config.rpcMaxRequestBytes   = static_cast<size_t>(optRpcMaxRequestBytes);
@@ -981,9 +1009,32 @@ int main(int argc, char* argv[]) {
   if (!config.adminSocket.empty()) {
     cesco = std::make_unique<ces::Cesco>(cescoIO, *server);
     if (cesco->listen(config.adminSocket)) {
-      cescoThread = std::thread([&cescoIO]() { cescoIO.run(); });
+      cescoThread = std::thread(
+        [&cescoIO]() { ces::runGuardedThread([&cescoIO]{ cescoIO.run(); }, "cescoIO"); });
     } else {
       cesco.reset();
+    }
+  }
+
+  // Start web dashboard if configured. Loopback only, no auth — reach it
+  // over an SSH tunnel. Runs on its own io_context, like Cesco.
+  boost::asio::io_context webIO;
+  std::unique_ptr<ces::CesWeb> cesweb;
+  std::vector<std::thread> webThreads;
+  if (config.webPort != 0) {
+    cesweb = std::make_unique<ces::CesWeb>(webIO, *server);
+    if (cesweb->listen(config.webBind, config.webPort)) {
+      // A small pool, not one thread: the dashboard's ledger reads block the
+      // serving thread on a logicStrand_ hop, and a browser polls several
+      // endpoints concurrently — a single thread stalls (dashboard "flicker")
+      // whenever one read waits on a busy strand (e.g. a server being mined
+      // on). The handlers are thread-safe (strand hops / mutexes / atomics),
+      // so serving them across a few threads is safe.
+      for (int i = 0; i < 4; ++i)
+        webThreads.emplace_back(
+          [&webIO]() { ces::runGuardedThread([&webIO]{ webIO.run(); }, "webIO"); });
+    } else {
+      cesweb.reset();
     }
   }
 
@@ -995,6 +1046,14 @@ int main(int argc, char* argv[]) {
   }
 
   LOGINFO << "ces stopping server";
+  if (cesweb) {
+    cesweb->stop();
+    webIO.stop();
+    for (auto& t : webThreads)
+      if (t.joinable())
+        t.join();
+    cesweb.reset();
+  }
   if (cesco) {
     cesco->stop();
     cescoIO.stop();

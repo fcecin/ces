@@ -275,10 +275,11 @@ std::string contentToDisplayString(const AssetData& data) {
 
 ClientSession::ClientSession(bool cacheOnly, uint16_t port,
                              const boost::asio::ip::udp::endpoint& ep,
-                             const KeyPair* kp)
+                             const KeyPair* kp, int tries)
     : isTcp(false) {
   client_.emplace(ep, !cacheOnly);
   client_->start(port);
+  client_->setTries(tries);
   if (kp)
     client_->setKey(*kp);
   if (!client_->connect())
@@ -287,10 +288,11 @@ ClientSession::ClientSession(bool cacheOnly, uint16_t port,
 
 ClientSession::ClientSession(bool cacheOnly,
                              const boost::asio::ip::tcp::endpoint& proxyEp,
-                             const KeyPair* kp)
+                             const KeyPair* kp, int tries)
     : isTcp(true) {
   client_.emplace(proxyEp, !cacheOnly);
   client_->start(0);
+  client_->setTries(tries);
   if (kp)
     client_->setKey(*kp);
   if (!client_->connect())
@@ -298,7 +300,7 @@ ClientSession::ClientSession(bool cacheOnly,
 }
 
 ClientSession::ClientSession(bool cacheOnly, const std::string& serverStr,
-                             const KeyPair* kp) {
+                             const KeyPair* kp, int tries) {
   // CesClient is non-movable, so we hold it inside an std::optional and
   // emplace it AFTER probing — no default-construct-then-replace dance.
   auto probe = Resolver::probe(serverStr);
@@ -309,6 +311,7 @@ ClientSession::ClientSession(bool cacheOnly, const std::string& serverStr,
     client_.emplace(probe.udpEp, !cacheOnly);
 
   client_->start(0);
+  client_->setTries(tries);
   if (kp)
     client_->setKey(*kp);
   if (!client_->connect())

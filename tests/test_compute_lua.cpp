@@ -188,7 +188,6 @@ struct LuaComputeFixture {
       /*size=*/source.size(),
       /*pricePerKb=*/0,
       initialDeposit,
-      /*contentType=*/"text/x-lua",
       bal, cost));
     ces::Bytes content(source.begin(), source.end());
     CES_REQUIRE_OK(fc.write(path, /*offset=*/0, content, bal));

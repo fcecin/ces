@@ -235,7 +235,7 @@ struct DialFixture {
     CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
     uint64_t bal = 0, cost = 0;
     CES_REQUIRE_OK(fc.create(
-      path, source.size(), 0, 100'000'000ULL, "text/x-lua", bal, cost));
+      path, source.size(), 0, 100'000'000ULL, bal, cost));
     ces::Bytes content(source.begin(), source.end());
     CES_REQUIRE_OK(fc.write(path, 0, content, bal));
     fc.disconnect();

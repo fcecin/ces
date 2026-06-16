@@ -1684,20 +1684,16 @@ int lua_ces_file_stat(lua_State* L) {
   if (!api_call(METHOD_FILE_STAT, args, reply)) return push_ipc_fail(L);
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
-  // Tail: [32B owner][u64 fb][u64 ppk][u64 size][u16 ctlen][ct]
+  // Tail: [32B owner][u64 fb][u64 ppk][u64 size]
   //       [u64 createdUs][u64 modifiedUs]
   const uint8_t* p = reply.body.data() + 1;
   size_t rem = reply.body.size() - 1;
-  if (rem < WIRE_KEY_LEN + sizeof(uint64_t) * 3 + sizeof(uint16_t))
+  if (rem < WIRE_KEY_LEN + sizeof(uint64_t) * 5)
     return push_file_err(L, STATUS_INTERNAL);
   const uint8_t* owner = p; p += 32;
   uint64_t fb = get_u64(p); p += 8;
   uint64_t ppk = get_u64(p); p += 8;
   uint64_t sz = get_u64(p); p += 8;
-  uint16_t ctlen = get_u16(p); p += 2;
-  size_t used = size_t(p - (reply.body.data() + 1));
-  if (rem < used + ctlen + 16) return push_file_err(L, STATUS_INTERNAL);
-  const char* ct = reinterpret_cast<const char*>(p); p += ctlen;
   uint64_t crUs = get_u64(p); p += 8;
   uint64_t mdUs = get_u64(p); p += 8;
   lua_newtable(L);
@@ -1706,7 +1702,6 @@ int lua_ces_file_stat(lua_State* L) {
   lua_pushnumber(L, double(fb));   lua_setfield(L, -2, "file_balance");
   lua_pushnumber(L, double(ppk));  lua_setfield(L, -2, "price_per_kb");
   lua_pushnumber(L, double(sz));   lua_setfield(L, -2, "size");
-  lua_pushlstring(L, ct, ctlen);   lua_setfield(L, -2, "content_type");
   lua_pushnumber(L, double(crUs)); lua_setfield(L, -2, "created_us");
   lua_pushnumber(L, double(mdUs)); lua_setfield(L, -2, "modified_us");
   return 1;
@@ -1789,24 +1784,21 @@ int lua_ces_file_append(lua_State* L) {
   return 3;
 }
 
-// ces.file_create(name, size, price_per_kb, initial_deposit, content_type)
+// ces.file_create(name, size, price_per_kb, initial_deposit)
 //   → true, file_balance | nil, err_code
 int lua_ces_file_create(lua_State* L) {
-  size_t nlen = 0, ctlen = 0;
+  size_t nlen = 0;
   const char* name = luaL_checklstring(L, 1, &nlen);
   lua_Number sz_n = luaL_checknumber(L, 2);
   lua_Number ppk_n = luaL_optnumber(L, 3, 0);
   lua_Number dep_n = luaL_optnumber(L, 4, 0);
-  const char* ct = luaL_optlstring(L, 5, "", &ctlen);
-  if (sz_n <= 0 || ppk_n < 0 || dep_n < 0 || ctlen > 128) {
+  if (sz_n <= 0 || ppk_n < 0 || dep_n < 0) {
     lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
   }
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(sz_n));
   put_u64(args, uint64_t(ppk_n));
   put_u64(args, uint64_t(dep_n));
-  put_u16(args, uint16_t(ctlen));
-  put_bytes(args, ct, ctlen);
   put_name(args, name, nlen);
   Frame reply;
   if (!api_call(METHOD_FILE_CREATE, args, reply)) return push_ipc_fail(L);
@@ -2667,10 +2659,9 @@ int lua_fc_create(lua_State* L) {
   uint64_t size = client_arg_u64(L, 3);
   uint64_t price = client_arg_u64(L, 4);
   uint64_t deposit = client_arg_u64(L, 5);
-  size_t clen = 0; const char* ct = luaL_checklstring(L, 6, &clen);
   uint64_t fb = 0, cost = 0;
   uint8_t rc = e->fc->create(std::string(name, nlen), size, price, deposit,
-                             std::string(ct, clen), fb, cost);
+                             fb, cost);
   if (rc != ces::CES_OK) return client_push_err(L, rc);
   lua_pushnumber(L, static_cast<lua_Number>(fb));
   lua_pushnumber(L, static_cast<lua_Number>(cost));
@@ -2801,8 +2792,6 @@ int lua_fc_stat(lua_State* L) {
   lua_setfield(L, -2, "price_per_kb");
   lua_pushnumber(L, static_cast<lua_Number>(info.size));
   lua_setfield(L, -2, "size");
-  lua_pushlstring(L, info.contentType.data(), info.contentType.size());
-  lua_setfield(L, -2, "content_type");
   lua_pushnumber(L, static_cast<lua_Number>(info.createdUs));
   lua_setfield(L, -2, "created_us");
   lua_pushnumber(L, static_cast<lua_Number>(info.modifiedUs));

@@ -155,7 +155,10 @@ int CesClient::proveWork(const minx::MinxProveWork& msg,
                               msg.time,
                               msg.nonce,
                               msg.solution,
-                              {}};
+                              msg.data};  // carry the appData (hdata commits to
+                                          // it); dropping it here is why a mined
+                                          // server's address never reached the
+                                          // peer it mined — inbound discovery.
 
     // Capture gen right before sending so stale responses are already behind us
     uint64_t g = proveWorkGen_;
@@ -820,6 +823,48 @@ uint8_t CesClient::queryAsset(const Hash& assetId, HashPrefix& outOwner,
   return CES_ERROR_TIMEOUT;
 }
 
+uint8_t CesClient::queryPeerInfo(uint16_t index, uint16_t& outCount, bool& outFound,
+                             Hash& outPubkey, std::string& outAddress) {
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+
+  CesUnsignedQueryPeerInfo req;
+  req.index = index;
+  minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
+                        req.toBytes()};
+  uint64_t g = peerQueryGen_;
+  int staleCount = 0;
+
+  for (int i = 0; i < tries_; ++i) {
+    transport_->sendMessage(msg);
+    auto res = ces::waitFor(kRetryIntervalMs,
+                            [&]() { return g < peerQueryGen_; });
+    switch (res) {
+    case ces::WaitResult::Success:
+      if (peerQueryIndex_ != index) {
+        g = peerQueryGen_;
+        if (++staleCount < tries_) { --i; }
+        continue;
+      }
+      outCount = peerQueryCount_;
+      outFound = peerQueryFound_ != 0;
+      outPubkey = peerQueryPubkey_;
+      {
+        const auto& a = peerQueryAddress_;
+        size_t n = 0;
+        while (n < a.size() && a[n] != 0) ++n;
+        outAddress.assign(reinterpret_cast<const char*>(a.data()), n);
+      }
+      return CES_OK;
+    case ces::WaitResult::Interrupted:
+      return CES_ERROR_INTERNAL;
+    case ces::WaitResult::Timeout:
+      break;
+    }
+  }
+  return CES_ERROR_TIMEOUT;
+}
+
 uint8_t CesClient::queryServerInfo(std::vector<ServerInfoEntry>& outEntries) {
   LOGTRACE << "queryServerInfo";
   uint32_t reqNonce;
@@ -1097,6 +1142,17 @@ void CesClient::incomingMessage(const minx::SockAddr& /* addr */,
         assetUnsignedQueryContent_ = r.content;
         assetUnsignedQueryBalance_ = r.balance;
         assetUnsignedQueryPrice_ = r.price;
+      });
+      break;
+
+    case CES_QUERY_PEER_INFO_RESULT:
+      handleUnsigned(CesUnsignedQueryPeerInfoResult{}, peerQueryGen_,
+                     [&](auto& r) {
+        peerQueryIndex_ = r.index;
+        peerQueryCount_ = r.peerCount;
+        peerQueryFound_ = r.found;
+        peerQueryPubkey_ = r.pubkey;
+        peerQueryAddress_ = r.address;
       });
       break;
 

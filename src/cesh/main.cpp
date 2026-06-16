@@ -203,6 +203,17 @@ int main(int argc, char* argv[]) {
   auto* cmd_sinfo =
     app.add_subcommand("server-info", "Query extended server info (paid)");
 
+  // ---- Subcommand: peer-info (unsigned, no actor needed) ----
+
+  auto* cmd_peer_info = app.add_subcommand(
+    "peer-info", "Read a server's peer-table slot (unsigned/free)");
+  uint16_t peer_info_id_arg = 0;
+  std::string peer_info_server_arg;
+  cmd_peer_info->add_option("id", peer_info_id_arg, "Peer-table slot index")
+    ->required();
+  cmd_peer_info->add_option("server", peer_info_server_arg,
+                            "Server endpoint (host:port)")->required();
+
   // ---- Subcommand: ping (unsigned, no actor needed) ----
 
   auto* cmd_ping = app.add_subcommand(
@@ -535,8 +546,9 @@ int main(int argc, char* argv[]) {
   boost::asio::ip::tcp::endpoint proxy_endpoint;
   // `cesh dial` only talks /ces/lua/1 on --rpc-port; it never opens a
   // CesClient session and so doesn't need the main server endpoint.
-  // Skip the resolver to allow `--server localhost` (no :port).
-  if (!cmd_dial->parsed()) {
+  // Skip the resolver to allow `--server localhost` (no :port). peer-info
+  // resolves its own positional <server>, so it skips this too.
+  if (!cmd_dial->parsed() && !cmd_peer_info->parsed()) {
     try {
       if (useProxy) {
         proxy_endpoint = ces::Resolver::resolveTcp(proxy_arg);
@@ -555,13 +567,45 @@ int main(int argc, char* argv[]) {
     -> std::unique_ptr<ClientSession> {
     std::unique_ptr<ClientSession> s;
     if (useProxy)
-      s = std::make_unique<ClientSession>(cacheOnly, proxy_endpoint, kp);
+      s = std::make_unique<ClientSession>(cacheOnly, proxy_endpoint, kp,
+                                           tries_arg);
     else
       s = std::make_unique<ClientSession>(cacheOnly, clientPort,
-                                           server_endpoint, kp);
+                                           server_endpoint, kp, tries_arg);
     s->client().setTries(tries_arg);
     return s;
   };
+
+  // ---- peer-info: positional <server>, unsigned/free, its own session ----
+  if (cmd_peer_info->parsed()) {
+    boost::asio::ip::udp::endpoint ep;
+    try {
+      ep = ces::Resolver::resolveUdp(peer_info_server_arg);
+    } catch (std::exception& e) {
+      std::cerr << "Resolve error: " << e.what() << "\n";
+      return 1;
+    }
+    ClientSession sess(cacheOnly, clientPort, ep, nullptr, tries_arg);
+    sess.client().setTries(tries_arg);
+    uint16_t count = 0;
+    bool found = false;
+    minx::Hash pk{};
+    std::string addr;
+    uint8_t rc = sess.client().queryPeerInfo(peer_info_id_arg, count, found,
+                                             pk, addr);
+    if (rc != CES_OK) {
+      std::cerr << "Peer-Info Failed: " << errorString(rc) << "\n";
+      return 1;
+    }
+    print_header("Peer slot " + std::to_string(peer_info_id_arg));
+    print_field("peers total", std::to_string(count));
+    print_field("found", found ? std::string("yes") : std::string("no"));
+    if (found) {
+      print_field("pubkey", minx::hashToString(pk));
+      print_field("address", addr);
+    }
+    return 0;
+  }
 
   // ---- Load wallet ----
   //
@@ -1492,7 +1536,6 @@ int main(int argc, char* argv[]) {
           uint64_t createdBalance = 0, costDebited = 0;
           uint8_t crc = cfc.create(remote, bytes.size(),
                                     /*price_per_kb=*/0, deposit,
-                                    /*content_type=*/"",
                                     createdBalance, costDebited);
           if (crc != CES_OK) {
             std::cerr << "Error: create failed: " << errorString(crc)
@@ -1599,8 +1642,6 @@ int main(int argc, char* argv[]) {
         print_field("Size", info.size);
         print_field("Balance", info.fileBalance);
         print_field("Price/KB", info.pricePerKb);
-        if (!info.contentType.empty())
-          print_field("Content-Type", info.contentType);
         print_field("Created", info.createdUs);
         print_field("Modified", info.modifiedUs);
         std::cout << std::endl;

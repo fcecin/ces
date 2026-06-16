@@ -143,19 +143,21 @@ std::string contentToDisplayString(const AssetData& data);
 
 class ClientSession {
 public:
-  /** UDP mode: connect directly to server. */
+  /** UDP mode: connect directly to server. `tries` is applied BEFORE the
+   *  constructor's connect()/handshake — pass it here, not via a later
+   *  setTries(), or the initial connect uses the default retry count. */
   ClientSession(bool cacheOnly, uint16_t port,
                 const boost::asio::ip::udp::endpoint& ep,
-                const KeyPair* kp = nullptr);
+                const KeyPair* kp = nullptr, int tries = 3);
 
   /** TCP proxy mode: connect through a MinxProxy. */
   ClientSession(bool cacheOnly,
                 const boost::asio::ip::tcp::endpoint& proxyEp,
-                const KeyPair* kp = nullptr);
+                const KeyPair* kp = nullptr, int tries = 3);
 
   /** Auto-detect mode: probe server, use TCP if proxy, UDP otherwise. */
   ClientSession(bool cacheOnly, const std::string& serverStr,
-                const KeyPair* kp = nullptr);
+                const KeyPair* kp = nullptr, int tries = 3);
 
   ~ClientSession();
 

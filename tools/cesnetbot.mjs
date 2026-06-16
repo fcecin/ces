@@ -237,6 +237,24 @@ async function main() {
   const failures = [];
   const rand = (max) => Math.floor(Math.random() * max);
 
+  // A cross-transfer can transiently fail with UNKNOWN_PEER while the origin
+  // server's peer miner hasn't probed the destination peer yet (reachability is
+  // set asynchronously, and a missed probe is only retried every
+  // peer_miner_interval). Retry such failures briefly so the test isn't flaky on
+  // a startup / re-probe race — settlement still has to conserve credits to pass.
+  const asleep = (ms) => new Promise((res) => setTimeout(res, ms));
+  const execOp = async (op) => {
+    let r = await op.run();
+    let tries = 0;
+    while (!r.ok && op.type === "cross" &&
+           /unknown.?peer/i.test(r.err) && tries < 8) {
+      await asleep(1500);
+      r = await op.run();
+      tries++;
+    }
+    return r;
+  };
+
   for (let round = 1; round <= opts.rounds; round++) {
     // Build all transfers for this round
     const ops = [];
@@ -254,7 +272,7 @@ async function main() {
 
         ops.push({
           type: "cross",
-          promise: ceshAsync(dir,
+          run: () => ceshAsync(dir,
             ["--server", srcAddr, "-a", `@${user.walletIdx}`,
              "cross", destUser.pub, String(opts.amount), destAddr]),
           desc: `@${user.walletIdx}→@${destUser.walletIdx} ${srcAddr}→${destAddr}`,
@@ -262,7 +280,7 @@ async function main() {
       } else {
         ops.push({
           type: "local",
-          promise: ceshAsync(dir,
+          run: () => ceshAsync(dir,
             ["--server", srcAddr, "-a", `@${user.walletIdx}`,
              "transfer", destUser.pub, String(opts.amount), "--open"]),
           desc: `@${user.walletIdx}→@${destUser.walletIdx} on ${srcAddr}`,
@@ -270,8 +288,9 @@ async function main() {
       }
     }
 
-    // Fire all in parallel, wait for all to complete
-    const results = await Promise.all(ops.map((op) => op.promise));
+    // Fire all in parallel, wait for all to complete (cross ops retry briefly
+    // on a transient UNKNOWN_PEER reachability race; see execOp above).
+    const results = await Promise.all(ops.map((op) => execOp(op)));
 
     for (let i = 0; i < results.length; i++) {
       const r = results[i];

@@ -39,6 +39,25 @@ static CesConfig makePeeringConfig(const bfs::path& dataDir,
   return cfg;
 }
 
+// Poll a server account until its balance equals `expected`, or `timeoutMs`
+// elapses. Cross-server settlement is async (openTransfer over the wire) but
+// normally lands in well under a second; polling lets these tests finish the
+// moment the ledger actually settles instead of sleeping a fixed 10s.
+static void waitForBalance(const std::unique_ptr<CesServer>& srv,
+                           const HashPrefix& mapKey, int64_t expected,
+                           int timeoutMs = 12000) {
+  for (int i = 0; i < timeoutMs / 50; ++i) {
+    int64_t bal = 0;
+    uint32_t nonce = 0;
+    HashPrefix xd{};
+    uint64_t xa = 0;
+    uint32_t xt = 0;
+    srv->unsignedQueryAccount(mapKey, bal, nonce, xd, xa, xt);
+    if (bal == expected) return;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+}
+
 BOOST_AUTO_TEST_SUITE(PeeringTests)
 
 BOOST_AUTO_TEST_CASE(AutomatedBilateralPeering) {
@@ -55,7 +74,6 @@ BOOST_AUTO_TEST_CASE(AutomatedBilateralPeering) {
   ces::KeyPair kpB(privB);
 
   CesConfig cfgA = makePeeringConfig(dirA, privA);
-  cfgA.peerMiningFullDataset = false;
   cfgA.peerMinerIntervalSecs = 2;
 
   CesConfig cfgB = cfgA;
@@ -89,11 +107,15 @@ BOOST_AUTO_TEST_CASE(AutomatedBilateralPeering) {
   serverA.reset();
   serverB.reset();
 
-  cfgA.peerTarget = 100000; // target 100k credits on each peer
+  // Small target: the test only asserts a reserve forms (bal > 0), so one
+  // low-difficulty solution per side suffices. A large target would make the
+  // smart-difficulty miner grind many cache-only RandomX hashes for no extra
+  // coverage — just slow CI.
+  cfgA.peerTarget = 2000;
   cfgA.peers.push_back({minx::hashToString(kpB.getPublicKeyAsHash()),
                          "localhost:" + std::to_string(portB)});
 
-  cfgB.peerTarget = 100000;
+  cfgB.peerTarget = 2000;
   cfgB.peers.push_back({minx::hashToString(kpA.getPublicKeyAsHash()),
                          "localhost:" + std::to_string(portA)});
 
@@ -127,8 +149,8 @@ BOOST_AUTO_TEST_CASE(AutomatedBilateralPeering) {
   bool aHasBalOnB = false;
   bool bHasBalOnA = false;
 
-  for (int attempt = 0; attempt < 90 && !(aHasBalOnB && bHasBalOnA); ++attempt) {
-    std::this_thread::sleep_for(std::chrono::seconds(2));
+  for (int attempt = 0; attempt < 900 && !(aHasBalOnB && bHasBalOnA); ++attempt) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
     // Check A's balance on B (query B directly via server API)
     if (!aHasBalOnB) {
@@ -272,7 +294,12 @@ BOOST_AUTO_TEST_CASE(CrossServerTransfer) {
   uint16_t portB = serverB->start(0);
   BOOST_REQUIRE(portB > 0);
 
-  std::string addrB = "localhost:" + std::to_string(portB);
+  // A v4 LITERAL on purpose (the sibling cross-server tests use "localhost",
+  // which resolves to ::1 first on a dual-stack host and hides the v4 path).
+  // Settlement opens a v6 dual-stack socket, so a plain-v4 destination must be
+  // v4-mapped before sending; this exercises that — it fails without the
+  // CesClientAsync v4-mapped normalization.
+  std::string addrB = "127.0.0.1:" + std::to_string(portB);
 
   // Fund Alice on Server A
   serverA->_brr(alice.getPublicKeyAsHash(), 10000);
@@ -334,8 +361,8 @@ BOOST_AUTO_TEST_CASE(CrossServerTransfer) {
     LOGINFO << "B's vostro on A: " << bal;
   }
 
-  // Wait for async remote delivery
-  std::this_thread::sleep_for(std::chrono::seconds(10));
+  // Wait for async cross-server settlement to land (polls; normally < 1s).
+  waitForBalance(serverB, Account::getMapKey(bob.getPublicKeyAsHash()), 5000);
 
   // Verify: A's reserve on B decreased
   {
@@ -476,8 +503,8 @@ BOOST_AUTO_TEST_CASE(CrossServerPaymentSettlement) {
 
   wait_net();
 
-  // Wait for async remote delivery
-  std::this_thread::sleep_for(std::chrono::seconds(10));
+  // Wait for async cross-server settlement to land (polls; normally < 1s).
+  waitForBalance(serverB, Account::getMapKey(alice.getPublicKeyAsHash()), 7000);
 
   // Verify: Alice's payment account on B is now settled (balance = 7000)
   {
@@ -748,7 +775,8 @@ BOOST_AUTO_TEST_CASE(DedupTimeRejection) {
   }
 
   wait_net();
-  std::this_thread::sleep_for(std::chrono::seconds(10));
+  // Wait for async cross-server settlement to land (polls; normally < 1s).
+  waitForBalance(serverB, Account::getMapKey(alice.getPublicKeyAsHash()), 1000);
 
   // Verify money arrived on B
   {
@@ -955,8 +983,8 @@ BOOST_AUTO_TEST_CASE(VmCrossTransfer) {
     LOGINFO << "B vostro on A: " << bal;
   }
 
-  // --- Async settlement: wait for delivery to land on B ---
-  std::this_thread::sleep_for(std::chrono::seconds(10));
+  // --- Async settlement: wait for delivery to land on B (polls; ~<1s) ---
+  waitForBalance(serverB, Account::getMapKey(bob.getPublicKeyAsHash()), 50);
 
   // Bob should have received the credits.
   {
@@ -1039,9 +1067,11 @@ BOOST_AUTO_TEST_CASE(PeerReachabilityDetection) {
   CesConfig cfgA = cfgB;
   cfgA.dataDir = dirA;
   cfgA.serverPrivKey = privA;
-  cfgA.peerTarget = 100'000;
+  // Target 0: this test only asserts the miner marks B reachable (a probe),
+  // not that it mines. At target 0 the miner probes without ever committing to
+  // a mine, so it never builds the full RandomX dataset — pure reachability.
+  cfgA.peerTarget = 0;
   cfgA.peerMinerIntervalSecs = 1;
-  cfgA.peerMiningFullDataset = false;
   cfgA.peers.push_back({minx::hashToString(kpB.getPublicKeyAsHash()),
                         "localhost:" + std::to_string(portB)});
 

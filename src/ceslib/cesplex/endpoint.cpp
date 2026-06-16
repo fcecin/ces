@@ -8,6 +8,7 @@
 
 #include <ces/cesplex/endpoint.h>
 #include <ces/types.h>          // getMicrosSinceEpoch
+#include <ces/util/helpers.h>   // runGuardedThread
 
 #include <minx/blog.h>
 #include <minx/stdext.h>
@@ -93,8 +94,10 @@ CesPlexEndpoint::CesPlexEndpoint(uint16_t port,
   }
 
   LOGINFO << "CesPlexEndpoint listening" << VAR(boundPort_);
-  netThread_ = std::thread([this]() { netIO_.run(); });
-  taskThread_ = std::thread([this]() { taskIO_.run(); });
+  netThread_ = std::thread(
+    [this]() { runGuardedThread([this]{ netIO_.run(); }, "cesplexEndpointNetIO"); });
+  taskThread_ = std::thread(
+    [this]() { runGuardedThread([this]{ taskIO_.run(); }, "cesplexEndpointTaskIO"); });
 
   // Rudp tick pulse on taskIO_; reschedules itself until running_ clears.
   tickTimer_ = std::make_shared<boost::asio::steady_timer>(taskIO_);

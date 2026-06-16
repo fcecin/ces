@@ -42,7 +42,6 @@ public:
     uint64_t fileBalance = 0;
     uint64_t pricePerKb = 0;
     uint64_t size = 0;
-    std::string contentType;
     uint64_t createdUs = 0;
     uint64_t modifiedUs = 0;
   };
@@ -88,7 +87,7 @@ public:
 
   uint8_t create(const std::string& name,
                  uint64_t size, uint64_t pricePerKb,
-                 uint64_t initialDeposit, const std::string& contentType,
+                 uint64_t initialDeposit,
                  uint64_t& outFileBalance, uint64_t& outCostDebited);
 
   // `content.size()` must be ≤ 1 MB (server cap). For bigger payloads

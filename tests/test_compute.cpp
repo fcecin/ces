@@ -106,8 +106,7 @@ struct ComputeE2EFixture {
     if (rc != CES_OK) return rc;
     uint64_t outBal = 0, outCost = 0;
     rc = fc.create(name, /*size=*/1, /*pricePerKb=*/0,
-                   deposit, /*contentType=*/"application/octet-stream",
-                   outBal, outCost);
+                   deposit, outBal, outCost);
     fc.disconnect();
     return rc;
   }
@@ -497,7 +496,7 @@ BOOST_AUTO_TEST_CASE(ComputeLaunchAcceptTimeoutIsClean) {
     uint64_t outBal = 0, outCost = 0;
     CES_REQUIRE_OK(fc.create(ownerPath, /*size=*/1, /*pricePerKb=*/0,
                              /*deposit=*/1'000'000,
-                             "application/octet-stream", outBal, outCost));
+                             outBal, outCost));
     fc.disconnect();
   }
 
@@ -579,7 +578,7 @@ BOOST_AUTO_TEST_CASE(LaunchIsNotDeduped) {
     uint64_t outBal = 0, outCost = 0;
     CES_REQUIRE_OK(fc.create(ownerPath, /*size=*/1, /*pricePerKb=*/0,
                              /*deposit=*/1'000'000'000,
-                             "application/octet-stream", outBal, outCost));
+                             outBal, outCost));
     fc.disconnect();
   }
 
@@ -661,7 +660,7 @@ struct PortServer {
     CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
     uint64_t b = 0, c = 0;
     CES_REQUIRE_OK(fc.create(src, 1, 0, 1'000'000'000,
-                             "application/octet-stream", b, c));
+                             b, c));
     fc.disconnect();
   }
   ~PortServer() {

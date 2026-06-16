@@ -25,6 +25,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace ces {
 
@@ -88,6 +89,24 @@ void computeHandlerOnApplicationMsg(
 // inbound RUDP channels and the running cesluajitd children. All run
 // on rpcTaskIO_'s strand — same as the supervisor itself — so they're
 // safe to call from there but not elsewhere.
+
+// Per-instance monitoring snapshot, surfaced to the web dashboard's
+// Compute tab. CPU is in basis points of one core (10000 = a full core);
+// rssBytes + cpuBasisPoints are the supervisor's last per-tick sample.
+struct ComputeInstanceStat {
+  uint64_t id = 0;
+  std::string source;          // source file path (e.g. /s/dice.lua)
+  uint32_t cpuBasisPoints = 0; // 0..10000, of one core
+  uint64_t rssBytes = 0;
+  uint64_t uptimeSecs = 0;
+  uint16_t clientPort = 0;     // outbound CES-client port (0 = none)
+  uint16_t rpcPort = 0;        // inbound /ces/luarpc/1 host port (0 = none)
+};
+
+// Snapshot every running instance for monitoring. Safe to call from any
+// thread; runs on the CesPlex strand internally (blocking post+wait), so
+// it sees a consistent registry. Empty if the handler is unbound.
+std::vector<ComputeInstanceStat> computeHandlerSnapshot();
 
 // True iff `instanceId` is currently registered in the supervisor.
 // Used by the lua handler to disambiguate "no such instance" from

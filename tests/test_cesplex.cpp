@@ -739,15 +739,12 @@ static RespTail fileCreate(boost::asio::io_context& ioc,
                            uint32_t reqNonce,
                            uint64_t size, uint64_t pricePerKb,
                            uint64_t initialDeposit,
-                           const std::string& contentType,
                            const std::string& name) {
   ces::Bytes pre;
   ces::Buffer::put<uint32_t>(pre, reqNonce);
   ces::Buffer::put<uint64_t>(pre, size);
   ces::Buffer::put<uint64_t>(pre, pricePerKb);
   ces::Buffer::put<uint64_t>(pre, initialDeposit);
-  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(contentType.size()));
-  pre.insert(pre.end(), contentType.begin(), contentType.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
   auto env = buildSignedEnvelope(signer, 0x01, pre, sessionToken);
@@ -866,7 +863,6 @@ struct StatResult {
   uint64_t fileBalance = 0;
   uint64_t pricePerKb = 0;
   uint64_t size = 0;
-  std::string contentType;
 };
 
 static StatResult fileStat(boost::asio::io_context& ioc,
@@ -910,14 +906,13 @@ static StatResult fileStat(boost::asio::io_context& ioc,
 
   // STAT response:
   //   [u8 status][32 owner][u64 balance][u64 price][u64 size]
-  //   [u16 ct_len][ct][u64 created][u64 modified]
+  //   [u64 created][u64 modified]
   //   [tail]
-  // Fixed part of preamble = 32+8+8+8+2 = 58; ct is variable.
+  // Fixed part of preamble = 32+8+8+8 = 56; timestamps follow.
   struct R2 : std::enable_shared_from_this<R2> {
     std::shared_ptr<minx::RudpStream> stream;
     std::array<uint8_t, 1> statusBuf{};
-    std::array<uint8_t, 58> fixed{};
-    ces::Bytes ctBuf;
+    std::array<uint8_t, 56> fixed{};
     std::array<uint8_t, 16> tsBuf{};
     std::array<uint8_t, 8 + 8 + 32 + 65> envTail{};
     std::promise<StatResult> prom;
@@ -940,38 +935,23 @@ static StatResult fileStat(boost::asio::io_context& ioc,
             *self->stream, boost::asio::buffer(self->fixed),
             [self](const boost::system::error_code& e2, std::size_t) {
               if (e2) { self->prom.set_value({}); return; }
-              uint16_t ctLen = ces::Buffer::peek<uint16_t>(self->fixed.data() + 56);
-              self->ctBuf.resize(ctLen);
-              auto readTs = [self]() {
-                boost::asio::async_read(
-                  *self->stream, boost::asio::buffer(self->tsBuf),
-                  [self](const boost::system::error_code& e3, std::size_t) {
-                    if (e3) { self->prom.set_value({}); return; }
-                    boost::asio::async_read(
-                      *self->stream, boost::asio::buffer(self->envTail),
-                      [self](const boost::system::error_code&, std::size_t) {
-                        StatResult r;
-                        r.status = CES_OK;
-                        std::memcpy(r.ownerPubkey.data(),
-                                    self->fixed.data(), 32);
-                        r.fileBalance = ces::Buffer::peek<uint64_t>(self->fixed.data() + 32);
-                        r.pricePerKb  = ces::Buffer::peek<uint64_t>(self->fixed.data() + 40);
-                        r.size        = ces::Buffer::peek<uint64_t>(self->fixed.data() + 48);
-                        r.contentType.assign(self->ctBuf.begin(),
-                                             self->ctBuf.end());
-                        self->prom.set_value(std::move(r));
-                      });
-                  });
-              };
-              if (ctLen == 0) readTs();
-              else
-                boost::asio::async_read(
-                  *self->stream, boost::asio::buffer(self->ctBuf),
-                  [self, readTs](const boost::system::error_code& e4,
-                                 std::size_t) {
-                    if (e4) { self->prom.set_value({}); return; }
-                    readTs();
-                  });
+              boost::asio::async_read(
+                *self->stream, boost::asio::buffer(self->tsBuf),
+                [self](const boost::system::error_code& e3, std::size_t) {
+                  if (e3) { self->prom.set_value({}); return; }
+                  boost::asio::async_read(
+                    *self->stream, boost::asio::buffer(self->envTail),
+                    [self](const boost::system::error_code&, std::size_t) {
+                      StatResult r;
+                      r.status = CES_OK;
+                      std::memcpy(r.ownerPubkey.data(),
+                                  self->fixed.data(), 32);
+                      r.fileBalance = ces::Buffer::peek<uint64_t>(self->fixed.data() + 32);
+                      r.pricePerKb  = ces::Buffer::peek<uint64_t>(self->fixed.data() + 40);
+                      r.size        = ces::Buffer::peek<uint64_t>(self->fixed.data() + 48);
+                      self->prom.set_value(std::move(r));
+                    });
+                });
             });
         });
     }
@@ -1092,7 +1072,7 @@ struct PutEnvelope {
 static PutEnvelope buildPutEnvelope(
     const ces::KeyPair& signer,
     uint32_t reqNonce, uint64_t allowance, uint32_t days,
-    const std::string& name, const std::string& contentType,
+    const std::string& name,
     const ces::Bytes& content) {
   // Body
   ces::Bytes body;
@@ -1101,8 +1081,6 @@ static PutEnvelope buildPutEnvelope(
   ces::Buffer::put<uint32_t>(body, days);
   ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(name.size()));
   body.insert(body.end(), name.begin(), name.end());
-  ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(contentType.size()));
-  body.insert(body.end(), contentType.begin(), contentType.end());
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(content.size()));
   body.insert(body.end(), content.begin(), content.end());
 
@@ -1181,7 +1159,6 @@ static PutResult doPut(boost::asio::io_context& ioc,
 
 struct GetResult {
   uint8_t status = 0xFF;
-  std::string contentType;
   ces::Bytes bytes;
 };
 
@@ -1193,8 +1170,6 @@ static GetResult doGet(boost::asio::io_context& ioc,
     std::array<uint8_t, 1> verb{0x02};
     ces::Bytes nameBuf;
     std::array<uint8_t, 1> statusBuf{};
-    std::array<uint8_t, 2> ctLenBuf{};
-    ces::Bytes ctBuf;
     std::array<uint8_t, 8> sizeBuf{};
     ces::Bytes body;
     std::promise<GetResult> prom;
@@ -1218,49 +1193,29 @@ static GetResult doGet(boost::asio::io_context& ioc,
                     return;
                   }
                   boost::asio::async_read(
-                    *self->stream, boost::asio::buffer(self->ctLenBuf),
-                    [self](const boost::system::error_code& e4,
+                    *self->stream,
+                    boost::asio::buffer(self->sizeBuf),
+                    [self](const boost::system::error_code& e6,
                            std::size_t) {
-                      if (e4) { self->prom.set_value({}); return; }
-                      uint16_t ctLen = ces::Buffer::peek<uint16_t>(self->ctLenBuf.data());
-                      self->ctBuf.resize(ctLen);
-                      auto after =
-                        [self](const boost::system::error_code& e5,
+                      if (e6) { self->prom.set_value({}); return; }
+                      uint64_t sz = ces::Buffer::peek<uint64_t>(self->sizeBuf.data());
+                      self->body.resize(sz);
+                      auto done =
+                        [self](const boost::system::error_code& e7,
                                std::size_t) {
-                          if (e5) { self->prom.set_value({}); return; }
-                          boost::asio::async_read(
-                            *self->stream,
-                            boost::asio::buffer(self->sizeBuf),
-                            [self](const boost::system::error_code& e6,
-                                   std::size_t) {
-                              if (e6) { self->prom.set_value({}); return; }
-                              uint64_t sz = ces::Buffer::peek<uint64_t>(self->sizeBuf.data());
-                              self->body.resize(sz);
-                              auto done =
-                                [self](const boost::system::error_code& e7,
-                                       std::size_t) {
-                                  if (e7) {
-                                    self->prom.set_value({}); return;
-                                  }
-                                  GetResult r;
-                                  r.status = CES_OK;
-                                  r.contentType.assign(
-                                    self->ctBuf.begin(), self->ctBuf.end());
-                                  r.bytes = std::move(self->body);
-                                  self->prom.set_value(std::move(r));
-                                };
-                              if (sz == 0) done({}, 0);
-                              else
-                                boost::asio::async_read(
-                                  *self->stream,
-                                  boost::asio::buffer(self->body), done);
-                            });
+                          if (e7) {
+                            self->prom.set_value({}); return;
+                          }
+                          GetResult r;
+                          r.status = CES_OK;
+                          r.bytes = std::move(self->body);
+                          self->prom.set_value(std::move(r));
                         };
-                      if (ctLen == 0) after({}, 0);
+                      if (sz == 0) done({}, 0);
                       else
                         boost::asio::async_read(
                           *self->stream,
-                          boost::asio::buffer(self->ctBuf), after);
+                          boost::asio::buffer(self->body), done);
                     });
                 });
             });
@@ -1303,7 +1258,7 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   const uint64_t postCreateBalance = deposit - upfrontBurn;
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       size, /*pricePerKb=*/10, deposit,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_OK);
 
   auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
@@ -1311,7 +1266,6 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   BOOST_CHECK_EQUAL(st.fileBalance, postCreateBalance);
   BOOST_CHECK_EQUAL(st.pricePerKb, 10u);
   BOOST_CHECK_EQUAL(st.size, 1024u);
-  BOOST_CHECK_EQUAL(st.contentType, std::string("text/plain"));
   BOOST_CHECK(std::memcmp(st.ownerPubkey.data(),
                           signer.getPublicKeyAsHash().data(), 32) == 0);
 
@@ -1350,7 +1304,7 @@ BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
   const uint64_t upfrontBurn = size * 1ull * 900 / 86400;  // fixture feeFileRent=1
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
                       CES_NONCELESS, size, /*pricePerKb=*/0, createDeposit,
-                      "text/plain", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
   const uint64_t postCreate = createDeposit - upfrontBurn;
 
@@ -1401,7 +1355,7 @@ BOOST_AUTO_TEST_CASE(FileWriteRead) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/64, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
-                      "text/plain", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   ces::Bytes content(64, 0);
@@ -1448,7 +1402,7 @@ BOOST_AUTO_TEST_CASE(FileCrossSignerEconomics) {
   auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
                       CES_NONCELESS, size, pricePerKb,
                       /*initialDeposit=*/500'000,
-                      "text/plain", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
   uint64_t expectedBalance = 500'000u - upfrontBurn;
 
@@ -1500,7 +1454,7 @@ BOOST_AUTO_TEST_CASE(FileNonOwnerWriteRejected) {
   auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
                       CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
-                      "text/plain", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   // B (different bound channel) tries to write — server rejects with
@@ -1531,7 +1485,7 @@ BOOST_AUTO_TEST_CASE(FileAppendExtendsSize) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
-                      "application/octet-stream", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   // WRITE 'A's into the first 16 bytes.
@@ -1577,7 +1531,7 @@ BOOST_AUTO_TEST_CASE(FileResizeGrowAndShrink) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/100, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
-                      "application/octet-stream", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   // Grow to 200.
@@ -1630,7 +1584,7 @@ BOOST_AUTO_TEST_CASE(FileRentKillsBrokeFile) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/1024 * 1024, /*pricePerKb=*/0,
                       /*initialDeposit=*/10924,
-                      "text/plain", name);
+                      name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
@@ -1661,7 +1615,7 @@ BOOST_AUTO_TEST_CASE(FileCreateRejectsUnderfundedDeposit) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/1024 * 1024, /*pricePerKb=*/0,
                       /*initialDeposit=*/1,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_ERROR_INSUFFICIENT_BALANCE);
 }
 
@@ -1700,7 +1654,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirSelfOwnedAllowed) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_OK);
 }
 
@@ -1727,7 +1681,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirWrongSignerRejected) {
   auto c = fileCreate(peer.taskIO(), sel.stream, bob, sel.sessionToken, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
 }
 
@@ -1754,7 +1708,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceRequiresAsset) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
 }
 
@@ -1776,12 +1730,12 @@ BOOST_AUTO_TEST_CASE(FileBadZoneRejected) {
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
-                      "text/plain", name);
+                      name);
   CES_CHECK_RC_EQ(c.status, CES_ERROR_BAD_NAME);
 }
 
 // Regression: writeSidecar used to hand-roll `key = "val"` TOML, which
-// corrupted the sidecar when name / content_type held quotes or newlines
+// corrupted the sidecar when name held quotes or newlines
 // (validateCesFileName permits everything except '/' and NUL). It now
 // serializes via tomlplusplus, so these round-trip through STAT's re-read.
 BOOST_AUTO_TEST_CASE(FileSidecarSurvivesQuotesAndNewlines) {
@@ -1798,16 +1752,13 @@ BOOST_AUTO_TEST_CASE(FileSidecarSurvivesQuotesAndNewlines) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/p/has\"quote/f.txt";
-  const std::string contentType =
-      "text/x; a=\"b\"\ninjected = \"evil\"\ttab\\back";
   auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
                       CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
-                      /*initialDeposit=*/1'000'000, contentType, name);
+                      /*initialDeposit=*/1'000'000, name);
   CES_CHECK_RC_EQ(c.status, CES_OK);
 
   auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
   CES_CHECK_RC_EQ(st.status, CES_OK);
-  BOOST_CHECK_EQUAL(st.contentType, contentType);
   BOOST_CHECK_EQUAL(st.size, 16u);
 }
 
@@ -1848,7 +1799,7 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
   for (const auto& name : bad) {
     auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
                         CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
-                        /*initialDeposit=*/1'000'000, "text/plain", name);
+                        /*initialDeposit=*/1'000'000, name);
     BOOST_CHECK_MESSAGE(c.status == CES_ERROR_BAD_NAME,
                         "expected BAD_NAME for '" << name << "' got "
                         << int(c.status));

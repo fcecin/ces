@@ -181,6 +181,27 @@ BOOST_AUTO_TEST_CASE(Test05_SignedQuery) {
   BOOST_CHECK(res[0].key == k1.getPublicKeyAsHash());
 }
 
+BOOST_AUTO_TEST_CASE(PeerQuerySlotLookup) {
+  // Seed one peer, then read it back by slot index over the wire
+  // (CES_QUERY_PEER). Out-of-range slots report found=false.
+  KeyPair peerKey;
+  Hash pk = peerKey.getPublicKeyAsHash();
+  server->_markPeerReachable(pk, "203.0.113.9:14001");
+
+  uint16_t count = 0;
+  bool found = false;
+  Hash gotPk{};
+  std::string gotAddr;
+  BOOST_CHECK(client->queryPeerInfo(0, count, found, gotPk, gotAddr) == CES_OK);
+  BOOST_CHECK(found);
+  BOOST_CHECK(count == 1);
+  BOOST_CHECK(gotPk == pk);
+  BOOST_CHECK_EQUAL(gotAddr, "203.0.113.9:14001");
+
+  BOOST_CHECK(client->queryPeerInfo(99, count, found, gotPk, gotAddr) == CES_OK);
+  BOOST_CHECK(!found);
+}
+
 BOOST_AUTO_TEST_CASE(Test12_AccountRentLogic) {
   LOGINFO << "TEST: Starting AccountRentLogic";
   KeyPair poor;

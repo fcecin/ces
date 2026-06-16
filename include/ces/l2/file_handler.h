@@ -41,6 +41,12 @@ void fileHandlerBind(CesServer* server);
 // Safe to call with no files present. No-op if not bound.
 void fileHandlerStartupReconcile();
 
+// Read store-level stats from .store.toml (under the store mutex) for
+// monitoring. Returns false if the handler is unbound (feature off);
+// otherwise fills the totals (0/0 when the store is empty). Any-thread
+// safe — used by the web dashboard's File tab.
+bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes);
+
 // ---------------------------------------------------------------------------
 // Cross-handler primitives
 // ---------------------------------------------------------------------------
@@ -161,7 +167,6 @@ struct FileExecReq {
   uint64_t pricePerKb = 0;        // CREATE, SET_PRICE
   uint64_t initialDeposit = 0;    // CREATE
   uint64_t amount = 0;            // DEPOSIT, WITHDRAW
-  std::string contentType;        // CREATE
   ces::Bytes body;      // WRITE, APPEND
 };
 
@@ -175,7 +180,6 @@ struct FileExecResp {
   uint64_t modifiedUs = 0;        // STAT
   uint64_t refunded = 0;          // DELETE
   std::array<uint8_t, 32> ownerPubkey{};  // STAT
-  std::string contentType;        // STAT
   ces::Bytes data;      // READ
 };
 

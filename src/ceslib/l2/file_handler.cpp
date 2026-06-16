@@ -117,7 +117,6 @@ constexpr uint8_t kVerbAppend   = 0x09;  // extend-write N bytes past size
 constexpr uint8_t kVerbResize   = 0x0a;  // set new size (sparse extend or truncate)
 
 constexpr uint16_t kMaxNameLen = 512;
-constexpr uint16_t kMaxContentTypeLen = 128;
 constexpr uint32_t kMaxWriteLen = 1024 * 1024; // 1 MB per WRITE
 constexpr uint32_t kMaxReadLen  = 1024 * 1024; // 1 MB per READ
 constexpr size_t   kMaxPathComponents = 5;
@@ -340,7 +339,6 @@ struct Sidecar {
   std::array<uint8_t, 32> program_privkey{};
   uint64_t price_per_kb = 0;
   uint64_t size = 0;
-  std::string content_type;
   uint64_t created_us = 0;
   uint64_t modified_us = 0;
   // Microseconds since epoch of the last moment rent was charged
@@ -356,9 +354,9 @@ struct Sidecar {
 };
 
 bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
-  // Serialize through tomlplusplus (symmetric with readSidecar) so name /
-  // content_type are escaped. A hand-rolled `key = "val"` dump corrupts the
-  // sidecar when those fields contain quotes or newlines, which they can:
+  // Serialize through tomlplusplus (symmetric with readSidecar) so name is
+  // escaped. A hand-rolled `key = "val"` dump corrupts the sidecar when that
+  // field contains quotes or newlines, which it can:
   // validateCesFileName only filters '/' and NUL.
   toml::table tbl;
   tbl.insert_or_assign("version", static_cast<int64_t>(s.version));
@@ -371,7 +369,6 @@ bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
                        hexOf(s.program_privkey.data(), s.program_privkey.size()));
   tbl.insert_or_assign("price_per_kb", static_cast<int64_t>(s.price_per_kb));
   tbl.insert_or_assign("size", static_cast<int64_t>(s.size));
-  tbl.insert_or_assign("content_type", s.content_type);
   tbl.insert_or_assign("created_us", static_cast<int64_t>(s.created_us));
   tbl.insert_or_assign("modified_us", static_cast<int64_t>(s.modified_us));
   tbl.insert_or_assign("last_rent_us", static_cast<int64_t>(s.last_rent_us));
@@ -433,7 +430,6 @@ bool readSidecar(const std::filesystem::path& path, Sidecar& s) {
     return false;
   if (!getU64("price_per_kb", s.price_per_kb)) return false;
   if (!getU64("size", s.size)) return false;
-  if (!getStr("content_type", s.content_type)) return false;
   if (!getU64("created_us", s.created_us)) return false;
   if (!getU64("modified_us", s.modified_us)) return false;
   if (!getU64("last_rent_us", s.last_rent_us)) return false;
@@ -851,16 +847,11 @@ void checkZoneOwnership(
 void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   ces::Buffer buf(std::move(pre));
   uint64_t size = 0, pricePerKb = 0, initialDeposit = 0;
-  std::string contentType, name;
+  std::string name;
   try {
     size = buf.get<uint64_t>();
     pricePerKb = buf.get<uint64_t>();
     initialDeposit = buf.get<uint64_t>();
-    uint16_t ctLen = buf.get<uint16_t>();
-    if (ctLen > kMaxContentTypeLen) {
-      sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
-    }
-    contentType = buf.getBytes<std::string>(ctLen);
     uint16_t nameLen = buf.get<uint16_t>();
     if (nameLen == 0 || nameLen > kMaxNameLen) {
       sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
@@ -880,7 +871,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // hops to the ledger strand and back. After it resolves, we
   // finish the CREATE under `finishCreate` below.
   auto finishCreate =
-    [ctx, size, pricePerKb, initialDeposit, contentType, name]
+    [ctx, size, pricePerKb, initialDeposit, name]
     (uint8_t zoneRc) mutable {
     if (zoneRc != CES_OK) { sendErrorAndLoop(ctx, zoneRc); return; }
 
@@ -925,7 +916,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
     auto after =
       [ctx, size, pricePerKb, initialDeposit, upfrontBurn,
-       contentType, name]
+       name]
       (uint8_t rc, bool duplicate) mutable {
         if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
         // Concurrent duplicate CREATE (two identical envelopes racing past the
@@ -971,7 +962,7 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
         reqServer(ctx)->_l2CreateProgramAccount(
           static_cast<int64_t>(programAccountInitial),
           [ctx, size, pricePerKb, initialDeposit, programAccountInitial,
-           contentType, name, cPath, sPath]
+           name, cPath, sPath]
           (minx::Hash programPubkey, minx::Hash programPrivkey) mutable {
             std::error_code ec;
             Sidecar s{};
@@ -985,7 +976,6 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
                         programPrivkey.data(), 32);
             s.price_per_kb = pricePerKb;
             s.size = size;
-            s.content_type = contentType;
             s.created_us = getMicrosSinceEpoch();
             s.modified_us = s.created_us;
             s.last_rent_us = s.created_us;
@@ -1557,7 +1547,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Read-only (the rent-roll ran before dedup); a duplicate just re-reads.
     // STAT response preamble:
     //   [u8[32] owner_pubkey][u64 file_balance][u64 price_per_kb]
-    //   [u64 size][u16 ct_len][ct][u64 created_us][u64 modified_us]
+    //   [u64 size][u64 created_us][u64 modified_us]
     // file_balance is now the file's program-account balance.
     uint64_t fileBalance = readProgramAccountBalance(reqServer(ctx), sc);
     ces::Bytes resp;
@@ -1566,9 +1556,6 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     ces::Buffer::put<uint64_t>(resp, fileBalance);
     ces::Buffer::put<uint64_t>(resp, sc.price_per_kb);
     ces::Buffer::put<uint64_t>(resp, sc.size);
-    ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(sc.content_type.size()));
-    resp.insert(resp.end(),
-                sc.content_type.begin(), sc.content_type.end());
     ces::Buffer::put<uint64_t>(resp, sc.created_us);
     ces::Buffer::put<uint64_t>(resp, sc.modified_us);
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
@@ -2158,7 +2145,6 @@ void execStat(CesServer* server, FileExecReq req,
   resp.fileBalance = readProgramAccountBalance(server, s);
   resp.pricePerKb = s.price_per_kb;
   resp.size = s.size;
-  resp.contentType = s.content_type;
   resp.createdUs = s.created_us;
   resp.modifiedUs = s.modified_us;
   boost::asio::post(cbEx, [cb, resp]() { cb(resp); });
@@ -2634,9 +2620,6 @@ void execCreate(CesServer* server, FileExecReq req,
   if (req.size == 0 || req.size > kMaxFileSize) {
     fail(CES_ERROR_INTERNAL); return;
   }
-  if (req.contentType.size() > kMaxContentTypeLen) {
-    fail(CES_ERROR_INTERNAL); return;
-  }
   uint8_t rc = validateCesFileName(req.name);
   if (rc != CES_OK) { fail(rc); return; }
 
@@ -2726,7 +2709,6 @@ void execCreate(CesServer* server, FileExecReq req,
     s.program_privkey = programPrivkey;
     s.price_per_kb = req.pricePerKb;
     s.size = req.size;
-    s.content_type = req.contentType;
     s.created_us = getMicrosSinceEpoch();
     s.modified_us = s.created_us;
     s.last_rent_us = s.created_us;
@@ -2970,24 +2952,6 @@ void fileHandlerExec(
   }
 }
 
-// Best-effort content-type inference from filename extension. /s/ is
-// operator-controlled at the disk level; the operator can drop any
-// file there and we infer a reasonable content_type for the sidecar.
-// Unknown extension → application/octet-stream.
-inline std::string inferContentType(const std::string& name) {
-  auto dot = name.rfind('.');
-  if (dot == std::string::npos) return "application/octet-stream";
-  std::string ext = name.substr(dot + 1);
-  for (auto& c : ext) c = static_cast<char>(std::tolower(c));
-  if (ext == "lua")  return "text/x-lua";
-  if (ext == "toml") return "text/x-toml";
-  if (ext == "md")   return "text/markdown";
-  if (ext == "txt")  return "text/plain";
-  if (ext == "json") return "application/json";
-  if (ext == "html" || ext == "htm") return "text/html";
-  return "application/octet-stream";
-}
-
 // Top-up amount the server credits to each /s/ file's program account on
 // every reconcile. /s/ programs are operator-donated; the server keeps the
 // account funded (~100 user-credits at default fees).
@@ -3073,7 +3037,6 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
       s.program_privkey = programPrivkey;
       s.price_per_kb = 0;
       s.size = size;
-      s.content_type = inferContentType(name);
       s.created_us = haveExisting && existing.created_us > 0
         ? existing.created_us : getMicrosSinceEpoch();
       s.modified_us = getMicrosSinceEpoch();
@@ -3122,6 +3085,18 @@ void fileHandlerStartupReconcile() {
   writeStoreMeta(storeMetaPath(dir), m);
   LOGINFO << "builtin:file store reconciled"
           << VAR(m.total_files) << VAR(m.total_bytes);
+}
+
+bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes) {
+  CesServer* server = gServer.load();
+  if (!server) return false;
+  const std::string& dir = server->_config().cesFileStoreDir;
+  StoreMeta m{};
+  std::lock_guard lk(gStoreMetaMutex);
+  readStoreMeta(storeMetaPath(dir), m);  // tolerant of a missing file
+  outTotalFiles = m.total_files;
+  outTotalBytes = m.total_bytes;
+  return true;
 }
 
 

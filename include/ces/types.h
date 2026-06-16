@@ -35,7 +35,8 @@ enum op_code_t : uint8_t {
   CES_OPEN_TRANSFER = 0x10,      // auto-create dest if not found
   CES_CREATE_PAYMENT = 0x11,     // create payment account
   CES_CROSS_TRANSFER = 0x12,     // inter-server transfer via peer
-  CES_RUN_ASSET = 0x13            // execute asset bytecode (CesVM)
+  CES_RUN_ASSET = 0x13,           // execute asset bytecode (CesVM)
+  CES_QUERY_PEER_INFO = 0x14           // unsigned: peer-table slot lookup (discovery)
 };
 
 /**
@@ -77,6 +78,7 @@ enum result_code_t : uint8_t {
   CES_CREATE_PAYMENT_RESULT = 0x11,
   CES_CROSS_TRANSFER_RESULT = 0x12,
   CES_RUN_ASSET_RESULT = 0x13,
+  CES_QUERY_PEER_INFO_RESULT = 0x14,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };
@@ -179,6 +181,7 @@ using Bytes = std::vector<uint8_t>;
 using Hash = minx::Hash;
 using HashTail = std::array<uint8_t, 24>;
 using HashPrefix = std::array<uint8_t, 8>;
+using PeerAddr = std::array<uint8_t, 64>;
 
 inline HashPrefix getHashPrefix(const Hash& full_hash) {
   HashPrefix prefix;
