@@ -424,6 +424,9 @@ BOOST_AUTO_TEST_CASE(Test22_QueryServerInfo) {
   BOOST_CHECK_EQUAL(find("maxAssets"), "100000");
   BOOST_CHECK_EQUAL(find("minDifficulty"), "1");
   BOOST_CHECK_EQUAL(find("spendSlotSize"), "10");
+  // rpcPort is now advertised in the paid KV too (mirrors the free GetInfo).
+  // Value is "0" when CesPlex is disabled, but the key must be present.
+  BOOST_CHECK(!find("rpcPort").empty());
 }
 
 // Total credits tracker is consistent through operations (exact accounting)

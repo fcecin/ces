@@ -2025,6 +2025,10 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
     kv("peerCount", std::to_string(peerTable_.size()));
   }
   kv("serverPublicKey", minx::hashToString(serverKeyPair_.getPublicKeyAsHash()));
+  // Where this server's CesPlex (file/compute/lua) listens; 0 = disabled.
+  // Already advertised in the free MINX GetInfo (rdata), mirrored here so the
+  // paid KV is self-complete too.
+  kv("rpcPort", std::to_string(rpcBoundPort_));
   if (!cfg_.serverName.empty())
     kv("serverName", cfg_.serverName);
   if (!cfg_.version.empty())
