@@ -32,9 +32,20 @@ struct RunResult {
   std::string out; // combined stdout+stderr
 };
 
-/// Run a shell command via /bin/sh -c. Returns exit code and combined output.
-inline RunResult runShell(const std::string& cmd) {
-  std::string full = cmd + " 2>&1";
+/// Run a shell command via /bin/sh -c, bounded by `timeoutSecs` so a wedged
+/// child (e.g. a cesh query with no client-side timeout) FAILS the test at the
+/// deadline instead of hanging forever — exit 124, then fixture teardown runs.
+inline RunResult runShell(const std::string& cmd, int timeoutSecs = 300) {
+  // `timeout` around an inner `sh -c` keeps env-prefixes / pipes in `cmd`
+  // working; SIGTERM at the deadline, SIGKILL 5 s later to reap a stuck tree.
+  std::string quoted;
+  quoted.reserve(cmd.size() + 16);
+  for (char c : cmd) {
+    if (c == '\'') quoted += "'\\''";
+    else quoted += c;
+  }
+  std::string full = "timeout --kill-after=5 " + std::to_string(timeoutSecs) +
+                     " /bin/sh -c '" + quoted + "' 2>&1";
   FILE* fp = popen(full.c_str(), "r");
   if (!fp)
     throw std::runtime_error("popen failed");
