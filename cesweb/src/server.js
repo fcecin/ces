@@ -326,9 +326,12 @@ header{padding:.5rem .8rem;background:#15181d;border-bottom:1px solid #ffffff14;
 font-size:.85rem;color:#8b94a0}
 header b{color:#cdd3da}
 header a{color:#6fae57;text-decoration:none}
-#out{flex:1;overflow:auto;padding:.6rem .8rem;white-space:pre-wrap;word-break:break-word}
-#out .e{color:#6fae57}
+#out{flex:1;overflow:auto;padding:.6rem .8rem;white-space:pre-wrap;word-break:break-word;cursor:text}
+#out:focus{outline:none}
 #out .s{color:#8b94a0;font-style:italic}
+.cur{display:inline-block;width:.55ch;height:1.05em;background:#cdd3da;vertical-align:text-bottom;animation:bl 1.06s steps(1) infinite}
+@keyframes bl{50%{opacity:0}}
+#out:not(:focus) .cur{animation:none;opacity:.35}
 form{display:flex;flex-wrap:wrap;gap:.5rem;padding:.5rem .8rem;background:#15181d;border-top:1px solid #ffffff14}
 input{flex:1;min-width:7rem;background:#0d0f12;color:#cdd3da;border:1px solid #ffffff22;border-radius:5px;
 padding:.45rem .6rem;font:inherit}
@@ -337,30 +340,23 @@ button{background:#1f6f3f;color:#fff;border:0;border-radius:5px;padding:.45rem .
 button:disabled{opacity:.5;cursor:default}
 </style>
 <header><a href="/">cesweb</a> &middot; <a href="/dev">dev tools</a> &middot; <b id=tgt>dial a CES compute instance</b></header>
-<div id=out></div>
+<div id=out tabindex=0><span id=inl style=display:none><span id=ed></span><span class=cur></span></span></div>
 <form id=connform>
 <input id=srv autocomplete=off placeholder="server host" value="${host}">
 <input id=port type=number autocomplete=off placeholder="port" value="${port}">
 <input id=pid type=number autocomplete=off placeholder="instance id (pid)" value="${pid}">
-<input id=connkey type=password autocomplete=off placeholder="paste your ed25519 private key (00 + 64 hex) — signs locally, never sent">
+<input id=connkey type=text autocomplete=off spellcheck=false placeholder="paste your ed25519 private key (00 + 64 hex) — signs locally, never sent">
 <button type=submit>Attach</button>
-</form>
-<form id=cmdform style=display:none>
-<input id=cmd autocomplete=off placeholder="type a command, Enter to send" disabled>
-<button id=cmdbtn type=submit disabled>Send</button>
-</form>
-<form id=reconform style=display:none>
-<button type=submit>Reconnect</button>
 </form>
 <script>
 const out=document.getElementById('out');
 const connform=document.getElementById('connform');
 const srv=document.getElementById('srv'), portin=document.getElementById('port'), pidin=document.getElementById('pid'), keyin=document.getElementById('connkey');
-const cmdform=document.getElementById('cmdform'), cmd=document.getElementById('cmd'), cmdbtn=document.getElementById('cmdbtn');
-const reconform=document.getElementById('reconform');
+const inl=document.getElementById('inl'), ed=document.getElementById('ed');
 const tgt=document.getElementById('tgt');
 const dec=new TextDecoder(), enc=new TextEncoder();
-function add(t,cls){const s=document.createElement('span');if(cls)s.className=cls;s.textContent=t;out.appendChild(s);out.scrollTop=out.scrollHeight;}
+// Scrollback is everything before the live input line; #inl stays last.
+function add(t,cls){const s=document.createElement('span');if(cls)s.className=cls;s.textContent=t;out.insertBefore(s,inl);out.scrollTop=out.scrollHeight;}
 function status(t){if(t)add(t+'\\n','s');}
 
 // ---- native WebCrypto Ed25519 signing (the key never leaves this page) ----
@@ -391,11 +387,16 @@ async function signDigest(digest){
 async function signBind(timeUs){const n=enc.encode('/ces/lua/1');return signDigest(await sha256(cat(be16(n.length),n,be64(timeUs),pubBytes)));}
 async function signAttach(token){return signDigest(await sha256(cat(Uint8Array.of(0x01),be64(target.pid),be64(token))));}
 
-let ws;
-function setConnected(){ cmd.disabled=false; cmdbtn.disabled=false; cmdform.style.display='flex'; connform.style.display='none'; reconform.style.display='none'; cmd.focus(); }
-function setDisconnected(){ cmd.disabled=true; cmdbtn.disabled=true; cmdform.style.display='none'; reconform.style.display=signKey?'flex':'none'; connform.style.display=signKey?'none':'flex'; }
+let ws, live=false, lineBuf='';
+function renderInput(){ ed.textContent=lineBuf; out.scrollTop=out.scrollHeight; }
+// Local echo is plain — exactly the bytes you typed, no injected prompt or color
+// (the program's output is rendered verbatim; only the cursor is ours).
+function commitLine(){ add(lineBuf+'\\n'); try{ws.send(enc.encode(lineBuf+'\\n'));}catch{} lineBuf=''; renderInput(); }
+function setConnected(){ if(live)return; live=true; inl.style.display=''; connform.style.display='none'; renderInput(); out.focus(); }
+function setDisconnected(){ live=false; lineBuf=''; inl.style.display='none'; connform.style.display='flex'; }
 function connectWs(){
-  status('connecting…');
+  for(let n=out.firstChild;n;){const nx=n.nextSibling;if(n!==inl)out.removeChild(n);n=nx;}  // fresh screen each attach
+  status('key imported locally (never sent) — dialing '+target.host+':'+target.port+' pid '+target.pid+'…');
   const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/dev/dial');
   ws.binaryType='arraybuffer';
@@ -409,7 +410,7 @@ function connectWs(){
       if(m._end){ setDisconnected(); }
     } else { add(dec.decode(ev.data)); setConnected(); }
   };
-  ws.onclose=()=>{ status('— disconnected — click Reconnect to resume'); setDisconnected(); };
+  ws.onclose=()=>{ status('— disconnected —'); setDisconnected(); };
   ws.onerror=()=>status('— connection error —');
 }
 connform.addEventListener('submit',async (e)=>{
@@ -420,17 +421,27 @@ connform.addEventListener('submit',async (e)=>{
   if(!/^\\d+$/.test(pid)){status('✗ enter a numeric instance id (pid) — find it with: cesh compute ps');return;}
   if(!k){status('✗ paste your ed25519 private key');return;}
   try{await importKey(k);}catch(err){status('✗ '+err.message);return;}
-  keyin.value='';
   target={host,port,pid};
   tgt.textContent=host+':'+port+' · pid '+pid;
-  status('key imported locally (never sent) — dialing '+host+':'+port+' pid '+pid);
   connectWs();
 });
-reconform.addEventListener('submit',(e)=>{ e.preventDefault(); connectWs(); });
-cmdform.addEventListener('submit',(e)=>{
+// Type directly in the pane (click it, then type) — no input box. Cooked mode:
+// local echo + line editing; the whole line is sent on Enter (the programs are
+// line REPLs).
+out.addEventListener('click',()=>{ if(live) out.focus(); });
+out.addEventListener('keydown',(e)=>{
+  if(!live||!ws||ws.readyState!==1) return;
+  if(e.ctrlKey||e.metaKey||e.altKey) return;          // leave copy/paste/devtools alone
+  if(e.key==='Enter'){ e.preventDefault(); commitLine(); }
+  else if(e.key==='Backspace'){ e.preventDefault(); lineBuf=lineBuf.slice(0,-1); renderInput(); }
+  else if(e.key.length===1){ e.preventDefault(); lineBuf+=e.key; renderInput(); }
+});
+out.addEventListener('paste',(e)=>{
+  if(!live) return;
   e.preventDefault();
-  if(!ws||ws.readyState!==1)return;
-  const line=cmd.value; add('» '+line+'\\n','e'); ws.send(enc.encode(line+'\\n')); cmd.value='';
+  const t=((e.clipboardData||window.clipboardData).getData('text')||'').replace(/\\r\\n?/g,'\\n');
+  for(const ch of t){ if(ch==='\\n'){ commitLine(); } else if(ch>=' '){ lineBuf+=ch; } }
+  renderInput();
 });
 </script>`;
 }

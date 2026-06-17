@@ -93,6 +93,7 @@ local function send_help(conn)
   send_line(conn, "commands:")
   send_line(conn, "  play       play your deposited bet")
   send_line(conn, "  balance    credits deposited & available to play")
+  send_line(conn, "  self       your pubkey + CES account balance")
   send_line(conn, "  help       this message")
   send_line(conn, "  quit       close the connection")
 end
@@ -192,6 +193,19 @@ local function handle_line(conn, line)
     -- played — winnings go to your CES account, not back onto the table).
     local n = pending_bet(conn)
     send_line(conn, "available to play: " .. n)
+    return
+  end
+
+  if line == "self" or line == "whoami" then
+    -- Your identity + your CES ACCOUNT balance (where winnings land) — distinct
+    -- from "available to play" (the bet you've deposited onto the table).
+    send_line(conn, "you: " .. hex(conn.pubkey))
+    local acc, err = ces.account_read(conn.pubkey)
+    if acc then
+      send_line(conn, "account balance: " .. acc.balance)
+    else
+      send_line(conn, "account balance: read failed (" .. tostring(err) .. ")")
+    end
     return
   end
 

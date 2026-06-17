@@ -102,11 +102,20 @@ cat > "$WORK/site/data.json" <<'JSON'
 { "from": "the CES web", "scope": "L2 file", "engine": "none", "ok": true }
 JSON
 
-# --- boot CES server (engine-free), wait, upload, start gateway ---
+# --- drop the dice Lua program into /s/ so the dev terminal has something to
+#     dial (the binary auto-seeds /s/welcome; dice is a builtin app) ---
+mkdir -p "$DATADIR/cesfilestore/s"
+cp "$HERE/../src/ceslib/builtin_apps/dice.lua" "$DATADIR/cesfilestore/s/dice.lua"
+
+# --- boot CES server (engine-free): file + compute + lua, dice autolaunched ---
 echo "booting CES server on :$CESPORT (rpc $RPCPORT), no PoW engine..."
 "$CES" -d "$DATADIR" --port "$CESPORT" --rpcport "$RPCPORT" --mindiff 1 \
   --nopowengine --filestoremaxbytes 64000000 \
-  --cesplexmount "/ces/file/1=builtin:file" --webport 0 \
+  --cesplexmount "/ces/file/1=builtin:file" \
+  --cesplexmount "/ces/compute/1=builtin:compute" \
+  --cesplexmount "/ces/lua/1=builtin:lua" \
+  --computemaxinstances 4 --computeuser "" --builtin-app dice \
+  --webport 0 \
   > "$WORK/ces.log" 2>&1 &
 SP=$!
 for i in $(seq 1 80); do
@@ -129,13 +138,18 @@ node "$HERE/src/server.js" > "$WORK/web.log" 2>&1 &
 WP=$!
 sleep 1
 
+PID=$("$CESH" --server "localhost:$CESPORT" --rpc-port "$RPCPORT" -r "$WALLET" -a @0 \
+       compute instances /s/dice.lua 2>/dev/null | head -1)
 echo
 echo "================================================================"
 echo "  OPEN IN YOUR BROWSER:"
 echo "    http://localhost:$WEBPORT/localhost/p/site/index.html"
-echo "    http://localhost:$WEBPORT/localhost/p/site/about.html"
 echo "    http://localhost:$WEBPORT/localhost            (gateway landing)"
-echo "  ('localhost' with no -port works because CES is on the default $CESPORT)"
+echo
+echo "  WEB TERMINAL (dial the dice program — click the pane and type):"
+echo "    http://localhost:$WEBPORT/dev/dial/localhost-$CESPORT/$PID"
+echo "    paste this key when asked:  $(cat "$WALLET")"
+echo "    try: help / balance  (deposit+play need a PoW server; this box is engine-free)"
 echo "================================================================"
 curl -s -o /dev/null -w "  self-check index.html -> HTTP %{http_code}\n" \
   "http://localhost:$WEBPORT/localhost/p/site/index.html" || true
