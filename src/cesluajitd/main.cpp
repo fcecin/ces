@@ -561,7 +561,7 @@ uint16_t g_rpc_port = 0;
 //
 // The endpoint runs on its own single strand; the Lua VM runs on main. The
 // bridge below crosses that boundary: inbound (endpoint → Lua) via a
-// mutex+condvar event queue drained by ces.luarpc.run(); outbound (Lua →
+// mutex+condvar event queue drained by ces.conn.run(); outbound (Lua →
 // endpoint) via asio::post onto the endpoint strand, where the per-conn
 // RudpStreams live. Blocking here is fine — the compute child is sandboxed
 // and metered, so a stalled strand has no global consequence.
@@ -584,7 +584,7 @@ std::mutex               g_luarpc_mx;
 std::deque<LuaRpcEvent>  g_luarpc_inq;     // endpoint pushes, run() drains
 int                      g_luarpc_wakefd = -1;  // eventfd; nudges run()'s poll
 
-// Accept gate: set by ces.luarpc.set_listener (Lua), read by serve()
+// Accept gate: set by ces.conn.set_listener (Lua), read by serve()
 // (endpoint). No listener → close-on-connect.
 std::atomic<bool> g_luarpc_listening{false};
 
@@ -1929,9 +1929,25 @@ int lua_ces_file_resize(lua_State* L) {
 // table is held in the Lua registry; passing nil to set_listener
 // flips the gate OFF (existing connections continue to work).
 
-// Registry keys.
+// Registry keys. kRegListenerTable is the SINGLE listener shared by BOTH
+// transports — relay /ces/lua/1 and direct /ces/luarpc/1. Each transport keeps
+// its OWN live-conn table keyed by its native conn id (relay: the supervisor's
+// per-instance nextConnId; direct: this endpoint's g_luarpc_next_id) purely for
+// inbound routing. Those two native spaces are independent and overlap, so they
+// are NEVER the program-facing identity — see g_conn_uid_next.
 constexpr const char* kRegListenerTable = "ces.conn.listener";
-constexpr const char* kRegConnsTable    = "ces.conn.live";  // [id] = conn
+constexpr const char* kRegConnsTable    = "ces.conn.relay.live";  // [native] = conn
+
+// Program-facing conn.id: ONE monotonic id owned entirely by this host, handed
+// out at open for EITHER transport, so it is unique across both — a program can
+// key its own state by conn.id with zero collisions. The native routing id is
+// kept privately in conn.__sid. conn.source (below) still reports the origin.
+// Lua-thread-only (the dispatchers and connect all run on the Lua thread).
+uint64_t g_conn_uid_next = 1;
+
+// conn.source — informational origin only, NOT identity and NOT used to route.
+constexpr int CONN_SOURCE_RELAY  = 0;  // /ces/lua/1, server-relayed over the UDS
+constexpr int CONN_SOURCE_DIRECT = 1;  // /ces/luarpc/1, this instance's own rpc port
 
 // Per-conn close-reason byte (matches kCloseReason* in handler).
 constexpr uint8_t CONN_CLOSE_NORMAL   = 0x00;
@@ -1991,10 +2007,10 @@ int lua_ces_conn_write(lua_State* L) {
   if (closed) {
     lua_pushnil(L); lua_pushstring(L, "closed"); return 2;
   }
-  lua_getfield(L, 1, "id");
+  lua_getfield(L, 1, "__sid");
   if (!lua_isnumber(L, -1)) {
     lua_pop(L, 1);
-    lua_pushnil(L); lua_pushstring(L, "missing id"); return 2;
+    lua_pushnil(L); lua_pushstring(L, "missing routing id"); return 2;
   }
   uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
   lua_pop(L, 1);
@@ -2025,7 +2041,7 @@ int lua_ces_conn_close(lua_State* L) {
     lua_pushboolean(L, 1);
     return 1;
   }
-  lua_getfield(L, 1, "id");
+  lua_getfield(L, 1, "__sid");
   uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
   lua_pop(L, 1);
   send_conn_close(id);
@@ -2045,16 +2061,19 @@ int lua_ces_conn_close(lua_State* L) {
   return 1;
 }
 
-// ces.conn.set_listener(table_or_nil)
-// Non-nil: stores listener in registry, sends TAG_LISTEN_ON.
-// nil: removes listener, sends TAG_LISTEN_OFF. Existing connections
-// in the live table continue to work; the gate just stops accepting
-// new ATTACHes.
+// ces.conn.set_listener(table_or_nil) — the ONE accept gate for both transports.
+// Non-nil: stores the listener, sends TAG_LISTEN_ON (relay accept gate), flips
+// the direct accept gate on, and lazy-opens this instance's /ces/luarpc/1
+// endpoint (a no-op if it got no rpc port). Inbound conns from EITHER transport
+// fan into the same on_open/on_data/on_close; tell them apart, if you must, by
+// conn.source. nil: clears the listener and closes both gates (existing conns in
+// either live table keep working).
 int lua_ces_conn_set_listener(lua_State* L) {
   if (lua_isnil(L, 1)) {
     lua_pushnil(L);
     lua_setfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!write_frame(TAG_LISTEN_OFF, 0, nullptr, 0)) {
+    g_luarpc_listening.store(false, std::memory_order_relaxed);   // direct gate off
+    if (!write_frame(TAG_LISTEN_OFF, 0, nullptr, 0)) {            // relay gate off
       lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
     }
     lua_pushboolean(L, 1);
@@ -2063,11 +2082,10 @@ int lua_ces_conn_set_listener(lua_State* L) {
   if (!lua_istable(L, 1)) {
     return luaL_error(L, "ces.conn.set_listener: expected table or nil");
   }
-  // Stash table in registry. A conn:write style via __index is possible
-  // later; for v1 the methods sit directly on each conn.
+  // Stash the listener table in the registry — both dispatchers read it.
   lua_pushvalue(L, 1);
   lua_setfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-  // Make sure the live-conns table exists.
+  // Make sure the relay live-conns table exists.
   lua_getfield(L, LUA_REGISTRYINDEX, kRegConnsTable);
   if (!lua_istable(L, -1)) {
     lua_pop(L, 1);
@@ -2076,6 +2094,10 @@ int lua_ces_conn_set_listener(lua_State* L) {
   } else {
     lua_pop(L, 1);
   }
+  // Direct transport: flip the gate on + open the endpoint (no-op if no port).
+  g_luarpc_listening.store(true, std::memory_order_relaxed);
+  luarpc_ensure_endpoint();
+  // Relay transport: tell the supervisor to start accepting ATTACHes.
   if (!write_frame(TAG_LISTEN_ON, 0, nullptr, 0)) {
     lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
   }
@@ -2083,14 +2105,20 @@ int lua_ces_conn_set_listener(lua_State* L) {
   return 1;
 }
 
-// Build a fresh conn table for the given (id, pubkey). Pushes onto
-// the stack and stores into kRegConnsTable[id]. The stack-top after
-// this call is the conn table (ready to pass to a Lua callback).
+// Build a fresh relay conn table for native id `conn_id` + `pubkey`. The
+// program-facing conn.id is a fresh host uid (unique across transports); the
+// native id goes in conn.__sid for routing and keys kRegConnsTable[conn_id] (so
+// later DATA_IN / CLOSED frames, which carry the native id, find it). Leaves the
+// conn table on the stack top, ready to pass to a Lua callback.
 void make_and_register_conn(lua_State* L, uint64_t conn_id,
                              const uint8_t* pubkey) {
   lua_newtable(L);
-  lua_pushnumber(L, static_cast<lua_Number>(conn_id));
+  lua_pushnumber(L, static_cast<lua_Number>(g_conn_uid_next++));
   lua_setfield(L, -2, "id");
+  lua_pushinteger(L, CONN_SOURCE_RELAY);
+  lua_setfield(L, -2, "source");
+  lua_pushnumber(L, static_cast<lua_Number>(conn_id));   // native routing id
+  lua_setfield(L, -2, "__sid");
   lua_pushlstring(L, reinterpret_cast<const char*>(pubkey), 32);
   lua_setfield(L, -2, "pubkey");
   lua_pushboolean(L, 0);
@@ -2099,7 +2127,8 @@ void make_and_register_conn(lua_State* L, uint64_t conn_id,
   lua_setfield(L, -2, "write");
   lua_pushcfunction(L, lua_ces_conn_close);
   lua_setfield(L, -2, "close");
-  // Register in the live-conns table.
+  // Register in the live-conns table, keyed by the native id (the wire id the
+  // dispatcher will look up on later DATA_IN / CLOSED frames).
   lua_getfield(L, LUA_REGISTRYINDEX, kRegConnsTable);
   if (lua_istable(L, -1)) {
     lua_pushnumber(L, static_cast<lua_Number>(conn_id));
@@ -2218,7 +2247,7 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
 // handler (dispatch_luarpc_event) is defined later in this file.
 void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e);
 
-// The UNIFIED event loop — ces.run() (also ces.conn.run / ces.luarpc.run).
+// The UNIFIED event loop — ces.run() (= ces.conn.run).
 // Consumes the program: blocks OUTSIDE Lua on every event source at once —
 // the host IPC socket (/ces/lua/1 conn frames + client DELIVER) AND the
 // luarpc bridge (peer conns on our own rpc port) — and re-enters Lua to
@@ -2286,14 +2315,13 @@ int lua_ces_run(lua_State* L) {
 }
 
 // ---------------------------------------------------------------------------
-// ces.luarpc — the Lua API over the bridge above. set_listener flips the
-// accept gate + stores the {on_open,on_data,on_close} table; run() is the
-// event loop that blocks on the bridge queue and dispatches (mirrors
-// ces.conn). The conn object's write/close hop to the endpoint strand; peer
-// is the authenticated pubkey of the other end.
+// Direct transport (/ces/luarpc/1) plumbing for the unified ces.conn API: the
+// conn write/close ops, the bridge-event dispatcher, and outbound connect().
+// These feed the SAME listener + run loop as the relay; the only program-
+// visible mark of the transport is conn.source == 1. conn write/close hop to
+// the endpoint strand; conn.pubkey is the authenticated pubkey of the peer.
 // ---------------------------------------------------------------------------
-constexpr const char* kRegLuaRpcListener = "ces.luarpc.listener";
-constexpr const char* kRegLuaRpcConns    = "ces.luarpc.live";
+constexpr const char* kRegLuaRpcConns    = "ces.conn.direct.live";  // [native] = conn
 
 // conn:write(bytes) → true | false (false if the conn is already closed).
 int lua_ces_luarpc_conn_write(lua_State* L) {
@@ -2304,7 +2332,7 @@ int lua_ces_luarpc_conn_write(lua_State* L) {
   bool closed = lua_toboolean(L, -1);
   lua_pop(L, 1);
   if (closed) { lua_pushboolean(L, 0); return 1; }
-  lua_getfield(L, 1, "id");
+  lua_getfield(L, 1, "__sid");
   uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
   lua_pop(L, 1);
   luarpc_conn_write(id, std::string(s, n));
@@ -2315,7 +2343,7 @@ int lua_ces_luarpc_conn_write(lua_State* L) {
 // conn:close() — graceful close. Idempotent.
 int lua_ces_luarpc_conn_close(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
-  lua_getfield(L, 1, "id");
+  lua_getfield(L, 1, "__sid");
   uint64_t id = static_cast<uint64_t>(lua_tonumber(L, -1));
   lua_pop(L, 1);
   lua_pushboolean(L, 1);
@@ -2335,14 +2363,20 @@ int lua_ces_luarpc_conn_close(lua_State* L) {
   return 0;
 }
 
-// Build a conn table {id, peer(32B), closed, write, close}, register it in the
-// live table, and leave it on the stack top.
+// Build a direct conn table {id=host uid, source=1, __sid=native, pubkey(32B),
+// closed, write, close}, key the live table by the native id, and leave it on
+// the stack top. Same shape as the relay builder; only source and the transport
+// the write/close route to differ.
 void make_luarpc_conn(lua_State* L, uint64_t id, const uint8_t* peer) {
   lua_newtable(L);
-  lua_pushnumber(L, static_cast<lua_Number>(id));
+  lua_pushnumber(L, static_cast<lua_Number>(g_conn_uid_next++));
   lua_setfield(L, -2, "id");
+  lua_pushinteger(L, CONN_SOURCE_DIRECT);
+  lua_setfield(L, -2, "source");
+  lua_pushnumber(L, static_cast<lua_Number>(id));   // native routing id
+  lua_setfield(L, -2, "__sid");
   lua_pushlstring(L, reinterpret_cast<const char*>(peer), 32);
-  lua_setfield(L, -2, "peer");
+  lua_setfield(L, -2, "pubkey");
   lua_pushboolean(L, 0);
   lua_setfield(L, -2, "closed");
   lua_pushcfunction(L, lua_ces_luarpc_conn_write);
@@ -2370,7 +2404,7 @@ void push_luarpc_conn(lua_State* L, uint64_t id) {
 // Dispatch one bridge event to the listener. Mirrors dispatch_conn_frame.
 void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
   if (e.type == LuaRpcEvent::Type::Opened) {
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
     make_luarpc_conn(L, e.connId, e.peer.data());
     lua_getfield(L, -2, "on_open");
@@ -2388,7 +2422,7 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
     return;
   }
   if (e.type == LuaRpcEvent::Type::Data) {
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
     if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
     lua_getfield(L, -1, "on_data");
     if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
@@ -2404,7 +2438,7 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
     return;
   }
   // Closed.
-  lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
   if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
   lua_getfield(L, -1, "on_close");
   bool hasCb = lua_isfunction(L, -1);
@@ -2432,34 +2466,13 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
   lua_pop(L, 1);  // listener
 }
 
-// ces.luarpc.run() — alias for the unified ces.run(); both run the one loop
-// that serves /ces/lua/1 and /ces/luarpc/1 together.
-int lua_ces_luarpc_run(lua_State* L) { return lua_ces_run(L); }
-
-// ces.luarpc.set_listener({on_open,on_data,on_close} | nil). Non-nil flips the
-// accept gate ON; nil flips it OFF (existing conns keep working).
-int lua_ces_luarpc_set_listener(lua_State* L) {
-  if (lua_isnil(L, 1)) {
-    lua_pushnil(L);
-    lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
-    g_luarpc_listening.store(false, std::memory_order_relaxed);
-    return 0;
-  }
-  if (!lua_istable(L, 1)) {
-    return luaL_error(L, "ces.luarpc.set_listener: expected table or nil");
-  }
-  lua_pushvalue(L, 1);
-  lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcListener);
-  g_luarpc_listening.store(true, std::memory_order_relaxed);
-  luarpc_ensure_endpoint();   // lazy-open the port now that we intend to serve
-  return 0;
-}
-
-// ces.luarpc.connect(addr, server_pubkey(32)) → conn | nil, err. Dials a
-// remote (or this) lua host's /ces/luarpc/1 out the SAME rpc socket. Blocks
-// on the bind; on success returns a conn whose inbound data flows to the
-// listener's on_data like any other.
-int lua_ces_luarpc_connect(lua_State* L) {
+// ces.conn.connect(addr, server_pubkey(32)) → conn | nil, err. Dials a remote
+// (or this) lua host's /ces/luarpc/1 out the instance's OWN rpc socket — the
+// only outbound path (the relay is inbound-only: the server brings users in, it
+// is not a generic egress proxy). Blocks on the bind; on success returns a
+// source=1 conn whose inbound data flows to the unified listener's on_data like
+// any other. (Listen + run are unified — see ces.conn.set_listener / ces.run.)
+int lua_ces_conn_connect(lua_State* L) {
   size_t alen = 0;
   const char* addr = luaL_checklstring(L, 1, &alen);
   size_t plen = 0;
@@ -3039,30 +3052,26 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_cross_transfer);
   lua_setfield(L, -2, "cross_transfer");
 
-  // ces.conn — /ces/lua/1 connection routing.
+  // ces.conn — the UNIFIED connection API: one listener + run loop + conn shape
+  // over BOTH transports (relay /ces/lua/1, server-relayed; direct /ces/luarpc/1
+  // on this instance's own port). connect() dials out the direct transport.
+  // Inbound conns from either fan into one set of callbacks; tell them apart, if
+  // you must, by conn.source (0 = relay, 1 = direct).
   lua_newtable(L);
   lua_pushcfunction(L, lua_ces_conn_set_listener);
   lua_setfield(L, -2, "set_listener");
   lua_pushcfunction(L, lua_ces_run);
   lua_setfield(L, -2, "run");
+  lua_pushcfunction(L, lua_ces_conn_connect);
+  lua_setfield(L, -2, "connect");
   lua_setfield(L, -2, "conn");
 
-  // ces.luarpc — raw byte-pipe protocol this host serves (and dials) on its
-  // rpc port. set_listener flips the accept gate; run() is the event loop.
-  lua_newtable(L);
-  lua_pushcfunction(L, lua_ces_luarpc_set_listener);
-  lua_setfield(L, -2, "set_listener");
-  lua_pushcfunction(L, lua_ces_luarpc_run);
-  lua_setfield(L, -2, "run");
-  lua_pushcfunction(L, lua_ces_luarpc_connect);
-  lua_setfield(L, -2, "connect");
-  lua_setfield(L, -2, "luarpc");
-
-  // luarpc live-conn registry (registry-keyed, like ces.conn's).
+  // Direct-transport live-conn registry (the relay's is created lazily in
+  // set_listener).
   lua_newtable(L);
   lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
 
-  // ces.run() — the unified event loop (ces.conn.run / ces.luarpc.run alias it).
+  // ces.run() — the unified event loop (ces.conn.run aliases it).
   lua_pushcfunction(L, lua_ces_run);
   lua_setfield(L, -2, "run");
 

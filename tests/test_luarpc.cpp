@@ -3,8 +3,9 @@
 //
 // Spins up real cesluajitd instances (the existing compute tests use the
 // no-Lua cescompmockd, so they never exercise luarpc). One instance runs an
-// echo SERVER program (ces.luarpc.set_listener + run); another runs a CLIENT
-// program that ces.luarpc.connect()s to it, writes a payload, and — on
+// echo SERVER program (ces.conn.set_listener + run); another runs a CLIENT
+// program that ces.conn.connect()s to it over /ces/luarpc/1, writes a payload,
+// and — on
 // receiving its echo back via on_data — transfers to a beacon account. The
 // test observes the beacon balance, which proves the whole symmetric path:
 // connect (dial out) + serve (accept) + conn:write + on_data, both ways.
@@ -157,8 +158,8 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   // 1. Echo server program.
   const std::string serverPath = "/h/" + ownerHex + "/echo.bin";
   const std::string serverSrc =
-    "ces.luarpc.set_listener({ on_data = function(c, b) c:write(b) end })\n"
-    "ces.luarpc.run()\n";
+    "ces.conn.set_listener({ on_data = function(c, b) c:write(b) end })\n"
+    "ces.conn.run()\n";
   const auto serverPk = deploy(serverPath, serverSrc);
   const uint64_t serverId = launch(serverPath);
 
@@ -176,14 +177,14 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   // 3. Client program: dial the server, write PINGPONG, and on receiving the
   //    echo back transfer 7 to the beacon.
   const std::string clientSrc =
-    "ces.luarpc.set_listener({ on_data = function(c, b)\n"
+    "ces.conn.set_listener({ on_data = function(c, b)\n"
     "  if b == 'PINGPONG' then ces.transfer('"
       + luaBytes(beaconPk.data(), 32) + "', 7) end\n"
     "end })\n"
-    "local conn = ces.luarpc.connect('127.0.0.1:" + std::to_string(serverRpc)
+    "local conn = ces.conn.connect('127.0.0.1:" + std::to_string(serverRpc)
       + "', '" + luaBytes(serverPk.data(), 32) + "')\n"
     "if conn then conn:write('PINGPONG') end\n"
-    "ces.luarpc.run()\n";
+    "ces.conn.run()\n";
   const std::string clientPath = "/h/" + ownerHex + "/client.bin";
   const auto clientPk = deploy(clientPath, clientSrc);
   server->_brr(clientPk, 1'000'000'000);   // fund the client's transfer

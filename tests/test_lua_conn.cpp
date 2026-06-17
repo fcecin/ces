@@ -797,7 +797,9 @@ BOOST_AUTO_TEST_CASE(MultipleConnsSameUser) {
   const std::string src =
     "ces.conn.set_listener({\n"
     "  on_data = function(conn, data)\n"
-    "    conn:write(string.format('%d:%s', conn.id, data))\n"
+    // Fixed-width id so the peer can read an exact length. conn.id is a
+    // host-assigned uid (unique across transports), not the wire conn_id.
+    "    conn:write(string.format('%020d:%s', conn.id, data))\n"
     "  end,\n"
     "})\n"
     "ces.conn.run()\n";
@@ -820,17 +822,18 @@ BOOST_AUTO_TEST_CASE(MultipleConnsSameUser) {
 
   BOOST_REQUIRE(peerWrite(p1, ces::Bytes{'A'}));
   BOOST_REQUIRE(peerWrite(p2, ces::Bytes{'B'}));
-  // Reply size = ndigits(connId) + 1 (':') + 1 (data byte).
-  auto expectedFor = [](uint64_t connId, char data) {
-    return std::to_string(connId) + ":" + data;
-  };
-  const std::string e1 = expectedFor(r1.connId, 'A');
-  const std::string e2 = expectedFor(r2.connId, 'B');
+  // Reply = 20-digit conn.id + ':' + 1 data byte = 22 bytes.
   ces::Bytes g1, g2;
-  BOOST_REQUIRE(peerReadExact(p1, g1, e1.size()));
-  BOOST_REQUIRE(peerReadExact(p2, g2, e2.size()));
-  BOOST_CHECK_EQUAL(std::string(g1.begin(), g1.end()), e1);
-  BOOST_CHECK_EQUAL(std::string(g2.begin(), g2.end()), e2);
+  BOOST_REQUIRE(peerReadExact(p1, g1, 22));
+  BOOST_REQUIRE(peerReadExact(p2, g2, 22));
+  const std::string s1(g1.begin(), g1.end());
+  const std::string s2(g2.begin(), g2.end());
+  BOOST_CHECK_EQUAL(s1[20], ':');
+  BOOST_CHECK_EQUAL(s2[20], ':');
+  BOOST_CHECK_EQUAL(s1[21], 'A');   // p1's data echoed back on p1's conn
+  BOOST_CHECK_EQUAL(s2[21], 'B');   // p2's data echoed back on p2's conn
+  // Distinct host uids → the two conns are independent routes.
+  BOOST_CHECK_NE(s1.substr(0, 20), s2.substr(0, 20));
 }
 
 // Two ATTACHes from two different users → conn.pubkey distinct on
