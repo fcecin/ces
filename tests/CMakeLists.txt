@@ -13,9 +13,14 @@ target_link_libraries(cestests
     Boost::filesystem
 )
 
+# Repo root, so tests can read in-tree source assets (e.g. the shipped
+# /s/dice.lua under src/ceslib/builtin_apps/) instead of hardcoding a path
+# relative to the build dir.
+target_compile_definitions(cestests PRIVATE CES_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+
 # E2E tests need the binaries they shell out to, plus the compute
 # child stub (the handler fork+execs cescompmockd).
-add_dependencies(cestests cesh cesproxy cescompmockd)
+add_dependencies(cestests cesh cesproxy cescompmockd cesluajitd)
 if(Qt6_FOUND)
   add_dependencies(cestests cesqt)
 endif()

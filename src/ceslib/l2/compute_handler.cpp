@@ -928,10 +928,14 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     return;
   }
 
-  // ---- ces.transfer(target_pubkey, amount). Origin is the
-  // program's owner. /s/ programs run with owner = server, so this
-  // pulls from the server's bottomless account; /h/ and /f/ programs
-  // pull from their owner's account, exactly as the file verbs do.
+  // ---- ces.transfer(target_pubkey, amount). Origin is the file's
+  // dedicated PROGRAM account (ces.program_pubkey()), NOT the owner —
+  // the program spends its own bankroll, not the deployer's wallet. This
+  // is what makes a deposit-funded game like /s/dice net-zero: bets are
+  // transferred into the program account and winnings are paid back out
+  // of it. (File-store ops are the ones billed to the owner's authority;
+  // transfers are not.) On /s/ the boot reconcile auto-tops the program
+  // account; off /s/ the deployer funds it with `cesh file deposit`.
   // Reply: [u8 status][u64 BE new_origin_balance].
   if (method == kApiMethodTransfer) {
     if (mlen < ces::KEY_SIZE + sizeof(uint64_t)) {
