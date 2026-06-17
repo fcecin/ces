@@ -375,6 +375,10 @@ int main(int argc, char* argv[]) {
 
   CLI::App app{"ces"};
   try {
+#ifndef CES_GIT_HASH
+#define CES_GIT_HASH "unknown"
+#endif
+    app.set_version_flag("--version", std::string(CES_GIT_HASH));
     app.add_option("-l,--loglevel", optLogLevel,
       "Log level ([t]race, [d]ebug, [i]nfo, [w]arning, [e]rror, [f]atal)")
       ->default_val("info");
@@ -799,9 +803,6 @@ int main(int argc, char* argv[]) {
     }
   }
 
-#ifndef CES_GIT_HASH
-#define CES_GIT_HASH "unknown"
-#endif
   LOGINFO << "ces start" << VAL("version", CES_GIT_HASH);
 
   minx::Hash serverPrivKey;
