@@ -4153,7 +4153,7 @@ void CesServer::deployBuiltinVmPrograms() {
   Asset::SerModeGuard guard(Asset::SerMode::Full);
   assets_->update(key, canonical);
 
-  LOGINFO << "deployed /b/<name> bytecode program" << SVAR(path);
+  LOGDEBUG << "deployed /b/<name> bytecode program" << SVAR(path);
 }
 
 void CesServer::_brrInner(const minx::Hash& accountKey, int64_t amount) {

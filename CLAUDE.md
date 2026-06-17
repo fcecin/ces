@@ -324,6 +324,8 @@ Offline ledger ops (no networking). Load stores, mutate, `_save()`, exit. Used b
 
 **cesbench** — in-process benchmark. Server + client in one binary. Tunes `threads`, `flush_value`.
 
+**cesweb** — HTTP gateway (Node) serving a server's L2 files to browsers, plus a `/dev` terminal into L2 programs; shells out to `cesh`. Lives in `cesweb/` with its own CLAUDE.md.
+
 **cesluajitd** / **cescompmockd** — compute children; spawned by supervisor. Default `cesluajitd` (LuaJIT); `cescompmockd` is no-Lua plumbing-test stub.
 
 ## Logging (`blog.h` from MINX)

@@ -50,7 +50,7 @@ handed them to you over plain HTTP.</p>
 <nav><a href="about.html">About</a> · <a href="notes.md">notes.md</a> ·
 <a href="data.json">data.json</a> · <a href="hello.txt">hello.txt</a> ·
 <a href="missing.html">a 404</a></nav>
-<footer>served from <code>/p/site/</code></footer>
+<footer><a href="/">← cesweb home</a> · served from <code>/p/site/</code></footer>
 </body></html>
 HTML
 

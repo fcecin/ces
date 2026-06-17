@@ -35,6 +35,7 @@
 #include <ces/cesplex/mux.h>
 #include <ces/cesplex/session.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/builtin_site.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
 #include <ces/keys.h>
@@ -932,7 +933,7 @@ void regenerateServerIndex(CesServer* server, const std::string& dir) {
   s.modified_us = s.created_us;
   s.last_rent_us = s.created_us;
   writeSidecar(resolveSidecarPath(dir, kServerIndexName), s);
-  LOGINFO << "builtin:file /s/ index regenerated" << VAR(names.size());
+  LOGDEBUG << "builtin:file /s/ index regenerated" << VAR(names.size());
 }
 
 // Hook fired at the success of a /s/ file-set change (CREATE / DELETE). Guarded
@@ -3104,6 +3105,9 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
     // The generated /s/ catalog is owned by regenerateServerIndex — it has no
     // program account and must not be "fixed up" or minted one here.
     if (name == kServerIndexName) continue;
+    // The bundled /s/welcome site is static server content seeded by
+    // seedBuiltinSite (server-owned sidecar, no program account) — same deal.
+    if (isBuiltinSitePath(name)) continue;
 
     auto sPath = resolveSidecarPath(dir, name);
     uint64_t size = 0;
@@ -3153,8 +3157,8 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
       s.last_rent_us = s.modified_us;
 
       if (writeSidecar(sPath, s)) {
-        LOGINFO << "builtin:file /s/ sidecar generated"
-                << SVAR(name) << VAR(size);
+        LOGDEBUG << "builtin:file /s/ sidecar generated"
+                 << SVAR(name) << VAR(size);
       } else {
         LOGWARNING << "builtin:file /s/ sidecar write failed"
                    << SVAR(name);
@@ -3173,23 +3177,60 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
   }
 }
 
+// Publish the bundled /s/welcome site into the file store. Forced by the file
+// feature (no switch) and overwritten on every boot, so the served demo always
+// matches the binary. Pure disk on the file/rpc strand (like
+// regenerateServerIndex): no verbs, no logicStrand_, no program account. Each
+// file gets a minimal server-owned sidecar; reconcileServerZone skips these
+// names (isBuiltinSitePath), so they're never minted one.
+void seedBuiltinSite(CesServer* server, const std::string& dir) {
+  if (!server) return;
+  namespace fs = std::filesystem;
+  std::array<uint8_t, 32> serverPk{};
+  std::memcpy(serverPk.data(),
+              server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
+  for (const auto& f : builtinSiteFiles()) {
+    const std::string name = "/s/" + f.relPath;
+    std::error_code ec;
+    fs::path cPath = resolveContentPath(dir, name);
+    fs::create_directories(cPath.parent_path(), ec);
+    fs::path tmp = cPath; tmp += ".tmp";
+    {
+      std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+      if (!out) { LOGWARNING << "builtin:file /s/ site open failed" << SVAR(name); continue; }
+      out.write(f.content.data(), static_cast<std::streamsize>(f.content.size()));
+      if (!out.good()) { LOGWARNING << "builtin:file /s/ site write failed" << SVAR(name); continue; }
+    }
+    fs::rename(tmp, cPath, ec);
+    if (ec) { LOGWARNING << "builtin:file /s/ site rename failed" << SVAR(name); fs::remove(tmp, ec); continue; }
+
+    Sidecar s{};
+    s.version = kSidecarVersion;
+    s.name = name;
+    s.owner_pubkey = serverPk;
+    s.price_per_kb = 0;
+    s.size = f.content.size();
+    s.created_us = getMicrosSinceEpoch();
+    s.modified_us = s.created_us;
+    s.last_rent_us = s.created_us;
+    writeSidecar(resolveSidecarPath(dir, name), s);
+  }
+  LOGDEBUG << "builtin:file /s/welcome site published";
+}
+
 void fileHandlerStartupReconcile() {
   CesServer* server = gServer.load();
   if (!server) return;
   const std::string& dir = server->_config().cesFileStoreDir;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
-  // Auto-generate sidecars for any /s/ files the operator dropped on
-  // disk. /s/ is operator-controlled — drop files in <storeDir>/s/,
-  // server fills in metadata.
+  // Publish the bundled /s/welcome site (forced with the file feature), then
+  // auto-generate sidecars for any /s/ files the operator dropped on disk.
+  seedBuiltinSite(server, dir);
   reconcileServerZone(server, dir);
-  // Generate the /s/ catalog at boot if it's missing (operator-curated zone —
-  // safe to enumerate). Runtime /s/ changes keep it current thereafter.
-  {
-    std::error_code iec;
-    if (!std::filesystem::exists(resolveContentPath(dir, kServerIndexName), iec))
-      regenerateServerIndex(server, dir);
-  }
+  // (Re)generate the /s/ catalog at boot so it reflects the seeded site plus
+  // whatever the operator dropped. Runtime /s/ changes keep it current after.
+  regenerateServerIndex(server, dir);
   StoreMeta m{};
   walkFileStore(dir, [&m](const std::filesystem::path&,
                           const std::filesystem::path&, Sidecar& s) {

@@ -221,4 +221,36 @@ BOOST_AUTO_TEST_CASE(ServerZoneAutoIndex) {
   BOOST_CHECK(idx2.find("/s/beta.lua") != std::string::npos);
 }
 
+// The bundled /s/welcome demo site ships inside the binary and is published into
+// the file store at boot whenever the file feature is on (forced, no switch).
+// It's readable by any signer and appears in the /s/ catalog.
+BOOST_AUTO_TEST_CASE(BundledWelcomeSiteIsSeeded) {
+  auto fc = connectClient(otherKey);   // any signer can READ /s/
+
+  auto readWhole = [&](const std::string& name, std::string& out) -> uint8_t {
+    CesFileClient::StatInfo si;
+    uint8_t src = fc->stat(name, si);
+    if (src != CES_OK) return src;
+    ces::Bytes data; minx::Hash h;
+    uint8_t rrc = fc->read(name, 0, si.size, data, h);
+    if (rrc != CES_OK) return rrc;
+    out.assign(data.begin(), data.end());
+    return CES_OK;
+  };
+
+  std::string html, css, svg;
+  CES_REQUIRE_OK(readWhole("/s/welcome/index.html", html));
+  BOOST_CHECK(html.find("Hello from CES") != std::string::npos);
+  BOOST_CHECK(html.find("style.css") != std::string::npos);   // relative asset link
+  CES_REQUIRE_OK(readWhole("/s/welcome/style.css", css));
+  BOOST_CHECK(css.find("body") != std::string::npos);
+  CES_REQUIRE_OK(readWhole("/s/welcome/logo.svg", svg));
+  BOOST_CHECK(svg.find("<svg") != std::string::npos);
+
+  // The boot-regenerated catalog lists the seeded site.
+  std::string cat;
+  CES_REQUIRE_OK(readWhole("/s/index.html", cat));
+  BOOST_CHECK(cat.find("/s/welcome/index.html") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

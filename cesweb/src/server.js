@@ -158,8 +158,8 @@ CES only speaks UDP, so this is the way in from the web.</p>
 <p>Files go by their path on the server. Leave the host off and it means
 <code>${esc(def)}</code>:</p>
 ${zones}
-<p>So <code><a href="/p/site/index.html">/p/site/index.html</a></code> pulls that
-file from <code>${esc(def)}</code>. A path ending in <code>/</code> gets
+<p>So <code><a href="/s/welcome/index.html">/s/welcome/index.html</a></code> pulls
+the demo page every CES server ships. A path ending in <code>/</code> gets
 <code>index.html</code>.</p>`;
     if (others.length)
       body += `<p>It can also reach ${others.map((h) => `<code>${esc(h)}</code>`).join(', ')} &mdash;

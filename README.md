@@ -35,6 +35,7 @@ A definition of public computing, and more on the rationale behind the design of
 * `cesproxy` is a TCP-to-UDP proxy for firewalled clients.
 * `cesbench` is a benchmark tool.
 * `cesnet` / `cesnetbot` are network simulation and testing tools.
+* `cesweb` is an HTTP gateway that serves a server's files to ordinary browsers (plus a `/dev` terminal to interact with L2 programs).
 
 ## Numbers
 
