@@ -212,7 +212,7 @@ Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser
 
 ## L2 lua — `builtin:lua` (channel routing)
 
-User binds `/ces/lua/1`, sends one ATTACH naming a source-file path. If an instance has its accept gate open (`ces.conn.set_listener` called), handler allocates `conn_id`, sends TAG_CONN_OPENED to child; RudpStream becomes raw byte pipe — user→program wraps as TAG_CONN_DATA_IN; `conn:write` from Lua routes back as TAG_CONN_DATA_OUT. Either side close tears down both directions; instance death tears down all routes. Gate closed → `NOT_LISTENING`; instance missing → `COMPUTE_INSTANCE_NOT_FOUND`.
+User binds `/ces/lua/1`, sends one ATTACH naming an `instance_id` (a running pid — discover it via compute STAT/INSTANCES; **not** a source path). If that instance has its accept gate open (`ces.conn.set_listener` called), handler allocates `conn_id`, sends TAG_CONN_OPENED to child carrying the **ATTACHing user's** authenticated pubkey; RudpStream becomes raw byte pipe — user→program wraps as TAG_CONN_DATA_IN; `conn:write` from Lua routes back as TAG_CONN_DATA_OUT. Either side close tears down both directions; instance death tears down all routes. Gate closed → `NOT_LISTENING`; instance missing → `COMPUTE_INSTANCE_NOT_FOUND`.
 
 `cesh dial <instance_id>` is the user-side primitive (stdin↔channel↔stdout, half-close on EOF).
 

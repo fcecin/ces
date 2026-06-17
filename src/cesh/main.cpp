@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <thread>
 #include <fstream>
+#include <filesystem>
 #include <iostream>
 #include <iomanip>
 #include <string>
@@ -1700,47 +1701,76 @@ int main(int argc, char* argv[]) {
           return 1;
         }
 
-        ces::Bytes all;
-        all.reserve(info.size);
+        // Stream each chunk straight to the sink — never buffer the whole file
+        // in RAM (peak is one chunk). To a real path: write a sibling ".part"
+        // and atomically rename over the destination on success (rename(2)
+        // replaces any existing file, so "already there" needs no handling); a
+        // mid-download failure leaves the original untouched and removes the
+        // .part. To stdout (the data-pipe / cesweb form): write chunks as they
+        // arrive — and because the file now grows incrementally, a watcher can
+        // stat it for live progress. On failure exit nonzero so the caller
+        // discards its own partial.
+        const bool toStdout = df_local_arg.empty() || df_local_arg == "-";
+        std::ofstream fout;
+        std::filesystem::path partPath;
+        if (!toStdout) {
+          partPath = std::filesystem::path(df_local_arg + ".part");
+          fout.open(partPath, std::ios::binary | std::ios::trunc);
+          if (!fout) {
+            std::cerr << "Error: cannot open local destination: "
+                      << df_local_arg << "\n";
+            return 1;
+          }
+        }
+        std::ostream& sink = toStdout ? std::cout : fout;
+
         uint64_t offset = 0;
         while (offset < info.size) {
           uint32_t chunkLen = static_cast<uint32_t>(
             std::min<uint64_t>(kChunkSize, info.size - offset));
           ces::Bytes chunk;
           minx::Hash rh;
-          uint8_t rrc = cfc.read(remote, offset, chunkLen,
-                                  chunk, rh);
+          uint8_t rrc = cfc.read(remote, offset, chunkLen, chunk, rh);
           if (rrc != CES_OK) {
             std::cerr << "Error: read at offset " << offset << " failed: "
                       << errorString(rrc) << "\n";
+            if (!toStdout) { fout.close(); std::error_code ec;
+                             std::filesystem::remove(partPath, ec); }
             return 1;
           }
-          all.insert(all.end(), chunk.begin(), chunk.end());
+          sink.write(reinterpret_cast<const char*>(chunk.data()), chunk.size());
+          if (!sink) {
+            std::cerr << "Error: write failed at offset " << offset << "\n";
+            if (!toStdout) { fout.close(); std::error_code ec;
+                             std::filesystem::remove(partPath, ec); }
+            return 1;
+          }
           offset += chunk.size();
         }
 
-        // No local path (or "-") → stream raw bytes to stdout (the data-pipe
-        // form). A real path → write the file + human summary.
-        if (df_local_arg.empty() || df_local_arg == "-") {
-          std::cout.write(reinterpret_cast<const char*>(all.data()),
-                          all.size());
+        if (toStdout) {
           std::cout.flush();
           return 0;
         }
-
-        std::ofstream out(df_local_arg, std::ios::binary | std::ios::trunc);
-        if (!out) {
-          std::cerr << "Error: cannot open local destination: "
-                    << df_local_arg << "\n";
+        fout.close();
+        if (!fout) {
+          std::cerr << "Error: failed to flush " << df_local_arg << "\n";
+          std::error_code ec; std::filesystem::remove(partPath, ec);
           return 1;
         }
-        out.write(reinterpret_cast<const char*>(all.data()), all.size());
-        out.close();
+        std::error_code ec;
+        std::filesystem::rename(partPath, df_local_arg, ec);
+        if (ec) {
+          std::cerr << "Error: rename to " << df_local_arg << " failed: "
+                    << ec.message() << "\n";
+          std::filesystem::remove(partPath, ec);
+          return 1;
+        }
 
         print_header("File Downloaded");
         print_field("Remote", remote);
         print_field("Local", df_local_arg);
-        print_field("Size", all.size());
+        print_field("Size", offset);
         print_field("Balance", info.fileBalance);
         std::cout << std::endl;
         return 0;
