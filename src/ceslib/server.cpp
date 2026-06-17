@@ -1207,6 +1207,8 @@ uint16_t CesServer::start(uint16_t serverPort) {
     if (cfg_.rpcRudpMaxReorderMsgsPerChannel >= 0)
       rudpCfg.maxReorderMessagesPerChannel =
         static_cast<size_t>(cfg_.rpcRudpMaxReorderMsgsPerChannel);
+    rudpCfg.channelInactivityTimeout =
+      std::chrono::seconds(cfg_.rpcRudpChannelIdleSecs);
     // RUDP's default 100 ms pulse emits only one packet per
     // channel-with-data per pulse. For a 275 MB file-store upload
     // that's ~198000 packets × 100 ms = 5.5 hours. 1 ms pulse gets

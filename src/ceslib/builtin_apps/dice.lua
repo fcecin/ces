@@ -91,8 +91,8 @@ end
 
 local function send_help(conn)
   send_line(conn, "commands:")
-  send_line(conn, "  play       bet your last transfer to the house")
-  send_line(conn, "  balance    show your account balance")
+  send_line(conn, "  play       play your deposited bet")
+  send_line(conn, "  balance    credits deposited & available to play")
   send_line(conn, "  help       this message")
   send_line(conn, "  quit       close the connection")
 end
@@ -114,76 +114,60 @@ local function send_greeting(conn)
   send_line(conn, "")
 end
 
-local function handle_play(conn)
-  local user = conn.pubkey
-
-  local acc, err = ces.account_read(user)
-  if not acc then
-    send_line(conn, "account read failed: " .. tostring(err))
-    return
-  end
+-- The credits this user has DEPOSITED on the contract and that are PLAYABLE
+-- right now — a fresh, unconsumed transfer to the house. Returns
+-- (amount, reason, xferTime): amount > 0 + xferTime when there's a bet ready;
+-- (0, why, nil) otherwise. This is the contract's notion of "your balance"
+-- (chips on the table), NOT your CES account balance. `balance` reports it;
+-- `play` spends it. Shared so the two can never disagree.
+local function pending_bet(conn)
+  local acc, err = ces.account_read(conn.pubkey)
+  if not acc then return 0, "account read failed: " .. tostring(err), nil end
 
   if acc.last_xfer_dest ~= HOUSE_PREFIX then
-    send_line(conn,
-      "no pending bet found. transfer credits to the house first, " ..
-      "then type `play`.")
-    return
+    return 0, "nothing deposited. transfer credits to the house, then `play`.", nil
   end
   local n = acc.last_xfer_amount
   if n < MIN_BET then
-    send_line(conn,
-      "last transfer of " .. tostring(n) ..
-      " is below the minimum bet of " .. MIN_BET ..
-      ". transfer a valid amount and try again.")
-    return
+    return 0, "your deposit of " .. tostring(n) ..
+              " is below the minimum bet of " .. MIN_BET .. ".", nil
   end
   if acc.last_xfer_time <= START_S then
-    send_line(conn,
-      "your last payment predates this dice instance; please send a "
-      .. "fresh transfer then type `play`.")
-    return
+    return 0, "your deposit predates this dice instance; send a fresh transfer.", nil
   end
-
-  -- Upper bound on freshness: anything older than the bucket's
-  -- guaranteed-retention window may have been aged out of consumed,
-  -- so we can no longer reliably tell whether it was already played.
-  -- Reject conservatively. GRACE keeps us safely inside the window.
+  -- Anything older than the bucket's guaranteed-retention window may have aged
+  -- out of `consumed`, so we can't tell if it was already played. Reject.
   local now_s = math.floor(ces.now() / 1000000)
-  local horizon = now_s - BUCKET_TTL_S + GRACE_S
-  if acc.last_xfer_time < horizon then
-    send_line(conn,
-      "your deposit is too old to verify (more than " ..
-      tostring(BUCKET_TTL_S) ..
-      "s); please send a fresh transfer then type `play`.")
-    return
+  if acc.last_xfer_time < (now_s - BUCKET_TTL_S + GRACE_S) then
+    return 0, "your deposit is too old to verify (over " ..
+              tostring(BUCKET_TTL_S) .. "s); send a fresh transfer.", nil
   end
-
-  -- Has this exact deposit (matched on lastXferTime) already been
-  -- consumed for this user? Bucket is guaranteed to remember at
-  -- least the last BUCKET_TTL_S seconds.
-  local prior_str = consumed:get(user)
+  local prior_str = consumed:get(conn.pubkey)
   if prior_str then
     local prior_t = tonumber(prior_str)
     if prior_t and acc.last_xfer_time <= prior_t then
-      send_line(conn,
-        "that deposit was already played. transfer again to bet again.")
-      return
+      return 0, "that deposit was already played. transfer again to bet again.", nil
     end
   end
+  return n, nil, acc.last_xfer_time
+end
 
-  -- Consume FIRST so a quick double-tap can't double-spend the
-  -- same transfer.
-  consumed:put(user, tostring(acc.last_xfer_time))
+local function handle_play(conn)
+  local n, why, xfer_time = pending_bet(conn)
+  if n == 0 then send_line(conn, why); return end
+
+  -- Consume FIRST so a quick double-tap can't double-spend the same transfer.
+  consumed:put(conn.pubkey, tostring(xfer_time))
 
   if flip() then
     local payout = n * 2
-    local ok, terr = ces.transfer(user, payout)
+    local ok, terr = ces.transfer(conn.pubkey, payout)
     if not ok then
       send_line(conn,
         "won " .. payout .. " but payout failed: " .. tostring(terr))
       return
     end
-    send_line(conn, "heads. you won " .. payout .. " (+" .. n .. ")")
+    send_line(conn, "heads. you won " .. payout .. " (+" .. n .. ", paid to your account)")
   else
     send_line(conn, "tails. house keeps " .. n)
   end
@@ -204,12 +188,10 @@ local function handle_line(conn, line)
   end
 
   if line == "balance" then
-    local acc, err = ces.account_read(conn.pubkey)
-    if not acc then
-      send_line(conn, "account read failed: " .. tostring(err))
-      return
-    end
-    send_line(conn, "balance: " .. tostring(acc.balance))
+    -- The CONTRACT balance: credits deposited and available to play (0 once
+    -- played — winnings go to your CES account, not back onto the table).
+    local n = pending_bet(conn)
+    send_line(conn, "available to play: " .. n)
     return
   end
 

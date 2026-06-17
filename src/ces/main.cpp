@@ -169,6 +169,10 @@ rpc_rudp_burst_bytes = 4294967295
 max_channels_per_peer = 2
 max_reorder_bytes_per_channel = -1
 max_reorder_msgs_per_channel = -1
+# Channel idle-GC timeout, seconds. A channel with no traffic for this long is
+# dropped. 60 suits request/reply; raise it for long-lived interactive dial
+# terminals (a human pauses between commands). CLI: --rpcrudpidlesecs.
+channel_idle_secs = 60
 
 # --- File-storage feature (CesPlex builtin:file, v2) ---
 #
@@ -331,6 +335,7 @@ int main(int argc, char* argv[]) {
   uint64_t optRpcRudpMaxChannelsPerPeer        = 2;
   int64_t  optRpcRudpMaxReorderBytesPerChannel = -1;
   int64_t  optRpcRudpMaxReorderMsgsPerChannel  = -1;
+  uint32_t optRpcRudpChannelIdleSecs           = 60;
   // File-storage feature (CesPlex builtin:file, v2).
   uint64_t optFileStoreMaxBytes = 0;
   std::string optFileStoreDir;
@@ -486,6 +491,11 @@ int main(int argc, char* argv[]) {
       "rpc_port RUDP: per-channel reorder buffer cap in messages "
       "(-1 = library default)")
       ->default_val("-1");
+    app.add_option("--rpcrudpidlesecs", optRpcRudpChannelIdleSecs,
+      "rpc_port RUDP channel idle-GC timeout in seconds (default 60). A channel "
+      "with no traffic for this long is dropped; raise it for long-lived "
+      "interactive dial terminals where a human pauses between commands.")
+      ->default_val("60");
     app.add_option("--peer", optPeers,
       "Peer server as key@host:port (repeatable)");
 
@@ -661,6 +671,10 @@ int main(int argc, char* argv[]) {
         if (app["--rpcrudpmaxreordermsgs"]->count() == 0) {
           if (auto v = (*t)["max_reorder_msgs_per_channel"].value<int64_t>())
             optRpcRudpMaxReorderMsgsPerChannel = *v;
+        }
+        if (app["--rpcrudpidlesecs"]->count() == 0) {
+          if (auto v = (*t)["channel_idle_secs"].value<int64_t>(); v && *v > 0)
+            optRpcRudpChannelIdleSecs = static_cast<uint32_t>(*v);
         }
       }
 
@@ -854,6 +868,7 @@ int main(int argc, char* argv[]) {
   config.rpcRudpMaxChannelsPerPeer        = static_cast<size_t>(optRpcRudpMaxChannelsPerPeer);
   config.rpcRudpMaxReorderBytesPerChannel = optRpcRudpMaxReorderBytesPerChannel;
   config.rpcRudpMaxReorderMsgsPerChannel  = optRpcRudpMaxReorderMsgsPerChannel;
+  config.rpcRudpChannelIdleSecs           = optRpcRudpChannelIdleSecs;
 
   // File-storage feature config.
   config.cesFileStoreMaxBytes = optFileStoreMaxBytes;

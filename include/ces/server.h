@@ -174,6 +174,12 @@ struct CesConfig {
   int64_t rpcRudpMaxReorderBytesPerChannel  = -1;
   int64_t rpcRudpMaxReorderMsgsPerChannel   = -1;
 
+  // rpc_port RUDP channel idle GC, in seconds: a channel with no traffic for
+  // this long is dropped. 60 suits request/reply, but is too short for a
+  // long-lived interactive channel (a `cesh dial` terminal where a human
+  // pauses between commands) — raise it on terminal-serving boxes.
+  uint32_t rpcRudpChannelIdleSecs           = 60;
+
   // --- File storage feature (CesPlex builtin:file, v2) ---
   // Master switch + hard capacity cap. The feature is entirely
   // disabled when 0 — fileHandlerBind is skipped, startup reconcile
