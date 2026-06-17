@@ -174,7 +174,7 @@ Disk-backed, priced per byte/day (rent) and per KB (I/O), namespaced. Ten verbs 
 - `/h/<64-hex-pubkey>/...` — auto home dir; signer must match the hex
 - `/f/<name>/...` — asset-gated; signer must own asset at `sha256("/f/<name>")`. Transferable via `CES_GIVE_ASSET`.
 - `/p/...` — public; first-come-first-served on exact path
-- `/s/...` — **server-deployed**, unmetered, outside the cap. Only the server's own private key may CREATE/WRITE; reads operator-donated. Used for curated programs (`/s/chat.lua` etc.).
+- `/s/...` — **server-deployed**, unmetered, outside the cap. Only the server's own private key may CREATE/WRITE; reads operator-donated. Used for curated programs (`/s/chat.lua` etc.). **Auto-indexed:** the handler keeps a generated `/s/index.html` catalog of the zone, regenerated on every `/s/` file-set change and at boot if missing (`regenerateServerIndex`, pure disk on the file strand — never `logicStrand_`). `/s/` is the **only** zone that's enumerable, and safely so: it's operator-write-only, so listing it leaks no untrusted content. Every other zone is deliberately non-enumerable (no LIST verb exists) — the path is the capability; knowing it is the access.
 
 Anything else → `BAD_NAME`. Zone ownership checked **only at CREATE**; subsequent ops use sidecar's stamped `owner_pubkey`.
 

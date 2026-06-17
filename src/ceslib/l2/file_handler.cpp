@@ -57,6 +57,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -124,6 +125,8 @@ constexpr uint64_t kMaxFileSize = 64ull * 1024 * 1024 * 1024; // 64 GB
 
 constexpr const char* kSidecarSuffix = ".sidecar.toml";
 constexpr const char* kStoreMetaName = ".store.toml";
+// Auto-generated catalog of the /s/ zone (see regenerateServerIndex).
+constexpr const char* kServerIndexName = "/s/index.html";
 // Sidecar schema: `program_pubkey` (32B reference to a real Account in
 // accountStore_) replaced the old sidecar-resident `file_balance` pool;
 // the file's credits now live in the ledger account store like any other
@@ -844,6 +847,105 @@ void checkZoneOwnership(
     cbExecutor);
 }
 
+// ---------------------------------------------------------------------------
+// /s/ auto-index — the one zone where enumeration is safe.
+//
+// /s/ is the only WRITE-operator-only zone (server key alone can create/write
+// there), so listing it can only ever reveal operator-curated, public content —
+// no untrusted uploads, no abuse surface. Every other zone is deliberately
+// non-enumerable (knowing the path is the capability). So we keep a generated
+// /s/index.html catalog in sync: regenerated on every /s/ file-set change, and
+// at boot if it is missing.
+//
+// Pure disk I/O on the file/rpc strand: it never touches logicStrand_ (no fee,
+// no program account), and it writes the index DIRECTLY here — not through the
+// CREATE verb — so it can never re-trigger itself (no churn loop). /s/ changes
+// only when the operator acts, so unconditional regen is fine forever.
+void regenerateServerIndex(CesServer* server, const std::string& dir) {
+  if (!server) return;
+  namespace fs = std::filesystem;
+  std::error_code ec;
+  fs::path sRoot = fs::path(dir) / "s";
+  if (!fs::exists(sRoot, ec)) return;
+
+  const std::string suffix = kSidecarSuffix;
+  std::vector<std::string> names;   // CES names, e.g. "/s/dice.lua"
+  for (auto it = fs::recursive_directory_iterator(sRoot, ec);
+       !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file()) continue;
+    std::string fn = it->path().filename().string();
+    if (fn.size() >= suffix.size() &&
+        fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0)
+      continue;                                   // skip sidecars
+    fs::path rel = fs::relative(it->path(), fs::path(dir), ec);
+    if (ec) { ec.clear(); continue; }
+    std::string nm = "/" + rel.generic_string();
+    if (nm == kServerIndexName) continue;         // never list the index itself
+    names.push_back(std::move(nm));
+  }
+  std::sort(names.begin(), names.end());
+
+  std::string html =
+    "<!doctype html><html lang=en><meta charset=utf-8>"
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>/s/ \xe2\x80\x94 server catalog</title>"
+    "<style>body{font:16px/1.6 system-ui,sans-serif;max-width:48rem;"
+    "margin:2.5rem auto;padding:0 1rem;color:#1c1c1e}h1{font-size:1.4rem}"
+    "ul{list-style:none;padding:0}li{padding:.3em 0;border-bottom:1px solid #eee}"
+    "a{color:#0a7d33;text-decoration:none}a:hover{text-decoration:underline}"
+    "footer{margin-top:1.5rem;color:#999;font-size:.85rem}</style>"
+    "<h1>/s/ \xe2\x80\x94 server catalog</h1><ul>";
+  for (const auto& nm : names)
+    html += "<li><a href=\"" + nm + "\">" + nm + "</a></li>";
+  html += "</ul><footer>auto-generated index of the operator-curated /s/ zone ("
+          + std::to_string(names.size()) + " files)</footer></html>\n";
+
+  // Write content atomically (temp + rename) so a concurrent READ never sees a
+  // partial index.
+  fs::path cPath = resolveContentPath(dir, kServerIndexName);
+  fs::create_directories(cPath.parent_path(), ec);
+  fs::path tmp = cPath; tmp += ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) { LOGWARNING << "builtin:file /s/ index: open failed"; return; }
+    f.write(html.data(), static_cast<std::streamsize>(html.size()));
+    if (!f.good()) { LOGWARNING << "builtin:file /s/ index: write failed"; return; }
+  }
+  fs::rename(tmp, cPath, ec);
+  if (ec) {
+    LOGWARNING << "builtin:file /s/ index: rename failed";
+    std::filesystem::remove(tmp, ec);
+    return;
+  }
+
+  // Minimal sidecar so READ serves it (owner = server; no program account — a
+  // generated static file, not a program). reconcileServerZone skips this name,
+  // so the zero program account is never "fixed up". Pure disk, no logicStrand_.
+  Sidecar s{};
+  s.version = kSidecarVersion;
+  s.name = kServerIndexName;
+  std::memcpy(s.owner_pubkey.data(),
+              server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
+  s.price_per_kb = 0;
+  s.size = html.size();
+  s.created_us = getMicrosSinceEpoch();
+  s.modified_us = s.created_us;
+  s.last_rent_us = s.created_us;
+  writeSidecar(resolveSidecarPath(dir, kServerIndexName), s);
+  LOGINFO << "builtin:file /s/ index regenerated" << VAR(names.size());
+}
+
+// Hook fired at the success of a /s/ file-set change (CREATE / DELETE). Guarded
+// to the /s/ zone and self-bypassing (the index write above never goes through
+// the verbs, so this can't recurse). Runs on the file/rpc strand.
+void noteServerZoneMutation(const std::string& name) {
+  if (!isServerZone(name)) return;
+  if (name == kServerIndexName) return;          // recursion guard (belt + braces)
+  CesServer* server = gServer.load();
+  if (!server) return;
+  regenerateServerIndex(server, server->_config().cesFileStoreDir);
+}
+
 void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   ces::Buffer buf(std::move(pre));
   uint64_t size = 0, pricePerKb = 0, initialDeposit = 0;
@@ -997,6 +1099,9 @@ void dispatchCreate(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
             // Response preamble: [u64 file_balance][u64 cost_debited]
             // file_balance now mirrors the program account.
+            // A new file appeared — if it's in /s/, refresh the catalog.
+            noteServerZoneMutation(name);
+
             ces::Bytes pre;
             ces::Buffer::put<uint64_t>(pre, programAccountInitial);
             ces::Buffer::put<uint64_t>(pre, static_cast<uint64_t>(
@@ -1655,6 +1760,8 @@ void dispatchDelete(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     }
     ces::PublicKey ownerPk(scSaved.owner_pubkey);
     notifyDeletion(name);
+    // A file vanished — if it was in /s/, refresh the catalog.
+    noteServerZoneMutation(name);
     reqServer(ctx)->_l2CreditAccount(
       ownerPk, static_cast<int64_t>(refund),
       [ctx, refund]() {
@@ -2994,6 +3101,9 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
     // absolute; strip the dir prefix and prepend "/".
     fs::path rel = fs::relative(cPath, fs::path(dir));
     std::string name = "/" + rel.generic_string();
+    // The generated /s/ catalog is owned by regenerateServerIndex — it has no
+    // program account and must not be "fixed up" or minted one here.
+    if (name == kServerIndexName) continue;
 
     auto sPath = resolveSidecarPath(dir, name);
     uint64_t size = 0;
@@ -3073,6 +3183,13 @@ void fileHandlerStartupReconcile() {
   // disk. /s/ is operator-controlled — drop files in <storeDir>/s/,
   // server fills in metadata.
   reconcileServerZone(server, dir);
+  // Generate the /s/ catalog at boot if it's missing (operator-curated zone —
+  // safe to enumerate). Runtime /s/ changes keep it current thereafter.
+  {
+    std::error_code iec;
+    if (!std::filesystem::exists(resolveContentPath(dir, kServerIndexName), iec))
+      regenerateServerIndex(server, dir);
+  }
   StoreMeta m{};
   walkFileStore(dir, [&m](const std::filesystem::path&,
                           const std::filesystem::path&, Sidecar& s) {

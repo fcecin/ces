@@ -180,4 +180,45 @@ BOOST_AUTO_TEST_CASE(ServerZoneNameValidationRejectsJustSlashS) {
   CES_CHECK_RC_EQ(rc, CES_ERROR_BAD_NAME);
 }
 
+// /s/ is the one zone safe to enumerate (operator-only write), so the server
+// keeps an auto-generated /s/index.html catalog in sync on every /s/ change.
+BOOST_AUTO_TEST_CASE(ServerZoneAutoIndex) {
+  auto fc = connectClient(serverKey);
+  uint64_t bal = 0, cost = 0;
+
+  // Each /s/ CREATE regenerates the catalog (synchronously, before the
+  // response returns).
+  CES_REQUIRE_OK(fc->create("/s/alpha.txt", 16, 0, 0, bal, cost));
+  CES_REQUIRE_OK(fc->create("/s/beta.lua",  16, 0, 0, bal, cost));
+
+  auto readWhole = [&](const std::string& name, std::string& out) -> uint8_t {
+    CesFileClient::StatInfo si;
+    uint8_t src = fc->stat(name, si);
+    if (src != CES_OK) return src;
+    ces::Bytes data; minx::Hash h;
+    uint8_t rrc = fc->read(name, 0, si.size, data, h);
+    if (rrc != CES_OK) return rrc;
+    out.assign(data.begin(), data.end());
+    return CES_OK;
+  };
+
+  std::string idx;
+  CES_REQUIRE_OK(readWhole("/s/index.html", idx));
+  BOOST_CHECK(idx.find("/s/alpha.txt") != std::string::npos);
+  BOOST_CHECK(idx.find("/s/beta.lua")  != std::string::npos);
+  BOOST_CHECK(idx.find("server catalog") != std::string::npos);
+  // The catalog never lists itself.
+  BOOST_CHECK_MESSAGE(idx.find("/s/index.html") == std::string::npos,
+                      "index must not list itself");
+
+  // Delete one — the catalog updates on the next read.
+  uint64_t refund = 0;
+  CES_REQUIRE_OK(fc->deleteFile("/s/alpha.txt", refund));
+  std::string idx2;
+  CES_REQUIRE_OK(readWhole("/s/index.html", idx2));
+  BOOST_CHECK_MESSAGE(idx2.find("/s/alpha.txt") == std::string::npos,
+                      "deleted file must drop out of the catalog");
+  BOOST_CHECK(idx2.find("/s/beta.lua") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
