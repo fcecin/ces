@@ -157,6 +157,12 @@ int main(int argc, char* argv[]) {
                  "Server's CesPlex/file-store UDP port "
                  "(required for 'file' subcommands)");
 
+  std::string server_key_arg;
+  app.add_option("--server-key", server_key_arg,
+                 "Server's 32-byte public key (hex) for response-sig "
+                 "verification. If omitted, the key is taken from the free "
+                 "handshake — no paid server-info query.");
+
   app.add_option("-a,--actor", actor_arg,
                  "Acting account (pubkey hex or @index)");
 
@@ -1467,35 +1473,43 @@ int main(int argc, char* argv[]) {
       if (colon != std::string::npos) host = host.substr(0, colon);
       if (host.empty()) host = "localhost";
 
-      // Fetch server-info once to get serverPublicKey for response sig
-      // verification, and feeFileRent for the CREATE upfront estimate.
-      // The query is paid from the signer's account.
-      std::vector<ServerInfoEntry> entries;
-      uint8_t sirc = cc.queryServerInfo(entries);
-      if (sirc != CES_OK) {
-        std::cerr << "Error: queryServerInfo failed: "
-                  << errorString(sirc) << "\n";
-        return 1;
-      }
+      // Server pubkey for response-sig verification — NO paid query:
+      // explicit --server-key wins; otherwise reuse the key the free MINX
+      // handshake already learned on connect.
       minx::Hash serverPk{};
       bool hasServerPk = false;
-      uint64_t feeFileRent = 0;
-      uint64_t feeFileWrite = 0;
-      for (const auto& e : entries) {
-        if (e.key == "serverPublicKey") {
-          try {
-            minx::stringToHash(serverPk, e.value);
-            hasServerPk = true;
-          } catch (...) {}
-        } else if (e.key == "feeFileRent") {
-          try { feeFileRent = std::stoull(e.value); } catch (...) {}
-        } else if (e.key == "feeFileWrite") {
-          try { feeFileWrite = std::stoull(e.value); } catch (...) {}
-        }
+      if (!server_key_arg.empty()) {
+        try { minx::stringToHash(serverPk, server_key_arg); hasServerPk = true; }
+        catch (...) { std::cerr << "Error: bad --server-key hex\n"; return 1; }
+      } else {
+        serverPk = cc.getServerKey();
+        minx::Hash zero{};
+        hasServerPk = (serverPk != zero);
       }
       if (!hasServerPk) {
-        std::cerr << "Warn: serverPublicKey not found in server-info; "
-                  << "response sig verification disabled.\n";
+        std::cerr << "Warn: no server key; response sig verification disabled.\n";
+      }
+
+      // feeFileRent/feeFileWrite are only needed to size the DEFAULT upfront
+      // deposit for `put` when the caller didn't pass --deposit. Fetch them
+      // via the paid server-info ONLY in that case — get/stat, and any put
+      // with an explicit --deposit, never trigger a paid query.
+      uint64_t feeFileRent = 0;
+      uint64_t feeFileWrite = 0;
+      if (cmd_dfp->parsed() && df_deposit_arg == 0) {
+        std::vector<ServerInfoEntry> entries;
+        uint8_t sirc = cc.queryServerInfo(entries);
+        if (sirc != CES_OK) {
+          std::cerr << "Error: queryServerInfo failed: "
+                    << errorString(sirc) << "\n";
+          return 1;
+        }
+        for (const auto& e : entries) {
+          if (e.key == "feeFileRent")
+            { try { feeFileRent = std::stoull(e.value); } catch (...) {} }
+          else if (e.key == "feeFileWrite")
+            { try { feeFileWrite = std::stoull(e.value); } catch (...) {} }
+        }
       }
 
       // Helper: auto-prepend /h/<signer>/ if the path doesn't start with /.
@@ -1845,24 +1859,17 @@ int main(int argc, char* argv[]) {
       if (colon != std::string::npos) host = host.substr(0, colon);
       if (host.empty()) host = "localhost";
 
-      // Fetch the server's public key for response-sig verification.
-      // Same pattern handleDiskFile uses.
+      // Server pubkey for response-sig verification — NO paid query:
+      // explicit --server-key wins; otherwise reuse the free handshake's key.
       minx::Hash serverPk{};
       bool hasServerPk = false;
-      {
-        std::vector<ServerInfoEntry> entries;
-        uint8_t sirc = cc.queryServerInfo(entries);
-        if (sirc == CES_OK) {
-          for (const auto& e : entries) {
-            if (e.key == "serverPublicKey") {
-              try {
-                minx::stringToHash(serverPk, e.value);
-                hasServerPk = true;
-              } catch (...) {}
-              break;
-            }
-          }
-        }
+      if (!server_key_arg.empty()) {
+        try { minx::stringToHash(serverPk, server_key_arg); hasServerPk = true; }
+        catch (...) { std::cerr << "Error: bad --server-key hex\n"; return 1; }
+      } else {
+        serverPk = cc.getServerKey();
+        minx::Hash zero{};
+        hasServerPk = (serverPk != zero);
       }
 
       auto normalizePath = [&](const std::string& raw) -> std::string {

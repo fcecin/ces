@@ -107,6 +107,12 @@ Two algorithms behind a 1-byte decorator: ED25519 (CryptoPP) and secp256k1 (libs
 
 Wallet format: one key per line, `"00" + 64-hex` or `"01" + 64-hex`. Wallets validate keys at insertion.
 
+**Private vs public key — read this before scripting cesh/ces (easy to get wrong):**
+- A wallet line / `cesh keys list` entry is the **decorated PRIVATE key**: a leading byte (`00`=ed25519, `01`=secp256k1) **that is part of the key (the algorithm), not padding** — `"00"+64-hex` = **66 hex chars** total. `keys list` is **private-key-prioritized** and does **NOT** print the public key.
+- The **public key** is the **account identity** — what you credit, query, and what the ledger keys accounts by (map key = first 8 bytes of the pubkey hash). It is **64 hex chars, no decorator**. `cesh keys gen` shows it in **parentheses** after the private key; `ces --genkeypair` labels `Private Key:` / `Public Key:` cleanly.
+- **NEVER** `grep -oE '[0-9a-fA-F]{64}'` a `keys list` line to get an account key — that grabs the decorator byte + the first 31 bytes of the private key (a mangled 64-hex value). Use `ces --genkeypair`'s `Public Key:` line, or the parenthesized value from `cesh keys gen`.
+- Funding the wrong hex is **silently self-consistent**: `ces credit <wrong>` and `cesh query <wrong>` agree (both key by the same wrong prefix, so the balance "shows up"), but every **signed/L2 op rejects it as `CES_ERROR_ORIGIN_NOT_FOUND`** because it binds the real key. If a funded account works for `query` but signed ops say ORIGIN_NOT_FOUND, you funded the wrong key.
+
 ## Wire protocol (`protocol.h`, `types.h`)
 
 `CES_INJECT_SIGNED_METHODS` / `CES_INJECT_UNSIGNED_METHODS` macros generate `toBytes`/`fromBytes`/`verifySignature`.
@@ -376,6 +382,8 @@ Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `S
 ## RandomX (via MINX)
 
 CPU-hard PoW for Sybil-resistance on minting (credits from PoW only; no premine). Default keeps full dataset in RAM for fast verify; `cache_only_pow=true` trades speed for memory. Solutions arrive on main UDP port as unsigned packets; verification on its own thread. `min_difficulty` = per-solution hash floor; higher-difficulty solutions mint more credit. `no_pow_engine=true` for dev/test (no minting).
+
+**The engine also verifies main-port anti-spam tickets** — so with `no_pow_engine=true`, **signed ops on the main port** (transfer, squery, `CES_QUERY_SERVER_INFO`, mint) silently drop and the client **times out**. But the **free MINX `GetInfo`** (cesh `ping`) and **all rpc-port CesPlex/L2 traffic** (file/compute binds + verbs) are **ticketless** and work fine without the engine. So a **pure file/compute-serving box can run `no_pow_engine=true`** (instant boot, no RandomX RAM) — only nodes that accept mints or serve signed main-port ops need the engine. (The cesweb file gateway exploits this: it uses `ping` + `--server-key` + rpc-port READ, never a signed main-port op.)
 
 ## Dependencies
 
