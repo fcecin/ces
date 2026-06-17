@@ -76,6 +76,8 @@ tests/              Boost.Test suites compiled into one `cestests` binary
                     (in-process server+client, 10B prefunded).
 tools/cesnet.mjs    network orchestrator (init/up/down/destroy)
 tools/cesnetbot.mjs parallel traffic simulator + conservation check
+cesweb/             L3 HTTP gateway (Node) serving CES files + a /dev terminal to
+                    browsers via the cesh CLI; self-contained, own CLAUDE.md
 ```
 
 ## Data model — the two-type ledger

@@ -1,0 +1,23 @@
+{
+  "name": "cesweb",
+  "version": "0.0.1",
+  "description": "HTTP gateway that serves CES file-store content to browsers (and a /dev terminal into CES compute) by shelling out to the cesh CLI.",
+  "type": "module",
+  "bin": {
+    "cesweb": "src/server.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "live": "bash scripts/live.sh",
+    "test": "node --test",
+    "e2e:dice": "bash scripts/diceweb.sh"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "@noble/curves": "^2.2.0",
+    "ws": "^8.21.0"
+  }
+}

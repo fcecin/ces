@@ -1,0 +1,45 @@
+[Unit]
+Description=cesweb — CES L2 file-store HTTP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/cesweb
+# Gateway listens on loopback only; nginx fronts it on :443 (TLS).
+Environment=CESWEB_PORT=8088
+Environment=CESWEB_BIND=127.0.0.1
+# Use the gateway's own cesh + libs (kept separate from /opt/ces).
+Environment=CESWEB_CESH=/opt/cesweb/cesh
+Environment=LD_LIBRARY_PATH=/opt/cesweb
+# The CES server this gateway fronts, by its PUBLIC name (@@CESHOST@@ is
+# substituted by deploy.sh; CESHOST=...). The gateway refuses non-routable hosts,
+# so it reaches even a co-located server over its globally-routable address. The
+# default host keeps URLs clean: /p/site/... instead of /<host>/p/site/...
+Environment=CESWEB_DEFAULT_CES_PORT=53830
+Environment=CESWEB_DEFAULT_HOST=@@CESHOST@@
+# Wallet the gateway pays file reads with. If it's the fronted server's own key,
+# reads are free (bottomless) and never 402; if cesweb fronts a server you don't
+# operate, use a dedicated funded key instead.
+Environment=CESWEB_WALLET_FILE=/opt/cesweb/wallet.txt
+# Concurrency: at most 8 fills run at once; extra requests queue (the engine
+# shows a live sitrep page meanwhile, it does not 503).
+Environment=CESWEB_MAX_INFLIGHT=8
+# Local disk cache: files are fetched from CES once, then served from here
+# (range-capable). Stat-validated; survives restarts. The engine evicts (LRU)
+# to keep the cache under MAX_CACHE_MB, and refuses (413) files over MAX_FILE_MB.
+Environment=CESWEB_CACHE_DIR=/opt/cesweb/cache
+Environment=CESWEB_MAX_FILE_MB=1024
+Environment=CESWEB_MAX_CACHE_MB=4096
+# Pin to a single CES server (no localhost, no arbitrary hosts) — combined with
+# the engine's non-routable-host refusal, this closes the open-proxy/SSRF surface.
+# Leave empty to front ANY server the URL names, or list several, comma-separated.
+Environment=CESWEB_ALLOW_HOSTS=@@CESHOST@@
+ExecStart=/usr/bin/node /opt/cesweb/src/server.js
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

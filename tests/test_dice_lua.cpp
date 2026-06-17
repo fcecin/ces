@@ -9,8 +9,7 @@
 // ces.program_pubkey()); the program only READS the player's account to
 // confirm the deposit, then pays winnings out of that same program account.
 //
-// What the dice MUST do (and what was once wrong — `balance` reported the
-// player's CES account, not the chips on the table):
+// What the dice must do:
 //   * `balance` reports CONTRACT state: credits deposited & playable, i.e.
 //     a fresh, unconsumed transfer to the house — NOT the CES account.
 //   * a single deposit is one bet: balance 0 → deposit N → balance N →
@@ -34,9 +33,8 @@
 
 namespace {
 
-// The bet/deposit used throughout. The user asked for exactly this: a
-// deposit of 100 must read back as "available to play: 100", and 0 after a
-// play. 100 is comfortably above the dice's MIN_BET (1).
+// The bet/deposit used throughout: 100 reads back as "available to play: 100"
+// and 0 after a play, and is comfortably above the dice's MIN_BET (1).
 constexpr uint64_t kBet = 100;
 
 // Read the actual shipped /s/dice.lua so the test pins the real program, not
@@ -173,9 +171,9 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
 
 BOOST_FIXTURE_TEST_SUITE(DiceLuaTests, LuaConnFixture)
 
-// The core contract cycle the user specified: balance 0 → deposit 100 →
-// balance 100 → play → balance 0, plus the payout direction for whichever
-// way the single coin lands, plus replay rejection.
+// The core contract cycle: balance 0 → deposit 100 → balance 100 → play →
+// balance 0, plus the payout direction for whichever way the single coin
+// lands, plus replay rejection.
 BOOST_AUTO_TEST_CASE(DepositBalancePlayCycle) {
   ServerOps ops(*server);
   PlexLuaPeer peer;
