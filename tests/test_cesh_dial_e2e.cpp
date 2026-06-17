@@ -24,6 +24,9 @@
 #include <ces/l2/file_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/server.h>
+#include <ces/cesplex/wire.h>     // computeBindRequestDigest / signPerOp (extsign)
+#include <ces/buffer.h>
+#include <ces/keys.h>
 
 #include <boost/test/unit_test.hpp>
 
@@ -34,6 +37,7 @@
 
 #include <chrono>
 #include <cstring>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -158,6 +162,74 @@ bool writeAll(int fd, const void* buf, size_t n) {
     sent += static_cast<size_t>(w);
   }
   return true;
+}
+
+std::string toHex(const uint8_t* p, size_t n) {
+  static const char* h = "0123456789abcdef";
+  std::string s; s.reserve(n * 2);
+  for (size_t i = 0; i < n; i++) { s.push_back(h[p[i] >> 4]); s.push_back(h[p[i] & 0xf]); }
+  return s;
+}
+
+// Read one '\n'-terminated line (newline stripped) from a pipe, byte-by-byte so
+// we don't consume past it into the raw byte pipe that follows the handshake.
+std::string readLine(int fd, std::chrono::milliseconds timeout) {
+  std::string s;
+  auto deadline = std::chrono::steady_clock::now() + timeout;
+  for (;;) {
+    auto rem = deadline - std::chrono::steady_clock::now();
+    if (rem <= std::chrono::milliseconds(0)) break;
+    char c;
+    size_t got = readUpTo(fd, &c, 1,
+                          std::chrono::duration_cast<std::chrono::milliseconds>(rem));
+    if (got == 0) break;
+    if (c == '\n') break;
+    if (c != '\r') s.push_back(c);
+  }
+  return s;
+}
+
+// Like spawnCeshDial, but external-signing: no CESH_WALLET; pass --extsign +
+// --pubkey. The caller drives the BIND/ATTACH control handshake on the pipes.
+DialChild spawnCeshDialExt(const std::string& ceshBin,
+                           const std::string& pubkeyHex,
+                           uint16_t rpcPort,
+                           uint64_t instId) {
+  int sin[2]{-1, -1}, sout[2]{-1, -1}, serr[2]{-1, -1};
+  BOOST_REQUIRE_EQUAL(::pipe(sin),  0);
+  BOOST_REQUIRE_EQUAL(::pipe(sout), 0);
+  BOOST_REQUIRE_EQUAL(::pipe(serr), 0);
+
+  pid_t pid = ::fork();
+  BOOST_REQUIRE(pid >= 0);
+  if (pid == 0) {
+    ::dup2(sin[0],  STDIN_FILENO);
+    ::dup2(sout[1], STDOUT_FILENO);
+    ::dup2(serr[1], STDERR_FILENO);
+    ::close(sin[0]);  ::close(sin[1]);
+    ::close(sout[0]); ::close(sout[1]);
+    ::close(serr[0]); ::close(serr[1]);
+    ::unsetenv("CESH_WALLET");   // no key in this process — that's the point
+
+    std::string portStr = std::to_string(rpcPort);
+    std::string idStr   = std::to_string(instId);
+    std::vector<const char*> argv;
+    argv.push_back("cesh");
+    argv.push_back("--server");   argv.push_back("localhost");
+    argv.push_back("--rpc-port"); argv.push_back(portStr.c_str());
+    argv.push_back("-l");         argv.push_back("fatal");
+    argv.push_back("dial");
+    argv.push_back("--extsign");
+    argv.push_back("--pubkey");   argv.push_back(pubkeyHex.c_str());
+    argv.push_back(idStr.c_str());
+    argv.push_back(nullptr);
+    ::execvp(ceshBin.c_str(), const_cast<char* const*>(argv.data()));
+    ::_exit(127);
+  }
+  ::close(sin[0]); ::close(sout[1]); ::close(serr[1]);
+  DialChild ch;
+  ch.pid = pid; ch.stdinW = sin[1]; ch.stdoutR = sout[0]; ch.stderrR = serr[0];
+  return ch;
 }
 
 // waitpid with a deadline. Returns true if reaped, fills `status`.
@@ -305,6 +377,73 @@ BOOST_AUTO_TEST_CASE(EchoThenSigterm) {
   BOOST_CHECK(WIFEXITED(status));
   BOOST_CHECK_EQUAL(WEXITSTATUS(status), 143);
   ch.pid = -1; // already reaped
+}
+
+// External-signing dial: the bind + ATTACH signatures are produced HERE (no key
+// in cesh) and fed over the stdio control handshake; the server cryptographically
+// verifies them. Exercises `cesh dial --extsign` / bindExt / attachExt /
+// buildBindRequestSigned end to end — the path cesweb uses so the key never
+// reaches the tunnel.
+BOOST_AUTO_TEST_CASE(ExtSignEchoRoundtrip) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string scriptPath = "/h/" + ownerHex + "/echo_ext.lua";
+  const std::string src =
+    "ces.conn.set_listener({\n"
+    "  on_data = function(conn, data) conn:write(data) end,\n"
+    "})\n"
+    "ces.conn.run()\n";
+  uploadScript(scriptPath, src);
+  uint64_t instId = launchScript(scriptPath);
+  BOOST_REQUIRE(instId > 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  std::string ceshBin = ces::e2e::findCeshBinary();
+  DialChild ch = spawnCeshDialExt(ceshBin, ownerHex, rpcPort, instId);
+
+  // Sign the bind here (the digest format must match the server's).
+  const std::string name = "/ces/lua/1";
+  uint64_t t = static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+  const auto& pk = ownerKey.getPublicKeyAsHash();
+  auto bindDigest = computeBindRequestDigest(
+    std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(name.data()), name.size()),
+    t, std::span<const uint8_t>(pk.data(), pk.size()));
+  Signature bindSig = ownerKey.signData(
+    std::span<const uint8_t>(bindDigest.data(), bindDigest.size()));
+  std::string bindLine = "BIND " + std::to_string(t) + " " +
+    toHex(bindSig.data(), bindSig.size()) + "\n";
+  BOOST_REQUIRE(writeAll(ch.stdinW, bindLine.data(), bindLine.size()));
+
+  // cesh binds, verifies the reply, hands back the session token.
+  std::string tokLine = readLine(ch.stdoutR, std::chrono::seconds(5));
+  BOOST_REQUIRE_MESSAGE(tokLine.rfind("TOKEN ", 0) == 0, "expected TOKEN, got: " + tokLine);
+  uint64_t token = std::stoull(tokLine.substr(6));
+
+  // Sign ATTACH over the token, send it.
+  ces::Bytes preamble;
+  ces::Buffer::put<uint64_t>(preamble, instId);
+  Signature attSig = signPerOp(ownerKey, 0x01,
+    std::span<const uint8_t>(preamble.data(), preamble.size()), token);
+  std::string attLine = "ATTACH " + toHex(attSig.data(), attSig.size()) + "\n";
+  BOOST_REQUIRE(writeAll(ch.stdinW, attLine.data(), attLine.size()));
+
+  std::string readyLine = readLine(ch.stdoutR, std::chrono::seconds(5));
+  BOOST_REQUIRE_EQUAL(readyLine, "READY");
+
+  // Raw byte pipe now — echo round-trip.
+  const std::string msg = "ping\n";
+  BOOST_REQUIRE(writeAll(ch.stdinW, msg.data(), msg.size()));
+  ces::Bytes got(msg.size(), 0);
+  size_t n = readUpTo(ch.stdoutR, got.data(), got.size(), std::chrono::seconds(3));
+  BOOST_CHECK_EQUAL(std::string(got.begin(), got.begin() + n), msg);
+
+  ::kill(ch.pid, SIGTERM);
+  int status = 0;
+  BOOST_REQUIRE(waitForExit(ch.pid, status, std::chrono::seconds(5)));
+  BOOST_CHECK(WIFEXITED(status));
+  BOOST_CHECK_EQUAL(WEXITSTATUS(status), 143);
+  ch.pid = -1;
 }
 
 // dial against a bogus instance id → ATTACH returns INSTANCE_NOT_FOUND

@@ -198,6 +198,17 @@ minx::Bytes buildBindRequest(const std::string& name,
                               uint64_t clientTimeUs,
                               const KeyPair& clientKey);
 
+// Same wire as buildBindRequest, but with the signature supplied from outside
+// instead of signing with a local KeyPair. For tunnelers (cesweb) where the
+// private key never reaches this process: the caller signs the bind digest
+// elsewhere (browser / node) and passes the 65-byte sig + the 32-byte pubkey.
+// The digest is recomputed here from (name, time, pubkey) so it always matches
+// what the server verifies; the caller's sig must be over that same digest.
+minx::Bytes buildBindRequestSigned(const std::string& name,
+                                   uint64_t clientTimeUs,
+                                   std::span<const uint8_t> clientPubkey,
+                                   const Signature& sig);
+
 // Compute the digest the client signs over (and the server recomputes
 // to verify): sha256(name_len || name || clientTimeUs || clientPubkey).
 std::array<uint8_t, CES_PLEX_SHA256_SIZE>

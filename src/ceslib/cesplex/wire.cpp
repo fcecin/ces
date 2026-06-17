@@ -57,6 +57,27 @@ minx::Bytes buildBindRequest(const std::string& name,
   return bytes;
 }
 
+minx::Bytes buildBindRequestSigned(const std::string& name,
+                                   uint64_t clientTimeUs,
+                                   std::span<const uint8_t> clientPubkey,
+                                   const Signature& sig) {
+  std::span<const uint8_t> nameSpan(
+    reinterpret_cast<const uint8_t*>(name.data()), name.size());
+  auto digest = computeBindRequestDigest(nameSpan, clientTimeUs, clientPubkey);
+
+  const size_t total =
+      CES_PLEX_NAME_LEN_SIZE + name.size() + CES_PLEX_BIND_REQ_TAIL_SIZE;
+  minx::Bytes bytes(total);
+  minx::Buffer buf(bytes);
+  buf.put<uint16_t>(static_cast<uint16_t>(name.size()));
+  buf.put(nameSpan);
+  buf.put<uint64_t>(clientTimeUs);
+  buf.put(clientPubkey);
+  buf.put(digest);
+  buf.put(sig);
+  return bytes;
+}
+
 // ---------------------------------------------------------------------------
 // Bind reply — server side
 // ---------------------------------------------------------------------------

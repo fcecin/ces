@@ -39,6 +39,19 @@ struct DialArgs {
   // the first reply's pubkey is TOFU-accepted (logged once on stderr).
   std::optional<minx::Hash> expectedServerPk;
   bool        verbose = false;     // -v: print "ATTACH ok conn_id=N" once
+
+  // External-signing mode (--extsign): no wallet/private key in this process.
+  // The bind + ATTACH signatures are supplied over a tiny stdio control
+  // handshake, so a tunneler (cesweb) keeps the key in the browser/gateway and
+  // never hands it to cesh. When set, signerKey is unused; clientPubkeyHex names
+  // the 32-byte client pubkey (64 hex) that signed. Control protocol:
+  //   stdin  <- "BIND <timeUs> <bindSigHex>\n"
+  //   stdout -> "TOKEN <sessionToken>\n"     (or "ERR <msg>\n" then exit)
+  //   stdin  <- "ATTACH <attachSigHex>\n"
+  //   stdout -> "READY\n"                     (or "ERR <msg>\n" then exit)
+  // after which the channel is a raw byte pipe exactly like the wallet path.
+  bool        extSign = false;
+  std::string clientPubkeyHex;
 };
 
 int runDial(const DialArgs& args);

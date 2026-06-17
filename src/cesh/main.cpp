@@ -554,6 +554,17 @@ int main(int argc, char* argv[]) {
                        "or shown in `cesh compute ps`.")->required();
   cmd_dial->add_flag("-v,--verbose", dial_verbose_arg,
                      "Print one ATTACH-ok line to stderr on success.");
+  bool dial_extsign_arg = false;
+  std::string dial_pubkey_arg;
+  cmd_dial->add_flag("--extsign", dial_extsign_arg,
+                     "External-signing tunnel mode: take bind + ATTACH "
+                     "signatures over a stdio control handshake instead of "
+                     "signing with a wallet (no private key in this process). "
+                     "Requires --pubkey. Used by cesweb so the key stays in the "
+                     "browser/gateway.");
+  cmd_dial->add_option("--pubkey", dial_pubkey_arg,
+                       "Client public key (64 hex) that signed the bind "
+                       "(required with --extsign).");
 
   // ---- autoexec subcommands ----
   auto* cmd_autoexec = app.add_subcommand("autoexec", "Boot-time program execution");
@@ -934,6 +945,32 @@ int main(int argc, char* argv[]) {
   if (cmd_asset->parsed() && cmd_asset->get_subcommands().empty()) {
     std::cout << cmd_asset->help() << "\n";
     return 0;
+  }
+
+  // ---- dial --extsign — external-signing tunnel; no wallet/private key. ----
+  // Handled before actor/wallet resolution: there is deliberately no key here;
+  // the bind + ATTACH signatures arrive over a stdio control handshake.
+  if (cmd_dial->parsed() && dial_extsign_arg) {
+    if (dial_pubkey_arg.empty()) {
+      std::cerr << "Error: --extsign requires --pubkey <64 hex>.\n";
+      return 1;
+    }
+    DialArgs da;
+    da.serverHost = server_arg;
+    if (auto colon = da.serverHost.rfind(':'); colon != std::string::npos)
+      da.serverHost = da.serverHost.substr(0, colon);
+    if (da.serverHost.empty()) da.serverHost = "localhost";
+    da.rpcPort     = rpcPort_arg;
+    da.instanceId  = dial_instance_arg;
+    da.verbose     = dial_verbose_arg;
+    da.extSign     = true;
+    da.clientPubkeyHex = dial_pubkey_arg;
+    if (!server_key_arg.empty()) {
+      minx::Hash pk{};
+      try { minx::stringToHash(pk, server_key_arg); da.expectedServerPk = pk; }
+      catch (...) { std::cerr << "Error: bad --server-key.\n"; return 1; }
+    }
+    return runDial(da);
   }
 
   bool needs_actor =
