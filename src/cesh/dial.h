@@ -1,4 +1,4 @@
-// dial.h — `cesh dial <instance_id>` implementation entry point.
+// dial.h — `cesh dial <pid>` implementation entry point.
 //
 // Opens a bidirectional byte stream from the cesh client to a running
 // compute instance over /ces/lua/1, then pipes stdin↔channel↔stdout.
@@ -33,7 +33,7 @@ namespace ces {
 struct DialArgs {
   std::string serverHost;          // hostname or IP (no port)
   uint16_t    rpcPort = 0;         // CesPlex RUDP port (--rpc-port)
-  uint64_t    instanceId = 0;
+  uint64_t    pid = 0;
   KeyPair     signerKey;
   // If provided, the bind reply's server pubkey must match. If absent,
   // the first reply's pubkey is TOFU-accepted (logged once on stderr).

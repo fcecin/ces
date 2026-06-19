@@ -135,7 +135,7 @@ enum error_code_t : uint8_t {
   // Compute feature — source file's file_balance too low to cover the
   // 15-min upfront deposit at LAUNCH.
   CES_ERROR_COMPUTE_FUND_TOO_LOW = 0x1d,
-  // Compute feature — KILL/STAT referenced an instance_id that isn't
+  // Compute feature — KILL/STAT referenced an pid that isn't
   // running (already exited, never existed, wrong owner).
   CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND = 0x1e,
   // Compute feature — LAUNCH would exceed compute_max_instances.

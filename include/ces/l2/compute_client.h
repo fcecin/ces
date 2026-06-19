@@ -6,16 +6,16 @@
 // log one LOGERROR and return the bytes.
 //
 // Verbs:
-//   launch(signer, name)    → instance_id + started_at_us  (always mints
+//   launch(signer, name)    → pid + started_at_us  (always mints
 //                             a new id; multiple instances per source
 //                             coexist up to compute_max_instances)
 //   kill(signer, id)        → ok
-//   list(signer)            → owner-scoped [instance_id, name,
+//   list(signer)            → owner-scoped [pid, name,
 //                             started_at_us, file_balance, cpu, rss,
 //                             ports]*
 //   stat(id)                → started_at_us, file_balance, cpu, rss,
 //                             ports, name  (public — any signer)
-//   instances(path)         → public [instance_id, started_at_us, cpu,
+//   instances(path)         → public [pid, started_at_us, cpu,
 //                             rss, ports]* for `path` (no owner check;
 //                             enables discovery AND dialing of services)
 //
@@ -43,7 +43,7 @@ class CesPlexChannel;
 class CesComputeClient {
 public:
   struct InstanceInfo {
-    uint64_t instanceId = 0;
+    uint64_t pid = 0;
     std::string sourceName;
     uint64_t startedAtUs = 0;
     uint64_t fileBalance = 0;
@@ -96,11 +96,11 @@ public:
   uint8_t launch(const std::string& name,
                  uint64_t& outInstanceId, uint64_t& outStartedAtUs);
 
-  uint8_t kill(uint64_t instanceId);
+  uint8_t kill(uint64_t pid);
 
   uint8_t list(std::vector<InstanceInfo>& out);
 
-  uint8_t stat(uint64_t instanceId, InstanceInfo& out);
+  uint8_t stat(uint64_t pid, InstanceInfo& out);
 
   // Public enumeration of live instances for a given source path —
   // discovery + endpoints in one call. Each InstanceInfo carries the

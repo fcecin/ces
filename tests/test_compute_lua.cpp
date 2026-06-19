@@ -518,7 +518,7 @@ BOOST_AUTO_TEST_CASE(CpuAndRssReportedForBusyLuaProgram) {
   CES_REQUIRE_OK(cc.kill(instId));
   cc.disconnect();
 
-  BOOST_CHECK_EQUAL(info.instanceId, instId);
+  BOOST_CHECK_EQUAL(info.pid, instId);
   // The program is pegging one core. We've seen CI noise dropping
   // samples, so check a conservative floor (20%).
   BOOST_CHECK_MESSAGE(info.cpuBasisPoints >= 2000,

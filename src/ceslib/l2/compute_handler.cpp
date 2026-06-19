@@ -14,16 +14,16 @@
 // envelope binding to sha256(verb || preamble), server-signed
 // response):
 //   0x01 LAUNCH  (owner): u16 path_len, path
-//     resp: u64 instance_id, u64 started_at_us
-//   0x02 KILL    (owner): u64 instance_id
+//     resp: u64 pid, u64 started_at_us
+//   0x02 KILL    (owner): u64 pid
 //     resp: (empty)
 //   0x03 LIST    (any, scoped to signer's own): (no preamble beyond reqNonce)
 //     resp: u32 count, [u64 id, u16 path_len, path,
 //                       u64 started_at_us, u64 file_balance,
 //                       u32 cpu_bp, u64 rss_bytes,
 //                       u16 client_port, u16 rpc_port]*
-//   0x04 STAT    (any): u64 instance_id
-//     resp: u64 instance_id, u64 started_at_us, u64 file_balance,
+//   0x04 STAT    (any): u64 pid
+//     resp: u64 pid, u64 started_at_us, u64 file_balance,
 //           u32 cpu_bp, u64 rss_bytes, u16 client_port, u16 rpc_port,
 //           u16 path_len, path
 //   0x05 INSTANCES (any): u16 path_len, path
@@ -91,7 +91,7 @@
 #include <string>
 #include <vector>
 
-LOG_MODULE("plex");
+LOG_MODULE("compute");
 
 namespace ces {
 
@@ -143,6 +143,8 @@ constexpr uint8_t kIpcTagConnDataOut  = 0x07;  // child → server
 constexpr uint8_t kIpcTagConnClose    = 0x08;  // child → server
 constexpr uint8_t kIpcTagListenOn     = 0x09;  // child → server
 constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
+constexpr uint8_t kIpcTagLog          = 0x0b;  // child → server (ces.log)
+constexpr size_t  kLuaProgramLogMax   = 4096;  // cap a program log line
 
 constexpr uint16_t kApiMethodClientSend = 0x0001;
 constexpr uint16_t kApiMethodFileCreate   = 0x0100;
@@ -238,10 +240,10 @@ constexpr size_t kMaxDeliverBacklog = 1024;
 // frames arrive from the child, and when an instance is dying (so the
 // lua handler can tear down all its routed connections before the
 // Instance is dropped).
-void luaHandlerHandleConnDataOut(uint64_t instId, uint64_t connId,
+void luaHandlerHandleConnDataOut(uint64_t pid, uint64_t connId,
                                   const uint8_t* data, size_t len);
-void luaHandlerHandleConnClose(uint64_t instId, uint64_t connId);
-void luaHandlerOnInstanceDying(uint64_t instId);
+void luaHandlerHandleConnClose(uint64_t pid, uint64_t connId);
+void luaHandlerOnInstanceDying(uint64_t pid);
 namespace {
 
 // All BE serialization goes through ces::Buffer (see ces/buffer.h).
@@ -258,7 +260,9 @@ using UnixSocket = boost::asio::local::stream_protocol::socket;
 using UnixAcceptor = boost::asio::local::stream_protocol::acceptor;
 
 struct Instance : std::enable_shared_from_this<Instance> {
-  uint64_t id = 0;
+  // CES process id -- the computing-layer "pid" (1, 2, 3, ...). Server-assigned,
+  // monotonic, never reused. This is what Lua, the protocol, and the UI speak.
+  uint64_t pid = 0;
   std::string sourceName;
   std::array<uint8_t, 32> ownerPk{};
   // Program account pubkey from the source file's sidecar.
@@ -267,7 +271,10 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // so it can sign its own remote ops.
   std::array<uint8_t, 32> programPrivkey{};
   std::array<uint8_t, 8> progPrefix{};  // first 8B of sha256(sourceName)
-  pid_t pid = -1;
+  // OS process id of the cesluajitd child. Internal bookkeeping only
+  // (waitpid/kill//proc) -- never spoken in Lua, the protocol, or the UI; the
+  // CES-facing process id is `pid` above.
+  pid_t ospid = -1;
   // UDP port the server statically assigned this instance for its
   // outbound CES client, from the configured compute port range. 0 =
   // no range configured (instance has no network). Handed to the child
@@ -309,7 +316,7 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // /ces/lua/1 connection state. The accept gate (default closed) is
   // flipped by the child via TAG_LISTEN_ON / TAG_LISTEN_OFF. The
   // routing table for active connections is owned by the lua handler
-  // (compute_lua_handler.cpp), keyed by (instId, connId); the
+  // (compute_lua_handler.cpp), keyed by (pid, connId); the
   // supervisor calls into it via forward-declared dispatchers when
   // CONN_DATA_OUT / CONN_CLOSE frames arrive from the child.
   bool acceptsConnections = false;
@@ -337,7 +344,7 @@ struct Instance : std::enable_shared_from_this<Instance> {
   uint32_t nextBucketId = 1;
 };
 
-// Instance registry. Keyed by instance_id (the only identity). The
+// Instance registry. Keyed by pid (the only identity). The
 // path → ids and prefix → ids indexes are multi-valued: a source path
 // may have N concurrent instances (one cesh compute launch ⇒ one new
 // id), and prog_pfx is content-addressed from the path so all sibling
@@ -347,7 +354,7 @@ struct Instance : std::enable_shared_from_this<Instance> {
 std::map<uint64_t, std::shared_ptr<Instance>> gInstances;
 std::map<std::array<uint8_t, 8>, std::set<uint64_t>> gByPrefix;
 std::map<std::string, std::set<uint64_t>> gByName;
-uint64_t gNextInstanceId = 1;
+uint64_t gNextPid = 1;
 
 // In-flight LAUNCH reservations: launches admitted past the cap check
 // whose instance isn't in gInstances yet (the child is still connecting
@@ -404,7 +411,7 @@ void releaseComputePort(uint16_t port) {
 // Holds the port across the async launch chain and returns it to the
 // pool on destruction unless commit()ted. A failed launch drops the
 // lease and frees the port; on success the port is committed to the
-// Instance, and killInstanceById frees it when the instance dies.
+// Instance, and killByPid frees it when the instance dies.
 struct PortLease {
   uint16_t port = 0;
   bool committed = false;
@@ -434,8 +441,8 @@ std::filesystem::path resolveWorkDir(const CesConfig& cfg) {
   return std::filesystem::path(cfg.dataDir.string()) / "cescompute";
 }
 
-std::filesystem::path instanceSocketPath(const CesConfig& cfg, uint64_t id) {
-  return resolveWorkDir(cfg) / (std::to_string(id) + ".sock");
+std::filesystem::path instanceSocketPath(const CesConfig& cfg, uint64_t pid) {
+  return resolveWorkDir(cfg) / (std::to_string(pid) + ".sock");
 }
 
 // Compute 8B prefix = first 8 bytes of sha256(name).
@@ -574,9 +581,9 @@ bool readProcSample(pid_t pid, ProcSample& out) {
 // mean over the interval since last sample — so a busy-loop Lua will
 // pin at ~10000 (= 100% of one core).
 void sampleInstanceProc(Instance& inst, uint64_t nowUs) {
-  if (inst.pid <= 0) return;
+  if (inst.ospid <= 0) return;
   ProcSample s;
-  if (!readProcSample(inst.pid, s)) return;
+  if (!readProcSample(inst.ospid, s)) return;
   uint64_t deltaUs = (nowUs > inst.lastSampleUs)
     ? (nowUs - inst.lastSampleUs) : 0;
   uint64_t deltaTicks = (s.ticks >= inst.lastCpuTicks)
@@ -616,33 +623,33 @@ void teardownInstance(Instance& inst) {
   }
 }
 
-// Kill an instance by id, remove from registries, clean up resources.
+// Kill an instance by pid, remove from registries, clean up resources.
 // No fee refund on kill: the upfront slot-fee paid for a commitment the
 // host already honored by running.
-void killInstanceById(uint64_t id) {
-  auto it = gInstances.find(id);
+void killByPid(uint64_t pid) {
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) return;
   auto inst = it->second;
   // Tear down any /ces/lua/1 connections routed to this instance
   // before we drop the registry entry, so the lua handler can
   // still find it (and so the bytes-and-onClosed cascade fires
   // while the supervisor is still in a coherent state).
-  luaHandlerOnInstanceDying(id);
-  killAndReap(inst->pid);
+  luaHandlerOnInstanceDying(pid);
+  killAndReap(inst->ospid);
   teardownInstance(*inst);
   releaseComputePort(inst->clientPort);
   releaseComputePort(inst->rpcPort);
   gInstances.erase(it);
   if (auto pit = gByPrefix.find(inst->progPrefix); pit != gByPrefix.end()) {
-    pit->second.erase(id);
+    pit->second.erase(pid);
     if (pit->second.empty()) gByPrefix.erase(pit);
   }
   if (auto nit = gByName.find(inst->sourceName); nit != gByName.end()) {
-    nit->second.erase(id);
+    nit->second.erase(pid);
     if (nit->second.empty()) gByName.erase(nit);
   }
-  LOGDEBUG << "builtin:compute instance terminated"
-           << VAR(id) << SVAR(inst->sourceName);
+  LOGDEBUG << "instance terminated"
+           << VAR(pid) << SVAR(inst->sourceName);
 }
 
 // ---------------------------------------------------------------------------
@@ -705,9 +712,9 @@ void kickOutboundIfIdle(std::shared_ptr<Instance> inst) {
       inst->writing = false;
       if (!inst->outbox.empty()) inst->outbox.pop_front();
       if (ec) {
-        LOGDEBUG << "builtin:compute ipc write failed"
-                 << VAR(inst->id) << SVAR(ec.message());
-        killInstanceById(inst->id);
+        LOGDEBUG << "ipc write failed"
+                 << VAR(inst->pid) << SVAR(ec.message());
+        killByPid(inst->pid);
         return;
       }
       kickOutboundIfIdle(inst);
@@ -723,8 +730,8 @@ void sendDeliverFrame(std::shared_ptr<Instance> inst,
   // queue, drop this message rather than grow the server's memory without
   // bound. A program that wants every message must keep draining.
   if (inst->peer && inst->outbox.size() >= kMaxDeliverBacklog) {
-    LOGDEBUG << "builtin:compute deliver dropped (outbox full)"
-             << VAR(inst->id) << VAR(inst->outbox.size());
+    LOGDEBUG << "deliver dropped (outbox full)"
+             << VAR(inst->pid) << VAR(inst->outbox.size());
     return;
   }
   ces::Bytes body;
@@ -819,14 +826,14 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
     [inst](const boost::system::error_code& ec, std::size_t) {
       if (ec) {
         // Child closed its end. Reap and clean up.
-        killInstanceById(inst->id);
+        killByPid(inst->pid);
         return;
       }
       uint32_t len = ces::Buffer::peek<uint32_t>(inst->rxLenBuf.data());
       if (len < 3 || len > kIpcMaxFrameLen) {
-        LOGDEBUG << "builtin:compute ipc bad frame len"
-                 << VAR(inst->id) << VAR(len);
-        killInstanceById(inst->id);
+        LOGDEBUG << "ipc bad frame len"
+                 << VAR(inst->pid) << VAR(len);
+        killByPid(inst->pid);
         return;
       }
       inst->rxBodyBuf.assign(len, 0);
@@ -834,11 +841,11 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
         *inst->peer, boost::asio::buffer(inst->rxBodyBuf),
         [inst](const boost::system::error_code& ec2, std::size_t) {
           if (ec2) {
-            killInstanceById(inst->id);
+            killByPid(inst->pid);
             return;
           }
           handleChildFrame(inst);
-          if (gInstances.count(inst->id))
+          if (gInstances.count(inst->pid))
             startIpcReader(inst);
         });
     });
@@ -846,7 +853,25 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
 
 // (Cross-handler dispatchers for the lua handler are forward-declared
 // at the top of this file, near the IPC tag constants, so they're
-// visible to both handleChildFrame and killInstanceById.)
+// visible to both handleChildFrame and killByPid.)
+
+// Emit a privileged (/s/) program's ces.log line under the "compute" module --
+// the deployed program talking, hosted by builtin:compute. Tagged with the
+// readable source path and the CES pid (the instance id: the computing-layer
+// process id, server-assigned and never reused -- NOT the internal ospid). The
+// program chooses the level (0=trace 1=debug 2=info 3=warn 4=error; unknown ->
+// info); the operator chooses what's visible via blog's "compute" level.
+void emitProgramLog(uint64_t pid, const std::string& source,
+                    uint8_t level, const char* msg, size_t len) {
+  std::string body(msg, len);
+  switch (level) {
+    case 0: LOGTRACE   << source << " pid " << pid << ": " << body; break;
+    case 1: LOGDEBUG   << source << " pid " << pid << ": " << body; break;
+    case 3: LOGWARNING << source << " pid " << pid << ": " << body; break;
+    case 4: LOGERROR   << source << " pid " << pid << ": " << body; break;
+    default: LOGINFO   << source << " pid " << pid << ": " << body; break;
+  }
+}
 
 void handleChildFrame(std::shared_ptr<Instance> inst) {
   const auto& body = inst->rxBodyBuf;
@@ -857,8 +882,8 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   // is reserved zero by the child.
   if (tag == kIpcTagListenOn || tag == kIpcTagListenOff) {
     inst->acceptsConnections = (tag == kIpcTagListenOn);
-    LOGDEBUG << "builtin:compute listener gate"
-             << VAR(inst->id) << VAR(inst->acceptsConnections);
+    LOGDEBUG << "listener gate"
+             << VAR(inst->pid) << VAR(inst->acceptsConnections);
     return;
   }
   // `body` still carries the [u8 tag][u16 corr_id] frame header; the
@@ -873,22 +898,38 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kConnIdOff);
     uint32_t dlen  = ces::Buffer::peek<uint32_t>(body.data() + kLenOff);
     if (body.size() < kDataOff + dlen) return;
-    luaHandlerHandleConnDataOut(inst->id, connId,
+    luaHandlerHandleConnDataOut(inst->pid, connId,
                                  body.data() + kDataOff, dlen);
     return;
   }
   if (tag == kIpcTagConnClose) {
     if (body.size() < kIpcHdr + sizeof(uint64_t)) return;
     uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
-    luaHandlerHandleConnClose(inst->id, connId);
+    luaHandlerHandleConnClose(inst->pid, connId);
+    return;
+  }
+  if (tag == kIpcTagLog) {
+    // Payload: [u8 level][message bytes]. ces.log from a privileged (/s/)
+    // program. Level + message are the program's; the instance + program prefix
+    // are stamped host-side (not trusted from the child). Emitted through blog
+    // under the "lua" module. One-way. /s/-only -- a non-privileged (or
+    // compromised) child can't inject attributed program log lines.
+    if (!isServerZone(inst->sourceName)) return;
+    if (body.size() < kIpcHdr + 1) return;
+    uint8_t level = body[kIpcHdr];
+    size_t mlen = body.size() - kIpcHdr - 1;
+    if (mlen > kLuaProgramLogMax) mlen = kLuaProgramLogMax;
+    emitProgramLog(
+      inst->pid, inst->sourceName, level,
+      reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
     return;
   }
   if (tag != kIpcTagApiCall) {
     // Child is only supposed to send API_CALL or one of the lua
     // routing tags above. Anything else is a protocol error.
-    LOGDEBUG << "builtin:compute unexpected child tag"
-             << VAR(inst->id) << VAR(int(tag));
-    killInstanceById(inst->id);
+    LOGDEBUG << "unexpected child tag"
+             << VAR(inst->pid) << VAR(int(tag));
+    killByPid(inst->pid);
     return;
   }
   if (body.size() < 5) {
@@ -1645,7 +1686,7 @@ void allocateAndSpawnInstance(
     std::shared_ptr<LaunchSlot> slot,
     std::shared_ptr<PortLease> portLease,
     std::shared_ptr<PortLease> rpcPortLease,
-    std::function<void(uint64_t id)> done) {
+    std::function<void(uint64_t pid)> done) {
   const auto& cfg = server->_config();
 
   auto workDir = resolveWorkDir(cfg);
@@ -1658,20 +1699,20 @@ void allocateAndSpawnInstance(
   fileHandlerReadProgramPubkey(name, programPubkey);
   fileHandlerReadProgramPrivkey(name, programPrivkey);
 
-  uint64_t id = gNextInstanceId++;
+  uint64_t pid = gNextPid++;
   auto inst = std::make_shared<Instance>();
-  inst->id = id;
+  inst->pid = pid;
   inst->sourceName = name;
   inst->ownerPk = ownerPk;
   inst->programPubkey = programPubkey;
   inst->programPrivkey = programPrivkey;
   inst->progPrefix = progPrefixOf(name);
-  inst->socketPath = instanceSocketPath(cfg, id).string();
+  inst->socketPath = instanceSocketPath(cfg, pid).string();
   inst->upfrontDeposit = upfront;
 
   int lfd = createListenSocket(inst->socketPath);
   if (lfd < 0) {
-    LOGWARNING << "builtin:compute socket create failed" << VAR(lfd);
+    LOGWARNING << "socket create failed" << VAR(lfd);
     done(0);
     return;
   }
@@ -1681,26 +1722,26 @@ void allocateAndSpawnInstance(
   // child with nothing to run.
   auto srcBytes = readSourceBytes(cfg, name);
   if (srcBytes.empty()) {
-    LOGWARNING << "builtin:compute source read failed" << SVAR(name);
+    LOGWARNING << "source read failed" << SVAR(name);
     ::close(lfd);
     teardownInstance(*inst);
     done(0);
     return;
   }
 
-  pid_t pid = spawnChild(cfg.cesComputeChildBinary,
-                         inst->socketPath,
-                         cfg.cesComputeUser,
-                         cfg.computeProcessMemMax);
-  if (pid <= 0) {
-    LOGWARNING << "builtin:compute spawn failed"
-               << VAR(pid) << SVAR(cfg.cesComputeChildBinary);
+  pid_t ospid = spawnChild(cfg.cesComputeChildBinary,
+                           inst->socketPath,
+                           cfg.cesComputeUser,
+                           cfg.computeProcessMemMax);
+  if (ospid <= 0) {
+    LOGWARNING << "spawn failed"
+               << VAR(ospid) << SVAR(cfg.cesComputeChildBinary);
     ::close(lfd);
     teardownInstance(*inst);
     done(0);
     return;
   }
-  inst->pid = pid;
+  inst->ospid = ospid;
 
   auto io = server->_rpcTaskIOExecutor();
   auto st = std::make_shared<LaunchAccept>();
@@ -1720,7 +1761,7 @@ void allocateAndSpawnInstance(
   boost::system::error_code aec;
   st->acceptor->assign(boost::asio::local::stream_protocol(), lfd, aec);
   if (aec) {
-    LOGWARNING << "builtin:compute acceptor assign failed"
+    LOGWARNING << "acceptor assign failed"
                << SVAR(aec.message());
     ::close(lfd);
     killAndReap(pid);
@@ -1737,8 +1778,8 @@ void allocateAndSpawnInstance(
     st->finished = true;
     boost::system::error_code ig;
     st->acceptor->close(ig);
-    LOGWARNING << "builtin:compute accept timed out" << VAR(st->inst->id);
-    killAndReap(st->inst->pid);
+    LOGWARNING << "accept timed out" << VAR(st->inst->pid);
+    killAndReap(st->inst->ospid);
     teardownInstance(*st->inst);
     st->done(0);
   });
@@ -1754,8 +1795,8 @@ void allocateAndSpawnInstance(
       st->acceptor->close(ig);
       auto inst = st->inst;
       if (cec) {
-        LOGWARNING << "builtin:compute accept failed" << SVAR(cec.message());
-        killAndReap(inst->pid);
+        LOGWARNING << "accept failed" << SVAR(cec.message());
+        killAndReap(inst->ospid);
         teardownInstance(*inst);
         st->done(0);
         return;
@@ -1763,7 +1804,7 @@ void allocateAndSpawnInstance(
       // Handler unbound mid-launch (server shutting down): don't register
       // a zombie into gInstances after teardown ran.
       if (gServer.load() == nullptr) {
-        killAndReap(inst->pid);
+        killAndReap(inst->ospid);
         teardownInstance(*inst);
         st->done(0);
         return;
@@ -1774,16 +1815,16 @@ void allocateAndSpawnInstance(
       inst->lastSampleUs = st->now;
       inst->lastCpuTicks = 0;
 
-      // Commit the reserved port to the instance: killInstanceById now
+      // Commit the reserved port to the instance: killByPid now
       // owns freeing it, so the lease must not also free it on drop.
       inst->clientPort = st->portLease->port;
       st->portLease->commit();
       inst->rpcPort = st->rpcPortLease->port;
       st->rpcPortLease->commit();
 
-      gInstances[inst->id] = inst;
-      gByPrefix[inst->progPrefix].insert(inst->id);
-      gByName[inst->sourceName].insert(inst->id);
+      gInstances[inst->pid] = inst;
+      gByPrefix[inst->progPrefix].insert(inst->pid);
+      gByName[inst->sourceName].insert(inst->pid);
       // Registered in gInstances now — drop the launch-slot reservation
       // so it isn't double-counted against the cap.
       st->slot.reset();
@@ -1793,10 +1834,10 @@ void allocateAndSpawnInstance(
       sendBootstrapFrame(inst, st->src.data(), st->src.size());
       startIpcReader(inst);
 
-      LOGINFO << "builtin:compute launched"
-              << VAR(inst->id) << SVAR(inst->sourceName)
-              << VAR(inst->pid) << VAR(st->upfront);
-      st->done(inst->id);
+      LOGINFO << "launched"
+              << VAR(inst->pid) << SVAR(inst->sourceName)
+              << VAR(inst->ospid) << VAR(st->upfront);
+      st->done(inst->pid);
     });
 }
 
@@ -1887,12 +1928,12 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     allocateAndSpawnInstance(
       reqServer(ctx), name, ownerPk, upfront, now, std::move(launchSlot),
       std::move(portLease), std::move(rpcPortLease),
-      [ctx, now](uint64_t id) {
-        if (id == 0) {
+      [ctx, now](uint64_t pid) {
+        if (pid == 0) {
           sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
         }
         ces::Bytes resp;
-        ces::Buffer::put<uint64_t>(resp, id);
+        ces::Buffer::put<uint64_t>(resp, pid);
         ces::Buffer::put<uint64_t>(resp, now);
         sendResponseAndLoop(ctx, CES_OK, std::move(resp));
       });
@@ -1915,12 +1956,12 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // ---------------------------------------------------------------------------
 
 void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  // Wire: [u64 instance_id]. Truncated preamble = caller wire-format bug,
+  // Wire: [u64 pid]. Truncated preamble = caller wire-format bug,
   // not a server failure → BAD_INPUT.
   if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
-  uint64_t id = ces::Buffer::peek<uint64_t>(pre.data());
+  uint64_t pid = ces::Buffer::peek<uint64_t>(pre.data());
 
-  auto it = gInstances.find(id);
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
   }
@@ -1931,12 +1972,12 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, id](uint8_t rc, bool duplicate) {
+  auto after = [ctx, pid](uint8_t rc, bool duplicate) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     // Duplicate (resent envelope): the kill already committed; don't re-run it
     // (idempotent anyway), just reply OK so the wire shape matches.
     if (duplicate) { sendResponseAndLoop(ctx, CES_OK, {}); return; }
-    killInstanceById(id);
+    killByPid(pid);
     sendResponseAndLoop(ctx, CES_OK, {});
   };
 
@@ -1961,10 +2002,10 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
     uint32_t countOff = resp.size();
     ces::Buffer::put<uint32_t>(resp, 0); // placeholder
     uint32_t count = 0;
-    for (auto& [id, inst] : gInstances) {
+    for (auto& [pid, inst] : gInstances) {
       if (std::memcmp(inst->ownerPk.data(),
                       ctx->bound.boundPubkey.getHash().data(), 32) != 0) continue;
-      ces::Buffer::put<uint64_t>(resp, inst->id);
+      ces::Buffer::put<uint64_t>(resp, inst->pid);
       ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(inst->sourceName.size()));
       resp.insert(resp.end(),
                   reinterpret_cast<const uint8_t*>(inst->sourceName.data()),
@@ -2003,15 +2044,15 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
 // ---------------------------------------------------------------------------
 
 void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-  // Wire: [u64 instance_id]. ID is the only identity — a path can refer
+  // Wire: [u64 pid]. ID is the only identity — a path can refer
   // to N instances, so name-keyed STAT is not well-defined (use INSTANCES).
   // Public: any signer may inspect a live instance — its uptime, last
   // cpu/rss sample, and leased ports — so a running service is discoverable
   // and dialable by anyone. Only LAUNCH/KILL stay owner-gated.
   if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
-  uint64_t instanceId = ces::Buffer::peek<uint64_t>(pre.data());
+  uint64_t pid = ces::Buffer::peek<uint64_t>(pre.data());
 
-  auto it = gInstances.find(instanceId);
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
   }
@@ -2027,17 +2068,17 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
 
-  auto after = [ctx, name, fileBalance, instanceId](uint8_t rc,
+  auto after = [ctx, name, fileBalance, pid](uint8_t rc,
                                                     bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     // Read-only: a duplicate just re-reads current state — correct, no skip.
-    auto it = gInstances.find(instanceId);
+    auto it = gInstances.find(pid);
     if (it == gInstances.end()) {
       sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
     }
     auto& inst = *it->second;
     ces::Bytes resp;
-    ces::Buffer::put<uint64_t>(resp, inst.id);
+    ces::Buffer::put<uint64_t>(resp, inst.pid);
     ces::Buffer::put<uint64_t>(resp, inst.startedAtUs);
     ces::Buffer::put<uint64_t>(resp, fileBalance);
     ces::Buffer::put<uint32_t>(resp, inst.cpuBasisPoints);
@@ -2102,11 +2143,11 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
       // std::set ⇒ ascending iteration; clients shouldn't depend on
       // the order. Two clients querying the same path back-to-back
       // see the same list as long as no LAUNCH/KILL hit in between.
-      for (uint64_t id : it->second) {
-        auto iit = gInstances.find(id);
+      for (uint64_t pid : it->second) {
+        auto iit = gInstances.find(pid);
         if (iit == gInstances.end()) continue;  // index/registry skew
         auto& inst = *iit->second;
-        ces::Buffer::put<uint64_t>(resp, inst.id);
+        ces::Buffer::put<uint64_t>(resp, inst.pid);
         ces::Buffer::put<uint64_t>(resp, inst.startedAtUs);
         ces::Buffer::put<uint32_t>(resp, inst.cpuBasisPoints);
         ces::Buffer::put<uint64_t>(resp, inst.rssBytes);
@@ -2154,7 +2195,7 @@ void supervisorTick() {
                             ? cfg.feeBucketByteSec : 0));
 
   std::vector<uint64_t> toKill;
-  for (auto& [id, inst] : gInstances) {
+  for (auto& [pid, inst] : gInstances) {
     // One tick: procfs sample (CPU delta + RSS) + compound debit.
     // Runs at cfg.computeTickIntervalMs cadence (default 60 s).
     sampleInstanceProc(*inst, now);
@@ -2207,7 +2248,7 @@ void supervisorTick() {
       ? UINT64_MAX : static_cast<uint64_t>(total);
     if (debit == 0) continue;
     if (!fileHandlerDebitBalance(inst->sourceName, debit)) {
-      toKill.push_back(id);
+      toKill.push_back(pid);
     } else {
       inst->lastTickUs = now;
     }
@@ -2215,14 +2256,14 @@ void supervisorTick() {
     // Reap zombies: if the child exited on its own, drop the
     // instance. No restart — owner re-LAUNCHes manually.
     int status = 0;
-    pid_t r = ::waitpid(inst->pid, &status, WNOHANG);
-    if (r == inst->pid) {
-      LOGDEBUG << "builtin:compute child exited"
-               << VAR(id) << VAR(status);
-      toKill.push_back(id);
+    pid_t r = ::waitpid(inst->ospid, &status, WNOHANG);
+    if (r == inst->ospid) {
+      LOGDEBUG << "child exited"
+               << VAR(pid) << VAR(status);
+      toKill.push_back(pid);
     }
   }
-  for (uint64_t id : toKill) killInstanceById(id);
+  for (uint64_t pid : toKill) killByPid(pid);
 }
 
 void scheduleNextTick() {
@@ -2255,9 +2296,9 @@ void onFileDeleted(const std::string& name) {
   boost::asio::post(io, [name]() {
     auto it = gByName.find(name);
     if (it == gByName.end()) return;
-    // Snapshot ids — killInstanceById mutates gByName.
+    // Snapshot ids — killByPid mutates gByName.
     std::vector<uint64_t> ids(it->second.begin(), it->second.end());
-    for (uint64_t id : ids) killInstanceById(id);
+    for (uint64_t pid : ids) killByPid(pid);
   });
 }
 
@@ -2271,7 +2312,7 @@ public:
              BoundChannelContext bound) override {
     CesServer* server = gServer.load();
     if (!server) {
-      LOGWARNING << "builtin:compute invoked with no bound CesServer";
+      LOGWARNING << "invoked with no bound CesServer";
       return;
     }
     CesPlexProtocol proto;
@@ -2312,11 +2353,11 @@ uint8_t computeHandlerBind(CesServer* server) {
       gTickTimer->cancel(ec);
     }
     // Kill all instances. Iterate over a snapshot since
-    // killInstanceById erases.
+    // killByPid erases.
     std::vector<uint64_t> ids;
     ids.reserve(gInstances.size());
-    for (auto& [id, _] : gInstances) ids.push_back(id);
-    for (uint64_t id : ids) killInstanceById(id);
+    for (auto& [pid, _] : gInstances) ids.push_back(pid);
+    for (uint64_t pid : ids) killByPid(pid);
     gTickTimer.reset();
     gServer.store(nullptr);
     return CES_OK;
@@ -2329,7 +2370,7 @@ uint8_t computeHandlerBind(CesServer* server) {
 
   // File handler must be registered.
   if (findCesPlexBuiltin("file") == nullptr) {
-    LOGERROR << "builtin:compute: requires builtin:file; refusing to bind";
+    LOGERROR << "requires builtin:file; refusing to bind";
     return CES_ERROR_COMPUTE_NO_FILE_HANDLER;
   }
 
@@ -2338,7 +2379,7 @@ uint8_t computeHandlerBind(CesServer* server) {
   std::error_code ec;
   std::filesystem::create_directories(workDir, ec);
   if (ec) {
-    LOGERROR << "builtin:compute: workdir unusable"
+    LOGERROR << "workdir unusable"
              << SVAR(workDir.string());
     return CES_ERROR_INTERNAL;
   }
@@ -2354,7 +2395,7 @@ uint8_t computeHandlerBind(CesServer* server) {
   // Start supervisor timer on rpcTaskIO_.
   auto io = server->_rpcTaskIOExecutor();
   if (!io) {
-    LOGERROR << "builtin:compute: rpcTaskIO not available";
+    LOGERROR << "rpcTaskIO not available";
     gServer.store(nullptr);
     return CES_ERROR_INTERNAL;
   }
@@ -2362,7 +2403,7 @@ uint8_t computeHandlerBind(CesServer* server) {
   gTickRunning.store(true);
   scheduleNextTick();
 
-  LOGINFO << "builtin:compute bound"
+  LOGINFO << "bound"
           << VAR(cfg.computeMaxInstances)
           << SVAR(cfg.cesComputeChildBinary)
           << SVAR(workDir.string());
@@ -2397,7 +2438,7 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   std::memcpy(serverPk.data(),
               server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
   if (ownerPk != serverPk) {
-    LOGWARNING << "builtin:compute internal launch: source not owned by server"
+    LOGWARNING << "internal launch: source not owned by server"
                << SVAR(name);
     return CES_ERROR_NOT_OWNER;
   }
@@ -2412,9 +2453,9 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   uint64_t now = getMicrosSinceEpoch();
   allocateAndSpawnInstance(server, name, ownerPk, 0, now,
     std::make_shared<LaunchSlot>(), std::move(portLease), std::move(rpcPortLease),
-    [name](uint64_t id) {
-      if (id == 0) {
-        LOGWARNING << "builtin:compute internal launch spawn failed"
+    [name](uint64_t pid) {
+      if (pid == 0) {
+        LOGWARNING << "internal launch spawn failed"
                    << SVAR(name);
       }
     });
@@ -2440,8 +2481,8 @@ void computeHandlerOnApplicationMsg(
   // Broadcast to every local instance sharing this content-addressed
   // prefix. Sibling instances see sibling traffic — same as if they
   // were on different servers in the swarm.
-  for (uint64_t id : it->second) {
-    auto inst = gInstances.find(id);
+  for (uint64_t pid : it->second) {
+    auto inst = gInstances.find(pid);
     if (inst == gInstances.end()) continue;
     sendDeliverFrame(inst->second, senderPfx, data + 11, payloadLen);
   }
@@ -2477,7 +2518,7 @@ void _computeTestForceTick() {
   cv.wait(lk, [&]{ return done; });
 }
 
-size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count) {
+size_t _computeTestFloodDeliver(uint64_t pid, size_t count) {
   CesServer* server = gServer.load();
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
@@ -2493,7 +2534,7 @@ size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count) {
   bool done = false;
   size_t depth = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(instanceId);
+    auto it = gInstances.find(pid);
     if (it != gInstances.end()) {
       std::array<uint8_t, 8> sender{};
       std::array<uint8_t, 16> payload{};
@@ -2510,7 +2551,7 @@ size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count) {
   return depth;
 }
 
-uint16_t _computeTestInstanceClientPort(uint64_t instanceId) {
+uint16_t _computeTestInstanceClientPort(uint64_t pid) {
   CesServer* server = gServer.load();
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
@@ -2520,7 +2561,7 @@ uint16_t _computeTestInstanceClientPort(uint64_t instanceId) {
   bool done = false;
   uint16_t port = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(instanceId);
+    auto it = gInstances.find(pid);
     if (it != gInstances.end()) port = it->second->clientPort;
     std::lock_guard lk(m);
     done = true;
@@ -2531,7 +2572,7 @@ uint16_t _computeTestInstanceClientPort(uint64_t instanceId) {
   return port;
 }
 
-uint16_t _computeTestInstanceRpcPort(uint64_t instanceId) {
+uint16_t _computeTestInstanceRpcPort(uint64_t pid) {
   CesServer* server = gServer.load();
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
@@ -2541,7 +2582,7 @@ uint16_t _computeTestInstanceRpcPort(uint64_t instanceId) {
   bool done = false;
   uint16_t port = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(instanceId);
+    auto it = gInstances.find(pid);
     if (it != gInstances.end()) port = it->second->rpcPort;
     std::lock_guard lk(m);
     done = true;
@@ -2557,8 +2598,8 @@ uint16_t _computeTestInstanceRpcPort(uint64_t instanceId) {
 // these from rpcTaskIO_'s strand. See include/ces/l2/compute_handler.h.
 // ---------------------------------------------------------------------------
 
-bool computeInstanceExists(uint64_t instanceId) {
-  return gInstances.find(instanceId) != gInstances.end();
+bool computeInstanceExists(uint64_t pid) {
+  return gInstances.find(pid) != gInstances.end();
 }
 
 std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
@@ -2573,9 +2614,9 @@ std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
   bool done = false;
   boost::asio::post(ex, [&]() {
     out.reserve(gInstances.size());
-    for (auto& [id, inst] : gInstances) {
+    for (auto& [pid, inst] : gInstances) {
       ComputeInstanceStat s;
-      s.id = inst->id;
+      s.pid = inst->pid;
       s.source = inst->sourceName;
       s.cpuBasisPoints = inst->cpuBasisPoints;
       s.rssBytes = inst->rssBytes;
@@ -2595,15 +2636,15 @@ std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
   return out;
 }
 
-bool computeInstanceAcceptsConnections(uint64_t instanceId) {
-  auto it = gInstances.find(instanceId);
+bool computeInstanceAcceptsConnections(uint64_t pid) {
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) return false;
   return it->second->acceptsConnections;
 }
 
-uint64_t computeOpenConnection(uint64_t instanceId,
+uint64_t computeOpenConnection(uint64_t pid,
                                 const std::array<uint8_t, 32>& userPubkey) {
-  auto it = gInstances.find(instanceId);
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) return 0;
   auto inst = it->second;
   uint64_t connId = inst->nextConnId++;
@@ -2617,9 +2658,9 @@ uint64_t computeOpenConnection(uint64_t instanceId,
   return connId;
 }
 
-void computeSendConnDataIn(uint64_t instanceId, uint64_t connId,
+void computeSendConnDataIn(uint64_t pid, uint64_t connId,
                             const uint8_t* data, std::size_t len) {
-  auto it = gInstances.find(instanceId);
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) return;
   // Body: [u64 conn_id BE][u32 BE len][len bytes].
   ces::Bytes body;
@@ -2631,9 +2672,9 @@ void computeSendConnDataIn(uint64_t instanceId, uint64_t connId,
                                          body.data(), body.size()));
 }
 
-void computeSendConnClosed(uint64_t instanceId, uint64_t connId,
+void computeSendConnClosed(uint64_t pid, uint64_t connId,
                             uint8_t reason) {
-  auto it = gInstances.find(instanceId);
+  auto it = gInstances.find(pid);
   if (it == gInstances.end()) return;
   // Body: [u64 conn_id BE][u8 reason].
   ces::Bytes body;

@@ -1,4 +1,4 @@
-// dial.cpp — implementation of `cesh dial <instance_id>`.
+// dial.cpp — implementation of `cesh dial <pid>`.
 //
 // Single self-contained translation unit. We don't reuse
 // CesComputeClient because (a) it's hardcoded to /ces/compute/1, (b) it
@@ -324,11 +324,11 @@ public:
   // on transport failure (write/read errored, no reply, etc.).
   std::string attach(const KeyPair& signer,
                      uint64_t sessionToken,
-                     uint64_t instanceId,
+                     uint64_t pid,
                      uint8_t& outStatus,
                      uint64_t& outConnId) {
     ces::Bytes preamble;
-    ces::Buffer::put<uint64_t>(preamble, instanceId);
+    ces::Buffer::put<uint64_t>(preamble, pid);
 
     Signature sig = ces::signPerOp(
       signer, kVerbAttach,
@@ -474,11 +474,11 @@ public:
   }
 
   // External-signing ATTACH: same as attach(), but `sig` was produced elsewhere
-  // over computePerOpDigest(kVerbAttach, preamble=instanceId, sessionToken).
-  std::string attachExt(const Signature& sig, uint64_t instanceId,
+  // over computePerOpDigest(kVerbAttach, preamble=pid, sessionToken).
+  std::string attachExt(const Signature& sig, uint64_t pid,
                         uint8_t& outStatus, uint64_t& outConnId) {
     ces::Bytes preamble;
-    ces::Buffer::put<uint64_t>(preamble, instanceId);
+    ces::Buffer::put<uint64_t>(preamble, pid);
     const size_t totalSize = ces::CES_PLEX_VERB_SIZE
                              + ces::CES_PLEX_PREAMBLE_LEN_SIZE
                              + preamble.size() + sig.size();
@@ -783,7 +783,7 @@ int runDial(const DialArgs& args) {
       writeControlLine("ERR bad attach sig"); return 1;
     }
     uint8_t st = 0xFF; uint64_t cid = 0;
-    if (auto e = dialer.attachExt(attSig, args.instanceId, st, cid); !e.empty()) {
+    if (auto e = dialer.attachExt(attSig, args.pid, st, cid); !e.empty()) {
       writeControlLine("ERR attach: " + e); return 5;
     }
     if (st != CES_OK) {
@@ -808,7 +808,7 @@ int runDial(const DialArgs& args) {
   uint8_t attachStatus = 0xFF;
   uint64_t connId = 0;
   if (auto e = dialer.attach(args.signerKey, sessionToken,
-                             args.instanceId, attachStatus, connId);
+                             args.pid, attachStatus, connId);
       !e.empty()) {
     std::cerr << "Error: attach: " << e << "\n";
     return 5;

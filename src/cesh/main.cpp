@@ -83,7 +83,7 @@ std::string jesc(const std::string& s) {
 // in --quiet mode).
 std::string instanceJson(const ces::CesComputeClient::InstanceInfo& e) {
   std::string o = "{";
-  o += "\"instanceId\":"     + std::to_string(e.instanceId);
+  o += "\"pid\":"     + std::to_string(e.pid);
   o += ",\"sourceName\":\""  + jesc(e.sourceName) + "\"";
   o += ",\"startedAtUs\":"   + std::to_string(e.startedAtUs);
   o += ",\"fileBalance\":"   + std::to_string(e.fileBalance);
@@ -509,11 +509,11 @@ int main(int argc, char* argv[]) {
   cmd_compute->require_subcommand(1);
 
   std::string compute_path_arg;
-  uint64_t compute_id_arg = 0;
+  uint64_t compute_pid_arg = 0;
 
   auto* cmd_clau = cmd_compute->add_subcommand(
     "launch", "Launch a fresh instance of the source file. Mints a new "
-              "instance_id every call — multiple instances per source "
+              "pid every call — multiple instances per source "
               "are allowed up to the server's compute_max_instances cap.");
   cmd_clau->add_option("remote", compute_path_arg,
                        "Source file path (/h/<hex>/…, /f/<name>/…, /p/…)")
@@ -521,22 +521,22 @@ int main(int argc, char* argv[]) {
 
   auto* cmd_ckil = cmd_compute->add_subcommand(
     "kill", "SIGKILL a running instance (owner only)");
-  cmd_ckil->add_option("instance_id", compute_id_arg,
-                       "Instance id returned from launch")->required();
+  cmd_ckil->add_option("pid", compute_pid_arg,
+                       "pid returned from launch")->required();
 
   auto* cmd_cps = cmd_compute->add_subcommand(
     "ps", "List running instances owned by the signer");
 
   auto* cmd_cst = cmd_compute->add_subcommand(
-    "stat", "Show status of an instance by id (owner only)");
-  cmd_cst->add_option("instance_id", compute_id_arg,
-                      "Instance id returned from launch")->required();
+    "stat", "Show status of an instance by pid (owner only)");
+  cmd_cst->add_option("pid", compute_pid_arg,
+                      "pid returned from launch")->required();
 
   auto* cmd_cinst = cmd_compute->add_subcommand(
     "instances",
-    "List running instance ids for a given source path. Public — no "
+    "List running pids for a given source path. Public — no "
     "owner check; useful for discovering services like /s/chat.lua. "
-    "Prints one numeric id per line on stdout (empty output = none).");
+    "Prints one numeric pid per line on stdout (empty output = none).");
   cmd_cinst->add_option("remote", compute_path_arg,
                         "Source file path (/h/<hex>/…, /f/<name>/…, "
                         "/p/…, or /s/…)")->required();
@@ -550,7 +550,7 @@ int main(int argc, char* argv[]) {
     "SIGINT/SIGTERM tears down with exit 130/143.");
   uint64_t dial_instance_arg = 0;
   bool dial_verbose_arg = false;
-  cmd_dial->add_option("instance_id", dial_instance_arg,
+  cmd_dial->add_option("pid", dial_instance_arg,
                        "Numeric uint64 returned by `cesh compute launch` "
                        "or shown in `cesh compute ps`.")->required();
   cmd_dial->add_flag("-v,--verbose", dial_verbose_arg,
@@ -962,7 +962,7 @@ int main(int argc, char* argv[]) {
       da.serverHost = da.serverHost.substr(0, colon);
     if (da.serverHost.empty()) da.serverHost = "localhost";
     da.rpcPort     = rpcPort_arg;
-    da.instanceId  = dial_instance_arg;
+    da.pid  = dial_instance_arg;
     da.verbose     = dial_verbose_arg;
     da.extSign     = true;
     da.clientPubkeyHex = dial_pubkey_arg;
@@ -1003,7 +1003,7 @@ int main(int argc, char* argv[]) {
       da.serverHost = da.serverHost.substr(0, colon);
     if (da.serverHost.empty()) da.serverHost = "localhost";
     da.rpcPort     = rpcPort_arg;
-    da.instanceId  = dial_instance_arg;
+    da.pid  = dial_instance_arg;
     da.signerKey   = actorKey;
     da.verbose     = dial_verbose_arg;
     return runDial(da);
@@ -1963,7 +1963,7 @@ int main(int argc, char* argv[]) {
           return 1;
         }
         if (g_quiet) {
-          std::cout << "{\"instanceId\":" << id
+          std::cout << "{\"pid\":" << id
                     << ",\"startedAtUs\":" << startedAt << "}\n";
           return 0;
         }
@@ -1976,18 +1976,18 @@ int main(int argc, char* argv[]) {
       }
 
       if (cmd_ckil->parsed()) {
-        uint8_t krc = cc2.kill(compute_id_arg);
+        uint8_t krc = cc2.kill(compute_pid_arg);
         if (krc != CES_OK) {
           std::cerr << "KILL Failed: " << errorString(krc) << "\n";
           return 1;
         }
         if (g_quiet) {
-          std::cout << "{\"instanceId\":" << compute_id_arg
+          std::cout << "{\"pid\":" << compute_pid_arg
                     << ",\"killed\":true}\n";
           return 0;
         }
         print_header("Compute Killed");
-        print_field("Instance", compute_id_arg);
+        print_field("Instance", compute_pid_arg);
         std::cout << std::endl;
         return 0;
       }
@@ -2011,7 +2011,7 @@ int main(int argc, char* argv[]) {
           std::cout << "  (none)\n";
         } else {
           for (auto& e : list) {
-            print_field("Instance",    e.instanceId);
+            print_field("Instance",    e.pid);
             print_field("Remote",      e.sourceName);
             print_field("StartedAt",   e.startedAtUs);
             print_field("FileBalance", e.fileBalance);
@@ -2028,7 +2028,7 @@ int main(int argc, char* argv[]) {
 
       if (cmd_cst->parsed()) {
         CesComputeClient::InstanceInfo info;
-        uint8_t src = cc2.stat(compute_id_arg, info);
+        uint8_t src = cc2.stat(compute_pid_arg, info);
         if (src != CES_OK) {
           std::cerr << "STAT Failed: " << errorString(src) << "\n";
           return 1;
@@ -2038,7 +2038,7 @@ int main(int argc, char* argv[]) {
           return 0;
         }
         print_header("Compute Status");
-        print_field("Instance",    info.instanceId);
+        print_field("Instance",    info.pid);
         print_field("Remote",      info.sourceName);
         print_field("StartedAt",   info.startedAtUs);
         print_field("FileBalance", info.fileBalance);
@@ -2068,7 +2068,7 @@ int main(int argc, char* argv[]) {
         }
         // Human mode: one id per line, no header — pipeable into
         // `head -1 | xargs cesh dial`. (Ports are in the -q JSON or stat.)
-        for (auto& e : insts) std::cout << e.instanceId << "\n";
+        for (auto& e : insts) std::cout << e.pid << "\n";
         return 0;
       }
 

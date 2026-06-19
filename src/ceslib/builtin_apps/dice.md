@@ -78,7 +78,7 @@ cesh -r $WALLET keys gen -w $WALLET 1
 cesh -r $WALLET --server $SRV mine                   # PoW, or
 ces --config server.toml credit <amount> <user-pub>  # operator-side
 
-# 3. Find the dice instance id
+# 3. Find the dice pid
 cesh -r $WALLET --server $SRV --rpc-port $RPC \
   compute instances /s/dice.lua
 # → 1

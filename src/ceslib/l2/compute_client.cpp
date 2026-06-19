@@ -43,7 +43,7 @@ uint8_t statVariableReader(CesPlexChannel& chan,
     if (!chan.readExact(nameBuf, nameLen)) return CES_ERROR_INTERNAL;
     preamble.insert(preamble.end(), nameBuf.begin(), nameBuf.end());
   }
-  out.instanceId     = ces::Buffer::peek<uint64_t>(preamble.data());
+  out.pid     = ces::Buffer::peek<uint64_t>(preamble.data());
   out.startedAtUs    = ces::Buffer::peek<uint64_t>(preamble.data() + 8);
   out.fileBalance    = ces::Buffer::peek<uint64_t>(preamble.data() + 16);
   out.cpuBasisPoints = ces::Buffer::peek<uint32_t>(preamble.data() + 24);
@@ -109,10 +109,10 @@ uint8_t CesComputeClient::launch(const std::string& name,
   return CES_OK;
 }
 
-uint8_t CesComputeClient::kill(uint64_t instanceId) {
+uint8_t CesComputeClient::kill(uint64_t pid) {
   ces::Bytes pre;
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
-  ces::Buffer::put<uint64_t>(pre, instanceId);
+  ces::Buffer::put<uint64_t>(pre, pid);
   auto env = impl_->chan->buildEnvelope(kVerbKill, pre);
 
   ces::Bytes resp;
@@ -153,7 +153,7 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
       preamble.insert(preamble.end(), tail.begin(), tail.end());
 
       InstanceInfo info;
-      info.instanceId     = ces::Buffer::peek<uint64_t>(header.data());
+      info.pid     = ces::Buffer::peek<uint64_t>(header.data());
       info.sourceName.assign(nameBuf.begin(), nameBuf.end());
       info.startedAtUs    = ces::Buffer::peek<uint64_t>(tail.data());
       info.fileBalance    = ces::Buffer::peek<uint64_t>(tail.data() + 8);
@@ -174,10 +174,10 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
   return rc;
 }
 
-uint8_t CesComputeClient::stat(uint64_t instanceId, InstanceInfo& out) {
+uint8_t CesComputeClient::stat(uint64_t pid, InstanceInfo& out) {
   ces::Bytes pre;
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
-  ces::Buffer::put<uint64_t>(pre, instanceId);
+  ces::Buffer::put<uint64_t>(pre, pid);
   auto env = impl_->chan->buildEnvelope(kVerbStat, pre);
 
   out = InstanceInfo{};
@@ -211,7 +211,7 @@ uint8_t CesComputeClient::instances(const std::string& path,
       if (!impl_->chan->readExact(e, 64)) return false;
       preamble.insert(preamble.end(), e.begin(), e.end());
       InstanceInfo info;
-      info.instanceId     = ces::Buffer::peek<uint64_t>(e.data());
+      info.pid     = ces::Buffer::peek<uint64_t>(e.data());
       info.startedAtUs    = ces::Buffer::peek<uint64_t>(e.data() + 8);
       info.cpuBasisPoints = ces::Buffer::peek<uint32_t>(e.data() + 16);
       info.rssBytes       = ces::Buffer::peek<uint64_t>(e.data() + 20);

@@ -11,7 +11,7 @@
 #include <iomanip>
 #include <sstream>
 
-LOG_MODULE("netbill");
+LOG_MODULE("plex");
 
 namespace ces {
 

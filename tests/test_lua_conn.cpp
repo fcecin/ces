@@ -379,9 +379,9 @@ BOOST_AUTO_TEST_CASE(MultipleConnsMultipleUsers) {
   BOOST_CHECK_EQUAL(g2[5], 'B');
 }
 
-// ATTACH for an instance_id that isn't registered →
-// CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND. Covers both "id was never
-// minted" and id=0 (gNextInstanceId starts at 1).
+// ATTACH for a pid that isn't registered →
+// CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND. Covers both "pid was never
+// minted" and pid=0 (gNextPid starts at 1).
 BOOST_AUTO_TEST_CASE(AttachUnknownInstance) {
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);

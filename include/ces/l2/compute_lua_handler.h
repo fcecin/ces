@@ -4,7 +4,7 @@
 // "lua" in the global builtin registry, mounted at /ces/lua/1. Its
 // job is to route a user's RUDP channel to a running cesluajitd
 // instance: the user binds, sends a one-shot ATTACH verb naming the
-// target instance_id, and from then on the channel is a raw byte
+// target pid, and from then on the channel is a raw byte
 // stream into and out of the program.
 //
 // Lifecycle: CesServer::start() calls luaHandlerBind(this) after
@@ -27,14 +27,14 @@ void luaHandlerBind(CesServer* server);
 // when it sees CONN_DATA_OUT or CONN_CLOSE frames coming FROM the
 // child process (Lua program writing bytes back to the user, or
 // closing a connection from the program side). The lua handler
-// looks up the (instance_id, conn_id) pair in its routing table
+// looks up the (pid, conn_id) pair in its routing table
 // and pushes bytes / closes the appropriate RudpStream.
 //
 // Also called when an instance dies (any reason) to tear down all
 // of that instance's connections.
-void luaHandlerHandleConnDataOut(uint64_t instanceId, uint64_t connId,
+void luaHandlerHandleConnDataOut(uint64_t pid, uint64_t connId,
                                   const uint8_t* data, size_t len);
-void luaHandlerHandleConnClose(uint64_t instanceId, uint64_t connId);
-void luaHandlerOnInstanceDying(uint64_t instanceId);
+void luaHandlerHandleConnClose(uint64_t pid, uint64_t connId);
+void luaHandlerOnInstanceDying(uint64_t pid);
 
 } // namespace ces

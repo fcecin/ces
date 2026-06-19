@@ -147,12 +147,12 @@ BOOST_AUTO_TEST_CASE(LaunchKillRoundTrip) {
   std::vector<CesComputeClient::InstanceInfo> list;
   CES_REQUIRE_OK(cc.list(list));
   BOOST_REQUIRE_EQUAL(list.size(), 1u);
-  BOOST_CHECK_EQUAL(list[0].instanceId, instId);
+  BOOST_CHECK_EQUAL(list[0].pid, instId);
   BOOST_CHECK_EQUAL(list[0].sourceName, ownerPath);
 
   CesComputeClient::InstanceInfo info;
   CES_REQUIRE_OK(cc.stat(instId, info));
-  BOOST_CHECK_EQUAL(info.instanceId, instId);
+  BOOST_CHECK_EQUAL(info.pid, instId);
   BOOST_CHECK_EQUAL(info.sourceName, ownerPath);
 
   CES_REQUIRE_OK(cc.kill(instId));
@@ -226,7 +226,7 @@ BOOST_AUTO_TEST_CASE(LaunchFundTooLow) {
 
 BOOST_AUTO_TEST_CASE(LaunchMintsFreshIdEachTime) {
   // Per-source idempotency was dropped: every launch returns a new
-  // instance_id. Multiple instances of the same source coexist up to
+  // pid. Multiple instances of the same source coexist up to
   // the configured cap.
   CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 10'000'000));
 
@@ -294,12 +294,12 @@ BOOST_AUTO_TEST_CASE(ListFiltersByOwner) {
   std::vector<CesComputeClient::InstanceInfo> list;
   CES_REQUIRE_OK(ccOwner.list(list));
   BOOST_REQUIRE_EQUAL(list.size(), 1u);
-  BOOST_CHECK_EQUAL(list[0].instanceId, a);
+  BOOST_CHECK_EQUAL(list[0].pid, a);
 
   list.clear();
   CES_REQUIRE_OK(ccOther.list(list));
   BOOST_REQUIRE_EQUAL(list.size(), 1u);
-  BOOST_CHECK_EQUAL(list[0].instanceId, b);
+  BOOST_CHECK_EQUAL(list[0].pid, b);
 
   CES_REQUIRE_OK(ccOwner.kill(a));
   CES_REQUIRE_OK(ccOther.kill(b));
@@ -332,7 +332,7 @@ BOOST_AUTO_TEST_CASE(InstancesIsPublicAndEnumeratesIds) {
   CES_REQUIRE_OK(ccStranger.instances(ownerPath, ids));
   BOOST_REQUIRE_EQUAL(ids.size(), 2u);
   std::set<uint64_t> got;
-  for (auto& e : ids) got.insert(e.instanceId);
+  for (auto& e : ids) got.insert(e.pid);
   BOOST_CHECK_EQUAL(got.count(a), 1u);
   BOOST_CHECK_EQUAL(got.count(b), 1u);
 
@@ -349,7 +349,7 @@ BOOST_AUTO_TEST_CASE(InstancesIsPublicAndEnumeratesIds) {
   ids.clear();
   CES_REQUIRE_OK(ccStranger.instances(ownerPath, ids));
   BOOST_REQUIRE_EQUAL(ids.size(), 1u);
-  BOOST_CHECK_EQUAL(ids[0].instanceId, b);
+  BOOST_CHECK_EQUAL(ids[0].pid, b);
 
   CES_REQUIRE_OK(ccOwner.kill(b));
   ccOwner.disconnect();
@@ -377,7 +377,7 @@ BOOST_AUTO_TEST_CASE(StatIsPublicAcrossSigners) {
 
   CesComputeClient::InstanceInfo info;
   CES_REQUIRE_OK(ccStranger.stat(id, info));
-  BOOST_CHECK_EQUAL(info.instanceId, id);
+  BOOST_CHECK_EQUAL(info.pid, id);
   BOOST_CHECK_EQUAL(info.sourceName, ownerPath);
   BOOST_CHECK_EQUAL(info.startedAtUs, startedAt);
 

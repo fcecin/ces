@@ -202,7 +202,7 @@ Plus `feeQuery` from bound signer on every signed op. READ also pays owner's `pr
 
 Hosts user programs. LAUNCH spawns a child process (default `cesluajitd`) with Unix-domain socket IPC. Supervisor tick (default 60s) samples /proc CPU+RSS and debits **source file's `file_balance`** for slot-seconds + cpu-seconds + rss-byte-days. Out of funds → SIGKILL; source file deleted → all instances SIGKILLed.
 
-Five verbs, keyed three different ways: **LAUNCH** / **KILL** (owner-gated, they mutate); **LIST** (by *signer* — your own instances, incl. `file_balance`); **STAT** (by *instance id* — **public** to any signer; id/uptime/cpu/rss/**ports**/name); **INSTANCES** (by *source path* — **public**; one record per live instance incl. **ports**, for discovering AND dialing services like `/s/chat.lua`). STAT and INSTANCES expose each instance's leased ports (outbound CES-client + inbound `/ces/luarpc/1` host; 0 = no lease) so anyone can find a running service and reach it — relayed via the server's rpc port (`/ces/lua/1`) or direct to the instance's own port. LAUNCH mints fresh `instance_id` (multiple per source allowed up to `computeMaxInstances`) and requires 15 min upfront slot+rss rent in `file_balance` or fails `COMPUTE_FUND_TOO_LOW`.
+Five verbs, keyed three different ways: **LAUNCH** / **KILL** (owner-gated, they mutate); **LIST** (by *signer* — your own instances, incl. `file_balance`); **STAT** (by *pid* — **public** to any signer; pid/uptime/cpu/rss/**ports**/name); **INSTANCES** (by *source path* — **public**; one record per live instance incl. **ports**, for discovering AND dialing services like `/s/chat.lua`). STAT and INSTANCES expose each instance's leased ports (outbound CES-client + inbound `/ces/luarpc/1` host; 0 = no lease) so anyone can find a running service and reach it — relayed via the server's rpc port (`/ces/lua/1`) or direct to the instance's own port. LAUNCH mints a fresh `pid` (multiple per source allowed up to `computeMaxInstances`) and requires 15 min upfront slot+rss rent in `file_balance` or fails `COMPUTE_FUND_TOO_LOW`.
 
 Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser` resolvable.
 
@@ -214,9 +214,9 @@ Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser
 
 ## L2 lua — `builtin:lua` (channel routing)
 
-User binds `/ces/lua/1`, sends one ATTACH naming an `instance_id` (a running pid — discover it via compute STAT/INSTANCES; **not** a source path). If that instance has its accept gate open (`ces.conn.set_listener` called), handler allocates `conn_id`, sends TAG_CONN_OPENED to child carrying the **ATTACHing user's** authenticated pubkey; RudpStream becomes raw byte pipe — user→program wraps as TAG_CONN_DATA_IN; `conn:write` from Lua routes back as TAG_CONN_DATA_OUT. Either side close tears down both directions; instance death tears down all routes. Gate closed → `NOT_LISTENING`; instance missing → `COMPUTE_INSTANCE_NOT_FOUND`.
+User binds `/ces/lua/1`, sends one ATTACH naming a `pid` (a running instance — discover it via compute STAT/INSTANCES; **not** a source path). If that instance has its accept gate open (`ces.conn.set_listener` called), handler allocates `conn_id`, sends TAG_CONN_OPENED to child carrying the **ATTACHing user's** authenticated pubkey; RudpStream becomes raw byte pipe — user→program wraps as TAG_CONN_DATA_IN; `conn:write` from Lua routes back as TAG_CONN_DATA_OUT. Either side close tears down both directions; instance death tears down all routes. Gate closed → `NOT_LISTENING`; instance missing → `COMPUTE_INSTANCE_NOT_FOUND`.
 
-`cesh dial <instance_id>` is the user-side primitive (stdin↔channel↔stdout, half-close on EOF).
+`cesh dial <pid>` is the user-side primitive (stdin↔channel↔stdout, half-close on EOF).
 
 ## L2 luarpc — `/ces/luarpc/1` (per-instance byte stream)
 
@@ -312,7 +312,7 @@ Offline ledger ops (no networking). Load stores, mutate, `_save()`, exit. Used b
 
 ## Client tools
 
-**cesh** — CLI client. Subcommands: `keys`, `query`/`squery`, `transfer`/`payment`/`cross`, `server-info`/`ping`, `peer-info <id> <server>` (unsigned peer-table slot read), `mine [-t N]` (clamped to `hardware_concurrency`), `asset` (create/update/meta/fast/fund/buy/give/query/squery/**run**), `ramfile` (L1; put/touch/get/info/scan/read/write/append/resize/rehash/fund; `--in text:|hex:|file:`), `file` (L2 disk; put/get/stat/rm/deposit/withdraw/set-price; needs `--rpc-port`), `compute` (L2; launch/kill/ps/stat/instances; needs `--rpc-port`), `dial <instance_id>` (bidirectional bytes over /ces/lua/1; stdin EOF half-closes; SIGINT/SIGTERM → 130/143; `-v` prints ATTACH-ok), `autoexec install`.
+**cesh** — CLI client. Subcommands: `keys`, `query`/`squery`, `transfer`/`payment`/`cross`, `server-info`/`ping`, `peer-info <id> <server>` (unsigned peer-table slot read), `mine [-t N]` (clamped to `hardware_concurrency`), `asset` (create/update/meta/fast/fund/buy/give/query/squery/**run**), `ramfile` (L1; put/touch/get/info/scan/read/write/append/resize/rehash/fund; `--in text:|hex:|file:`), `file` (L2 disk; put/get/stat/rm/deposit/withdraw/set-price; needs `--rpc-port`), `compute` (L2; launch/kill/ps/stat/instances; needs `--rpc-port`), `dial <pid>` (bidirectional bytes over /ces/lua/1; stdin EOF half-closes; SIGINT/SIGTERM → 130/143; `-v` prints ATTACH-ok), `autoexec install`.
 
 **Two output modes.** Default is human (headers + aligned fields). Global `-q`/`--quiet` is **silent/pipe mode: stdout is data only** — raw bytes for content (`file get` with no/`-` local path streams the file to stdout) and JSON for structured results (`query`, `ping`, `server-info`, `asset query`, `file stat`, `compute ps`/`stat`/`instances`, `compute launch`/`kill`); all human chrome is suppressed and errors still go to stderr with a nonzero exit. This makes cesh a clean data pipe for callers (e.g. a web gateway that shells out to it). The server's rpc port is discoverable without `--rpc-port`: free `ces ping` (and the paid `server-info`) advertise `rpcPort` (from the MINX `GetInfo` rdata, mirrored into the paid KV).
 
@@ -339,7 +339,7 @@ LOGTRACE << "packet"  << BVAR(payload);
 
 Macros: `LOGTRACE`/`DEBUG`/`INFO`/`WARNING`/`ERROR`/`FATAL`. `VAR(x)` native, `SVAR(x)` string-convertible, `BVAR(x)` bytes-as-hex. `blog::fast_min_level` is plain int — zero overhead for disabled levels. `blog::enable("module")`, `blog::set_level("module", blog::trace)`. `ces::setupLogger("debug")` is the shared CLI parser (`util/log.h`).
 
-**Module names**: `csv` server, `ccl` client, `acc` accounts, `ast` assets, `cesvm` VM, `cesco` admin, `ceslib` wallet, `plex` CesPlex+file/compute handlers, `lua` builtin:lua, `netbill` ChannelMeter, `cfc` CesFileClient, `ccc` CesComputeClient.
+**Module names**: `csv` server, `ccl` client, `acc` accounts, `ast` assets, `cesvm` VM, `cesco` admin, `ceslib` wallet, `plex` CesPlex core (mux/session/endpoint/meter), `file` builtin:file, `compute` builtin:compute (incl. program `ces.log` output), `lua` builtin:lua, `cfc` CesFileClient, `ccc` CesComputeClient.
 
 **Production policy**: INFO = lifecycle only. DEBUG = failure conditions. TRACE = per-op firehose (NOT for production).
 

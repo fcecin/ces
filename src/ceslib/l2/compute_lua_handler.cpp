@@ -66,7 +66,7 @@ std::atomic<CesServer*> gServer{nullptr};
 struct ConnCtx : std::enable_shared_from_this<ConnCtx> {
   std::shared_ptr<minx::RudpStream> stream;
   BoundChannelContext bound;
-  uint64_t instanceId = 0;
+  uint64_t pid = 0;
   uint64_t connId = 0;
   bool attached = false;
   bool closed = false;
@@ -81,7 +81,7 @@ struct ConnCtx : std::enable_shared_from_this<ConnCtx> {
   bool writing = false;
 };
 
-// Keyed by (instance_id, conn_id). All access on rpcTaskIO_.
+// Keyed by (pid, conn_id). All access on rpcTaskIO_.
 using ConnKey = std::pair<uint64_t, uint64_t>;
 std::map<ConnKey, std::shared_ptr<ConnCtx>> gConns;
 
@@ -101,10 +101,10 @@ void teardownConn(std::shared_ptr<ConnCtx> ctx, uint8_t reason,
   if (ctx->closed) return;
   ctx->closed = true;
   if (ctx->attached && notifyChild) {
-    computeSendConnClosed(ctx->instanceId, ctx->connId, reason);
+    computeSendConnClosed(ctx->pid, ctx->connId, reason);
   }
   if (ctx->attached) {
-    gConns.erase({ctx->instanceId, ctx->connId});
+    gConns.erase({ctx->pid, ctx->connId});
   }
   // Graceful close. shutdown() lets any in-flight async_write (e.g.
   // the program's final "bye\n") drain into Rudp's sendBuf, then
@@ -186,7 +186,7 @@ void sendAttachReply(std::shared_ptr<ConnCtx> ctx, uint8_t status,
 
 // Read the per-op envelope for the ATTACH verb:
 //   [u8 verb=0x01][u32 preamble_len][preamble][65 sig]
-// preamble = [u64 instance_id].
+// preamble = [u64 pid].
 void readAttachVerb(std::shared_ptr<ConnCtx> ctx) {
   auto stream = ctx->stream;
   auto verbBuf = std::make_shared<std::array<uint8_t, 1>>();
@@ -215,7 +215,7 @@ void readAttachVerb(std::shared_ptr<ConnCtx> ctx) {
           uint32_t preLen = ces::Buffer::peek<uint32_t>(
             std::span<const uint8_t>(*lenBuf), 0);
           if (preLen != 8) {
-            // ATTACH preamble is exactly [u64 instance_id]. Anything
+            // ATTACH preamble is exactly [u64 pid]. Anything
             // else is a wire-format mismatch (likely an old client).
             teardownConn(ctx, kCloseReasonInternal, false);
             return;
@@ -248,20 +248,20 @@ void readAttachVerb(std::shared_ptr<ConnCtx> ctx) {
                     teardownConn(ctx, kCloseReasonInternal, false);
                     return;
                   }
-                  // Decode preamble: [u64 instance_id]. ATTACH is a
+                  // Decode preamble: [u64 pid]. ATTACH is a
                   // one-shot verb on a fresh channel — no nonce needed,
                   // sig dedup handles the trivial replay case.
-                  uint64_t instId = ces::Buffer::peek<uint64_t>(
+                  uint64_t pid = ces::Buffer::peek<uint64_t>(
                     std::span<const uint8_t>(*preBuf), 0);
                   uint64_t sigHash = ces::sigDedupHash(*sigBuf);
 
-                  if (!computeInstanceExists(instId)) {
+                  if (!computeInstanceExists(pid)) {
                     sendAttachReply(
                       ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND,
                       sigHash);
                     return;
                   }
-                  if (!computeInstanceAcceptsConnections(instId)) {
+                  if (!computeInstanceAcceptsConnections(pid)) {
                     sendAttachReply(
                       ctx, CES_ERROR_NOT_LISTENING, sigHash);
                     return;
@@ -271,19 +271,19 @@ void readAttachVerb(std::shared_ptr<ConnCtx> ctx) {
                   std::memcpy(userPk.data(),
                               ctx->bound.boundPubkey.getHash().data(),
                               32);
-                  uint64_t connId = computeOpenConnection(instId, userPk);
+                  uint64_t connId = computeOpenConnection(pid, userPk);
                   if (connId == 0) {
                     sendAttachReply(
                       ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND,
                       sigHash);
                     return;
                   }
-                  ctx->instanceId = instId;
+                  ctx->pid = pid;
                   ctx->connId = connId;
                   ctx->attached = true;
-                  gConns.emplace(ConnKey{instId, connId}, ctx);
+                  gConns.emplace(ConnKey{pid, connId}, ctx);
                   LOGDEBUG << "builtin:lua attached"
-                           << VAR(instId) << VAR(connId);
+                           << VAR(pid) << VAR(connId);
                   sendAttachReply(ctx, CES_OK, sigHash);
                 });
             });
@@ -314,7 +314,7 @@ void dataReadLoop(std::shared_ptr<ConnCtx> ctx) {
         return;
       }
       if (n > 0) {
-        computeSendConnDataIn(ctx->instanceId, ctx->connId,
+        computeSendConnDataIn(ctx->pid, ctx->connId,
                                ctx->readBuf.data(), n);
       }
       dataReadLoop(ctx);
@@ -367,9 +367,9 @@ void luaHandlerBind(CesServer* server) {
   gServer.store(server);
 }
 
-void luaHandlerHandleConnDataOut(uint64_t instId, uint64_t connId,
+void luaHandlerHandleConnDataOut(uint64_t pid, uint64_t connId,
                                   const uint8_t* data, size_t len) {
-  auto it = gConns.find({instId, connId});
+  auto it = gConns.find({pid, connId});
   if (it == gConns.end()) return;
   auto ctx = it->second;
   if (ctx->closed || !ctx->stream || len == 0) return;
@@ -378,19 +378,19 @@ void luaHandlerHandleConnDataOut(uint64_t instId, uint64_t connId,
   kickConnWrite(ctx);
 }
 
-void luaHandlerHandleConnClose(uint64_t instId, uint64_t connId) {
-  auto it = gConns.find({instId, connId});
+void luaHandlerHandleConnClose(uint64_t pid, uint64_t connId) {
+  auto it = gConns.find({pid, connId});
   if (it == gConns.end()) return;
   auto ctx = it->second;
   // Program asked us to close. Don't echo the CONN_CLOSED back to it.
   teardownConn(ctx, kCloseReasonProgram, /*notifyChild=*/false);
 }
 
-void luaHandlerOnInstanceDying(uint64_t instId) {
+void luaHandlerOnInstanceDying(uint64_t pid) {
   // Tear down every connection routed to this instance. We don't
   // notify the child (it's about to die anyway).
   for (auto it = gConns.begin(); it != gConns.end(); ) {
-    if (it->first.first != instId) { ++it; continue; }
+    if (it->first.first != pid) { ++it; continue; }
     auto ctx = it->second;
     ctx->closed = true;
     if (ctx->stream) {

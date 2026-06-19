@@ -524,7 +524,7 @@ std::string buildCompute(CesServer& s) {
   for (auto& i : insts) {
     if (!first) o << ",";
     first = false;
-    o << "{\"id\":" << i.id
+    o << "{\"pid\":" << i.pid
       << ",\"source\":" << jstr(i.source)
       << ",\"cpuBp\":" << i.cpuBasisPoints
       << ",\"rssBytes\":" << i.rssBytes
@@ -1894,7 +1894,7 @@ async function loadFile(){let fs,cfg;try{fs=await api('/api/filestore');cfg=awai
 async function loadCompute(){let cp,cfg;try{cp=await api('/api/compute');cfg=await api('/api/config');}catch(e){return;}
   if(cp.enabled){
     $('#computeStats').innerHTML=[['Running',fmtNum(cp.instances.length)],['Max',fmtNum(cp.maxInstances)],['Port range',cp.portCount>0?(cp.portBase+'–'+(cp.portBase+cp.portCount-1)):'none','wide']].map(c=>`<div class="card${c[2]?' '+c[2]:''}"><h3>${c[0]}</h3><div class="stat">${c[1]}</div></div>`).join('');
-    $('#computeTbl').innerHTML='<tr><th>id</th><th>source</th><th class="num">CPU</th><th class="num">RSS</th><th class="num">uptime</th><th class="num" title="outbound CES-client port / inbound /ces/luarpc/1 host port (0 = none)">ports (CES/rpc)</th></tr>'+(cp.instances.length?cp.instances.map(i=>`<tr><td class="mono">${i.id}</td><td class="mono">${esc(i.source)}</td><td class="num">${(i.cpuBp/100).toFixed(0)}%</td><td class="num">${fmtBytes(i.rssBytes)}</td><td class="num">${fmtDur(i.uptimeSecs)}</td><td class="num">${i.clientPort||'-'} / ${i.rpcPort||'-'}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no running instances</td></tr>');
+    $('#computeTbl').innerHTML='<tr><th>pid</th><th>source</th><th class="num">CPU</th><th class="num">RSS</th><th class="num">uptime</th><th class="num" title="outbound CES-client port / inbound /ces/luarpc/1 host port (0 = none)">ports (CES/rpc)</th></tr>'+(cp.instances.length?cp.instances.map(i=>`<tr><td class="mono">${i.pid}</td><td class="mono">${esc(i.source)}</td><td class="num">${(i.cpuBp/100).toFixed(0)}%</td><td class="num">${fmtBytes(i.rssBytes)}</td><td class="num">${fmtDur(i.uptimeSecs)}</td><td class="num">${i.clientPort||'-'} / ${i.rpcPort||'-'}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no running instances</td></tr>');
     $('#computeOff').textContent='';
   }else{$('#computeStats').innerHTML='';$('#computeTbl').innerHTML='';$('#computeOff').innerHTML='<b>Compute disabled.</b> Set <span class="mono">computeMaxInstances</span> &gt; 0 (needs the file store) and restart.';}
   if(!computeReady){$('#computeFees').innerHTML=feeRows(FEES_COMPUTE);fillFees(cfg.knobs,FEES_COMPUTE);

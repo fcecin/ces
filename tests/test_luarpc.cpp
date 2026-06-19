@@ -285,7 +285,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramComputeClient, LuaRpcFixture) {
     "local ids = cc:instances('/p/cl_noop')\n"
     "local mine = cc:list()\n"
     "local ok = 0\n"
-    "if info.instance_id ~= id then ok = 410\n"
+    "if info.pid ~= id then ok = 410\n"
     "elseif not (ids and #ids >= 1) then ok = 411\n"
     "elseif not (mine and #mine >= 1) then ok = 412 end\n"
     "cc:kill(id)\n"
@@ -325,7 +325,7 @@ BOOST_FIXTURE_TEST_CASE(PortsInspectableByStranger, LuaRpcFixture) {
 
   CesComputeClient::InstanceInfo info;
   CES_REQUIRE_OK(cc.stat(id, info));
-  BOOST_CHECK_EQUAL(info.instanceId, id);
+  BOOST_CHECK_EQUAL(info.pid, id);
   // Port range is configured, so the instance leased a real inbound luarpc
   // host port — and the stranger can see it.
   BOOST_CHECK_MESSAGE(info.rpcPort != 0,
@@ -335,7 +335,7 @@ BOOST_FIXTURE_TEST_CASE(PortsInspectableByStranger, LuaRpcFixture) {
   std::vector<CesComputeClient::InstanceInfo> insts;
   CES_REQUIRE_OK(cc.instances(path, insts));
   BOOST_REQUIRE_EQUAL(insts.size(), 1u);
-  BOOST_CHECK_EQUAL(insts[0].instanceId, id);
+  BOOST_CHECK_EQUAL(insts[0].pid, id);
   BOOST_CHECK_EQUAL(insts[0].rpcPort, info.rpcPort);
   cc.disconnect();
 

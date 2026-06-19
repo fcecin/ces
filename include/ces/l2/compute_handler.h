@@ -94,7 +94,7 @@ void computeHandlerOnApplicationMsg(
 // Compute tab. CPU is in basis points of one core (10000 = a full core);
 // rssBytes + cpuBasisPoints are the supervisor's last per-tick sample.
 struct ComputeInstanceStat {
-  uint64_t id = 0;
+  uint64_t pid = 0;
   std::string source;          // source file path (e.g. /s/dice.lua)
   uint32_t cpuBasisPoints = 0; // 0..10000, of one core
   uint64_t rssBytes = 0;
@@ -108,33 +108,33 @@ struct ComputeInstanceStat {
 // it sees a consistent registry. Empty if the handler is unbound.
 std::vector<ComputeInstanceStat> computeHandlerSnapshot();
 
-// True iff `instanceId` is currently registered in the supervisor.
+// True iff `pid` is currently registered in the supervisor.
 // Used by the lua handler to disambiguate "no such instance" from
 // "instance exists but accept gate closed".
-bool computeInstanceExists(uint64_t instanceId);
+bool computeInstanceExists(uint64_t pid);
 
 // True iff the given instance has its accept gate open (the program
 // has called ces.conn.set_listener(handler)). Returns false for any
 // missing / dead instance.
-bool computeInstanceAcceptsConnections(uint64_t instanceId);
+bool computeInstanceAcceptsConnections(uint64_t pid);
 
 // Allocate a fresh server-side conn_id for the given instance and
 // send TAG_CONN_OPENED to its child (with the user's pubkey).
 // Returns the new conn_id, or 0 if the instance is gone before the
 // allocation lands.
-uint64_t computeOpenConnection(uint64_t instanceId,
+uint64_t computeOpenConnection(uint64_t pid,
                                 const std::array<uint8_t, 32>& userPubkey);
 
 // Send TAG_CONN_DATA_IN (bytes flowing user → program) to the
 // instance's child. No-op if the instance is gone.
-void computeSendConnDataIn(uint64_t instanceId, uint64_t connId,
+void computeSendConnDataIn(uint64_t pid, uint64_t connId,
                             const uint8_t* data, std::size_t len);
 
 // Send TAG_CONN_CLOSED (channel ended for any reason) to the
 // instance's child. No-op if the instance is gone. The lua handler
-// is responsible for cleaning up its own (instId, connId) routing
+// is responsible for cleaning up its own (pid, connId) routing
 // entry separately.
-void computeSendConnClosed(uint64_t instanceId, uint64_t connId,
+void computeSendConnClosed(uint64_t pid, uint64_t connId,
                             uint8_t reason);
 
 // Test hook: reads CPU ticks (utime + stime from /proc/<pid>/stat)
@@ -161,14 +161,14 @@ void _computeTestForceTick();
 // single non-yielding strand task so nothing drains mid-flood — the result
 // is deterministic, with no socket-buffer or timing dependence. 0 if the
 // handler is unbound or the instance is gone.
-size_t _computeTestFloodDeliver(uint64_t instanceId, size_t count);
+size_t _computeTestFloodDeliver(uint64_t pid, size_t count);
 
 // Test hook: returns the UDP port the server statically assigned the
 // given instance's outbound client (Instance::clientPort), or 0 if the
 // instance is gone (or no static range was configured). Runs on the
 // CesPlex strand with a blocking post+wait.
-uint16_t _computeTestInstanceClientPort(uint64_t instanceId);
+uint16_t _computeTestInstanceClientPort(uint64_t pid);
 // Same, for the instance's inbound CesPlex host port (Instance::rpcPort).
-uint16_t _computeTestInstanceRpcPort(uint64_t instanceId);
+uint16_t _computeTestInstanceRpcPort(uint64_t pid);
 
 } // namespace ces

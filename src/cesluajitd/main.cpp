@@ -211,6 +211,7 @@ constexpr uint8_t  TAG_CONN_DATA_OUT = 0x07;  // child → server
 constexpr uint8_t  TAG_CONN_CLOSE    = 0x08;  // child → server
 constexpr uint8_t  TAG_LISTEN_ON     = 0x09;  // child → server
 constexpr uint8_t  TAG_LISTEN_OFF    = 0x0a;  // child → server
+constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (one-way)
 
 constexpr uint16_t METHOD_CLIENT_SEND      = 0x0001;
 constexpr uint16_t METHOD_FILE_CREATE      = 0x0100;
@@ -885,19 +886,40 @@ int lua_ces_sha256(lua_State* L) {
   return 1;
 }
 
-// ces.log(msg) - operator instrumentation, registered ONLY for privileged
-// (/s/) programs (see install_ces_api). Emits a line to the node's log (the
-// child inherits the server's stderr), tagged with the program key so logs
-// from many instances are tellable apart. Never exposed to user programs, so
-// it cannot spam an operator's log in production.
+// ces.log([level,] msg) - operator instrumentation, registered ONLY for
+// privileged (/s/) programs (see install_ces_api). The application picks the
+// level ("trace"|"debug"|"info"|"warn"|"error", default "info"); the operator
+// picks what's visible via blog's "compute" module level. Fire-and-forget over
+// a one-way IPC frame; the host (builtin:compute) logs it through blog under
+// "compute", tagged with the instance + program prefix (added host-side, not
+// trusted from here). Never reaches user programs. Capped so a program can't
+// emit huge log lines.
+// Level byte: 0=trace 1=debug 2=info 3=warn 4=error (mirrors the compute side).
+static uint8_t log_level_from_name(lua_State* L, const char* name) {
+  if (std::strcmp(name, "trace") == 0) return 0;
+  if (std::strcmp(name, "debug") == 0) return 1;
+  if (std::strcmp(name, "info")  == 0) return 2;
+  if (std::strcmp(name, "warn")  == 0 || std::strcmp(name, "warning") == 0) return 3;
+  if (std::strcmp(name, "error") == 0) return 4;
+  return static_cast<uint8_t>(luaL_error(L, "ces.log: invalid level '%s'", name));
+}
+
 int lua_ces_log(lua_State* L) {
+  uint8_t level = 2;  // info
   size_t n = 0;
-  const char* s = luaL_checklstring(L, 1, &n);
-  char tag[17];
-  for (int i = 0; i < 8; ++i)
-    std::snprintf(tag + i * 2, 3, "%02x", g_program_pubkey[i]);
-  std::fprintf(stderr, "lualog %s: %.*s\n", tag, static_cast<int>(n), s);
-  std::fflush(stderr);
+  const char* s;
+  if (lua_gettop(L) >= 2) {
+    level = log_level_from_name(L, luaL_checkstring(L, 1));
+    s = luaL_checklstring(L, 2, &n);
+  } else {
+    s = luaL_checklstring(L, 1, &n);
+  }
+  if (n > 4096) n = 4096;
+  std::vector<uint8_t> body;
+  body.reserve(1 + n);
+  body.push_back(level);
+  body.insert(body.end(), s, s + n);
+  write_frame(TAG_LOG, 0, body.data(), body.size());
   return 0;
 }
 
@@ -3256,8 +3278,8 @@ int lua_ces_file_client(lua_State* L) {
 void push_instance_info(lua_State* L,
                         const ces::CesComputeClient::InstanceInfo& info) {
   lua_newtable(L);
-  lua_pushnumber(L, static_cast<lua_Number>(info.instanceId));
-  lua_setfield(L, -2, "instance_id");
+  lua_pushnumber(L, static_cast<lua_Number>(info.pid));
+  lua_setfield(L, -2, "pid");
   lua_pushlstring(L, info.sourceName.data(), info.sourceName.size());
   lua_setfield(L, -2, "source_name");
   lua_pushnumber(L, static_cast<lua_Number>(info.startedAtUs));

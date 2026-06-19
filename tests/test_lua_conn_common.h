@@ -15,7 +15,7 @@
 //
 //   Client → Server (ATTACH):
 //     [u8 verb=0x01][u32 BE preamble_len=8][preamble][65 sig]
-//     preamble = [u64 instance_id]
+//     preamble = [u64 pid]
 //     sig over sha256(verb || preamble || sessionToken)
 //
 //   Server → Client (ATTACH reply):
@@ -235,12 +235,12 @@ public:
 
   AttachResult attach(const KeyPair& signer,
                       uint64_t sessionToken,
-                      uint64_t instanceId,
+                      uint64_t pid,
                       std::chrono::milliseconds timeout =
                         std::chrono::seconds(3)) {
-    // Build preamble = [u64 instance_id].
+    // Build preamble = [u64 pid].
     ces::Bytes preamble;
-    ces::Buffer::put<uint64_t>(preamble, instanceId);
+    ces::Buffer::put<uint64_t>(preamble, pid);
 
     constexpr uint8_t kVerbAttach = 0x01;
     ces::Signature sig = ces::signPerOp(

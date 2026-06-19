@@ -69,7 +69,7 @@
 #include <string>
 #include <vector>
 
-LOG_MODULE("plex");
+LOG_MODULE("file");
 
 namespace ces {
 
@@ -724,7 +724,7 @@ public:
              BoundChannelContext bound) override {
     CesServer* server = gServer.load();
     if (!server) {
-      LOGWARNING << "builtin:file invoked with no bound CesServer";
+      LOGWARNING << "invoked with no bound CesServer";
       return;
     }
     CesPlexProtocol proto;
@@ -901,13 +901,13 @@ void regenerateServerIndex(CesServer* server, const std::string& dir) {
   fs::path tmp = cPath; tmp += ".tmp";
   {
     std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-    if (!f) { LOGWARNING << "builtin:file /s/ index: open failed"; return; }
+    if (!f) { LOGWARNING << "/s/ index: open failed"; return; }
     f.write(html.data(), static_cast<std::streamsize>(html.size()));
-    if (!f.good()) { LOGWARNING << "builtin:file /s/ index: write failed"; return; }
+    if (!f.good()) { LOGWARNING << "/s/ index: write failed"; return; }
   }
   fs::rename(tmp, cPath, ec);
   if (ec) {
-    LOGWARNING << "builtin:file /s/ index: rename failed";
+    LOGWARNING << "/s/ index: rename failed";
     std::filesystem::remove(tmp, ec);
     return;
   }
@@ -926,7 +926,7 @@ void regenerateServerIndex(CesServer* server, const std::string& dir) {
   s.modified_us = s.created_us;
   s.last_rent_us = s.created_us;
   writeSidecar(resolveSidecarPath(dir, kServerIndexName), s);
-  LOGDEBUG << "builtin:file /s/ index regenerated" << VAR(names.size());
+  LOGDEBUG << "/s/ index regenerated" << VAR(names.size());
 }
 
 // Hook fired at the success of a /s/ file-set change (CREATE / DELETE). Guarded
@@ -3150,10 +3150,10 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
       s.last_rent_us = s.modified_us;
 
       if (writeSidecar(sPath, s)) {
-        LOGDEBUG << "builtin:file /s/ sidecar generated"
+        LOGDEBUG << "/s/ sidecar generated"
                  << SVAR(name) << VAR(size);
       } else {
-        LOGWARNING << "builtin:file /s/ sidecar write failed"
+        LOGWARNING << "/s/ sidecar write failed"
                    << SVAR(name);
         continue;
       }
@@ -3190,12 +3190,12 @@ void seedBuiltinSite(CesServer* server, const std::string& dir) {
     fs::path tmp = cPath; tmp += ".tmp";
     {
       std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-      if (!out) { LOGWARNING << "builtin:file /s/ site open failed" << SVAR(name); continue; }
+      if (!out) { LOGWARNING << "/s/ site open failed" << SVAR(name); continue; }
       out.write(f.content.data(), static_cast<std::streamsize>(f.content.size()));
-      if (!out.good()) { LOGWARNING << "builtin:file /s/ site write failed" << SVAR(name); continue; }
+      if (!out.good()) { LOGWARNING << "/s/ site write failed" << SVAR(name); continue; }
     }
     fs::rename(tmp, cPath, ec);
-    if (ec) { LOGWARNING << "builtin:file /s/ site rename failed" << SVAR(name); fs::remove(tmp, ec); continue; }
+    if (ec) { LOGWARNING << "/s/ site rename failed" << SVAR(name); fs::remove(tmp, ec); continue; }
 
     Sidecar s{};
     s.version = kSidecarVersion;
@@ -3208,7 +3208,7 @@ void seedBuiltinSite(CesServer* server, const std::string& dir) {
     s.last_rent_us = s.created_us;
     writeSidecar(resolveSidecarPath(dir, name), s);
   }
-  LOGDEBUG << "builtin:file /s/welcome site published";
+  LOGDEBUG << "/s/welcome site published";
 }
 
 void fileHandlerStartupReconcile() {
@@ -3234,7 +3234,7 @@ void fileHandlerStartupReconcile() {
   });
   std::lock_guard lk(gStoreMetaMutex);
   writeStoreMeta(storeMetaPath(dir), m);
-  LOGINFO << "builtin:file store reconciled"
+  LOGINFO << "store reconciled"
           << VAR(m.total_files) << VAR(m.total_bytes);
 }
 
