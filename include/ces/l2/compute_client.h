@@ -30,6 +30,7 @@
 #include <ces/keys.h>
 #include <ces/types.h>
 
+#include <array>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -56,6 +57,9 @@ public:
     // instance's own inbound /ces/luarpc/1 host port (directly dialable).
     uint16_t clientPort = 0;
     uint16_t rpcPort = 0;
+    // The instance's program-keypair pubkey (0 = none). A peer needs it to
+    // address this instance's /ces/luarpc/1 endpoint via ces.conn.connect.
+    std::array<uint8_t, 32> programPubkey{};
   };
 
   CesComputeClient();

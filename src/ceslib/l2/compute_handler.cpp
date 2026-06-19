@@ -1863,6 +1863,7 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
       // Leased ports (0 = none): outbound CES-client, inbound luarpc host.
       ces::Buffer::put<uint16_t>(resp, inst->clientPort);
       ces::Buffer::put<uint16_t>(resp, inst->rpcPort);
+      resp.insert(resp.end(), inst->programPubkey.begin(), inst->programPubkey.end());
       count++;
     }
     // Patch count.
@@ -1923,6 +1924,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Leased ports (0 = none): outbound CES-client, inbound luarpc host.
     ces::Buffer::put<uint16_t>(resp, inst.clientPort);
     ces::Buffer::put<uint16_t>(resp, inst.rpcPort);
+    resp.insert(resp.end(), inst.programPubkey.begin(), inst.programPubkey.end());
     ces::Buffer::put<uint16_t>(resp, static_cast<uint16_t>(name.size()));
     resp.insert(resp.end(),
                 reinterpret_cast<const uint8_t*>(name.data()),
@@ -1987,6 +1989,7 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
         ces::Buffer::put<uint64_t>(resp, inst.rssBytes);
         ces::Buffer::put<uint16_t>(resp, inst.clientPort);
         ces::Buffer::put<uint16_t>(resp, inst.rpcPort);
+        resp.insert(resp.end(), inst.programPubkey.begin(), inst.programPubkey.end());
         count++;
       }
     }

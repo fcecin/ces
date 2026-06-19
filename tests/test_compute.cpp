@@ -164,6 +164,36 @@ BOOST_AUTO_TEST_CASE(LaunchKillRoundTrip) {
   cc.disconnect();
 }
 
+BOOST_AUTO_TEST_CASE(InstanceRecordExposesProgramPubkey) {
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));
+
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+
+  uint64_t instId = 0, startedAt = 0;
+  CES_REQUIRE_OK(cc.launch(ownerPath, instId, startedAt));
+
+  const std::array<uint8_t, 32> zero{};
+
+  CesComputeClient::InstanceInfo s;
+  CES_REQUIRE_OK(cc.stat(instId, s));
+  BOOST_CHECK(s.programPubkey != zero);
+
+  std::vector<CesComputeClient::InstanceInfo> list;
+  CES_REQUIRE_OK(cc.list(list));
+  BOOST_REQUIRE_EQUAL(list.size(), 1u);
+  BOOST_CHECK(list[0].programPubkey == s.programPubkey);
+
+  std::vector<CesComputeClient::InstanceInfo> insts;
+  CES_REQUIRE_OK(cc.instances(ownerPath, insts));
+  BOOST_REQUIRE_EQUAL(insts.size(), 1u);
+  BOOST_CHECK(insts[0].programPubkey == s.programPubkey);
+
+  cc.kill(instId);
+  cc.disconnect();
+}
+
 BOOST_AUTO_TEST_CASE(LaunchNotOwner) {
   CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));
 

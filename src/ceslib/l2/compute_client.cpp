@@ -11,6 +11,7 @@
 #include <ces/types.h>
 
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <vector>
 
@@ -26,10 +27,10 @@ constexpr uint8_t kVerbInstances = 0x05;
 
 constexpr const char* kComputeProto = "/ces/compute/1";
 
-// Parse a STAT response preamble: after the 40-byte fixed header
+// Parse a STAT response preamble: after the 72-byte fixed header
 // (id | started_at | file_balance | cpu_bp | rss_bytes | client_port |
-// rpc_port) comes u16 name_len + name. Pulls the variable tail off the
-// channel.
+// rpc_port | program_pubkey) comes u16 name_len + name. Pulls the variable
+// tail off the channel.
 uint8_t statVariableReader(CesPlexChannel& chan,
                            CesComputeClient::InstanceInfo& out,
                            ces::Bytes& preamble) {
@@ -49,6 +50,7 @@ uint8_t statVariableReader(CesPlexChannel& chan,
   out.rssBytes       = ces::Buffer::peek<uint64_t>(preamble.data() + 28);
   out.clientPort     = ces::Buffer::peek<uint16_t>(preamble.data() + 36);
   out.rpcPort        = ces::Buffer::peek<uint16_t>(preamble.data() + 38);
+  std::memcpy(out.programPubkey.data(), preamble.data() + 40, 32);
   out.sourceName.assign(nameBuf.begin(), nameBuf.end());
   return CES_OK;
 }
@@ -141,11 +143,12 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
         preamble.insert(preamble.end(), nameBuf.begin(), nameBuf.end());
       }
       // Per-entry trailer: startedAtUs | fileBalance | cpuBp | rssBytes |
-      // client_port | rpc_port.
+      // client_port | rpc_port | program_pubkey.
       ces::Bytes tail;
       if (!impl_->chan->readExact(tail, sizeof(uint64_t) + sizeof(uint64_t)
                                           + sizeof(uint32_t) + sizeof(uint64_t)
-                                          + sizeof(uint16_t) + sizeof(uint16_t)))
+                                          + sizeof(uint16_t) + sizeof(uint16_t)
+                                          + 32))
         return false;
       preamble.insert(preamble.end(), tail.begin(), tail.end());
 
@@ -158,6 +161,7 @@ uint8_t CesComputeClient::list(std::vector<InstanceInfo>& out) {
       info.rssBytes       = ces::Buffer::peek<uint64_t>(tail.data() + 20);
       info.clientPort     = ces::Buffer::peek<uint16_t>(tail.data() + 28);
       info.rpcPort        = ces::Buffer::peek<uint16_t>(tail.data() + 30);
+      std::memcpy(info.programPubkey.data(), tail.data() + 32, 32);
       out.push_back(std::move(info));
     }
     return true;
@@ -181,7 +185,7 @@ uint8_t CesComputeClient::stat(uint64_t instanceId, InstanceInfo& out) {
     return statVariableReader(*impl_->chan, out, preamble) == CES_OK;
   };
   ces::Bytes resp;
-  return impl_->chan->driveVerb(kVerbStat, env, /*fixedPre=*/40, reader, resp);
+  return impl_->chan->driveVerb(kVerbStat, env, /*fixedPre=*/72, reader, resp);
 }
 
 uint8_t CesComputeClient::instances(const std::string& path,
@@ -193,8 +197,9 @@ uint8_t CesComputeClient::instances(const std::string& path,
   auto env = impl_->chan->buildEnvelope(kVerbInstances, pre);
 
   out.clear();
-  // Variable preamble: read u32 count, then count × fixed 32-byte entries:
-  // id | started_at | cpu_bp | rss_bytes | client_port | rpc_port.
+  // Variable preamble: read u32 count, then count × fixed 64-byte entries:
+  // id | started_at | cpu_bp | rss_bytes | client_port | rpc_port |
+  // program_pubkey.
   auto reader = [this, &out, path](ces::Bytes& preamble) -> bool {
     ces::Bytes countBuf;
     if (!impl_->chan->readExact(countBuf, 4)) return false;
@@ -203,7 +208,7 @@ uint8_t CesComputeClient::instances(const std::string& path,
     out.reserve(count);
     for (uint32_t i = 0; i < count; ++i) {
       ces::Bytes e;
-      if (!impl_->chan->readExact(e, 32)) return false;
+      if (!impl_->chan->readExact(e, 64)) return false;
       preamble.insert(preamble.end(), e.begin(), e.end());
       InstanceInfo info;
       info.instanceId     = ces::Buffer::peek<uint64_t>(e.data());
@@ -212,6 +217,7 @@ uint8_t CesComputeClient::instances(const std::string& path,
       info.rssBytes       = ces::Buffer::peek<uint64_t>(e.data() + 20);
       info.clientPort     = ces::Buffer::peek<uint16_t>(e.data() + 28);
       info.rpcPort        = ces::Buffer::peek<uint16_t>(e.data() + 30);
+      std::memcpy(info.programPubkey.data(), e.data() + 32, 32);
       info.sourceName     = path;  // the query key, echoed for convenience
       out.push_back(std::move(info));
     }

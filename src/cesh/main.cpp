@@ -91,6 +91,7 @@ std::string instanceJson(const ces::CesComputeClient::InstanceInfo& e) {
   o += ",\"rssBytes\":"      + std::to_string(e.rssBytes);
   o += ",\"clientPort\":"    + std::to_string(e.clientPort);
   o += ",\"rpcPort\":"       + std::to_string(e.rpcPort);
+  o += ",\"programPubkey\":\"" + ces::bytesToHex(e.programPubkey) + "\"";
   o += "}";
   return o;
 }
