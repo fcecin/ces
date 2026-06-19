@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <deque>
@@ -2384,10 +2385,21 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e);
 struct LuaTimer {
   uint64_t next_us;
   uint64_t interval_us;
-  int ref;       // registry ref to the Lua function
+  int ref;              // registry ref to the Lua cb (ces.every), or LUA_NOREF
+  lua_State* resume_co; // coroutine to resume (ces.sleep), or nullptr
   bool active;
 };
 std::vector<LuaTimer> g_timers;
+
+// Cooperative scheduler. spawn() runs a function as a coroutine; sleep() (and,
+// later, yielding I/O) suspends a coroutine so the run loop services everyone
+// else. All the hard part lives here in C++ -- the Lua side just calls
+// blocking-looking functions and never sees a coroutine. Coroutines are resumed
+// ONLY from the run loop, and a primitive yields from leaf Lua, so there is no
+// cross-C-boundary yield (LuaJIT's one constraint stays satisfied).
+struct ReadyCoro { lua_State* co; int nargs; };
+std::deque<ReadyCoro>     g_ready;      // coroutines to resume now
+std::map<lua_State*, int> g_coro_refs;  // coro -> registry ref (keeps it alive)
 
 static uint64_t timer_now_us() {
   return static_cast<uint64_t>(
@@ -2417,6 +2429,12 @@ static void fire_due_timers(lua_State* L) {
   // so never hold a reference across the pcall.
   for (size_t i = 0; i < g_timers.size(); ++i) {
     if (!g_timers[i].active || g_timers[i].next_us > now) continue;
+    if (g_timers[i].resume_co) {
+      // One-shot sleep timer: mark the coroutine ready (the run loop resumes it).
+      g_ready.push_back({g_timers[i].resume_co, 0});
+      g_timers[i].active = false;
+      continue;
+    }
     int ref = g_timers[i].ref;
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     if (lua_isfunction(L, -1)) {
@@ -2435,6 +2453,13 @@ static void fire_due_timers(lua_State* L) {
         g_timers[i].next_us = now + g_timers[i].interval_us;  // skip missed
     }
   }
+  // Reap dead entries (fired one-shot sleeps, cancelled ces.every) so a program
+  // that sleeps in a loop does not grow g_timers without bound. Inactive timers
+  // already released their ref; nothing else references them.
+  g_timers.erase(
+    std::remove_if(g_timers.begin(), g_timers.end(),
+                   [](const LuaTimer& t) { return !t.active; }),
+    g_timers.end());
 }
 
 // ces.every(ms, fn) -> id. Calls fn() every ms from the run loop. Returns a
@@ -2446,7 +2471,7 @@ int lua_ces_every(lua_State* L) {
   lua_pushvalue(L, 2);
   int ref = luaL_ref(L, LUA_REGISTRYINDEX);
   uint64_t iv = static_cast<uint64_t>(ms * 1000.0);
-  g_timers.push_back({timer_now_us() + iv, iv, ref, true});
+  g_timers.push_back({timer_now_us() + iv, iv, ref, nullptr, true});
   lua_pushinteger(L, ref);
   return 1;
 }
@@ -2455,13 +2480,66 @@ int lua_ces_every(lua_State* L) {
 int lua_ces_cancel(lua_State* L) {
   int ref = static_cast<int>(luaL_checkinteger(L, 1));
   for (auto& t : g_timers) {
-    if (t.ref == ref && t.active) {
+    if (t.ref == ref && t.active && t.resume_co == nullptr) {
       t.active = false;
       luaL_unref(L, LUA_REGISTRYINDEX, t.ref);
       break;
     }
   }
   return 0;
+}
+
+// ces.spawn(fn) - run fn as a concurrent behavior (coroutine). Returns at once;
+// fn starts on the next run-loop turn. Other behaviors keep running while this
+// one waits on a timeout-bounded call.
+int lua_ces_spawn(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_State* co = lua_newthread(L);            // pushes the new thread on L
+  int ref = luaL_ref(L, LUA_REGISTRYINDEX);    // pop + ref it (registry is global)
+  g_coro_refs[co] = ref;
+  lua_pushvalue(L, 1);                          // copy fn to top of L
+  lua_xmove(L, co, 1);                          // move fn onto co; co stack = [fn]
+  g_ready.push_back({co, 0});                   // resume with 0 args -> calls fn()
+  return 0;
+}
+
+// ces.sleep(ms) - looks blocking, isn't: suspends THIS behavior for ms while
+// the run loop services the rest. Only valid inside spawn() (a coroutine), not
+// in the main chunk or an event handler (those run on the host thread and
+// cannot yield); calling it there is a clean error, not a crash.
+int lua_ces_sleep(lua_State* L) {
+  if (lua_pushthread(L)) {                      // 1 == this IS the main thread
+    lua_pop(L, 1);
+    return luaL_error(L, "ces.sleep: only inside spawn()");
+  }
+  lua_pop(L, 1);
+  lua_Number ms = luaL_checknumber(L, 1);
+  if (ms < 0) ms = 0;
+  uint64_t iv = static_cast<uint64_t>(ms * 1000.0);
+  g_timers.push_back({timer_now_us() + iv, 0, LUA_NOREF, L, true});
+  return lua_yield(L, 0);
+}
+
+// Resume every ready coroutine. A coroutine that yields parks (its waker -- a
+// sleep timer, later an I/O completion -- re-readies it); one that finishes or
+// errors is unreferenced. Spawns made while draining are picked up in the same
+// pass, so a burst of spawns all start before the loop blocks again.
+static void drain_ready(lua_State* mainL) {
+  while (!g_ready.empty()) {
+    ReadyCoro rc = g_ready.front();
+    g_ready.pop_front();
+    int r = lua_resume(rc.co, rc.nargs);
+    if (r == LUA_YIELD) continue;              // parked; nothing to do
+    if (r != 0) {
+      std::fprintf(stderr, "cesluajitd: task error: %s\n",
+                   lua_tostring(rc.co, -1));
+    }
+    auto it = g_coro_refs.find(rc.co);
+    if (it != g_coro_refs.end()) {
+      luaL_unref(mainL, LUA_REGISTRYINDEX, it->second);
+      g_coro_refs.erase(it);
+    }
+  }
 }
 
 // The UNIFIED event loop — ces.run() (= ces.conn.run).
@@ -2492,10 +2570,13 @@ int lua_ces_run(lua_State* L) {
       dispatch_luarpc_event(L, std::move(e));
     }
 
-    // Fire any due periodic timers (ces.every).
+    // Fire any due periodic timers (ces.every) + sleep wakeups, then run every
+    // ready coroutine (spawn/sleep) before blocking again.
     fire_due_timers(L);
+    drain_ready(L);
 
     // Block until the next event on either source, or the next timer deadline.
+    // Don't block if a coroutine became ready in the meantime.
     pollfd pfds[2];
     pfds[0].fd = g_sock_fd;
     pfds[0].events = POLLIN;
@@ -2507,7 +2588,7 @@ int lua_ces_run(lua_State* L) {
       pfds[1].revents = 0;
       nfds = 2;
     }
-    int pr = ::poll(pfds, nfds, next_timer_timeout_ms());
+    int pr = ::poll(pfds, nfds, g_ready.empty() ? next_timer_timeout_ms() : 0);
     if (pr < 0) {
       if (errno == EINTR) continue;
       return 0;
@@ -3245,6 +3326,8 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_verify);        lua_setfield(L, -2, "verify");
   lua_pushcfunction(L, lua_ces_every);         lua_setfield(L, -2, "every");
   lua_pushcfunction(L, lua_ces_cancel);        lua_setfield(L, -2, "cancel");
+  lua_pushcfunction(L, lua_ces_spawn);         lua_setfield(L, -2, "spawn");
+  lua_pushcfunction(L, lua_ces_sleep);         lua_setfield(L, -2, "sleep");
   lua_pushcfunction(L, lua_ces_client_recv);   lua_setfield(L, -2, "client_recv");
   lua_pushcfunction(L, lua_ces_client_send);   lua_setfield(L, -2, "client_send");
   lua_pushcfunction(L, lua_ces_prog_prefix);   lua_setfield(L, -2, "prog_prefix");
