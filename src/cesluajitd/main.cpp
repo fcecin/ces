@@ -554,6 +554,10 @@ uint16_t g_program_port = 0;
 // The static UDP port reserved for this instance's inbound CesPlex host
 // (/ces/luarpc/1). 0 = none → the instance hosts nothing.
 uint16_t g_rpc_port = 0;
+// Whether this instance runs privileged, decided once by the server (source in
+// the /s/ zone) and delivered in the bootstrap. The host trusts this verdict;
+// it never re-derives privilege. Gates operator-only API such as ces.log.
+bool g_privileged = false;
 
 // ---------------------------------------------------------------------------
 // /ces/luarpc/1 — the protocol this lua host SERVES (and, later, dials) on
@@ -875,6 +879,22 @@ int lua_ces_sha256(lua_State* L) {
   sha256_final(c, digest);
   lua_pushlstring(L, reinterpret_cast<const char*>(digest), 32);
   return 1;
+}
+
+// ces.log(msg) - operator instrumentation, registered ONLY for privileged
+// (/s/) programs (see install_ces_api). Emits a line to the node's log (the
+// child inherits the server's stderr), tagged with the program key so logs
+// from many instances are tellable apart. Never exposed to user programs, so
+// it cannot spam an operator's log in production.
+int lua_ces_log(lua_State* L) {
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  char tag[17];
+  for (int i = 0; i < 8; ++i)
+    std::snprintf(tag + i * 2, 3, "%02x", g_program_pubkey[i]);
+  std::fprintf(stderr, "lualog %s: %.*s\n", tag, static_cast<int>(n), s);
+  std::fflush(stderr);
+  return 0;
 }
 
 // ces.sign(bytes) -> sig(65 bytes). Signs with this instance's program key.
@@ -3322,6 +3342,10 @@ void install_ces_api(lua_State* L) {
   lua_newtable(L);
   lua_pushcfunction(L, lua_ces_now);           lua_setfield(L, -2, "now");
   lua_pushcfunction(L, lua_ces_sha256);        lua_setfield(L, -2, "sha256");
+  // ces.log is operator-only: present solely for privileged (/s/) programs.
+  if (g_privileged) {
+    lua_pushcfunction(L, lua_ces_log);         lua_setfield(L, -2, "log");
+  }
   lua_pushcfunction(L, lua_ces_sign);          lua_setfield(L, -2, "sign");
   lua_pushcfunction(L, lua_ces_verify);        lua_setfield(L, -2, "verify");
   lua_pushcfunction(L, lua_ces_every);         lua_setfield(L, -2, "every");
@@ -3440,7 +3464,8 @@ int main(int argc, char** argv) {
   constexpr size_t kOffPrivkey = kOffProgram + WIRE_KEY_LEN;
   constexpr size_t kOffPort    = kOffPrivkey + WIRE_KEY_LEN;
   constexpr size_t kOffRpcPort = kOffPort    + sizeof(uint16_t);
-  constexpr size_t kOffStart   = kOffRpcPort + sizeof(uint16_t);
+  constexpr size_t kOffPriv    = kOffRpcPort + sizeof(uint16_t);
+  constexpr size_t kOffStart   = kOffPriv    + 1;
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
@@ -3453,6 +3478,7 @@ int main(int argc, char** argv) {
   std::memcpy(g_program_privkey, bs.body.data() + kOffPrivkey, WIRE_KEY_LEN);
   g_program_port  = get_u16(bs.body.data() + kOffPort);
   g_rpc_port      = get_u16(bs.body.data() + kOffRpcPort);
+  g_privileged    = bs.body[kOffPriv] != 0;
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {

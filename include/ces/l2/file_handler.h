@@ -32,6 +32,15 @@ namespace ces {
 
 class CesServer;
 
+// The single /s/ ("server zone") predicate. /s/ paths are operator-deployed:
+// unmetered, outside the store cap, server-key-write-only; a compute program
+// sourced from /s/ runs privileged (may use operator-only API such as ces.log).
+// Every /s/ and privilege decision routes through here -- do not re-derive it.
+inline bool isServerZone(const std::string& name) {
+  return name.size() >= 3 && name[0] == '/' &&
+         name[1] == 's' && name[2] == '/';
+}
+
 // Bind/unbind the builtin:file handler to a CesServer. See header
 // comment for semantics.
 void fileHandlerBind(CesServer* server);

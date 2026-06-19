@@ -252,13 +252,6 @@ uint8_t validateCesFileName(const std::string& name) {
   return CES_OK;
 }
 
-// True iff `name` starts with "/s/". Used to gate the unmetered /
-// outside-the-cap / server-owner-only code paths.
-inline bool isServerZone(const std::string& name) {
-  return name.size() >= 3 && name[0] == '/' &&
-         name[1] == 's' && name[2] == '/';
-}
-
 // Per-KB fee arithmetic. feeFileWrite and feeFileRead are charged
 // "credits per 1024 bytes" (ceiling-rounded); at the default values
 // a per-byte reading would make a 1 MB file cost 20 B credits. Use

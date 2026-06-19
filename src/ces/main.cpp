@@ -1007,6 +1007,12 @@ int main(int argc, char* argv[]) {
   LOGINFO << "ces starting server";
 
   uint16_t boundPort = server->start(optServerPort);
+  if (boundPort == 0) {
+    LOGERROR << "ces failed to bind the server port; aborting"
+             << VAR(optServerPort);
+    server.reset();
+    return 1;
+  }
 
   if (optNoPowEngine) {
     LOGINFO << "ces will not create the PoW engine";

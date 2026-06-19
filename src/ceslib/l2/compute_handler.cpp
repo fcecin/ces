@@ -753,7 +753,10 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 // Send the bootstrap frame at LAUNCH time. Body layout:
 //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
 //   [32B program_privkey][2B client_port BE][2B rpc_port BE]
-//   [8B start_time_us BE][u32 BE src_len][src bytes]
+//   [1B privileged][8B start_time_us BE][u32 BE src_len][src bytes]
+// - privileged: 1 for an operator /s/ program (server-deployed, runs under the
+//   server identity), 0 otherwise. Gates operator-only API like ces.log so an
+//   untrusted user program can't reach it.
 // - prog_prefix: first 8B of sha256(source path); used as the
 //   "prog_pfx" field on outbound CES_APP_COMPUTE_MSG packets so the
 //   remote CES client can demux by program.
@@ -781,7 +784,7 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
   ces::Bytes body;
   body.reserve(sizeof(inst->progPrefix) + sizeof(inst->ownerPk)
                + sizeof(inst->programPubkey) + sizeof(inst->programPrivkey)
-               + sizeof(uint16_t) + sizeof(uint16_t) + sizeof(uint64_t)
+               + sizeof(uint16_t) + sizeof(uint16_t) + 1 + sizeof(uint64_t)
                + sizeof(uint32_t) + srcLen);
   body.insert(body.end(),
               inst->progPrefix.begin(), inst->progPrefix.end());
@@ -793,6 +796,7 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
               inst->programPrivkey.begin(), inst->programPrivkey.end());
   ces::Buffer::put<uint16_t>(body, inst->clientPort);
   ces::Buffer::put<uint16_t>(body, inst->rpcPort);
+  body.push_back(isServerZone(inst->sourceName) ? 1 : 0);
   ces::Buffer::put<uint64_t>(body, inst->startedAtUs);
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(srcLen));
   if (srcLen > 0)
@@ -1753,7 +1757,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // upfront commitment must be waived too. Otherwise a /s/ program -- the
   // "ships standard" model (dht, dice) -- cannot be launched via the explicit
   // verb at all, only via the internal builtin-app path.
-  const bool serverZone = name.rfind("/s/", 0) == 0;
+  const bool serverZone = isServerZone(name);
 
   // Discounted slot rate for the upfront commitment (LAUNCH-time price).
   uint64_t slot = reqServer(ctx)->discountFee(
