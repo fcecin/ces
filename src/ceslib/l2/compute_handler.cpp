@@ -187,6 +187,7 @@ constexpr uint16_t kApiMethodBucketGet    = 0x0212;
 // typical case is "program mints loot to a player"). Asset rent is
 // paid by the program's owner account.
 constexpr uint16_t kApiMethodAuthenticAssetCreate = 0x0220;
+constexpr uint16_t kApiMethodPeers        = 0x0230;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -1157,6 +1158,39 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     return;
   }
 
+  // ---- ces.peers() → the server's peer-table snapshot.
+  //   Request: (no args)
+  //   Reply body (after the u8 status): [u16 count] then per peer
+  //     [32B ckey][u16 addr_len][addr][u8 flags][u16 rpc_port]
+  //     flags: bit0 reachable, bit1 verified, bit2 outbound, bit3 inbound
+  //   Same data as the public CES_QUERY_PEER_INFO opcode; _peerSnapshot()
+  //   locks the peer-table mutex internally, so it is safe off logicStrand_.
+  if (method == kApiMethodPeers) {
+    CesServer* server = gServer.load();
+    if (!server) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    auto peers = server->_peerSnapshot();
+    ces::Bytes body;
+    ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(peers.size()));
+    for (const auto& p : peers) {
+      body.insert(body.end(), p.ckey.begin(), p.ckey.end());
+      ces::Buffer::put<uint16_t>(
+        body, static_cast<uint16_t>(p.declaredAddress.size()));
+      body.insert(body.end(), p.declaredAddress.begin(),
+                  p.declaredAddress.end());
+      uint8_t flags = 0;
+      if (p.reachable) flags |= 0x01;
+      if (p.verified)  flags |= 0x02;
+      if (p.outbound)  flags |= 0x04;
+      if (p.inbound)   flags |= 0x08;
+      body.push_back(flags);
+      ces::Buffer::put<uint16_t>(body, p.rpcPort);
+    }
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
   // ---- ces.authentic_asset_create(asset_id, recipient_pubkey,
   //                                  payload, days).
   //   Request: [32B asset_id][32B recipient_pubkey][u16 BE days][payload <= 178B]
@@ -1714,12 +1748,19 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   if (std::memcmp(ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
     sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
+  // /s/ programs are operator-deployed and unmetered: supervisor billing
+  // no-ops on them (their file_balance is decorative), so the LAUNCH-time
+  // upfront commitment must be waived too. Otherwise a /s/ program -- the
+  // "ships standard" model (dht, dice) -- cannot be launched via the explicit
+  // verb at all, only via the internal builtin-app path.
+  const bool serverZone = name.rfind("/s/", 0) == 0;
+
   // Discounted slot rate for the upfront commitment (LAUNCH-time price).
   uint64_t slot = reqServer(ctx)->discountFee(
     FeeKind::ComputeSlot, slotFeePerSec(cfg));
-  uint64_t upfront = slot * kUpfrontSeconds;
+  uint64_t upfront = serverZone ? 0 : slot * kUpfrontSeconds;
 
-  if (fileBalance < upfront) {
+  if (!serverZone && fileBalance < upfront) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_FUND_TOO_LOW); return;
   }
 
@@ -1933,10 +1974,12 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
+  // STAT is public to any signer: allow a signer with no account here to read
+  // for free (cross-server discovery).
   reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor());
+    std::move(after), ctx->stream->get_executor(), /*allowMissingOrigin=*/true);
 }
 
 // ---------------------------------------------------------------------------
@@ -1997,10 +2040,12 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
+  // INSTANCES is public to any signer: allow a signer with no account here
+  // (a peer's P2P node discovering us) to read for free.
   reqServer(ctx)->_l2ValidateDedupAndDebit(
     signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
     ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor());
+    std::move(after), ctx->stream->get_executor(), /*allowMissingOrigin=*/true);
 }
 
 // ---------------------------------------------------------------------------

@@ -708,6 +708,7 @@ public:
     uint64_t lastInboundTime = 0;
     uint64_t lastCheckTime = 0;
     uint32_t pingFailures = 0;
+    uint16_t rpcPort = 0;   // peer's CesPlex rpc port (0 = not yet probed)
   };
   std::vector<PeerInfo> _peerSnapshot();
   // Vostro balances: for each peer pubkey, the balance of THAT peer's account on
@@ -825,6 +826,10 @@ public:
   //      are one logic-strand task, so retries serialize and exactly one is
   //      duplicate=false.
   // All stages run on the logic strand; callback hops to cbExecutor.
+  // allowMissingOrigin: for PUBLIC read verbs (compute STAT / INSTANCES) a
+  // signer with no account on THIS server is served for free instead of being
+  // rejected ORIGIN_NOT_FOUND. Required for cross-server discovery: a peer's
+  // P2P node has no account here yet still must read public instance records.
   void _l2ValidateDedupAndDebit(
       const ces::PublicKey& signer,
       int64_t amount,
@@ -832,7 +837,8 @@ public:
       uint64_t timeUs,
       uint64_t sigHash,
       std::function<void(uint8_t rc, bool duplicate)> cb,
-      boost::asio::any_io_executor cbExecutor);
+      boost::asio::any_io_executor cbExecutor,
+      bool allowMissingOrigin = false);
 
   // Ledger credit — creates or credits the destination account.
   // No validation, no nonce — server-authoritative (only called
@@ -1514,6 +1520,7 @@ private:
     bool verified = false;
     bool outbound = false;
     uint32_t pingFailures = 0;
+    uint16_t rpcPort = 0;   // peer's CesPlex rpc port, learned at probe time
   };
 
   std::mutex peerTableMutex_;

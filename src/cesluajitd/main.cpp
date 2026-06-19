@@ -230,6 +230,7 @@ constexpr uint16_t METHOD_BUCKET_NEW       = 0x0210;
 constexpr uint16_t METHOD_BUCKET_PUT       = 0x0211;
 constexpr uint16_t METHOD_BUCKET_GET       = 0x0212;
 constexpr uint16_t METHOD_AUTHENTIC_ASSET_CREATE = 0x0220;
+constexpr uint16_t METHOD_PEERS            = 0x0230;
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
@@ -875,6 +876,48 @@ int lua_ces_sha256(lua_State* L) {
   return 1;
 }
 
+// ces.sign(bytes) -> sig(65 bytes). Signs with this instance's program key.
+// The private key never enters the sandbox: signing happens here in the host
+// and only the signature comes back. Decorator byte + 64-byte signature.
+int lua_ces_sign(lua_State* L) {
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  ces::Hash priv{};
+  std::memcpy(priv.data(), g_program_privkey, 32);
+  ces::KeyPair kp(priv, ces::KeyAlgo::ED25519);
+  ces::Signature sig = kp.signData(s, n);
+  lua_pushlstring(L, reinterpret_cast<const char*>(sig.data()), sig.size());
+  return 1;
+}
+
+// ces.verify(pubkey(32), bytes, sig(65)) -> bool. Verifies any party's
+// signature over bytes; the signature's decorator byte selects the algorithm.
+int lua_ces_verify(lua_State* L) {
+  size_t pkn = 0, dn = 0, sn = 0;
+  const char* pk = luaL_checklstring(L, 1, &pkn);
+  const char* data = luaL_checklstring(L, 2, &dn);
+  const char* sigs = luaL_checklstring(L, 3, &sn);
+  if (pkn != 32 || sn != ces::SIG_SIZE) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  ces::Hash pkh{};
+  std::memcpy(pkh.data(), pk, 32);
+  ces::PublicKey pub(pkh);
+  ces::Signature sig{};
+  std::memcpy(sig.data(), sigs, ces::SIG_SIZE);
+  bool ok = false;
+  try {
+    ok = pub.verifySignature(data, dn, sig);
+  } catch (...) {
+    // A malformed pubkey or signature must verify as false, never throw
+    // through LuaJIT.
+    ok = false;
+  }
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
 // ces.client_recv([nowait]) → (sender_pfx:string(8), payload:string) | nil
 //
 // Default: BLOCKING. Drains the socket first (so any currently-
@@ -1200,6 +1243,51 @@ int lua_ces_remote_account_read(lua_State* L) {
   lua_pushnumber(L, static_cast<lua_Number>(lastAmt));
   lua_pushnumber(L, static_cast<lua_Number>(lastTime));
   return 5;
+}
+
+// ces.ping(addr) → {pubkey(32), rpc_port, min_difficulty} | nil, err
+//
+// Free MINX GetInfo handshake to a remote server: learns its public key and
+// the rpc port that reaches its CesPlex handlers (file/compute/luarpc). A P2P
+// node turns a peer's main address (from ces.peers) into the rpc endpoint where
+// the peer's DHT instance can be discovered and dialed. Ticketless, so it works
+// even against a no-PoW-engine peer.
+int lua_ces_ping(lua_State* L) {
+  if (g_program_port == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking permanently disabled (no compute port)");
+    return 2;
+  }
+  size_t alen = 0;
+  const char* addr = luaL_checklstring(L, 1, &alen);
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = ces::Resolver::resolveUdp(std::string(addr, alen));
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  ces::CesClient client(ep, /*useDataset=*/false);
+  client.setTries(1);  // fast-fail: a departed peer must not freeze the run loop
+  if (!client.start(g_program_port) || !client.connect()) {
+    lua_pushnil(L);
+    lua_pushstring(L, "unreachable");
+    return 2;
+  }
+  minx::Hash serverKey = client.getServerKey();
+  uint16_t rpcPort = client.getServerRpcPort();
+  uint8_t minDiff = client.getMinDifficulty();
+  client.disconnect();
+  client.stop();
+  lua_newtable(L);
+  lua_pushlstring(L, reinterpret_cast<const char*>(serverKey.data()), 32);
+  lua_setfield(L, -2, "pubkey");
+  lua_pushnumber(L, static_cast<lua_Number>(rpcPort));
+  lua_setfield(L, -2, "rpc_port");
+  lua_pushnumber(L, static_cast<lua_Number>(minDiff));
+  lua_setfield(L, -2, "min_difficulty");
+  return 1;
 }
 
 // ces.remote_transfer(addr:string, dest_pubkey:string(32), amount:number)
@@ -1530,6 +1618,46 @@ int lua_ces_account_read(lua_State* L) {
   lua_setfield(L, -2, "last_xfer_amount");
   lua_pushnumber(L, static_cast<lua_Number>(lastTime));
   lua_setfield(L, -2, "last_xfer_time");
+  return 1;
+}
+
+// ces.peers() → array of {pubkey(32), address, reachable, verified,
+//   outbound, inbound}. The local server's peer table snapshot (the same
+//   data the public CES_QUERY_PEER_INFO opcode exposes). This is the P2P
+//   overlay's bootstrap topology: a Lua node discovers its server's peers,
+//   then dials their instances over /ces/luarpc/1.
+int lua_ces_peers(lua_State* L) {
+  std::vector<uint8_t> args;  // no arguments
+  Frame reply;
+  if (!api_call(METHOD_PEERS, args, reply)) return push_ipc_fail(L);
+  if (reply.body.empty() || reply.body[0] != STATUS_OK)
+    return push_file_err(L, reply.body.empty() ? STATUS_INTERNAL : reply.body[0]);
+  const uint8_t* p = reply.body.data() + 1;
+  const uint8_t* end = reply.body.data() + reply.body.size();
+  if (p + 2 > end) return push_file_err(L, STATUS_INTERNAL);
+  uint16_t count = get_u16(p); p += 2;
+  lua_newtable(L);
+  for (uint16_t i = 0; i < count; ++i) {
+    if (p + 32 + 2 > end) break;
+    const uint8_t* ckey = p; p += 32;
+    uint16_t alen = get_u16(p); p += 2;
+    if (p + size_t(alen) + 1 + 2 > end) break;
+    const char* addr = reinterpret_cast<const char*>(p); p += alen;
+    uint8_t flags = *p; p += 1;
+    uint16_t rpcPort = get_u16(p); p += 2;
+    lua_newtable(L);
+    lua_pushlstring(L, reinterpret_cast<const char*>(ckey), 32);
+    lua_setfield(L, -2, "pubkey");
+    lua_pushlstring(L, addr, alen);
+    lua_setfield(L, -2, "address");
+    lua_pushboolean(L, (flags & 0x01) ? 1 : 0); lua_setfield(L, -2, "reachable");
+    lua_pushboolean(L, (flags & 0x02) ? 1 : 0); lua_setfield(L, -2, "verified");
+    lua_pushboolean(L, (flags & 0x04) ? 1 : 0); lua_setfield(L, -2, "outbound");
+    lua_pushboolean(L, (flags & 0x08) ? 1 : 0); lua_setfield(L, -2, "inbound");
+    lua_pushnumber(L, static_cast<lua_Number>(rpcPort));
+    lua_setfield(L, -2, "rpc_port");
+    lua_rawseti(L, -2, i + 1);
+  }
   return 1;
 }
 
@@ -2247,6 +2375,95 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
 // handler (dispatch_luarpc_event) is defined later in this file.
 void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e);
 
+// ---------------------------------------------------------------------------
+// Periodic timers — ces.every(ms, fn). The run loop fires due callbacks and
+// uses the nearest deadline as its poll timeout, so a program can do periodic
+// work (gossip rounds, liveness, republish) without an external driver. All on
+// the Lua thread, like the conn dispatchers.
+// ---------------------------------------------------------------------------
+struct LuaTimer {
+  uint64_t next_us;
+  uint64_t interval_us;
+  int ref;       // registry ref to the Lua function
+  bool active;
+};
+std::vector<LuaTimer> g_timers;
+
+static uint64_t timer_now_us() {
+  return static_cast<uint64_t>(
+    std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count());
+}
+
+// Poll timeout (ms) until the next due timer; -1 if no active timers.
+static int next_timer_timeout_ms() {
+  uint64_t next = std::numeric_limits<uint64_t>::max();
+  bool any = false;
+  for (auto& t : g_timers) {
+    if (t.active) { any = true; if (t.next_us < next) next = t.next_us; }
+  }
+  if (!any) return -1;
+  uint64_t now = timer_now_us();
+  if (next <= now) return 0;
+  uint64_t ms = (next - now) / 1000;
+  if (ms > 1000000) ms = 1000000;     // cap a single sleep at ~1000s
+  return static_cast<int>(ms) + 1;     // round up so we never wake early
+}
+
+static void fire_due_timers(lua_State* L) {
+  if (g_timers.empty()) return;
+  uint64_t now = timer_now_us();
+  // Index-based: a callback may register more timers (vector may reallocate),
+  // so never hold a reference across the pcall.
+  for (size_t i = 0; i < g_timers.size(); ++i) {
+    if (!g_timers[i].active || g_timers[i].next_us > now) continue;
+    int ref = g_timers[i].ref;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    if (lua_isfunction(L, -1)) {
+      if (lua_pcall(L, 0, 0, 0) != 0) {
+        std::fprintf(stderr, "cesluajitd: timer cb error: %s\n",
+                     lua_tostring(L, -1));
+        lua_pop(L, 1);
+      }
+    } else {
+      lua_pop(L, 1);
+    }
+    // Re-index (vector may have grown); a callback may have cancelled this one.
+    if (i < g_timers.size() && g_timers[i].ref == ref && g_timers[i].active) {
+      g_timers[i].next_us += g_timers[i].interval_us;
+      if (g_timers[i].next_us <= now)
+        g_timers[i].next_us = now + g_timers[i].interval_us;  // skip missed
+    }
+  }
+}
+
+// ces.every(ms, fn) -> id. Calls fn() every ms from the run loop. Returns a
+// timer id usable with ces.cancel.
+int lua_ces_every(lua_State* L) {
+  lua_Number ms = luaL_checknumber(L, 1);
+  luaL_checktype(L, 2, LUA_TFUNCTION);
+  if (ms < 1) ms = 1;
+  lua_pushvalue(L, 2);
+  int ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  uint64_t iv = static_cast<uint64_t>(ms * 1000.0);
+  g_timers.push_back({timer_now_us() + iv, iv, ref, true});
+  lua_pushinteger(L, ref);
+  return 1;
+}
+
+// ces.cancel(id) — stop a timer created by ces.every.
+int lua_ces_cancel(lua_State* L) {
+  int ref = static_cast<int>(luaL_checkinteger(L, 1));
+  for (auto& t : g_timers) {
+    if (t.ref == ref && t.active) {
+      t.active = false;
+      luaL_unref(L, LUA_REGISTRYINDEX, t.ref);
+      break;
+    }
+  }
+  return 0;
+}
+
 // The UNIFIED event loop — ces.run() (= ces.conn.run).
 // Consumes the program: blocks OUTSIDE Lua on every event source at once —
 // the host IPC socket (/ces/lua/1 conn frames + client DELIVER) AND the
@@ -2275,7 +2492,10 @@ int lua_ces_run(lua_State* L) {
       dispatch_luarpc_event(L, std::move(e));
     }
 
-    // Block until the next event on either source.
+    // Fire any due periodic timers (ces.every).
+    fire_due_timers(L);
+
+    // Block until the next event on either source, or the next timer deadline.
     pollfd pfds[2];
     pfds[0].fd = g_sock_fd;
     pfds[0].events = POLLIN;
@@ -2287,7 +2507,7 @@ int lua_ces_run(lua_State* L) {
       pfds[1].revents = 0;
       nfds = 2;
     }
-    int pr = ::poll(pfds, nfds, -1);
+    int pr = ::poll(pfds, nfds, next_timer_timeout_ms());
     if (pr < 0) {
       if (errno == EINTR) continue;
       return 0;
@@ -2870,6 +3090,9 @@ void push_instance_info(lua_State* L,
   lua_setfield(L, -2, "client_port");
   lua_pushnumber(L, static_cast<lua_Number>(info.rpcPort));
   lua_setfield(L, -2, "rpc_port");
+  lua_pushlstring(L, reinterpret_cast<const char*>(info.programPubkey.data()),
+                  info.programPubkey.size());
+  lua_setfield(L, -2, "program_pubkey");
 }
 
 int lua_cc_launch(lua_State* L) {
@@ -3018,6 +3241,10 @@ void install_ces_api(lua_State* L) {
   lua_newtable(L);
   lua_pushcfunction(L, lua_ces_now);           lua_setfield(L, -2, "now");
   lua_pushcfunction(L, lua_ces_sha256);        lua_setfield(L, -2, "sha256");
+  lua_pushcfunction(L, lua_ces_sign);          lua_setfield(L, -2, "sign");
+  lua_pushcfunction(L, lua_ces_verify);        lua_setfield(L, -2, "verify");
+  lua_pushcfunction(L, lua_ces_every);         lua_setfield(L, -2, "every");
+  lua_pushcfunction(L, lua_ces_cancel);        lua_setfield(L, -2, "cancel");
   lua_pushcfunction(L, lua_ces_client_recv);   lua_setfield(L, -2, "client_recv");
   lua_pushcfunction(L, lua_ces_client_send);   lua_setfield(L, -2, "client_send");
   lua_pushcfunction(L, lua_ces_prog_prefix);   lua_setfield(L, -2, "prog_prefix");
@@ -3028,6 +3255,8 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_transfer);      lua_setfield(L, -2, "transfer");
   lua_pushcfunction(L, lua_ces_random_bytes);  lua_setfield(L, -2, "random_bytes");
   lua_pushcfunction(L, lua_ces_account_read);  lua_setfield(L, -2, "account_read");
+  lua_pushcfunction(L, lua_ces_peers);         lua_setfield(L, -2, "peers");
+  lua_pushcfunction(L, lua_ces_ping);          lua_setfield(L, -2, "ping");
   lua_pushcfunction(L, lua_ces_authentic_asset_create);
   lua_setfield(L, -2, "authentic_asset_create");
   lua_pushcfunction(L, lua_ces_bucket_new);    lua_setfield(L, -2, "bucket_new");

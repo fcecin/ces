@@ -4216,11 +4216,13 @@ void CesServer::_l2ValidateDedupAndDebit(
     uint64_t timeUs,
     uint64_t sigHash,
     std::function<void(uint8_t rc, bool duplicate)> cb,
-    boost::asio::any_io_executor cbExecutor) {
+    boost::asio::any_io_executor cbExecutor,
+    bool allowMissingOrigin) {
   (void)timeUs; // reserved for future time-window enforcement beyond dedup
   auto self = this;
   postLogic(
-    [self, signer, amount, reqNonce, sigHash, cb, cbExecutor]() {
+    [self, signer, amount, reqNonce, sigHash, cb, cbExecutor,
+     allowMissingOrigin]() {
       // 1. NONCELESS dedup — CHECK ONLY (do NOT insert here). Keying the
       // record on the committed debit below (step 3), not on first sight
       // of the request, is what keeps a *failed* op retryable and stops a
@@ -4239,6 +4241,12 @@ void CesServer::_l2ValidateDedupAndDebit(
       uint8_t rc = acc.validateSpend(
         static_cast<uint64_t>(amount), 0, reqNonce, errFee);
       if (rc != CES_OK) {
+        // Public read verbs: a signer with no account here reads for free
+        // rather than being rejected, so cross-server discovery works.
+        if (allowMissingOrigin && rc == CES_ERROR_ORIGIN_NOT_FOUND) {
+          boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/false); });
+          return;
+        }
         boost::asio::post(cbExecutor, [cb, rc]() { cb(rc, /*duplicate=*/false); });
         return;
       }
@@ -4819,6 +4827,7 @@ std::vector<CesServer::PeerInfo> CesServer::_peerSnapshot() {
     pi.lastInboundTime = p.lastInboundTime;
     pi.lastCheckTime = p.lastCheckTime;
     pi.pingFailures = p.pingFailures;
+    pi.rpcPort = p.rpcPort;
     out.push_back(std::move(pi));
   }
   return out;
@@ -5344,6 +5353,7 @@ void CesServer::peerMinerLoop() {
             p.reachable = c.reachable;
             p.verified = c.verified;
             p.pingFailures = c.pingFailures;
+            p.rpcPort = c.rpcPort;
             p.lastCheckTime = c.lastCheckTime;
             p.resolvedIP = c.resolvedIP;
             p.resolvedEndpoint = c.resolvedEndpoint;
@@ -5400,6 +5410,10 @@ void CesServer::peerMinerLoop() {
         // Verify server key from handshake matches expected peer key
         peer.reachable = true;
         peer.verified = (client.getServerKey() == peer.ckey);
+        // The handshake already carries the peer's rpc port; capture it so the
+        // peer table (and ces.peers()) expose where to reach the peer's CesPlex
+        // handlers, no separate ces.ping needed on the discovery hot path.
+        peer.rpcPort = client.getServerRpcPort();
         peer.pingFailures = 0;
         peer.lastCheckTime = minx::getSecsSinceEpoch();
         if (!wasReachable || !everChecked) {
