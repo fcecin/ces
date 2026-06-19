@@ -603,6 +603,104 @@ void creditProgramAccount(CesServer* server, const Sidecar& sc, uint64_t amount)
   server->_l2CreditProgramAccountSync(pubkey, static_cast<int64_t>(amount));
 }
 
+// Top-up the server credits to each /s/ file's program account on every
+// reconcile (boot scan) or first on-access mint. /s/ programs are operator
+// donated; the server keeps the account funded (~100 user-credits at default
+// fees).
+constexpr int64_t kServerZoneProgramAccountTopUp = 10'000'000'000LL;
+
+// Reconcile one /s/ file: ensure it has a valid server-owned sidecar (minting a
+// fresh program keypair on first sight, preserving an existing one across
+// reboots, rewriting a stale one) and top up its program account. Pure disk
+// plus a sync hop to logicStrand_ for the credit, so it MUST run off
+// logicStrand_ (the file/rpc strand or boot). Returns the resulting sidecar in
+// `out`; false if the content file is unreadable. Shared by the boot scan
+// (reconcileServerZone) and the on-access lazy path (loadSidecar).
+bool reconcileOneServerZoneFile(CesServer* server, const std::string& dir,
+                                const std::string& name, Sidecar& out) {
+  namespace fs = std::filesystem;
+  auto cPath = resolveContentPath(dir, name);
+  std::error_code sec;
+  uint64_t size = static_cast<uint64_t>(fs::file_size(cPath, sec));
+  if (sec) return false;
+
+  std::array<uint8_t, 32> serverPk{};
+  std::memcpy(serverPk.data(),
+              server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
+
+  auto sPath = resolveSidecarPath(dir, name);
+  Sidecar existing{};
+  bool haveExisting = readSidecar(sPath, existing);
+
+  // Preserve an existing non-zero program keypair across reboots so assets
+  // already stamped with that identity stay resolvable; generate a fresh one
+  // only on first sight.
+  std::array<uint8_t, 32> programPubkey{};
+  std::array<uint8_t, 32> programPrivkey{};
+  bool existingHasPubkey = haveExisting && sidecarHasProgramAccount(existing);
+  if (existingHasPubkey) {
+    programPubkey = existing.program_pubkey;
+    programPrivkey = existing.program_privkey;
+  } else {
+    ces::KeyPair kp = ces::KeyPair::generate();
+    std::memcpy(programPubkey.data(), kp.getPublicKeyAsHash().data(), 32);
+    std::memcpy(programPrivkey.data(), kp.getPrivateKey().data(), 32);
+  }
+
+  bool sidecarOk = haveExisting &&
+    existing.size == size &&
+    existing.owner_pubkey == serverPk &&
+    existing.name == name &&
+    existingHasPubkey;
+
+  out = existing;
+  if (!sidecarOk) {
+    Sidecar s{};
+    s.version = kSidecarVersion;
+    s.name = name;
+    s.owner_pubkey = serverPk;
+    s.program_pubkey = programPubkey;
+    s.program_privkey = programPrivkey;
+    s.price_per_kb = 0;
+    s.size = size;
+    s.created_us = haveExisting && existing.created_us > 0
+      ? existing.created_us : getMicrosSinceEpoch();
+    s.modified_us = getMicrosSinceEpoch();
+    s.last_rent_us = s.modified_us;
+    if (!writeSidecar(sPath, s)) {
+      LOGWARNING << "/s/ sidecar write failed" << SVAR(name);
+      return false;
+    }
+    LOGDEBUG << "/s/ sidecar generated" << SVAR(name) << VAR(size);
+    out = s;
+  }
+
+  // Top up the program account from thin air. _brrInner creates the account if
+  // missing (e.g., recovered from rent exhaustion) and credits otherwise.
+  minx::Hash pubkey{};
+  std::memcpy(pubkey.data(), programPubkey.data(), 32);
+  server->_l2CreditProgramAccountSync(pubkey, kServerZoneProgramAccountTopUp);
+  return true;
+}
+
+// Fetch a file's sidecar by name. For the /s/ zone, if the sidecar is missing
+// but the content file is present (the operator dropped it on disk without a
+// signed CREATE), mint it on the fly via the same reconcile the boot scan runs
+// -- so "cp into /s/ and use it" works without a restart. The generated /s/
+// catalog and the bundled welcome site are static server content whose sidecars
+// are seeded elsewhere; they are never auto-minted a program account. MUST run
+// off logicStrand_ (the lazy mint may top up the program account via a sync
+// hop). Non-/s/ names: a plain readSidecar, no auto-create.
+bool loadSidecar(const std::string& dir, const std::string& name, Sidecar& sc) {
+  auto sPath = resolveSidecarPath(dir, name);
+  if (readSidecar(sPath, sc)) return true;
+  if (!isServerZone(name)) return false;
+  if (name == kServerIndexName || isBuiltinSitePath(name)) return false;
+  CesServer* server = gServer.load();
+  if (!server) return false;
+  return reconcileOneServerZoneFile(server, dir, name, sc);
+}
+
 bool chargeRentOrDelete(const std::filesystem::path& cPath,
                         const std::filesystem::path& sPath,
                         Sidecar& sc,
@@ -1308,7 +1406,7 @@ void dispatchRead(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!readSidecar(sPath, sc)) {
+  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) {
     sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
   }
   if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
@@ -1630,7 +1728,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!readSidecar(sPath, sc)) {
+  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) {
     sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
   }
   if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
@@ -2233,7 +2331,8 @@ void execStat(CesServer* server, FileExecReq req,
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, req.name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, req.name);
   Sidecar s{};
-  if (!readSidecar(sPath, s)) { resp.status = CES_ERROR_FILE_NOT_FOUND;
+  if (!loadSidecar(cfg.cesFileStoreDir, req.name, s)) {
+    resp.status = CES_ERROR_FILE_NOT_FOUND;
     boost::asio::post(cbEx, [cb, resp]() { cb(resp); }); return; }
   if (!chargeRentOrDelete(cPath, sPath, s, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
@@ -2268,7 +2367,8 @@ void execRead(CesServer* server, FileExecReq req,
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, req.name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, req.name);
   Sidecar s{};
-  if (!readSidecar(sPath, s)) { fail(CES_ERROR_FILE_NOT_FOUND); return; }
+  if (!loadSidecar(cfg.cesFileStoreDir, req.name, s)) {
+    fail(CES_ERROR_FILE_NOT_FOUND); return; }
   if (!chargeRentOrDelete(cPath, sPath, s, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     fail(CES_ERROR_FILE_NOT_FOUND); return;
@@ -2846,9 +2946,8 @@ bool fileHandlerReadProgramPubkey(
   CesServer* server = gServer.load();
   if (!server) return false;
   const auto& cfg = server->_config();
-  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!readSidecar(sPath, sc)) return false;
+  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
   outProgramPubkey = sc.program_pubkey;
   return true;
 }
@@ -2862,9 +2961,8 @@ bool fileHandlerReadProgramPrivkey(
   CesServer* server = gServer.load();
   if (!server) return false;
   const auto& cfg = server->_config();
-  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!readSidecar(sPath, sc)) return false;
+  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
   outProgramPrivkey = sc.program_privkey;
   return true;
 }
@@ -2879,7 +2977,7 @@ bool fileHandlerReadOwnerAndBalance(
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!readSidecar(sPath, sc)) return false;
+  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
   if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     // chargeRentOrDelete already fired notifyDeletion + removed disk.
@@ -3053,10 +3151,6 @@ void fileHandlerExec(
   }
 }
 
-// Top-up amount the server credits to each /s/ file's program account on
-// every reconcile. /s/ programs are operator-donated; the server keeps the
-// account funded (~100 user-credits at default fees).
-constexpr int64_t kServerZoneProgramAccountTopUp = 10'000'000'000LL;
 
 // Walk <storeDir>/s/ and ensure every regular non-sidecar file has a
 // well-formed sidecar pointing at the server's pubkey. Handles two cases:
@@ -3076,11 +3170,7 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
   std::error_code ec;
   if (!fs::exists(sRoot, ec)) return;
 
-  std::array<uint8_t, 32> serverPk{};
-  std::memcpy(serverPk.data(),
-              server->_serverKeyPair().getPublicKeyAsHash().data(), 32);
   const std::string suffix = kSidecarSuffix;
-
   for (auto it = fs::recursive_directory_iterator(sRoot, ec);
        !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
     if (!it->is_regular_file()) continue;
@@ -3091,82 +3181,21 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
         fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0)
       continue;
 
-    // Compute the canonical CES name: "/s/<rel>". it->path() is
-    // absolute; strip the dir prefix and prepend "/".
+    // Compute the canonical CES name: "/s/<rel>". it->path() is absolute;
+    // strip the dir prefix and prepend "/".
     fs::path rel = fs::relative(cPath, fs::path(dir));
     std::string name = "/" + rel.generic_string();
-    // The generated /s/ catalog is owned by regenerateServerIndex — it has no
-    // program account and must not be "fixed up" or minted one here.
+    // The generated /s/ catalog and the bundled welcome site are static server
+    // content (seeded with their own sidecars elsewhere) — never mint them a
+    // program account.
     if (name == kServerIndexName) continue;
-    // The bundled /s/welcome site is static server content seeded by
-    // seedBuiltinSite (server-owned sidecar, no program account) — same deal.
     if (isBuiltinSitePath(name)) continue;
 
-    auto sPath = resolveSidecarPath(dir, name);
-    uint64_t size = 0;
-    {
-      std::error_code sec;
-      size = static_cast<uint64_t>(fs::file_size(cPath, sec));
-      if (sec) continue;
-    }
-
-    Sidecar existing{};
-    bool haveExisting = readSidecar(sPath, existing);
-
-    // Preserve an existing non-zero program_pubkey across reboots so
-    // already-minted assets stamped with that program identity stay
-    // resolvable. Generate a fresh one only on first sight.
-    std::array<uint8_t, 32> programPubkey{};
-    std::array<uint8_t, 32> programPrivkey{};
-    bool existingHasPubkey = haveExisting &&
-      sidecarHasProgramAccount(existing);
-    if (existingHasPubkey) {
-      programPubkey = existing.program_pubkey;
-      programPrivkey = existing.program_privkey;
-    } else {
-      ces::KeyPair kp = ces::KeyPair::generate();
-      std::memcpy(programPubkey.data(), kp.getPublicKeyAsHash().data(), 32);
-      std::memcpy(programPrivkey.data(), kp.getPrivateKey().data(), 32);
-    }
-
-    bool sidecarOk = haveExisting &&
-      existing.size == size &&
-      existing.owner_pubkey == serverPk &&
-      existing.name == name &&
-      existingHasPubkey;
-
-    if (!sidecarOk) {
-      Sidecar s{};
-      s.version = kSidecarVersion;
-      s.name = name;
-      s.owner_pubkey = serverPk;
-      s.program_pubkey = programPubkey;
-      s.program_privkey = programPrivkey;
-      s.price_per_kb = 0;
-      s.size = size;
-      s.created_us = haveExisting && existing.created_us > 0
-        ? existing.created_us : getMicrosSinceEpoch();
-      s.modified_us = getMicrosSinceEpoch();
-      s.last_rent_us = s.modified_us;
-
-      if (writeSidecar(sPath, s)) {
-        LOGDEBUG << "/s/ sidecar generated"
-                 << SVAR(name) << VAR(size);
-      } else {
-        LOGWARNING << "/s/ sidecar write failed"
-                   << SVAR(name);
-        continue;
-      }
-    }
-
-    // Top up the program account from thin air. _brrInner creates
-    // the account if missing (e.g., recovered from rent exhaustion)
-    // and credits otherwise. /s/ programs draw on this for compute
-    // supervision + Lua-side ces.transfer / asset minting.
-    minx::Hash pubkey{};
-    std::memcpy(pubkey.data(), programPubkey.data(), 32);
-    server->_l2CreditProgramAccountSync(
-      pubkey, kServerZoneProgramAccountTopUp);
+    // Same per-file mint the on-access lazy path uses: one mechanism, two
+    // callers. Boot eagerly walks the whole zone so already-deployed programs
+    // are stamped and topped up before launchBuiltinApps runs.
+    Sidecar s{};
+    reconcileOneServerZoneFile(server, dir, name, s);
   }
 }
 

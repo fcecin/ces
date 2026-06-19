@@ -22,6 +22,8 @@
 #include <ces/server.h>
 
 #include <chrono>
+#include <cstring>
+#include <fstream>
 #include <thread>
 
 using namespace ces;
@@ -251,6 +253,44 @@ BOOST_AUTO_TEST_CASE(BundledWelcomeSiteIsSeeded) {
   std::string cat;
   CES_REQUIRE_OK(readWhole("/s/index.html", cat));
   BOOST_CHECK(cat.find("/s/welcome/index.html") != std::string::npos);
+}
+
+// An operator can drop a program straight onto disk under <storeDir>/s/ with no
+// signed CREATE and no sidecar; the first fetch from the /s/ zone mints the
+// sidecar on the fly (server-owned, fresh program account) — the same per-file
+// reconcile the boot scan runs — so "cp into /s/ and use it" works without a
+// restart.
+BOOST_AUTO_TEST_CASE(ServerZoneLazyMintsSidecarForDroppedFile) {
+  const std::string& storeDir = server->_config().cesFileStoreDir;
+  fs::path sDir = fs::path(storeDir) / "s";
+  fs::create_directories(sDir);
+  fs::path content = sDir / "dropped.lua";
+  fs::path sidecar(content.string() + ".sidecar.toml");
+
+  const std::string body = "return 42\n";
+  {
+    std::ofstream f(content, std::ios::binary);
+    f << body;
+  }
+  BOOST_REQUIRE(fs::exists(content));
+  BOOST_REQUIRE(!fs::exists(sidecar));   // no signed CREATE happened
+
+  // First fetch (STAT by any signer) materializes the sidecar on the spot.
+  auto fc = connectClient(otherKey);
+  CesFileClient::StatInfo si;
+  CES_REQUIRE_OK(fc->stat("/s/dropped.lua", si));
+  BOOST_CHECK_EQUAL(si.size, body.size());
+
+  // The minted sidecar is server-owned, and now exists on disk.
+  const auto& srvPk = server->_serverKeyPair().getPublicKeyAsHash();
+  BOOST_CHECK(std::memcmp(si.ownerPubkey.data(), srvPk.data(), 32) == 0);
+  BOOST_CHECK(fs::exists(sidecar));
+
+  // And the dropped bytes read back unchanged.
+  ces::Bytes data; minx::Hash h;
+  CES_REQUIRE_OK(fc->read("/s/dropped.lua", 0, si.size, data, h));
+  std::string got(data.begin(), data.end());
+  BOOST_CHECK_EQUAL(got, body);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
