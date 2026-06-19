@@ -188,6 +188,10 @@ constexpr uint16_t kApiMethodBucketGet    = 0x0212;
 // paid by the program's owner account.
 constexpr uint16_t kApiMethodAuthenticAssetCreate = 0x0220;
 constexpr uint16_t kApiMethodPeers        = 0x0230;
+constexpr uint16_t kApiMethodPeerAdd       = 0x0231;
+constexpr uint16_t kApiMethodPeerRemove    = 0x0232;
+constexpr uint16_t kApiMethodPeerTargetSet = 0x0233;
+constexpr uint16_t kApiMethodPeerTargetGet = 0x0234;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -213,6 +217,7 @@ constexpr uint8_t kFileVerbResize   = 0x0a;
 constexpr uint8_t kApiStatusOk            = 0x00;
 constexpr uint8_t kApiStatusNotConnected  = 0x01;
 constexpr uint8_t kApiStatusInsufficient  = 0x02;
+constexpr uint8_t kApiStatusDenied        = 0x03;  // privileged API, non-/s/ caller
 constexpr uint8_t kApiStatusInternal      = 0xFF;
 
 constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
@@ -1191,6 +1196,77 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       body.push_back(flags);
       ces::Buffer::put<uint16_t>(body, p.rpcPort);
     }
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
+  // ---- Peering control (privileged: /s/ programs only). The supervisor is the
+  //   authority -- it gates on the instance's own source zone, so the boundary
+  //   holds even if a child bypasses cesluajitd's registration-time gate.
+
+  // ces.add_peer(pubkey, address) — establish an outbound peering.
+  //   Request: [32B pubkey][address bytes]. Reply: [u8 status].
+  if (method == kApiMethodPeerAdd) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    if (mlen <= 32 || mlen > 32 + 256) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    CesServer* server = gServer.load();
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    minx::Hash ckey{};
+    std::memcpy(ckey.data(), mbody, 32);
+    std::string address(reinterpret_cast<const char*>(mbody + 32), mlen - 32);
+    server->_addOutboundPeer(ckey, address);
+    sendApiReply(inst, corr_id, kApiStatusOk);
+    return;
+  }
+
+  // ces.remove_peer(pubkey) — drop a peering.
+  //   Request: [32B pubkey]. Reply: [u8 status][u8 removed].
+  if (method == kApiMethodPeerRemove) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    if (mlen < 32) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    CesServer* server = gServer.load();
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    minx::Hash ckey{};
+    std::memcpy(ckey.data(), mbody, 32);
+    bool removed = server->_removePeer(ckey);
+    ces::Bytes body;
+    body.push_back(removed ? 1 : 0);
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
+  // ces.set_peer_target(credits) — set the reserve-mining target the peer miner
+  //   drives toward. Request: [u64 BE]. Reply: [u8 status].
+  if (method == kApiMethodPeerTargetSet) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    if (mlen < sizeof(uint64_t)) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    CesServer* server = gServer.load();
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    server->_setPeerTarget(ces::Buffer::peek<uint64_t>(mbody));
+    sendApiReply(inst, corr_id, kApiStatusOk);
+    return;
+  }
+
+  // ces.peer_target() — read the current reserve-mining target.
+  //   Reply: [u8 status][u64 BE target].
+  if (method == kApiMethodPeerTargetGet) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    CesServer* server = gServer.load();
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    ces::Bytes body;
+    ces::Buffer::put<uint64_t>(body, server->_peerTarget());
     sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
     return;
   }

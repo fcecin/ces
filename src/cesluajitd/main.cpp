@@ -232,6 +232,10 @@ constexpr uint16_t METHOD_BUCKET_PUT       = 0x0211;
 constexpr uint16_t METHOD_BUCKET_GET       = 0x0212;
 constexpr uint16_t METHOD_AUTHENTIC_ASSET_CREATE = 0x0220;
 constexpr uint16_t METHOD_PEERS            = 0x0230;
+constexpr uint16_t METHOD_PEER_ADD         = 0x0231;
+constexpr uint16_t METHOD_PEER_REMOVE      = 0x0232;
+constexpr uint16_t METHOD_PEER_TARGET_SET  = 0x0233;
+constexpr uint16_t METHOD_PEER_TARGET_GET  = 0x0234;
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
@@ -1679,6 +1683,83 @@ int lua_ces_peers(lua_State* L) {
     lua_setfield(L, -2, "rpc_port");
     lua_rawseti(L, -2, i + 1);
   }
+  return 1;
+}
+
+// Peering control (privileged: registered only for /s/ programs, and the
+// supervisor enforces the same gate). These let an operator-deployed extension
+// run the node's peering policy from Lua -- e.g. an autopeering agent that
+// learns the network from gossip and decides who to befriend.
+
+// ces.add_peer(pubkey(32), address) -> true | nil,err. Establish an outbound
+// peering; the peer miner then probes it (and mines a reserve if the target>0).
+int lua_ces_add_peer(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L); lua_pushstring(L, "peer pubkey must be 32 bytes"); return 2;
+  }
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 2, &addr_len);
+  if (addr_len == 0 || addr_len > 256) {
+    lua_pushnil(L); lua_pushstring(L, "address must be 1..256 bytes"); return 2;
+  }
+  std::vector<uint8_t> args;
+  put_bytes(args, pk, 32);
+  put_bytes(args, addr, addr_len);
+  Frame reply;
+  if (!api_call(METHOD_PEER_ADD, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// ces.remove_peer(pubkey(32)) -> removed(bool) | nil,err.
+int lua_ces_remove_peer(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L); lua_pushstring(L, "peer pubkey must be 32 bytes"); return 2;
+  }
+  std::vector<uint8_t> args;
+  put_bytes(args, pk, 32);
+  Frame reply;
+  if (!api_call(METHOD_PEER_REMOVE, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  lua_pushboolean(L, reply.body.size() >= 2 && reply.body[1] != 0);
+  return 1;
+}
+
+// ces.set_peer_target(credits) -> true | nil,err. The reserve the peer miner
+// aims to accumulate on each peer (0 = never mine, just keep peers fresh).
+int lua_ces_set_peer_target(lua_State* L) {
+  lua_Number n = luaL_checknumber(L, 1);
+  if (n < 0 || n > 9.2233720368547e18) {
+    lua_pushnil(L); lua_pushstring(L, "target out of range"); return 2;
+  }
+  std::vector<uint8_t> args;
+  put_u64(args, static_cast<uint64_t>(n));
+  Frame reply;
+  if (!api_call(METHOD_PEER_TARGET_SET, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// ces.peer_target() -> credits(number) | nil,err.
+int lua_ces_peer_target(lua_State* L) {
+  std::vector<uint8_t> args;  // no arguments
+  Frame reply;
+  if (!api_call(METHOD_PEER_TARGET_GET, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (reply.body.size() < 1 + sizeof(uint64_t))
+    return push_file_err(L, STATUS_INTERNAL);
+  uint64_t target = get_u64(reply.body.data() + 1);
+  lua_pushnumber(L, static_cast<lua_Number>(target));
   return 1;
 }
 
@@ -3363,6 +3444,15 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, lua_ces_random_bytes);  lua_setfield(L, -2, "random_bytes");
   lua_pushcfunction(L, lua_ces_account_read);  lua_setfield(L, -2, "account_read");
   lua_pushcfunction(L, lua_ces_peers);         lua_setfield(L, -2, "peers");
+  // Peering CONTROL is operator-only: present solely for privileged (/s/)
+  // programs. The supervisor enforces the same gate, so the boundary holds even
+  // if the sandbox were bypassed.
+  if (g_privileged) {
+    lua_pushcfunction(L, lua_ces_add_peer);        lua_setfield(L, -2, "add_peer");
+    lua_pushcfunction(L, lua_ces_remove_peer);     lua_setfield(L, -2, "remove_peer");
+    lua_pushcfunction(L, lua_ces_set_peer_target); lua_setfield(L, -2, "set_peer_target");
+    lua_pushcfunction(L, lua_ces_peer_target);     lua_setfield(L, -2, "peer_target");
+  }
   lua_pushcfunction(L, lua_ces_ping);          lua_setfield(L, -2, "ping");
   lua_pushcfunction(L, lua_ces_authentic_asset_create);
   lua_setfield(L, -2, "authentic_asset_create");
