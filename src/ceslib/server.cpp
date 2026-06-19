@@ -5324,6 +5324,36 @@ void CesServer::peerMinerLoop() {
                         : static_cast<int64_t>(p.totalOutboundPoW);
     };
 
+    // Merge probe + mining results for every candidate we touched this round
+    // back into peerTable_. `lastCheckTime != 0` means the probe loop actually
+    // ran on this candidate (either success or failure path updates it).
+    // Called twice per cycle: once right after probing so reachability is
+    // visible to cross-transfers immediately, and once after mining to persist
+    // the updated reserve/PoW totals. The post-probe call matters because
+    // mining a single peer can run RandomX for a long time; without it a peer
+    // that needs mining holds its fresh reachability hostage to that mining,
+    // and cross-transfers fail CES_ERROR_UNKNOWN_PEER for the whole duration.
+    auto mergeCandidates = [&]() {
+      std::lock_guard lock(peerTableMutex_);
+      for (const auto& c : candidates) {
+        if (c.lastCheckTime == 0) continue;
+        for (auto& p : peerTable_) {
+          if (p.ckey == c.ckey) {
+            p.ourBalanceThere = c.ourBalanceThere;
+            p.totalOutboundPoW = c.totalOutboundPoW;
+            p.reachable = c.reachable;
+            p.verified = c.verified;
+            p.pingFailures = c.pingFailures;
+            p.lastCheckTime = c.lastCheckTime;
+            p.resolvedIP = c.resolvedIP;
+            p.resolvedEndpoint = c.resolvedEndpoint;
+            p.resolvedEndpointValid = c.resolvedEndpointValid;
+            break;
+          }
+        }
+      }
+    };
+
     // Pick the neediest reachable peer: largest positive gap (target - progress).
     int bestIdx = -1;
     int64_t bestGap = 0;
@@ -5409,6 +5439,9 @@ void CesServer::peerMinerLoop() {
         bestIdx = i;
       }
     }
+
+    // Make reachability visible before the (possibly long) mining step below.
+    mergeCandidates();
 
     if (bestIdx >= 0) {
       auto& peer = candidates[bestIdx];
@@ -5509,33 +5542,9 @@ void CesServer::peerMinerLoop() {
       LOGTRACE << "peer miner: all peers at target or unreachable";
     }
 
-    // Persist probe + mining results for every candidate we touched this
-    // round. `lastCheckTime != 0` means the probe loop actually ran on
-    // this candidate (either success or failure path updates it). Without
-    // this pass, peers that were probed but not picked as `bestIdx` would
-    // silently discard their fresh `reachable`/`ourBalanceThere` — so a
-    // peer whose reserve is already at target never gets its reachability
-    // persisted, and cross-transfers fail with CES_ERROR_UNKNOWN_PEER.
-    {
-      std::lock_guard lock(peerTableMutex_);
-      for (const auto& c : candidates) {
-        if (c.lastCheckTime == 0) continue;
-        for (auto& p : peerTable_) {
-          if (p.ckey == c.ckey) {
-            p.ourBalanceThere = c.ourBalanceThere;
-            p.totalOutboundPoW = c.totalOutboundPoW;
-            p.reachable = c.reachable;
-            p.verified = c.verified;
-            p.pingFailures = c.pingFailures;
-            p.lastCheckTime = c.lastCheckTime;
-            p.resolvedIP = c.resolvedIP;
-            p.resolvedEndpoint = c.resolvedEndpoint;
-            p.resolvedEndpointValid = c.resolvedEndpointValid;
-            break;
-          }
-        }
-      }
-    }
+    // Persist the post-mining reserve/PoW totals (reachability was already
+    // merged right after the probe loop above).
+    mergeCandidates();
     savePeerData();
 
     // Heartbeat — a visible "the thread is alive and just cycled" signal for
