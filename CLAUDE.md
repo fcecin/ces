@@ -84,7 +84,7 @@ cesweb/             L3 HTTP gateway (Node) serving CES files + a /dev terminal t
 
 CES has exactly two ledger types: **Account** and **Asset**. Files, programs, schedules, namespaces, autoexec, the market — all compose out of those two. No separate file/program/namespace tables.
 
-**Account** (map key = first 8 bytes of `sha256(pubkey)`; a key-tail disambiguates prefix collisions):
+**Account** (map key = first 8 bytes of the raw pubkey, not a hash of it; a key-tail disambiguates prefix collisions):
 - `balance` — **sign-overloaded**: positive = ordinary account; negative = unsettled payment account
 - `nonce` — replay counter (`reqNonce == nonce+1`), **overloaded** on payment accounts as days-until-expiry
 - last-transfer receipt (dest/amount/time) — doubles as the signed single-query payment proof
@@ -111,7 +111,7 @@ Wallet format: one key per line, `"00" + 64-hex` or `"01" + 64-hex`. Wallets val
 
 **Private vs public key — read this before scripting cesh/ces (easy to get wrong):**
 - A wallet line / `cesh keys list` entry is the **decorated PRIVATE key**: a leading byte (`00`=ed25519, `01`=secp256k1) **that is part of the key (the algorithm), not padding** — `"00"+64-hex` = **66 hex chars** total. `keys list` is **private-key-prioritized** and does **NOT** print the public key.
-- The **public key** is the **account identity** — what you credit, query, and what the ledger keys accounts by (map key = first 8 bytes of the pubkey hash). It is **64 hex chars, no decorator**. `cesh keys gen` shows it in **parentheses** after the private key; `ces --genkeypair` labels `Private Key:` / `Public Key:` cleanly.
+- The **public key** is the **account identity** — what you credit, query, and what the ledger keys accounts by (map key = first 8 bytes of the raw pubkey). It is **64 hex chars, no decorator**. `cesh keys gen` shows it in **parentheses** after the private key; `ces --genkeypair` labels `Private Key:` / `Public Key:` cleanly.
 - **NEVER** `grep -oE '[0-9a-fA-F]{64}'` a `keys list` line to get an account key — that grabs the decorator byte + the first 31 bytes of the private key (a mangled 64-hex value). Use `ces --genkeypair`'s `Public Key:` line, or the parenthesized value from `cesh keys gen`.
 - Funding the wrong hex is **silently self-consistent**: `ces credit <wrong>` and `cesh query <wrong>` agree (both key by the same wrong prefix, so the balance "shows up"), but every **signed/L2 op rejects it as `CES_ERROR_ORIGIN_NOT_FOUND`** because it binds the real key. If a funded account works for `query` but signed ops say ORIGIN_NOT_FOUND, you funded the wrong key.
 

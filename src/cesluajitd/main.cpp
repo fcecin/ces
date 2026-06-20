@@ -241,6 +241,7 @@ constexpr uint16_t METHOD_PEER_TARGET_GET  = 0x0234;
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
 constexpr uint8_t STATUS_INSUFFICIENT_BAL = 0x02;
+constexpr uint8_t STATUS_BUCKET_FULL      = 0x04;
 constexpr uint8_t STATUS_INTERNAL         = 0xFF;
 
 // Byte widths of fixed wire fields shared with the host. This TU has no
@@ -1786,18 +1787,20 @@ int lua_ces_peer_target(lua_State* L) {
 }
 
 // ---------------------------------------------------------------------------
-// ces.bucket_* — per-instance rotating cache (TTL-bounded forgetting).
+// ces.bucket_* - per-instance rotating cache (TTL-bounded forgetting).
 //
 // Backed by minx::BucketCache on the host. Two rotating buckets with
-// auto-flip at ttl_secs: an entry put at time T is guaranteed present
-// for at least ttl_secs and at most 2×ttl_secs before being aged out.
-// Programs that need replay-protection state (dice.lua's per-user
-// last-consumed transfer time, etc.) use this so they don't have to
-// keep "all deposits for all eternity."
+// auto-flip at ttl_secs: an entry is guaranteed present for at least
+// ttl_secs and at most 2x ttl_secs before being aged out. Capacity is
+// enforced by REFUSAL, not eviction: when the active bucket is full,
+// put returns false instead of clearing entries, so the ttl_secs
+// retention floor holds regardless of load. Programs that need
+// replay-protection state (dice.lua's per-deposit marker, etc.) use
+// this so they don't have to keep "all deposits for all eternity."
 //
 // Surface:
-//   local b = ces.bucket_new(ttl_secs[, max_size])
-//   b:put(key, value)            -- key, value are Lua strings (bytes)
+//   local b = ces.bucket_new(ttl_secs, max_entries, max_entry_bytes)
+//   local ok = b:put(key, value) -- true if stored; false if bucket full
 //   local v = b:get(key)         -- string, or nil if missing
 //
 // `key` and `value` are arbitrary bytes (Lua's lstring carries length).
@@ -1833,6 +1836,7 @@ int lua_ces_bucket_put(lua_State* L) {
   Frame reply;
   if (!api_call(METHOD_BUCKET_PUT, args, reply)) return push_ipc_fail(L);
   uint8_t st = reply.body[0];
+  if (st == STATUS_BUCKET_FULL) { lua_pushboolean(L, 0); return 1; }
   if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;

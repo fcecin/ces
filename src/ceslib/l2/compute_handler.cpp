@@ -220,6 +220,7 @@ constexpr uint8_t kApiStatusOk            = 0x00;
 constexpr uint8_t kApiStatusNotConnected  = 0x01;
 constexpr uint8_t kApiStatusInsufficient  = 0x02;
 constexpr uint8_t kApiStatusDenied        = 0x03;  // privileged API, non-/s/ caller
+constexpr uint8_t kApiStatusBucketFull    = 0x04;  // bucket at capacity, put refused
 constexpr uint8_t kApiStatusInternal      = 0xFF;
 
 constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
@@ -1133,7 +1134,9 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     std::string val(reinterpret_cast<const char*>(mbody + off), vlen);
-    it->second.cache->put(key, val);
+    if (!it->second.cache->tryPut(key, val)) {
+      sendApiReply(inst, corr_id, kApiStatusBucketFull); return;
+    }
     sendApiReply(inst, corr_id, kApiStatusOk);
     return;
   }

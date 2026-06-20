@@ -39,21 +39,20 @@ local HOUSE_PREFIX = HOUSE_PUBKEY:sub(1, 8)
 -- aimed at it. Replay-protection floor.
 local START_S = math.floor(ces.start_time() / 1000000)
 
--- Replay-protection bucket. Maps user_pubkey (32 bytes raw) to the
--- last_xfer_time (decimal string, ≤ 10 chars) of the deposit we
--- already played for that user. Bucket TTL = BUCKET_TTL_S; entries
--- older than that may have been aged out, so any deposit older than
--- (now - BUCKET_TTL_S + GRACE_S) is rejected as too-old-to-track.
+-- Replay-protection bucket. Key = a deposit's identity (player pubkey +
+-- the ledger time of the transfer); presence means "already played." A
+-- new transfer is a new key, so a new playable deposit. The bucket flips
+-- on a BUCKET_TTL_S period and retains a marker for at least one period;
+-- a deposit older than one period is rejected before we look, so a still-
+-- playable deposit's marker is always still present.
 --
--- Capacity is declared up-front: max_entries × max_entry_bytes is
--- the standing footprint the host bills against (feeBucketByteSec).
--- 32 (key) + ~10 (value) + slack ⇒ 64 bytes per entry; 100k entries
--- ⇒ ~6.4 MB committed. /s/ files are unmetered so the bill is a
--- no-op for the bottomless server account.
-local BUCKET_TTL_S    = 7200      -- 2 hours of guaranteed retention
-local BUCKET_MAX_E    = 100000    -- up to 100k unique players
-local BUCKET_MAX_B    = 64        -- bytes per entry (key + value)
-local GRACE_S         = 60        -- safety margin on the bucket horizon
+-- Capacity is declared up front: max_entries x max_entry_bytes is the
+-- standing footprint the host bills against (feeBucketByteSec). About
+-- 64 bytes per entry, 100k entries -> ~6.4 MB. /s/ files are unmetered,
+-- so the bill is a no-op for the bottomless server account.
+local BUCKET_TTL_S = 7200      -- one bucket flip period == the play window
+local BUCKET_MAX_E = 100000    -- recent deposits tracked at once
+local BUCKET_MAX_B = 64        -- bytes per entry (key + value)
 local consumed = ces.bucket_new(BUCKET_TTL_S, BUCKET_MAX_E, BUCKET_MAX_B)
 if not consumed then
   error("/s/dice.lua: failed to allocate bucket cache")
@@ -121,6 +120,12 @@ end
 -- (0, why, nil) otherwise. This is the contract's notion of "your balance"
 -- (chips on the table), NOT your CES account balance. `balance` reports it;
 -- `play` spends it. Shared so the two can never disagree.
+-- A deposit's single-use identity: the player's key plus the ledger time of
+-- their transfer. A fresh transfer has a new time, hence a new playable key.
+local function deposit_key(pubkey, t)
+  return pubkey .. tostring(t)
+end
+
 local function pending_bet(conn)
   local acc, err = ces.account_read(conn.pubkey)
   if not acc then return 0, "account read failed: " .. tostring(err), nil end
@@ -133,35 +138,59 @@ local function pending_bet(conn)
     return 0, "your deposit of " .. tostring(n) ..
               " is below the minimum bet of " .. MIN_BET .. ".", nil
   end
-  if acc.last_xfer_time <= START_S then
+  local t = acc.last_xfer_time
+
+  -- Predates this instance: the bucket was empty at boot, so a deposit from
+  -- before it cannot be proven unplayed. Reject (replay guard across restart).
+  if t <= START_S then
     return 0, "your deposit predates this dice instance; send a fresh transfer.", nil
   end
-  -- Anything older than the bucket's guaranteed-retention window may have aged
-  -- out of `consumed`, so we can't tell if it was already played. Reject.
+
+  -- now - deposit_time must be within one bucket flip period. Past that, the
+  -- marker may have aged out, so we can no longer prove the deposit unplayed.
   local now_s = math.floor(ces.now() / 1000000)
-  if acc.last_xfer_time < (now_s - BUCKET_TTL_S + GRACE_S) then
-    return 0, "your deposit is too old to verify (over " ..
+  if now_s - t > BUCKET_TTL_S then
+    return 0, "your deposit is too old to play (over " ..
               tostring(BUCKET_TTL_S) .. "s); send a fresh transfer.", nil
   end
-  local prior_str = consumed:get(conn.pubkey)
-  if prior_str then
-    local prior_t = tonumber(prior_str)
-    if prior_t and acc.last_xfer_time <= prior_t then
-      return 0, "that deposit was already played. transfer again to bet again.", nil
-    end
+
+  -- Single-use: present in the bucket means this exact deposit already played.
+  if consumed:get(deposit_key(conn.pubkey, t)) then
+    return 0, "that deposit was already played. transfer again to bet again.", nil
   end
-  return n, nil, acc.last_xfer_time
+
+  return n, nil, t
 end
 
 local function handle_play(conn)
   local n, why, xfer_time = pending_bet(conn)
   if n == 0 then send_line(conn, why); return end
 
+  local payout = n * 2
+
+  -- Solvency: never take a bet the house can't pay 2x on. The deposit already
+  -- sits in the house account, so its balance must be >= payout. Reject
+  -- WITHOUT consuming, so the deposit stays playable once the house is funded.
+  local house, herr = ces.account_read(HOUSE_PUBKEY)
+  if not house then
+    send_line(conn, "house unavailable (" .. tostring(herr) .. "); try again.")
+    return
+  end
+  if house.balance < payout then
+    send_line(conn, "house can't cover a " .. payout ..
+                    " payout right now; bet less or try later.")
+    return
+  end
+
   -- Consume FIRST so a quick double-tap can't double-spend the same transfer.
-  consumed:put(conn.pubkey, tostring(xfer_time))
+  -- Fail-closed: if the replay cache is full, refuse rather than play a bet we
+  -- cannot dedup. The deposit is not consumed, so it stays playable for a retry.
+  if not consumed:put(deposit_key(conn.pubkey, xfer_time), "1") then
+    send_line(conn, "house busy right now; try `play` again shortly.")
+    return
+  end
 
   if flip() then
-    local payout = n * 2
     local ok, terr = ces.transfer(conn.pubkey, payout)
     if not ok then
       send_line(conn,
@@ -189,10 +218,19 @@ local function handle_line(conn, line)
   end
 
   if line == "balance" then
-    -- The CONTRACT balance: credits deposited and available to play (0 once
-    -- played — winnings go to your CES account, not back onto the table).
-    local n = pending_bet(conn)
-    send_line(conn, "available to play: " .. n)
+    -- The CONTRACT balance: credits deposited and playable right now (0 once
+    -- played, or once the deposit ages past the play window), plus the seconds
+    -- left to play it. Winnings go to your CES account, not back onto the table.
+    local n, _, t = pending_bet(conn)
+    if n == 0 then
+      send_line(conn, "available to play: 0")
+    else
+      local now_s = math.floor(ces.now() / 1000000)
+      local left = BUCKET_TTL_S - (now_s - t)
+      if left < 0 then left = 0 end
+      send_line(conn, "available to play: " .. n)
+      send_line(conn, "time left to play: " .. left .. "s")
+    end
     return
   end
 

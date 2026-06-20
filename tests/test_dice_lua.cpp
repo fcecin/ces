@@ -74,12 +74,20 @@ void drainQuiet(PlexLuaPeer& peer, PlexLineReader& rd) {
 }
 
 // `balance` → the integer after "available to play:" (the contract balance).
+// A live (playable) deposit also prints a "time left to play: Ns" line; consume
+// it so it doesn't desync the next read, and assert it's there.
 int64_t readAvailable(PlexLuaPeer& peer, PlexLineReader& rd) {
   BOOST_REQUIRE(sendCmd(peer, "balance\n"));
   const std::string marker = "available to play:";
   std::string line = rd.lineContaining(marker);
   BOOST_REQUIRE_MESSAGE(!line.empty(), "dice did not answer `balance`");
-  return std::stoll(line.substr(line.find(marker) + marker.size()));
+  int64_t n = std::stoll(line.substr(line.find(marker) + marker.size()));
+  if (n > 0) {
+    std::string tl = rd.lineContaining("time left to play:");
+    BOOST_REQUIRE_MESSAGE(!tl.empty(),
+                          "dice did not print time-left for a live deposit");
+  }
+  return n;
 }
 
 // `play` → the single result line (heads / tails / rejection reason).
