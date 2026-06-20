@@ -55,7 +55,17 @@ void CesClient::setKey(const KeyPair& keyPair) { keyPair_ = keyPair; }
 
 bool CesClient::start(uint16_t localPort) {
   LOGTRACE << "start";
-  bool ok = transport_->start(localPort);
+  // Never let a transport-layer exception (e.g. thread/socket creation hitting
+  // a sandboxed compute child's RLIMIT_AS/RLIMIT_NOFILE) propagate to callers:
+  // every caller already treats false as "could not start". This keeps the Lua
+  // networking APIs (ces.ping / ces.remote_*) from throwing into the VM.
+  bool ok = false;
+  try {
+    ok = transport_->start(localPort);
+  } catch (const std::exception& e) {
+    LOGDEBUG << "start threw" << SVAR(e.what());
+    return false;
+  }
   LOGTRACE << "start done" << VAR(ok);
   return ok;
 }
@@ -75,18 +85,23 @@ bool CesClient::connect() {
   }
   LOGTRACE << "connect";
 
-  for (int i = 0; i < tries_; ++i) {
-    if (getInfo()) {
-      LOGTRACE << "connect ok";
-      return connected_ = true;
-    }
-    if (i + 1 < tries_) {
-      LOGTRACE << "connect failed; retrying..." << VAR(i) << VAR(tries_);
-      if (!ces::sleep(kRetryIntervalMs)) {
-        LOGTRACE << "connect interrupted";
-        return false;
+  try {
+    for (int i = 0; i < tries_; ++i) {
+      if (getInfo()) {
+        LOGTRACE << "connect ok";
+        return connected_ = true;
+      }
+      if (i + 1 < tries_) {
+        LOGTRACE << "connect failed; retrying..." << VAR(i) << VAR(tries_);
+        if (!ces::sleep(kRetryIntervalMs)) {
+          LOGTRACE << "connect interrupted";
+          return false;
+        }
       }
     }
+  } catch (const std::exception& e) {
+    LOGDEBUG << "connect threw" << SVAR(e.what());
+    return connected_ = false;
   }
 
   LOGTRACE << "connect out of tries, failed";

@@ -71,6 +71,7 @@
 #include <pwd.h>
 #include <string>
 #include <sys/resource.h>
+#include <malloc.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -449,6 +450,13 @@ bool drop_privileges_if_root(const char* user_name) {
 }
 
 void apply_rlimits(size_t mem_max_bytes) {
+  // Cap glibc's per-thread malloc arenas. Each new thread otherwise gets its
+  // own 64 MB virtual arena, and the transient CesClient behind the outbound
+  // networking APIs (ces.ping / ces.remote_*) spawns IO threads per call --
+  // a few of those reserve enough address space to trip RLIMIT_AS and throw
+  // std::bad_alloc. Two arenas is plenty for a mostly single-threaded VM and
+  // keeps outbound networking inside the documented mem ceiling.
+  mallopt(M_ARENA_MAX, 2);
   // Hard ceilings that cannot be raised from inside Lua. RLIMIT_AS is
   // the merciless memory cap (from the server's compute_process_mem_max):
   // the kernel denies any allocation past it, so a runaway or malicious
@@ -1794,8 +1802,10 @@ int lua_ces_remove_peer(lua_State* L) {
   return 1;
 }
 
-// ces.set_peer_target(credits) -> true | nil,err. The reserve the peer miner
-// aims to accumulate on each peer (0 = never mine, just keep peers fresh).
+// ces.set_peer_target(units) -> true | nil,err. The reserve the peer miner
+// aims to accumulate on each peer, in raw internal units (PRICE_UNIT = 1 full
+// credit = 100000000 units; the value is stored unscaled). 0 = never mine,
+// just keep peers fresh.
 int lua_ces_set_peer_target(lua_State* L) {
   lua_Number n = luaL_checknumber(L, 1);
   if (n < 0 || n > 9.2233720368547e18) {
@@ -1811,7 +1821,8 @@ int lua_ces_set_peer_target(lua_State* L) {
   return 1;
 }
 
-// ces.peer_target() -> credits(number) | nil,err.
+// ces.peer_target() -> units(number) | nil,err. Raw internal units (see
+// ces.set_peer_target; PRICE_UNIT = 100000000 units per full credit).
 int lua_ces_peer_target(lua_State* L) {
   std::vector<uint8_t> args;  // no arguments
   Frame reply;
