@@ -79,6 +79,11 @@ public:
   // failed to open. Touch only on the io() strand.
   minx::Rudp* rudp() { return rudp_.get(); }
 
+  // The endpoint's ChannelMeter, for registering OUTBOUND channels so they are
+  // metered like the inbound ones (which are auto-tracked on bind). Null if the
+  // endpoint failed to start. Touch only on the io() strand.
+  ChannelMeter* meter() { return meter_.get(); }
+
 private:
   // No-op MinxListener: the endpoint's Minx carries only the Rudp
   // extension lane, never CES signed-op traffic.

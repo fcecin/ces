@@ -971,6 +971,16 @@ public:
                           const minx::SockAddr& peer, uint32_t channelId,
                           const CesPlexUsage& usage) override;
 
+  // Price a CesPlexUsage tick at the live discounted feeNet* rates -> credits
+  // (0 = free). Shared by cesplexReportUsage and the compute handler's
+  // per-instance-endpoint billing.
+  uint64_t priceNetUsage(const CesPlexUsage& usage) const;
+
+  // Debit a pre-priced net bill to `payerPfx` on logicStrand_, no close callback
+  // (the per-instance endpoint owns its channel). Used by the compute handler to
+  // bill a child's INBOUND luarpc usage to the caller. Pair with priceNetUsage.
+  void debitNetworkBill(const HashPrefix& payerPfx, uint64_t amount);
+
   // The rpcTaskIO executor — L2 handlers that need to post work onto
   // the CesPlex / handler strand (e.g. the compute supervisor tick,
   // file-deletion interlocks) fetch the executor through this hook.

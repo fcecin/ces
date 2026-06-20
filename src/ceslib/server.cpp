@@ -4411,14 +4411,10 @@ void CesServer::_l2QueryAccount(
     });
 }
 
-void CesServer::cesplexReportUsage(const HashPrefix& payer,
-                                   const minx::SockAddr& peer,
-                                   uint32_t channelId,
-                                   const CesPlexUsage& usage) {
-  // The bus measured this channel's resource usage this tick; price it in
-  // credits at the live discounted feeNet* rates. mem-byte-seconds → the
-  // per-byte-DAY rate (divide by seconds/day); __uint128_t guards the
-  // conversion against overflow.
+uint64_t CesServer::priceNetUsage(const CesPlexUsage& usage) const {
+  // Price a channel's measured resource usage in credits at the live discounted
+  // feeNet* rates. mem-byte-seconds → the per-byte-DAY rate (divide by
+  // seconds/day); __uint128_t guards the conversion against overflow.
   const uint64_t feeChanSec = discountFee(FeeKind::Net, cfg_.feeNetChannelSec);
   const uint64_t feeMemDay  = discountFee(FeeKind::Net, cfg_.feeNetMemByteDay);
   const uint64_t feeBSent   = discountFee(FeeKind::Net, cfg_.feeNetByteSent);
@@ -4430,11 +4426,17 @@ void CesServer::cesplexReportUsage(const HashPrefix& payer,
   debit += (static_cast<__uint128_t>(usage.memByteSeconds) * feeMemDay)
            / SECS_PER_DAY;
   debit += static_cast<__uint128_t>(usage.ageSeconds)     * feeChanSec;
-  if (debit == 0) return;  // free at current rates — nothing to charge
-  const uint64_t amount =
-    debit > std::numeric_limits<uint64_t>::max()
-      ? std::numeric_limits<uint64_t>::max()
-      : static_cast<uint64_t>(debit);
+  return debit > std::numeric_limits<uint64_t>::max()
+           ? std::numeric_limits<uint64_t>::max()
+           : static_cast<uint64_t>(debit);
+}
+
+void CesServer::cesplexReportUsage(const HashPrefix& payer,
+                                   const minx::SockAddr& peer,
+                                   uint32_t channelId,
+                                   const CesPlexUsage& usage) {
+  const uint64_t amount = priceNetUsage(usage);
+  if (amount == 0) return;  // free at current rates — nothing to charge
 
   // Debit the payer on logicStrand; if it can't cover the tick, the host
   // closes the channel (on the rpc strand). The bus never sees the cost
@@ -4448,6 +4450,14 @@ void CesServer::cesplexReportUsage(const HashPrefix& payer,
       if (rpcRudp_) rpcRudp_->closeChannel(peer, channelId);
     },
     rpcTaskIO_.get_executor());
+}
+
+void CesServer::debitNetworkBill(const HashPrefix& payerPfx, uint64_t amount) {
+  // Per-instance endpoint billing: charge a child's INBOUND luarpc caller. No
+  // close callback - the child owns the channel (no rpc-side channel to evict).
+  if (amount == 0) return;
+  _l2DebitNetworkBill(payerPfx, static_cast<int64_t>(amount), nullptr,
+                      rpcTaskIO_.get_executor());
 }
 
 void CesServer::_l2DebitNetworkBill(

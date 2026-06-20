@@ -503,4 +503,39 @@ BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   BOOST_CHECK_EQUAL(rows.size(), 0u);
 }
 
+// 6. Regression guard: real channel usage must be billed. The net meter rates
+//    are derived non-zero in the CesServer ctor; if that derivation regresses
+//    to 0 or priceNetUsage breaks, real usage would price to 0 and networking
+//    would be free. At the configured (full / 0%-discount) rate a non-empty
+//    tick costs > 0, and more usage costs strictly more (so a rates-to-0
+//    regression - where everything collapses to 0 - is caught). An empty tick
+//    is free. priceNetUsage is pure, so construct-only (no start()), mirroring
+//    test_metrics.
+BOOST_AUTO_TEST_CASE(RealNetUsageIsPriced) {
+  auto dir = makeUniqueTempDir("net_usage_priced");
+  minx::Hash priv; priv.fill(0x5A);
+  ces::CesConfig cfg = makeTestConfig(
+    dir, priv, std::numeric_limits<uint64_t>::max());
+  ces::CesServer srv(cfg);
+
+  ces::CesPlexUsage justOpen{};
+  justOpen.ageSeconds = 1;                 // open one second, no bytes
+  ces::CesPlexUsage traffic{};
+  traffic.bytesSent      = 1500;
+  traffic.bytesReceived  = 1500;
+  traffic.memByteSeconds = 100000;
+  traffic.ageSeconds     = 60;
+
+  // Real usage is billed at the full (no-discount) rate.
+  BOOST_CHECK_GT(srv.priceNetUsage(justOpen), 0u);
+  BOOST_CHECK_GT(srv.priceNetUsage(traffic),  0u);
+  // Rates are live: more usage costs strictly more. If the net rates regress to
+  // 0, both go to 0 and this fails.
+  BOOST_CHECK_GT(srv.priceNetUsage(traffic), srv.priceNetUsage(justOpen));
+  // An empty tick is free.
+  BOOST_CHECK_EQUAL(srv.priceNetUsage(ces::CesPlexUsage{}), 0u);
+
+  fs::remove_all(dir);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

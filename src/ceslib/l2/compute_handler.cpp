@@ -144,6 +144,7 @@ constexpr uint8_t kIpcTagConnClose    = 0x08;  // child → server
 constexpr uint8_t kIpcTagListenOn     = 0x09;  // child → server
 constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
 constexpr uint8_t kIpcTagLog          = 0x0b;  // child → server (ces.log)
+constexpr uint8_t kIpcTagNetUsage     = 0x0c;  // child -> server (channel usage)
 constexpr size_t  kLuaProgramLogMax   = 4096;  // cap a program log line
 
 constexpr uint16_t kApiMethodClientSend = 0x0001;
@@ -923,6 +924,34 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     emitProgramLog(
       inst->pid, inst->sourceName, level,
       reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
+    return;
+  }
+  if (tag == kIpcTagNetUsage) {
+    // Payload: [8B payerPfx][u64 bytesSent][u64 bytesReceived][u64 memByteSec]
+    //          [u64 ageSeconds]. The child's endpoint meter reporting one
+    // channel tick. The payer is this instance's own program prefix for an
+    // OUTBOUND channel (bill the source file's file_balance) or the remote
+    // caller's prefix for an INBOUND one (bill that caller). One-way, no reply.
+    constexpr size_t kNeed = kIpcHdr + 8 + 4 * sizeof(uint64_t);
+    if (body.size() < kNeed) return;
+    size_t o = kIpcHdr;
+    ces::HashPrefix payer{};
+    std::memcpy(payer.data(), body.data() + o, payer.size()); o += payer.size();
+    ces::CesPlexUsage usage{};
+    usage.bytesSent      = ces::Buffer::peek<uint64_t>(body.data() + o); o += 8;
+    usage.bytesReceived  = ces::Buffer::peek<uint64_t>(body.data() + o); o += 8;
+    usage.memByteSeconds = ces::Buffer::peek<uint64_t>(body.data() + o); o += 8;
+    usage.ageSeconds     = ces::Buffer::peek<uint64_t>(body.data() + o);
+    CesServer* server = gServer.load();
+    if (!server) return;
+    const uint64_t amount = server->priceNetUsage(usage);
+    if (amount == 0) return;
+    ces::HashPrefix self{};
+    std::memcpy(self.data(), inst->programPubkey.data(), self.size());
+    if (payer == self)
+      fileHandlerDebitBalance(inst->sourceName, amount);  // outbound: instance pays
+    else
+      server->debitNetworkBill(payer, amount);            // inbound: caller pays
     return;
   }
   if (tag != kIpcTagApiCall) {

@@ -212,6 +212,7 @@ constexpr uint8_t  TAG_CONN_CLOSE    = 0x08;  // child → server
 constexpr uint8_t  TAG_LISTEN_ON     = 0x09;  // child → server
 constexpr uint8_t  TAG_LISTEN_OFF    = 0x0a;  // child → server
 constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (one-way)
+constexpr uint8_t  TAG_NET_USAGE     = 0x0c;  // child -> server (one-way)
 
 constexpr uint16_t METHOD_CLIENT_SEND      = 0x0001;
 constexpr uint16_t METHOD_FILE_CREATE      = 0x0100;
@@ -614,6 +615,20 @@ struct LuaRpcConn {
 std::map<uint64_t, std::shared_ptr<LuaRpcConn>> g_luarpc_conns;  // strand-only
 uint64_t g_luarpc_next_id = 1;                                   // strand-only
 
+// Per-channel resource usage the endpoint's ChannelMeter reports (endpoint
+// strand); the run() loop drains it into a one-way TAG_NET_USAGE frame to the
+// parent (IPC thread; only it may touch g_sock_fd). Each report carries the
+// channel's bound payer prefix. Inbound channels carry the remote caller's
+// prefix; outbound channels are tracked under this instance's OWN program prefix
+// (see luarpc_do_connect). The parent prices the usage and routes the bill by
+// payer: own prefix -> source file_balance, anyone else -> that caller.
+struct NetUsageRecord {
+  ces::HashPrefix   payer{};
+  ces::CesPlexUsage usage{};
+};
+std::mutex                  g_net_usage_mx;
+std::deque<NetUsageRecord>  g_net_usage_q;
+
 void luarpc_push(LuaRpcEvent e) {
   {
     std::lock_guard<std::mutex> lk(g_luarpc_mx);
@@ -692,6 +707,7 @@ void luarpc_conn_close(uint64_t id) {
 // Outbound dialing rides the SAME endpoint Rudp/socket as serving (the user's
 // "religiously the same socket"). Armed in main alongside g_luarpc_io.
 minx::Rudp*                   g_luarpc_rudp = nullptr;
+ces::ChannelMeter*            g_luarpc_meter = nullptr;  // = endpoint->meter()
 std::shared_ptr<ces::KeyPair> g_luarpc_signer;   // the program's keypair
 
 struct LuaRpcConnectResult {
@@ -735,13 +751,13 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
         std::span<const uint8_t>(pkArr.data(), pkArr.size())));
 
   boost::asio::async_write(*stream, boost::asio::buffer(*bindReq),
-    [stream, bindReq, clientDigest, pr, expectPk]
+    [stream, bindReq, clientDigest, pr, expectPk, peer, channel]
     (const boost::system::error_code& ec, std::size_t) {
       if (ec) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
       auto reply = std::make_shared<
         std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
       boost::asio::async_read(*stream, boost::asio::buffer(*reply),
-        [stream, reply, clientDigest, pr, expectPk]
+        [stream, reply, clientDigest, pr, expectPk, peer, channel]
         (const boost::system::error_code& ec2, std::size_t) {
           if (ec2) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
           ces::ParsedBindReply r = ces::parseBindReply(
@@ -760,6 +776,15 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
           auto c = std::make_shared<LuaRpcConn>();
           c->stream = stream;
           g_luarpc_conns[id] = c;
+          // Meter this OUTBOUND channel so the instance pays its own server
+          // (file_balance) for dialing out. Track it under this instance's own
+          // program prefix: the parent recognizes that as "the instance itself"
+          // and routes the bill to file_balance (vs an inbound caller's prefix).
+          if (g_luarpc_meter) {
+            ces::HashPrefix self{};
+            std::memcpy(self.data(), g_program_pubkey, self.size());
+            g_luarpc_meter->track(peer, channel, "luarpc:out", self);
+          }
           LuaRpcConnectResult res{ces::CES_OK, id, {}};
           std::memcpy(res.peer.data(), r.serverPubkey.data(), 32);
           luarpc_start_read(id, c);
@@ -793,17 +818,30 @@ public:
 LuaRpcHandler g_luaRpcHandler;
 
 // CesPlexHost for this lua host's rpc endpoint: signs bind replies + per-op
-// responses with the program's own keypair. Usage reporting is a no-op for
-// now (future: forward to the parent server so it bills the source file's
-// file_balance).
+// responses with the program's own keypair. Usage is reported up to the parent
+// server, which prices it and bills the caller (inbound) or this instance's
+// file_balance (outbound).
 class LuaHostPlexHost : public ces::CesPlexHost {
 public:
   explicit LuaHostPlexHost(const ces::KeyPair& key) : key_(key) {}
   const ces::KeyPair& cesplexSigningKey() const override { return key_; }
-  void cesplexReportUsage(const ces::HashPrefix& /*payer*/,
+  void cesplexReportUsage(const ces::HashPrefix& payer,
                           const minx::SockAddr& /*peer*/,
                           uint32_t /*channelId*/,
-                          const ces::CesPlexUsage& /*usage*/) override {}
+                          const ces::CesPlexUsage& usage) override {
+    // Endpoint strand: must NOT touch g_sock_fd. Queue the (payer, usage) and
+    // nudge; run() emits the TAG_NET_USAGE frame on the IPC thread. The parent
+    // decides who pays from the payer prefix.
+    {
+      std::lock_guard<std::mutex> lk(g_net_usage_mx);
+      g_net_usage_q.push_back(NetUsageRecord{payer, usage});
+    }
+    if (g_luarpc_wakefd >= 0) {
+      uint64_t one = 1;
+      ssize_t w = ::write(g_luarpc_wakefd, &one, sizeof(one));
+      (void)w;
+    }
+  }
 private:
   ces::KeyPair key_;
 };
@@ -856,6 +894,7 @@ void luarpc_ensure_endpoint() {
         std::move(minxCfg), std::move(rudpCfg));
     g_luarpc_io = &g_luarpc_endpoint->io();
     g_luarpc_rudp = g_luarpc_endpoint->rudp();
+    g_luarpc_meter = g_luarpc_endpoint->meter();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "cesluajitd: rpc endpoint setup failed: %s\n",
                  e.what());
@@ -2695,6 +2734,25 @@ int lua_ces_run(lua_State* L) {
         g_luarpc_inq.pop_front();
       }
       dispatch_luarpc_event(L, std::move(e));
+    }
+
+    // Drain channel-usage the endpoint's meter queued and report it to the
+    // parent (one-way TAG_NET_USAGE). Only this (IPC) thread may write g_sock_fd.
+    for (;;) {
+      NetUsageRecord r;
+      {
+        std::lock_guard<std::mutex> lk(g_net_usage_mx);
+        if (g_net_usage_q.empty()) break;
+        r = g_net_usage_q.front();
+        g_net_usage_q.pop_front();
+      }
+      std::vector<uint8_t> nb;
+      put_bytes(nb, r.payer.data(), r.payer.size());
+      put_u64(nb, r.usage.bytesSent);
+      put_u64(nb, r.usage.bytesReceived);
+      put_u64(nb, r.usage.memByteSeconds);
+      put_u64(nb, r.usage.ageSeconds);
+      write_frame(TAG_NET_USAGE, 0, nb.data(), nb.size());
     }
 
     // Fire any due periodic timers (ces.every) + sleep wakeups, then run every
