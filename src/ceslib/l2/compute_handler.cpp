@@ -1841,6 +1841,33 @@ void allocateAndSpawnInstance(
     });
 }
 
+// Charge the bound signer `cost` (with NONCELESS dedup) in one atomic
+// _l2Transact. Returns the status + whether this was a replay; the verb then
+// runs its `after` body inline. allowMissingOrigin lets a no-account signer read
+// public verbs for free (cross-server discovery). reqNonce==0 opts out of dedup
+// (LAUNCH).
+struct SignerChargeResult { uint8_t status; bool duplicate; };
+SignerChargeResult chargeSignerSync(CesServer* server, const ces::PublicKey& signer,
+                                    int64_t cost, uint32_t reqNonce, uint64_t sigHash,
+                                    int64_t errFee, bool allowMissingOrigin) {
+  minx::Hash signerHash = signer.getHash();
+  uint8_t status = CES_ERROR_INTERNAL;
+  bool duplicate = false;
+  server->_l2Transact([&](ces::LedgerTxn& t) {
+    if (reqNonce == CES_NONCELESS && t.isReplay(sigHash)) {
+      duplicate = true; status = CES_OK; return;
+    }
+    uint8_t r = t.signerSpend(signerHash, static_cast<uint64_t>(cost), reqNonce, errFee);
+    if (r != CES_OK) {
+      if (allowMissingOrigin && r == CES_ERROR_ORIGIN_NOT_FOUND) { status = CES_OK; return; }
+      status = r; return;
+    }
+    if (reqNonce == CES_NONCELESS) t.recordDedup(sigHash);
+    status = CES_OK;
+  });
+  return { status, duplicate };
+}
+
 void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   if (pre.size() < 2) {
     sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
@@ -1945,10 +1972,12 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // the wire CES_NONCELESS. Every LAUNCH is then independently
   // fee-validated and spawns — a same-name relaunch is a real second
   // instance, charged, not a dedup-skipped freebie that still spawns.
-  reqServer(ctx)->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
-    /*reqNonce=*/0, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor());
+  auto chg = chargeSignerSync(
+    reqServer(ctx), signer,
+    static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
+    /*reqNonce=*/0, ctx->reqSigHash,
+    static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/false);
+  after(chg.status, chg.duplicate);
 }
 
 // ---------------------------------------------------------------------------
@@ -1981,10 +2010,12 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendResponseAndLoop(ctx, CES_OK, {});
   };
 
-  reqServer(ctx)->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
-    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor());
+  auto chg = chargeSignerSync(
+    reqServer(ctx), signer,
+    static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, ctx->reqSigHash,
+    static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/false);
+  after(chg.status, chg.duplicate);
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,10 +2064,12 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
     sendResponseAndLoop(ctx, CES_OK, std::move(resp));
   };
 
-  reqServer(ctx)->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
-    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor());
+  auto chg = chargeSignerSync(
+    reqServer(ctx), signer,
+    static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, ctx->reqSigHash,
+    static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/false);
+  after(chg.status, chg.duplicate);
 }
 
 // ---------------------------------------------------------------------------
@@ -2097,10 +2130,12 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
   // STAT is public to any signer: allow a signer with no account here to read
   // for free (cross-server discovery).
-  reqServer(ctx)->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
-    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor(), /*allowMissingOrigin=*/true);
+  auto chg = chargeSignerSync(
+    reqServer(ctx), signer,
+    static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, ctx->reqSigHash,
+    static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/true);
+  after(chg.status, chg.duplicate);
 }
 
 // ---------------------------------------------------------------------------
@@ -2163,10 +2198,12 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
 
   // INSTANCES is public to any signer: allow a signer with no account here
   // (a peer's P2P node discovering us) to read for free.
-  reqServer(ctx)->_l2ValidateDedupAndDebit(
-    signer, static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
-    ctx->reqNonce, getMicrosSinceEpoch(), ctx->reqSigHash,
-    std::move(after), ctx->stream->get_executor(), /*allowMissingOrigin=*/true);
+  auto chg = chargeSignerSync(
+    reqServer(ctx), signer,
+    static_cast<int64_t>(reqServer(ctx)->discountFee(FeeKind::Query, cfg.feeQuery)),
+    ctx->reqNonce, ctx->reqSigHash,
+    static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/true);
+  after(chg.status, chg.duplicate);
 }
 
 // ---------------------------------------------------------------------------

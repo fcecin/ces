@@ -21,6 +21,8 @@
 #include <ces/keys.h>
 #include <ces/util/metrics.h>
 #include <ces/cesplex/meter.h>
+#include <ces/l2/ledger_txn.h>
+#include <functional>
 #include <ces/cesplex/mux.h>   // CesPlexHost (CesServer implements it)
 #include <ces/protocol.h>
 #include <minx/bucketcache.h>
@@ -433,6 +435,7 @@ private:
 
 class CesServer : public minx::MinxListener, public CesPlexHost {
   friend class CesRpcRudpListener;
+  friend struct ServerLedgerTxn;   // L2 verb ledger transaction (server.cpp)
 public:
   using ActiveAccount = Accounts::ActiveAccount;
   using ActiveAsset = Assets::ActiveAsset;
@@ -808,48 +811,6 @@ public:
   std::string _loadHelloFile(bool& existed);
 
   // ---- L2 handler support ----
-  //
-  // Helper the builtin CesPlex file handler (and any future builtin
-  // that needs on-behalf-of signed ops) calls to perform the
-  // dedup+validate+debit dance on logicStrand_ without reaching into
-  // private state. Posts the work to logicStrand_ and fires `cb` on
-  // `cbExecutor` with the resulting rc.
-  //
-  // Dedup keyed on the committed event, not on first sight of the request:
-  //   1. NONCELESS + sigHash already recorded this window → cb(CES_OK,
-  //      duplicate=true); the caller must skip its side effect (replay a
-  //      correct-shape OK) so a resent envelope can't re-credit/re-debit.
-  //   2. Else validateSpend(amount, fee=0, reqNonce, feeQuery). On failure →
-  //      cb(rc, false), recording nothing (a failed op stays retryable).
-  //   3. On success → debit(amount), record the dedup (NONCELESS only) at this
-  //      commit point → cb(CES_OK, false). amount is burned. Check+debit+record
-  //      are one logic-strand task, so retries serialize and exactly one is
-  //      duplicate=false.
-  // All stages run on the logic strand; callback hops to cbExecutor.
-  // allowMissingOrigin: for PUBLIC read verbs (compute STAT / INSTANCES) a
-  // signer with no account on THIS server is served for free instead of being
-  // rejected ORIGIN_NOT_FOUND. Required for cross-server discovery: a peer's
-  // P2P node has no account here yet still must read public instance records.
-  void _l2ValidateDedupAndDebit(
-      const ces::PublicKey& signer,
-      int64_t amount,
-      uint32_t reqNonce,
-      uint64_t timeUs,
-      uint64_t sigHash,
-      std::function<void(uint8_t rc, bool duplicate)> cb,
-      boost::asio::any_io_executor cbExecutor,
-      bool allowMissingOrigin = false);
-
-  // Ledger credit — creates or credits the destination account.
-  // No validation, no nonce — server-authoritative (only called
-  // from L2 handlers after their own authorization checks).
-  // Used by the file handler for WITHDRAW and DELETE refund paths.
-  // Posts to logicStrand, callback hops to cbExecutor.
-  void _l2CreditAccount(
-      const ces::PublicKey& recipient,
-      int64_t amount,
-      std::function<void()> cb,
-      boost::asio::any_io_executor cbExecutor);
 
   // ChannelMeter per-tick debit. Looks up the account
   // by `payerPfx`; if it exists AND has at least `amount` credits,
@@ -894,17 +855,6 @@ public:
   // sidecar (program_pubkey / program_privkey). All running instances of
   // the same source file share the same program account.
 
-  // Generate a fresh ed25519 keypair for the program account, then on
-  // logicStrand_ create an Account with that pubkey and starting balance
-  // `initial`. The pubkey and private key are returned via `cb`. If the
-  // account already existed (e.g., a recreated /s/ deployment recovering
-  // from rent exhaustion) the existing account is credited by `initial`
-  // instead — same shape as _brr.
-  void _l2CreateProgramAccount(
-      int64_t initial,
-      std::function<void(minx::Hash newPubkey, minx::Hash newPrivkey)> cb,
-      boost::asio::any_io_executor cbExecutor);
-
   // Atomically debit `amount` from the program account at `pubkey`
   // on logicStrand_. If the account doesn't exist or balance <
   // amount, calls cb(false, currentBalance) and the account is
@@ -938,6 +888,12 @@ public:
   // Read-only balance query. Returns the account's balance, or 0 if
   // the account doesn't exist (collected by daily maintenance).
   int64_t _l2ProgramAccountBalanceSync(const minx::Hash& pubkey);
+
+  // The L2 verb primitive: run `fn` as one atomic logicStrand_ task with a
+  // LedgerTxn over the account/asset stores (dedup + debit + credit + reads).
+  // Blocks until the task completes. The caller must not be on logicStrand_
+  // (would deadlock); a verb makes at most one of these per request.
+  void _l2Transact(const std::function<void(LedgerTxn&)>& fn);
 
   // Program-initiated transfer. Origin is the program's owner pubkey
   // (the program acts as its owner — same model as fileHandlerExec).

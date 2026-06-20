@@ -4209,92 +4209,50 @@ void CesServer::_burnInner(const minx::Hash& accountKey, int64_t amount) {
   }
 }
 
-void CesServer::_l2ValidateDedupAndDebit(
-    const ces::PublicKey& signer,
-    int64_t amount,
-    uint32_t reqNonce,
-    uint64_t timeUs,
-    uint64_t sigHash,
-    std::function<void(uint8_t rc, bool duplicate)> cb,
-    boost::asio::any_io_executor cbExecutor,
-    bool allowMissingOrigin) {
-  (void)timeUs; // reserved for future time-window enforcement beyond dedup
-  auto self = this;
-  postLogic(
-    [self, signer, amount, reqNonce, sigHash, cb, cbExecutor,
-     allowMissingOrigin]() {
-      // 1. NONCELESS dedup — CHECK ONLY (do NOT insert here). Keying the
-      // record on the committed debit below (step 3), not on first sight
-      // of the request, is what keeps a *failed* op retryable and stops a
-      // *committed* op from re-running its side effect. On a hit, signal
-      // the caller it's a duplicate so it skips the side effect.
-      if (reqNonce == CES_NONCELESS && self->isDuplicateDedup(sigHash)) {
-        boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/true); });
-        return;
-      }
-      // 2. validateSpend handles all three nonce modes. errFee is
-      // feeQuery (same as every other signed op). A failure records
-      // nothing → the op stays retryable.
-      HashPrefix id = Account::getMapKey(signer.getHash());
-      ActiveAccount acc = self->accounts_.get(id);
-      const int64_t errFee = static_cast<int64_t>(self->cfg_.getFeeError());
-      uint8_t rc = acc.validateSpend(
-        static_cast<uint64_t>(amount), 0, reqNonce, errFee);
-      if (rc != CES_OK) {
-        // Public read verbs: a signer with no account here reads for free
-        // rather than being rejected, so cross-server discovery works.
-        if (allowMissingOrigin && rc == CES_ERROR_ORIGIN_NOT_FOUND) {
-          boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/false); });
-          return;
-        }
-        boost::asio::post(cbExecutor, [cb, rc]() { cb(rc, /*duplicate=*/false); });
-        return;
-      }
-      // 3. Debit (the committed ledger event). No credit — the amount is
-      // burned (operator IS the CES server; it mints what it needs).
-      // Record the dedup at THIS commit point (NONCELESS only): check +
-      // debit + record run as one logic-strand task, so two retries
-      // serialize and exactly one sees duplicate=false.
-      acc.debit(static_cast<uint64_t>(amount));
-      if (reqNonce == CES_NONCELESS)
-        self->recordDedup(sigHash);
-      boost::asio::post(cbExecutor, [cb]() { cb(CES_OK, /*duplicate=*/false); });
-    });
-}
+// Concrete LedgerTxn over CesServer's private stores. Constructed and used only
+// inside _l2Transact's logicStrand_ task, so every op here runs on the strand.
+struct ServerLedgerTxn : ces::LedgerTxn {
+  CesServer* s;
+  explicit ServerLedgerTxn(CesServer* srv) : s(srv) {}
 
-void CesServer::_l2CreditAccount(
-    const ces::PublicKey& recipient,
-    int64_t amount,
-    std::function<void()> cb,
-    boost::asio::any_io_executor cbExecutor) {
-  auto self = this;
-  minx::Hash key = recipient.getHash();
-  postLogic(
-    [self, key, amount, cb, cbExecutor]() {
-      self->_brrInner(key, amount);
-      if (cb) boost::asio::post(cbExecutor, cb);
-    });
-}
+  uint8_t signerSpend(const minx::Hash& signer, uint64_t amount,
+                      uint32_t reqNonce, int64_t errFee) override {
+    auto acc = s->accounts_.get(Account::getMapKey(signer));
+    uint8_t rc = acc.validateSpend(amount, 0, reqNonce, errFee);
+    if (rc != CES_OK) return rc;
+    acc.debit(amount);            // committed event; amount is burned
+    return CES_OK;
+  }
+  bool debitAccount(const minx::Hash& pubkey, uint64_t amount) override {
+    auto acc = s->accounts_.get(Account::getMapKey(pubkey));
+    if (!acc.exists() || acc.balance() < static_cast<int64_t>(amount))
+      return false;
+    acc.debit(amount);
+    return true;
+  }
+  void credit(const minx::Hash& pubkey, int64_t amount) override {
+    s->_brrInner(pubkey, amount);
+  }
+  int64_t balance(const minx::Hash& pubkey) override {
+    auto acc = s->accounts_.get(Account::getMapKey(pubkey));
+    return acc.exists() ? acc.balance() : 0;
+  }
+  bool isReplay(uint64_t sigHash) override { return s->isDuplicateDedup(sigHash); }
+  void recordDedup(uint64_t sigHash) override { s->recordDedup(sigHash); }
+  bool assetOwnedBy(const minx::Hash& assetId, const minx::Hash& who) override {
+    Assets::ActiveAsset asset = s->assets_.get(assetId);
+    return asset.exists() && asset.getOwnerId() == Account::getMapKey(who);
+  }
+};
 
-void CesServer::_l2CreateProgramAccount(
-    int64_t initial,
-    std::function<void(minx::Hash newPubkey, minx::Hash newPrivkey)> cb,
-    boost::asio::any_io_executor cbExecutor) {
-  // Generate the program account's ed25519 keypair. PRNG is thread-local;
-  // safe to call here on rpcTaskIO_ before posting.
-  ces::KeyPair kp = ces::KeyPair::generate();
-  minx::Hash pubkey = kp.getPublicKeyAsHash();
-  minx::Hash privkey = kp.getPrivateKey();
-
-  auto self = this;
-  postLogic(
-    [self, pubkey, privkey, initial, cb, cbExecutor]() {
-      // _brrInner: credits if account exists, creates if missing.
-      self->_brrInner(pubkey, initial);
-      if (cb)
-        boost::asio::post(cbExecutor,
-          [cb, pubkey, privkey]() { cb(pubkey, privkey); });
-    });
+void CesServer::_l2Transact(const std::function<void(LedgerTxn&)>& fn) {
+  std::promise<void> done;
+  postLogic([this, &fn, &done]() {
+    ServerLedgerTxn txn(this);
+    fn(txn);
+    done.set_value();
+  });
+  done.get_future().get();
 }
 
 void CesServer::_l2DebitProgramAccount(

@@ -928,4 +928,110 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetHashStableAcrossMints) {
   qc.stop();
 }
 
+// ---------------------------------------------------------------------------
+// Exec-path coverage for the mutators the FileApi* tests don't touch:
+// DEPOSIT, SET_PRICE, RESIZE, WITHDRAW, STAT all dispatched in-process from
+// Lua (source-billing). The program runs the chain on its own file and
+// reports the post-mutation price+size, proving each exec* core ran and the
+// sidecar reflects the changes.
+// ---------------------------------------------------------------------------
+BOOST_FIXTURE_TEST_CASE(FileApiExecMutatorsRoundTrip, LuaComputeFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string scriptPath = "/h/" + ownerHex + "/mutators.lua";
+  const std::string dataPath   = "/h/" + ownerHex + "/mutators_scratch.bin";
+
+  const std::string src =
+    std::string("local p = '") + dataPath + "'\n" +
+    "local pfx = ces.client_recv()\n"
+    "if not pfx then return end\n"
+    "if not ces.file_create(p, 256, 0, 5000000) then ces.client_send(pfx,'ERR-create'); return end\n"
+    "if not ces.file_deposit(p, 1000000) then ces.client_send(pfx,'ERR-deposit'); return end\n"
+    "if not ces.file_set_price(p, 7) then ces.client_send(pfx,'ERR-setprice'); return end\n"
+    "if not ces.file_resize(p, 512) then ces.client_send(pfx,'ERR-resize'); return end\n"
+    "if not ces.file_withdraw(p, 200000) then ces.client_send(pfx,'ERR-withdraw'); return end\n"
+    "local info = ces.file_stat(p)\n"
+    "if not info then ces.client_send(pfx,'ERR-stat'); return end\n"
+    "ces.client_send(pfx, string.format('price=%d size=%d', info.price_per_kb, info.size))\n";
+
+  uploadScript(scriptPath, src);
+  uint64_t instId = launchScript(scriptPath);
+  BOOST_REQUIRE(instId > 0);
+  auto pfx = progPrefixOf(scriptPath);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  sendAppToProgram(pfx, "go");
+  BOOST_REQUIRE_MESSAGE(
+    listener->wait_for(1, std::chrono::seconds(5)),
+    "timed out waiting for program to reply");
+
+  std::pair<uint8_t, minx::Bytes> got;
+  {
+    std::lock_guard lk(listener->m);
+    BOOST_REQUIRE(!listener->messages.empty());
+    got = listener->messages.front();
+  }
+  const auto& data = got.second;
+  BOOST_REQUIRE(data.size() >= 11);
+  uint16_t len = ces::Buffer::peek<uint16_t>(
+    reinterpret_cast<const uint8_t*>(data.data()) + 9);
+  std::string payload(
+    reinterpret_cast<const char*>(data.data() + 11), len);
+  BOOST_CHECK_EQUAL(payload, "price=7 size=512");
+}
+
+// ---------------------------------------------------------------------------
+// Regression guard: a TARGET-side INSUFFICIENT must NOT delete the program's
+// SOURCE file. The program (well-funded source) creates a small target then
+// withdraws more than the target holds -> withdrawCore returns INSUFFICIENT
+// before bill() runs, so the source-exhaustion flag never sets. The source
+// must survive. (Before the fix, execWithSource deleted the source on any
+// INSUFFICIENT, including this target-side one.)
+// ---------------------------------------------------------------------------
+BOOST_FIXTURE_TEST_CASE(ExecTargetInsufficientKeepsSource, LuaComputeFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string scriptPath = "/h/" + ownerHex + "/keepsrc.lua";
+  const std::string targetPath = "/h/" + ownerHex + "/keepsrc_target.bin";
+
+  const std::string src =
+    std::string("local t = '") + targetPath + "'\n" +
+    "local pfx = ces.client_recv()\n"
+    "if not pfx then return end\n"
+    "if not ces.file_create(t, 64, 0, 300000) then ces.client_send(pfx,'ERR-create'); return end\n"
+    "local wok = ces.file_withdraw(t, 999999999)\n"
+    "if wok then ces.client_send(pfx,'UNEXPECTED-OK') else ces.client_send(pfx,'rejected') end\n";
+
+  uploadScript(scriptPath, src);
+  uint64_t instId = launchScript(scriptPath);
+  BOOST_REQUIRE(instId > 0);
+  auto pfx = progPrefixOf(scriptPath);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+  sendAppToProgram(pfx, "go");
+  BOOST_REQUIRE_MESSAGE(
+    listener->wait_for(1, std::chrono::seconds(5)),
+    "timed out waiting for program to reply");
+
+  std::pair<uint8_t, minx::Bytes> got;
+  {
+    std::lock_guard lk(listener->m);
+    BOOST_REQUIRE(!listener->messages.empty());
+    got = listener->messages.front();
+  }
+  const auto& data = got.second;
+  BOOST_REQUIRE(data.size() >= 11);
+  uint16_t len = ces::Buffer::peek<uint16_t>(
+    reinterpret_cast<const uint8_t*>(data.data()) + 9);
+  std::string payload(
+    reinterpret_cast<const char*>(data.data() + 11), len);
+  BOOST_CHECK_EQUAL(payload, "rejected");
+
+  // The SOURCE script file must still exist after the target-side failure.
+  std::array<uint8_t, 32> srcOwner;
+  uint64_t srcBal = 0;
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_MESSAGE(
+    ces::fileHandlerReadOwnerAndBalance(scriptPath, srcOwner, srcBal),
+    "source file was wrongly deleted by a target-side INSUFFICIENT");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

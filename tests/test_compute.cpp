@@ -450,6 +450,37 @@ BOOST_AUTO_TEST_CASE(LaunchRespectsInstanceCap) {
   cc.disconnect();
 }
 
+// STAT is public even to a signer that has NO account on the ledger. The
+// stranger here is never funded (no _brr), so its origin is absent; the
+// charge path must take the allowMissingOrigin branch and still return OK
+// rather than CES_ERROR_ORIGIN_NOT_FOUND. This is the inspectability
+// contract the web gateway relies on for account-less callers.
+BOOST_AUTO_TEST_CASE(StatByUnfundedSignerIsPublic) {
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 10'000'000));
+
+  CesComputeClient ccOwner;
+  ccOwner.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(ccOwner.connect("localhost", rpcPort, ownerKey));
+  uint64_t id = 0, startedAt = 0;
+  CES_REQUIRE_OK(ccOwner.launch(ownerPath, id, startedAt));
+  BOOST_REQUIRE(id != 0);
+
+  // Brand-new key, deliberately never funded -> no account cell exists.
+  KeyPair unfundedKey;
+  CesComputeClient ccUnfunded;
+  ccUnfunded.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(ccUnfunded.connect("localhost", rpcPort, unfundedKey));
+
+  CesComputeClient::InstanceInfo info;
+  CES_REQUIRE_OK(ccUnfunded.stat(id, info));
+  BOOST_CHECK_EQUAL(info.pid, id);
+  BOOST_CHECK_EQUAL(info.sourceName, ownerPath);
+
+  CES_REQUIRE_OK(ccOwner.kill(id));
+  ccOwner.disconnect();
+  ccUnfunded.disconnect();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ---------------------------------------------------------------------------
