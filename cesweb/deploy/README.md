@@ -65,6 +65,20 @@ HOST=root@server DOMAIN=your.public.host bash deploy.sh
 SKIP_BUILD=1 HOST=root@server DOMAIN=your.public.host bash deploy.sh
 ```
 
+## Clear the cache
+
+cesweb stat-validates each cached file against CES on a short TTL, so ordinary
+content changes refresh on their own. Force a full wipe only when an out-of-band
+change kept the same size + mtime (which STAT can't see):
+
+```bash
+HOST=root@server bash cache-clear.sh
+```
+
+Stops the gateway, clears `/opt/cesweb/cache`, restarts it (~1 s; drops open
+`/dev/dial` terminals and in-flight fetches). Override `CACHE_DIR` / `SERVICE`
+for a non-default install. ADDITIVE + SAFE: touches only `/opt/cesweb`.
+
 ## Add content
 
 ```bash

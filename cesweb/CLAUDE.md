@@ -50,7 +50,11 @@ Split so a slow CES read can never block a web request.
   children, and rebuilds its index from disk on boot. Nothing it does touches the
   request path.
 
-Content key = `sha256(host:port \0 cesPath)` (irreversible). Per-entry states:
+Content key = `sha256(serverKey \0 cesPath)` — the CES server's pubkey (from
+`ping`), not the host string, so the same server reached as a DNS name / IPv4 /
+IPv6 shares ONE cache entry instead of a copy per spelling (irreversible). A new
+host spelling resolves first (one cached ping → RESOLVING), then keys by that
+identity. Per-entry states:
 `resolving → statting → queued → downloading → ready` (or `failed`). READY ⇒ the
 responder serves; FAILED ⇒ error page; anything else ⇒ sitrep. A recovered entry
 is "dormant ready": serveable, re-attached to its host/path by the first live
@@ -175,6 +179,7 @@ everywhere). That's the feature, not a blocker:
 - `CESWEB_CACHE_LOW_WATER_PCT` (90) — evict until under this % of the cap
 - `CESWEB_VALIDATE_TTL_MS` (15000) — trust a stat-validation this long
 - `CESWEB_RESOLVE_TTL_MS` (60000) — reuse a host's resolved rpcPort/key this long
+- `CESWEB_MAX_RESOLVE_ENTRIES` (4096) — hard cap on the resolve cache (host→identity); LRU-evicted, since the host-spelling key space is caller-controlled on the open `/<host>/` form
 - `CESWEB_GET_TIMEOUT_MS` (900000) — hard cap on one fill
 - `CESWEB_STALL_TIMEOUT_MS` (60000) — kill a fill that makes no progress
 - `CESWEB_FAIL_TTL_MS` (10000) — cache a failure this long before retrying
@@ -251,4 +256,8 @@ release rebuild (use it when only the JS/nginx changed).
   generic. TLS (`:443`, `:80`→301); `location /dev/dial` forwards the WebSocket
   upgrade and lets sessions stay open (cesweb's own caps bound them). Ubuntu
   24.04 nginx 1.24 rejects `http2 on;` — don't add it.
+- `deploy/cache-clear.sh` — `HOST=user@server bash deploy/cache-clear.sh` wipes
+  the gateway's `/opt/cesweb/cache` and restarts cesweb, forcing a full refresh.
+  Rarely needed (STAT-revalidation catches ordinary changes); for an out-of-band
+  same-size+mtime swap STAT can't see. ADDITIVE + SAFE: never touches `/opt/ces`.
 - `deploy/README.md` — one-time box setup + the deploy env vars.

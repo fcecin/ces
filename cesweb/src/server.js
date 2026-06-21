@@ -60,6 +60,7 @@ const engine = new Engine({
   maxInflight:   num(process.env.CESWEB_MAX_INFLIGHT, 8),
   validateTtlMs: num(process.env.CESWEB_VALIDATE_TTL_MS, 15000),
   resolveTtlMs:  num(process.env.CESWEB_RESOLVE_TTL_MS, 60000),
+  maxResolveEntries: num(process.env.CESWEB_MAX_RESOLVE_ENTRIES, 4096),
   getTimeoutMs:  num(process.env.CESWEB_GET_TIMEOUT_MS, 900000),
   stallTimeoutMs:num(process.env.CESWEB_STALL_TIMEOUT_MS, 60000),
   failTtlMs:     num(process.env.CESWEB_FAIL_TTL_MS, 10000),
@@ -95,8 +96,10 @@ function esc(s) {
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
 
-function page(title, body, { refresh } = {}) {
-  const meta = refresh ? `<meta http-equiv=refresh content="${refresh}">` : '';
+function page(title, body, { refresh, countdown } = {}) {
+  const meta = (refresh && !countdown) ? `<meta http-equiv=refresh content="${refresh}">` : '';
+  const cd = countdown ? `<script>(function(){var n=${countdown},e=document.getElementById('cesweb-cd');
+var t=setInterval(function(){n--;if(e)e.textContent=n;if(n<=0){clearInterval(t);location.reload();}},1000);})();</script>` : '';
   return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">${meta}
 <title>${esc(title)}</title>
@@ -115,7 +118,7 @@ a{color:#0a7d33;text-decoration:none}a:hover{text-decoration:underline}
 .bar>span{display:block;height:100%;background:#0a7d33;transition:width .4s}
 .pct{font-size:1.3rem;font-weight:600}
 </style>
-${body}`;
+${body}${cd}`;
 }
 
 function sendHtml(res, status, body, extra = {}) {
@@ -210,7 +213,13 @@ function sitrepPage(snap, target) {
   let head, detail, refresh = 2;
   switch (snap.state) {
     case State.RESOLVING:
-      head = 'Reaching the server'; detail = `Resolving <code>${on}</code>&hellip;`; refresh = 1; break;
+      // No stale bytes while we resolve the server's identity: a clean page with
+      // a client-side 10s countdown that reloads to land on the real content.
+      return page('Resolving cache entry',
+        `<h1>Resolving cache entry</h1>
+         <p>Reaching <code>${on}</code> and matching <code>${file}</code> in the gateway cache&hellip;</p>
+         <p class=muted>Re-checking in <b id=cesweb-cd>10</b>s&hellip;</p>`,
+        { countdown: 10 });
     case State.STATTING:
       head = 'Checking the file'; detail = `Looking up <code>${file}</code> on <code>${on}</code>&hellip;`; refresh = 1; break;
     case State.QUEUED:

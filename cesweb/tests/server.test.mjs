@@ -68,10 +68,14 @@ async function poll(p, until, { timeout = 8000, interval = 50 } = {}) {
   }
 }
 
-test('cold request returns a sitrep, then the real content after refresh', async () => {
-  const first = await get('/p/a.txt');
+test('cold request shows the resolving page (10s client countdown, no stale bytes), then content', async () => {
+  const first = await get('/p/a.txt');                 // first hit: host not yet resolved
   assert.equal(first.status, 200);
-  assert.match(first.ct, /text\/html/);          // a progress/sitrep page, not the file yet
+  assert.match(first.ct, /text\/html/);                // a page, not the file yet
+  assert.match(first.body, /Resolving cache entry/);   // the resolving page
+  assert.match(first.body, /id=cesweb-cd>10</);        // client-side 10s countdown element
+  assert.match(first.body, /location\.reload/);        // retries client-side, not a meta-refresh
+  assert.doesNotMatch(first.body, /hello world/);      // never serves stale/partial content
   const ready = await poll('/p/a.txt', (r) => r.ct.includes('text/plain'));
   assert.equal(ready.body, 'hello world');
 });

@@ -11,10 +11,12 @@
 // and every transition is fault-tolerant (a dead/stalled cesh, a truncated
 // part-file, an unreachable host — none of them wedge the machine).
 //
-// Content key = sha256(host:port \0 cesPath). It is irreversible, so an entry
-// recovered from disk at boot is "dormant ready": it can be SERVED (we have its
-// bytes) but cannot be revalidated/refilled until a live request re-supplies
-// the host/path that hashes to it. requestContent() re-attaches that identity.
+// Content key = sha256(serverKey \0 cesPath) — the CES server's pubkey (learned
+// via ping), NOT the host string, so the same server reached as a DNS name, an
+// IPv4, or an IPv6 shares one entry instead of a full copy per spelling. It is
+// irreversible, so an entry recovered from disk at boot is "dormant ready": it
+// can be SERVED (we have its bytes) but cannot be revalidated/refilled until a
+// live request resolves a host to that serverKey and re-attaches the identity.
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -48,6 +50,11 @@ export class Engine {
     this.maxInflight = opts.maxInflight ?? 8;      // concurrent downloads
     this.validateTtlMs = opts.validateTtlMs ?? 15000;
     this.resolveTtlMs = opts.resolveTtlMs ?? 60000;
+    // Hard cap on the resolve cache (host:port -> identity). The host-spelling
+    // key space is unbounded and caller-controlled on the open `/<host>/` form,
+    // so — like the content cache — it is size-capped with LRU eviction rather
+    // than left to grow. Evicting a resolved host is safe: it just re-pings.
+    this.maxResolveEntries = opts.maxResolveEntries ?? 4096;
     // SSRF guard: refuse hosts that resolve to a non-globally-routable address
     // (loopback, RFC1918, link-local, CGNAT, …) so a crafted URL can't aim the
     // gateway at localhost or the internal network. Off only for tests/localdemo.
@@ -62,6 +69,7 @@ export class Engine {
     this.entries = new Map();  // hash -> entry
     this.hosts = new Map();    // "host:port" -> { rpcPort, serverKey, ts, _inflight? }
     this.totalBytes = 0;
+    this.metrics = { hits: 0, misses: 0, dedupSaves: 0 };  // cache serves / fetches / copies avoided by identity-dedup
     this.active = 0;           // download slots in use
     this.waiters = [];         // FIFO of resolve fns waiting for a slot
     this.timers = [];
@@ -130,27 +138,63 @@ export class Engine {
 
   // ---- the responder's single entry point --------------------------------
 
-  // Cheap + synchronous. Returns a snapshot of the entry's current state and,
+  // Cheap + synchronous. Returns a snapshot of the content's current state and,
   // when needed, KICKS background work (never awaits it). The responder calls
   // this and renders the snapshot — that is the whole web path.
+  //
+  // Cache identity is the CES server's PUBKEY (learned via ping), NOT the host
+  // string: a DNS name, its IPv4, and its IPv6 all ping the same server and so
+  // share ONE cache entry instead of a full copy per spelling. That needs the
+  // host resolved first; until then we report RESOLVING and let the resolve's
+  // continuation materialize the entry (so it makes progress with no further
+  // request). A failed resolve is reported as FAILED, not an infinite RESOLVING.
   requestContent(host, cesPort, cesPath) {
     const target = `${host}:${cesPort}`;
-    const hash = crypto.createHash('sha256').update(target + '\0' + cesPath).digest('hex');
+    const now = Date.now();
+    const r = this.hosts.get(target);
+
+    if (r && r.serverKey) { r.used = now; return this._serveByKey(r.serverKey, host, cesPort, cesPath, target); }
+    if (r && r.error && (now - r.ts) < this.failTtlMs) { r.used = now; return this._fakeSnap(State.FAILED, host, cesPath, r.error); }
+
+    this._resolveHost(target)
+      .then((ent) => { if (ent && ent.serverKey) this._serveByKey(ent.serverKey, host, cesPort, cesPath, target); })
+      .catch(() => {});
+    return this._fakeSnap(State.RESOLVING, host, cesPath);
+  }
+
+  // Snapshot for a state with no content entry yet (resolving / resolve-failed).
+  _fakeSnap(state, host, cesPath, errKind) {
+    return { state, file: undefined, cesPath, host, size: 0, gotBytes: 0, wantSize: 0,
+             errKind, queueAhead: this.waiters.length };
+  }
+
+  // Get-or-create the content entry keyed by (serverKey, cesPath) and return its
+  // snapshot, driving background work as needed. Idempotent — safe to call from
+  // a poll OR from a resolve continuation.
+  _serveByKey(serverKey, host, cesPort, cesPath, target) {
+    const hash = crypto.createHash('sha256').update(serverKey + '\0' + cesPath).digest('hex');
     const now = Date.now();
     let e = this.entries.get(hash);
 
     if (!e) {
-      e = { hash, host, cesPort, cesPath, target,
-            file: path.join(this.cacheDir, hash),
+      this.metrics.misses++;
+      e = { hash, host, cesPort, cesPath, target, serverKey,
+            file: path.join(this.cacheDir, hash), spellings: new Set([target]),
             state: State.RESOLVING, hits: 0, lastAccess: now };
       this.entries.set(hash, e);
       this._drive(e);
       return this._snap(e);
     }
 
-    // Re-attach identity to a dormant (recovered) entry so it can be driven.
-    if (!e.target) { e.host = host; e.cesPort = cesPort; e.cesPath = cesPath; e.target = target; }
+    // Re-attach identity to a dormant (recovered) entry; track the freshest
+    // target that reached this server (any spelling resolving to its key).
+    if (!e.serverKey) { e.cesPath = cesPath; e.serverKey = serverKey; }
+    e.host = host; e.cesPort = cesPort; e.target = target;
     e.lastAccess = now;
+
+    // A new host spelling reusing this entry is a full copy the dedup avoided.
+    if (!e.spellings) e.spellings = new Set();
+    if (!e.spellings.has(target)) { e.spellings.add(target); if (e.spellings.size > 1) this.metrics.dedupSaves++; }
 
     if (e.state === State.READY) {
       // Self-heal: if the cache file vanished out from under us (operator rm,
@@ -162,6 +206,7 @@ export class Engine {
         return this._snap(e);
       }
       e.hits = (e.hits || 0) + 1;
+      this.metrics.hits++;
       if ((now - (e.validatedMs || 0)) > this.validateTtlMs && !e.revalidating) this._revalidate(e);
       return this._snap(e);
     }
@@ -387,20 +432,45 @@ export class Engine {
   _resolveHost(target) {
     const now = Date.now();
     const c = this.hosts.get(target);
-    if (c && c.rpcPort != null && (now - c.ts) < this.resolveTtlMs) return Promise.resolve(c);
+    if (c && c.serverKey && (now - c.ts) < this.resolveTtlMs) { c.used = now; return Promise.resolve(c); }
     if (c && c._inflight) return c._inflight;
     const p = this._assertRoutable(target)
-      .then(() => ping(this.cesh, target, this.walletOpts)).then((info) => {
-      const ent = { rpcPort: info.rpcPort, serverKey: info.serverPublicKey, ts: Date.now() };
-      this.hosts.set(target, ent);
-      return ent;
-    });
+      .then(() => ping(this.cesh, target, this.walletOpts))
+      .then((info) => {
+        const ts = Date.now();
+        const ent = { rpcPort: info.rpcPort, serverKey: info.serverPublicKey, ts, used: ts };
+        this.hosts.set(target, ent);
+        this._evictResolveCache();
+        return ent;
+      }, (err) => {
+        // Record the failure so requestContent reports FAILED instead of looping
+        // on RESOLVING; cleared by a retry after failTtl.
+        const ts = Date.now();
+        this.hosts.set(target, { error: 'unreachable', ts, used: ts });
+        this._evictResolveCache();
+        throw err;
+      });
     this.hosts.set(target, { ...(c || { ts: 0 }), _inflight: p });
     p.then(() => {}, () => {}).finally(() => {
       const cur = this.hosts.get(target);
       if (cur && cur._inflight === p) delete cur._inflight;
     });
     return p;
+  }
+
+  // Keep the resolve cache under its hard cap, dropping least-recently-used
+  // entries (never an in-flight resolve). Re-resolving an evicted host is safe.
+  _evictResolveCache() {
+    let over = this.hosts.size - this.maxResolveEntries;
+    if (over <= 0) return;
+    const cands = [...this.hosts.entries()]
+      .filter(([, v]) => !v._inflight)
+      .sort((a, b) => (a[1].used || a[1].ts || 0) - (b[1].used || b[1].ts || 0));
+    for (const [k] of cands) {
+      if (over <= 0) break;
+      this.hosts.delete(k);
+      over--;
+    }
   }
 
   _writeMeta(file, m) {
@@ -417,6 +487,8 @@ export class Engine {
     return {
       totalBytes: this.totalBytes, maxCacheBytes: this.maxCacheBytes, maxFileBytes: this.maxFileBytes,
       active: this.active, queued: this.waiters.length, entries: this.entries.size,
+      hits: this.metrics.hits, misses: this.metrics.misses, dedupSaves: this.metrics.dedupSaves,
+      resolveEntries: this.hosts.size,
       items: [...this.entries.values()].map((e) => ({
         host: e.host, cesPath: e.cesPath, state: e.state,
         size: e.size || 0, gotBytes: e.gotBytes || 0, wantSize: e.wantSize || 0,

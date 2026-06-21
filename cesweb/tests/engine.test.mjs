@@ -194,10 +194,68 @@ test('recovery: a fresh engine reloads the cache from disk', async () => {
 
   const e2 = makeEngine(cache, fx);
   try {
-    assert.equal(e2.totalBytes, 10);
-    const s = e2.requestContent(H, P, '/p/keep.txt');
-    assert.equal(s.state, State.READY);         // immediately serveable, no refetch
+    assert.equal(e2.totalBytes, 10);            // recovered from disk
+    // Identity-keyed cache: a recovered file is matched once the host resolves to
+    // its serverKey (one cached ping), then served with NO refetch.
+    const s = await waitState(e2, H, P, '/p/keep.txt', State.READY);
+    assert.equal(s.size, 10);
     assert.equal(fs.readFileSync(file, 'utf8'), 'persist me');
+    assert.equal(e2.totalBytes, 10);            // reused the dormant file, not re-downloaded
     assert.ok(!fs.existsSync(path.join(cache, 'deadbeef.part')), 'orphan part swept');
   } finally { e2.stop(); }
+});
+
+test('cache dedup: one server reached as DNS name / IPv4 / IPv6 is ONE entry', async () => {
+  // The fake cesh pings every host to the same serverKey — i.e. these are the
+  // SAME CES server reached three ways. The cache must key on that identity, not
+  // on the host string, or it stores a full copy per spelling.
+  const { engine } = setup({
+    ping: { serverKey: 'ab'.repeat(32), rpcPort: 40000 },
+    files: { '/p/big.bin': { size: 100_000 } },
+  });
+  try {
+    await waitState(engine, 'ces.example', P, '/p/big.bin', State.READY);
+    await waitState(engine, '203.0.113.7', P, '/p/big.bin', State.READY);   // IPv4
+    await waitState(engine, '2001:db8::7', P, '/p/big.bin', State.READY);   // IPv6
+    assert.equal(engine.stats().entries, 1, 'one entry for one server, any spelling');
+    assert.equal(engine.totalBytes, 100_000, 'stored once, not once per host');
+    const onDisk = fs.readdirSync(engine.cacheDir).filter((f) => /^[0-9a-f]{64}$/.test(f));
+    assert.equal(onDisk.length, 1, 'one cache file on disk');
+  } finally { engine.stop(); }
+});
+
+test('metrics: hits / misses / dedupSaves track the cache and the identity-dedup', async () => {
+  const { engine } = setup({
+    ping: { serverKey: 'cd'.repeat(32), rpcPort: 40000 },
+    files: { '/p/m.txt': { bytes: 'metric me', modifiedUs: 1 } },
+  });
+  try {
+    await waitState(engine, 'one.example', P, '/p/m.txt', State.READY);   // miss: one fetch
+    await waitState(engine, 'one.example', P, '/p/m.txt', State.READY);   // hit: same spelling
+    await waitState(engine, 'two.example', P, '/p/m.txt', State.READY);   // hit + dedupSave: new spelling, same server
+    const s = engine.stats();
+    assert.equal(s.misses, 1, 'fetched exactly once for one server');
+    assert.ok(s.hits >= 2, 'served from cache on the repeat + the alias');
+    assert.equal(s.dedupSaves, 1, 'the second host spelling reused the entry (a copy avoided)');
+  } finally { engine.stop(); }
+});
+
+test('resolve cache is bounded (LRU cap), and eviction is safe (re-resolve)', async () => {
+  // The host-spelling key space is unbounded/caller-controlled; the resolve cache
+  // must be size-capped, not grow per distinct spelling seen.
+  const { engine } = setup({
+    ping: { serverKey: 'ef'.repeat(32), rpcPort: 40000 },
+    files: { '/p/b.txt': { bytes: 'bounded', modifiedUs: 1 } },
+  }, { maxResolveEntries: 3 });
+  try {
+    for (let i = 0; i < 10; i++)
+      await waitState(engine, `h${i}.example`, P, '/p/b.txt', State.READY);
+    const s = engine.stats();
+    assert.ok(s.resolveEntries <= 3, `resolve cache capped at 3, got ${s.resolveEntries}`);
+    assert.equal(s.entries, 1, 'still one content entry (dedup holds across all spellings)');
+    // A spelling evicted from the resolve cache re-resolves and serves on its next
+    // request — eviction is safe, never a hole.
+    const again = await waitState(engine, 'h0.example', P, '/p/b.txt', State.READY);
+    assert.equal(fs.readFileSync(again.file, 'utf8'), 'bounded');
+  } finally { engine.stop(); }
 });
