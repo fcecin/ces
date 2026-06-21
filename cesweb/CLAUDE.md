@@ -38,32 +38,51 @@ Split so a slow CES read can never block a web request.
   engine for the content's current state, render it (a ready cache file, streamed
   + Range-capable → a sitrep page that auto-refreshes while work happens → an
   error page). It also serves the home page, the `/dev` index, the `/dev/dial`
-  terminal page, and `/__cesweb/status` (engine state as JSON), and owns the
+  terminal page, and `/status` (engine state as JSON), and owns the
   WebSocket upgrade for the terminal. It never fetches, validates, evicts, or
   awaits anything but a local file stream.
 
-- **`src/engine.js` — the content state machine.** The single owner of the cache
-  dir, the in-memory content index, every `cesh` child, and the per-host resolve
-  cache. It resolves hosts, STATs, downloads (watching the growing `.part` file
-  for live progress), revalidates ready files, refills changed ones (serving the
-  old copy until the new one is renamed in), evicts under the cap, reaps stalled
-  children, and rebuilds its index from disk on boot. Nothing it does touches the
-  request path.
+- **`src/engine.js` — the content engine. The cache IS the filesystem.** Content
+  lives at its natural path, `cache/<host>/<cesPath>`, and the file's own **size +
+  mtime ARE its metadata** (mtime is set to the CES file's `modifiedUs`). No hash,
+  no sidecar, no in-RAM index of cached files — the OS owns the index, so the
+  gateway boots instantly and scales with the filesystem. The engine resolves
+  hosts, STATs, downloads (watching the growing `.part` for live progress),
+  revalidates ready files, refills changed ones (serving the old copy until the
+  new one is renamed in), and sweeps. Nothing it does touches the request path.
 
-Content key = `sha256(serverKey \0 cesPath)` — the CES server's pubkey (from
-`ping`), not the host string, so the same server reached as a DNS name / IPv4 /
-IPv6 shares ONE cache entry instead of a copy per spelling (irreversible). A new
-host spelling resolves first (one cached ping → RESOLVING), then keys by that
-identity. Per-entry states:
+Identity = **(host, cesPath)**. Serving needs no resolve: the responder maps a
+request straight to its `cache/<host>/<cesPath>` and `stat`s it — a real FILE
+there is a hit. Resolving (`ping` → rpc port + server key, bounded-LRU resolve
+cache) is only needed to *fetch*. Per-request states:
 `resolving → statting → queued → downloading → ready` (or `failed`). READY ⇒ the
-responder serves; FAILED ⇒ error page; anything else ⇒ sitrep. A recovered entry
-is "dormant ready": serveable, re-attached to its host/path by the first live
-request so it can be revalidated/refilled.
+responder serves; FAILED ⇒ error page; anything else ⇒ sitrep. There is no
+recovery step — a restart serves the on-disk tree immediately.
 
-Eviction is **LRU** (least-recently-used; hits break ties), not LFU — a
-just-filled file has the freshest access time and survives, avoiding the
-re-download thrash pure hit-counting causes. `maxFileBytes` is clamped to
-`maxCacheBytes` so one cacheable file always fits.
+**Revalidation** compares the CES STAT's `size`/`modifiedUs` against the cached
+file's `size`/`mtime` (so even a *same-size* change is caught), on a TTL, in the
+background; an upstream deletion drops the cache file.
+
+**A file↔directory type change at a path is the invalidation signal**, not a
+collision: the CES source store can't have both, and the server tells us which
+via signed STAT, so the stale node (a file where a dir is now needed, or a dir
+where a file is) is removed and replaced with what the server reports.
+
+**Path traversal is contained** (security-critical): `cesPath` is caller-driven,
+so `_fsPath` rejects `..`/`.`/control-chars and asserts the result stays under
+`cache/<host>/`.
+
+**Eviction is insertion-driven and disk-bounded — no sweep, no RAM index.** The
+LRU signal is the filesystem's own `atime` (the OS bumps it when a file is
+served), so a million cached files cost zero RAM. Before the worker caches a new
+file it checks free disk (`statfs`, O(1)); only if free is below `minFreeBytes`
+does it walk and **list** candidates (never deleting mid-walk), stopping when it
+has listed enough files idle past `maxAgeMs` to cover the need (after a `minScan`
+sample, so small caches get a full eval), or at `maxScan` (RAM guard), or at the
+walk's end. Then it deletes oldest-first until the need is met — preferring idle
+files, falling back to reaping the oldest recent ones. CPU is spent only under
+disk pressure; latency under load is unbounded by design (requests wait).
+`maxFileBytes` refuses any single file bigger than itself.
 
 ## Security: no key to the server, and no SSRF
 
@@ -105,7 +124,9 @@ re-download thrash pure hit-counting causes. `maxFileBytes` is clamped to
 Anchors on the server's **primary** (CES) port; the gateway resolves the rpc port
 + server key from it for free via `cesh ping` (MINX GetInfo). `-53830` is
 omittable (defaults to `CESWEB_DEFAULT_CES_PORT`). Host may contain dashes; the
-port is only a trailing `-<digits>`. The remainder is the **verbatim CES path** —
+port is only a trailing `-<digits>`. **The host must be a DNS name — IP literals
+(v4 and v6) are rejected** (`400`), so the cache dir is always the name verbatim
+(filesystem-safe, no lossy rewrite, no collisions). The remainder is the **verbatim CES path** —
 the CES zone namespace IS the URL namespace. Zones: `/h/ /f/ /p/ /s/` (only `/s/`
 lists its contents). A trailing `/` ⇒ `index.html`.
 
@@ -173,17 +194,18 @@ everywhere). That's the feature, not a blocker:
   Tests + `live.sh` only. NEVER set in production.
 - `CESWEB_WALLET_FILE` or `CESWEB_WALLET` (inline) — the gateway's wallet
 - `CESWEB_PUBKEY` — gateway account (else derived at boot via `keys list -p`)
-- `CESWEB_CACHE_DIR` (`<cwd>/cache`) — disk cache (+`.meta` sidecars)
-- `CESWEB_MAX_FILE_MB` (1024) — refuse (413) bigger; clamped to MAX_CACHE
-- `CESWEB_MAX_CACHE_MB` (4096) — total cap; LRU eviction down to LOW_WATER
-- `CESWEB_CACHE_LOW_WATER_PCT` (90) — evict until under this % of the cap
+- `CESWEB_CACHE_DIR` (`<cwd>/cache`) — the cache tree (`cache/<host>/<cesPath>`)
+- `CESWEB_MAX_FILE_MB` (1024) — refuse (413) any single file bigger than this
+- `CESWEB_MIN_FREE_MB` (2048) — keep this much disk free; eviction triggers below it
+- `CESWEB_MAX_AGE_HOURS` (24) — a file idle longer than this is freely evictable
+- `CESWEB_MAX_INFLIGHT` (1) — fetch workers; misses queue and wait (cache hits aren't gated)
 - `CESWEB_VALIDATE_TTL_MS` (15000) — trust a stat-validation this long
 - `CESWEB_RESOLVE_TTL_MS` (60000) — reuse a host's resolved rpcPort/key this long
 - `CESWEB_MAX_RESOLVE_ENTRIES` (4096) — hard cap on the resolve cache (host→identity); LRU-evicted, since the host-spelling key space is caller-controlled on the open `/<host>/` form
+- `CESWEB_MAX_STATUS_ITEMS` (200) — cap on the `/status` items list (live entries only; the cache itself is never enumerated)
 - `CESWEB_GET_TIMEOUT_MS` (900000) — hard cap on one fill
 - `CESWEB_STALL_TIMEOUT_MS` (60000) — kill a fill that makes no progress
 - `CESWEB_FAIL_TTL_MS` (10000) — cache a failure this long before retrying
-- `CESWEB_MAX_INFLIGHT` (8) — concurrent fills; extra requests QUEUE (no 503)
 
 Dev terminal (`/dev/dial`) bounds:
 - `CESWEB_MAX_TERMINALS` (8) / `CESWEB_MAX_TERMINALS_PER_IP` (2)
@@ -197,10 +219,13 @@ Dev terminal (`/dev/dial`) bounds:
 src/server.js   HTTP responder: routes, home/dev pages, the /dev/dial terminal
                 page + its WebSocket upgrade, status endpoint, range serving.
                 Holds the cached gateway balance.
-src/engine.js   content state machine: resolve(+SSRF guard) / stat /
-                download(+progress) / revalidate / refill / LRU-evict / reap /
-                disk-recover. Owns the cache + resolve cache. Exports
-                isGloballyRoutable / hostOf / fmtBytes.
+src/engine.js   filesystem-backed cache (one worker, no RAM index): maps
+                (host, cesPath) -> cache/<host>/<cesPath> (size+mtime are the
+                metadata, atime is the LRU); resolve(+SSRF guard) / stat /
+                download(+progress) / revalidate / refill / file<->dir
+                invalidation / disk-bounded age-first eviction on insert.
+                Owns the resolve cache. Exports isGloballyRoutable / hostOf /
+                fmtBytes.
 src/cesh.js     spawn-cesh: runCesh / ping / queryBalance / stat /
                 spawnFileGet(engine primitive) / gatewayPubkey
 src/term.js     dev terminal: WebSocket ↔ `cesh dial <pid> --extsign` bridge.

@@ -55,12 +55,14 @@ const engine = new Engine({
   cacheDir: CACHE_DIR,
   walletOpts,
   maxFileBytes:  num(process.env.CESWEB_MAX_FILE_MB, 1024) * MB,
-  maxCacheBytes: num(process.env.CESWEB_MAX_CACHE_MB, 4096) * MB,
-  lowWaterPct:   num(process.env.CESWEB_CACHE_LOW_WATER_PCT, 90),
-  maxInflight:   num(process.env.CESWEB_MAX_INFLIGHT, 8),
+  minFreeBytes:  num(process.env.CESWEB_MIN_FREE_MB, 2048) * MB,   // keep this much disk free; evict to maintain it
+  maxAgeMs:      num(process.env.CESWEB_MAX_AGE_HOURS, 24) * 3600 * 1000,
+  maxInflight:   num(process.env.CESWEB_MAX_INFLIGHT, 1),         // one fetch worker
   validateTtlMs: num(process.env.CESWEB_VALIDATE_TTL_MS, 15000),
   resolveTtlMs:  num(process.env.CESWEB_RESOLVE_TTL_MS, 60000),
   maxResolveEntries: num(process.env.CESWEB_MAX_RESOLVE_ENTRIES, 4096),
+  maxStatusItems: num(process.env.CESWEB_MAX_STATUS_ITEMS, 200),
+  defaultCesPort: DEFAULT_CES_PORT,
   getTimeoutMs:  num(process.env.CESWEB_GET_TIMEOUT_MS, 900000),
   stallTimeoutMs:num(process.env.CESWEB_STALL_TIMEOUT_MS, 60000),
   failTtlMs:     num(process.env.CESWEB_FAIL_TTL_MS, 10000),
@@ -207,43 +209,44 @@ ${cost}
 // A live progress page. Returned immediately for any non-ready, non-failed
 // state; it auto-refreshes so the browser lands on the real content (or an
 // error page) the moment the engine finishes.
+// Every not-ready state is a page reload (not streaming), so it uses one gentle
+// client-side 10s countdown — never a tight meta-refresh. DOWNLOADING also shows
+// the progress bar, which advances each reload.
 function sitrepPage(snap, target) {
   const file = esc(snap.cesPath || '');
   const on = esc(target);
-  let head, detail, refresh = 2;
+  let head, body;
   switch (snap.state) {
     case State.RESOLVING:
-      // No stale bytes while we resolve the server's identity: a clean page with
-      // a client-side 10s countdown that reloads to land on the real content.
-      return page('Resolving cache entry',
-        `<h1>Resolving cache entry</h1>
-         <p>Reaching <code>${on}</code> and matching <code>${file}</code> in the gateway cache&hellip;</p>
-         <p class=muted>Re-checking in <b id=cesweb-cd>10</b>s&hellip;</p>`,
-        { countdown: 10 });
+      head = 'Resolving cache entry';
+      body = `<p>Reaching <code>${on}</code> and matching <code>${file}</code> in the gateway cache&hellip;</p>`;
+      break;
     case State.STATTING:
-      head = 'Checking the file'; detail = `Looking up <code>${file}</code> on <code>${on}</code>&hellip;`; refresh = 1; break;
+      head = 'Checking the file';
+      body = `<p>Looking up <code>${file}</code> on <code>${on}</code>&hellip;</p>`;
+      break;
     case State.QUEUED:
       head = 'Queued';
-      detail = `<code>${file}</code> is waiting for a download slot` +
-               (snap.queueAhead ? ` (${snap.queueAhead} ahead)` : '') + '&hellip;';
-      refresh = 2; break;
+      body = `<p><code>${file}</code> is waiting for the fetch worker` +
+             (snap.queueAhead ? ` (${snap.queueAhead} ahead)` : '') + '&hellip;</p>';
+      break;
     case State.DOWNLOADING: {
       const want = snap.wantSize || 0, got = snap.gotBytes || 0;
       const pct = want ? Math.min(100, Math.floor((got / want) * 100)) : 0;
       head = 'Downloading from CES';
-      detail =
+      body =
         `<p>Pulling <code>${file}</code> from <code>${on}</code> into the gateway cache.
-         CES reads in chunks, so a large file takes a while &mdash; this page refreshes itself.</p>
+         CES reads in chunks, so a large file takes a while.</p>
          <div class=bar><span style="width:${pct}%"></span></div>
          <p class=pct>${pct}%</p>
          <p class=muted>${fmtBytes(got)} of ${want ? fmtBytes(want) : '?'}</p>`;
-      refresh = 2;
-      return page('Downloading…', `<h1>${head}</h1>${detail}`, { refresh });
+      break;
     }
     default:
-      head = 'Working'; detail = 'One moment&hellip;'; refresh = 2;
+      head = 'Working'; body = '<p>One moment&hellip;</p>';
   }
-  return page(head, `<h1>${head}</h1><p>${detail}</p>`, { refresh });
+  body += `<p class=muted>Refreshing in <b id=cesweb-cd>10</b>s&hellip;</p>`;
+  return page(head, `<h1>${head}</h1>${body}`, { countdown: 10 });
 }
 
 // errKind (from cesh/engine) -> HTTP status + page.
@@ -473,7 +476,7 @@ const httpd = http.createServer((req, res) => {
       return sendHtml(res, 405, page('405', '<h1>405</h1>'), { allow: 'GET, HEAD' });
     }
     const u = new URL(req.url, 'http://gateway');
-    if (u.pathname === '/__cesweb/status') return sendJson(res, 200, engine.stats());
+    if (u.pathname === '/status' || u.pathname === '/status/') return sendJson(res, 200, engine.stats());
 
     // Dev tools index.
     if (u.pathname === '/dev' || u.pathname === '/dev/') return sendHtml(res, 200, devIndex());

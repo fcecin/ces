@@ -22,15 +22,18 @@ Environment=CESWEB_DEFAULT_HOST=@@CESHOST@@
 # reads are free (bottomless) and never 402; if cesweb fronts a server you don't
 # operate, use a dedicated funded key instead.
 Environment=CESWEB_WALLET_FILE=/opt/cesweb/wallet.txt
-# Concurrency: at most 8 fills run at once; extra requests queue (the engine
-# shows a live sitrep page meanwhile, it does not 503).
-Environment=CESWEB_MAX_INFLIGHT=8
-# Local disk cache: files are fetched from CES once, then served from here
-# (range-capable). Stat-validated; survives restarts. The engine evicts (LRU)
-# to keep the cache under MAX_CACHE_MB, and refuses (413) files over MAX_FILE_MB.
+# ONE fetch worker: misses queue and wait (the live sitrep page); cache hits are
+# served straight off disk and are not worker-gated, so hot content stays parallel.
+Environment=CESWEB_MAX_INFLIGHT=1
+# Local disk cache: the filesystem IS the cache (no RAM index). Fetched once,
+# served from here (range-capable), stat-validated, survives restarts. Eviction
+# is disk-bounded + age-first: when free disk drops below MIN_FREE_MB the fetching
+# request walks and deletes files idle past MAX_AGE_HOURS (oldest first), only as
+# far as needed. One file over MAX_FILE_MB is refused.
 Environment=CESWEB_CACHE_DIR=/opt/cesweb/cache
 Environment=CESWEB_MAX_FILE_MB=1024
-Environment=CESWEB_MAX_CACHE_MB=4096
+Environment=CESWEB_MIN_FREE_MB=2048
+Environment=CESWEB_MAX_AGE_HOURS=24
 # Pin to a single CES server (no localhost, no arbitrary hosts) — combined with
 # the engine's non-routable-host refusal, this closes the open-proxy/SSRF surface.
 # Leave empty to front ANY server the URL names, or list several, comma-separated.

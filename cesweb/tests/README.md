@@ -26,5 +26,5 @@ upstream changes (rewrite the fixture between calls) — with zero network.
   upstream-deletion eviction, and disk recovery on restart.
 - **`server.test.mjs`** — spawns the real `src/server.js` (with `CESWEB_PORT=0`,
   reading the bound port back from its log) against the fake cesh and exercises
-  the HTTP surface: cold sitrep → content, Range/206, `/__cesweb/status`, and the
+  the HTTP surface: cold sitrep → content, Range/206, `/status`, and the
   404 / 402 / 403 / 400 mappings.

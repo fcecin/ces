@@ -6,6 +6,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
 import { tmpDir, writeFixture, SERVER, FAKECESH, sleep } from './util.mjs';
 
 let child, base;
@@ -89,13 +91,15 @@ test('warm file serves a byte range (206)', async () => {
   assert.equal(r.body, 'hello');
 });
 
-test('status endpoint reports engine state as JSON', async () => {
-  const r = await get('/__cesweb/status');
+test('status endpoint reports engine state as JSON (at /status)', async () => {
+  const r = await get('/status');
   assert.equal(r.status, 200);
   assert.match(r.ct, /application\/json/);
   const j = JSON.parse(r.body);
-  assert.ok(Array.isArray(j.items));
-  assert.ok(j.items.some((i) => i.cesPath === '/p/a.txt'));
+  assert.ok(Array.isArray(j.items));                          // live-only; cache itself is not enumerated
+  assert.ok(typeof j.freeBytes === 'number' && typeof j.hits === 'number');
+  const old = await get('/__cesweb/status');     // moved off the old gateway-internal prefix
+  assert.notEqual(old.status, 200);
 });
 
 test('missing file → 404', async () => {
@@ -116,4 +120,40 @@ test('disallowed host → 403', async () => {
 test('non-zone path → 400', async () => {
   const r = await get('/localhost/notazone');
   assert.equal(r.status, 400);
+});
+
+// The open `/<ces-host>/<path>` form (a browser pointing the gateway at a CES
+// server named in the URL), with NO allowlist — proves the feature end to end:
+// a DNS-named server is fetched + served; an IP host is refused at the engine
+// (400 badname), not merely by an allowlist.
+test('open form: a DNS-named CES host is served; an IP host is refused (400)', async () => {
+  const cache = tmpDir();
+  const fx = writeFixture(cache, {
+    ping: { rpcPort: 40000, serverKey: 'ab'.repeat(32) },
+    files: { '/p/a.txt': { bytes: 'open world', modifiedUs: 1 } },
+  });
+  const child2 = spawn('node', [SERVER], {
+    env: {
+      ...process.env, FAKECESH_FIXTURE: fx, CESWEB_PORT: '0', CESWEB_BIND: '127.0.0.1',
+      CESWEB_CESH: FAKECESH, CESWEB_CACHE_DIR: cache,
+      CESWEB_ALLOW_HOSTS: '',               // OPEN: any host the URL names
+      CESWEB_ALLOW_PRIVATE_HOSTS: '1',      // the fake cesh stands in for resolution
+    },
+  });
+  const port2 = await new Promise((resolve, reject) => {
+    let buf = ''; const to = setTimeout(() => reject(new Error('no start: ' + buf)), 5000);
+    child2.stderr.on('data', (d) => { buf += d.toString(); const m = buf.match(/http:\/\/127\.0\.0\.1:(\d+)/); if (m) { clearTimeout(to); resolve(parseInt(m[1], 10)); } });
+  });
+  const b2 = `http://127.0.0.1:${port2}`;
+  const g2 = async (p) => { const r = await fetch(b2 + p); return { status: r.status, ct: r.headers.get('content-type') || '', body: await r.text() }; };
+  try {
+    const ready = await (async () => {
+      const t0 = Date.now();
+      for (;;) { const r = await g2('/ok.example/p/a.txt'); if (r.ct.includes('text/plain')) return r; if (Date.now() - t0 > 8000) throw new Error('timeout ' + JSON.stringify(r).slice(0, 120)); await sleep(50); }
+    })();
+    assert.equal(ready.body, 'open world');                       // DNS-named open fetch works
+    assert.ok(fs.existsSync(path.join(cache, 'ok.example', 'p', 'a.txt')), 'cached under the DNS-named tree');
+    const ip = await g2('/1.2.3.4/p/a.txt');                      // IP host refused at the engine, not an allowlist
+    assert.equal(ip.status, 400);
+  } finally { child2.kill('SIGKILL'); }
 });
