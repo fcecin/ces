@@ -212,7 +212,8 @@ constexpr uint8_t  TAG_CONN_DATA_OUT = 0x07;  // child → server
 constexpr uint8_t  TAG_CONN_CLOSE    = 0x08;  // child → server
 constexpr uint8_t  TAG_LISTEN_ON     = 0x09;  // child → server
 constexpr uint8_t  TAG_LISTEN_OFF    = 0x0a;  // child → server
-constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (one-way)
+constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (ces.log, one-way)
+constexpr uint8_t  TAG_HOST_LOG      = 0x0c;  // child → server (host C++, one-way)
 constexpr uint8_t  TAG_NET_USAGE     = 0x0c;  // child -> server (one-way)
 
 constexpr uint16_t METHOD_CLIENT_SEND      = 0x0001;
@@ -326,6 +327,49 @@ bool write_frame(uint8_t tag, uint16_t corr_id,
   if (!write_exact(hdr, 7)) return false;
   if (body_len > 0 && !write_exact(body, body_len)) return false;
   return true;
+}
+
+// Structured log line from the C++ host side of this instance (not the Lua
+// program). Rides the same one-way IPC the Lua ces.log uses, but on its own tag
+// so the server attributes it to the host, not the program. level: 0 trace,
+// 1 debug, 2 info, 3 warning, 4 error. Call only from the run-loop thread (where
+// every ces.* C function runs), matching ces.log's threading.
+void host_log(uint8_t level, const std::string& msg) {
+  std::vector<uint8_t> body;
+  body.reserve(1 + msg.size());
+  body.push_back(level);
+  body.insert(body.end(), msg.begin(), msg.end());
+  write_frame(TAG_HOST_LOG, 0, body.data(), body.size());
+}
+
+// Safe-stringify the Lua error value on top of `s`'s stack, for host_log.
+std::string lua_err_str(lua_State* s) {
+  const char* m = lua_tostring(s, -1);
+  return m ? std::string(m) : std::string("(non-string error)");
+}
+
+// Exception firewall wrapped around EVERY native function exposed to Lua. A
+// std::exception thrown inside a native -- std::bad_alloc under the child's
+// RLIMIT_AS, a CryptoPP/Boost.System throw, a length_error from a bad size --
+// must never unwind into LuaJIT as a foreign "C++ exception": uncaught above a
+// pcall it can take down the run-loop thread. Catch it here and re-raise as an
+// ordinary Lua error the program's pcall can handle, logging it host-side.
+//
+// Only std::exception is caught, deliberately: LuaJIT's OWN error propagation
+// (luaL_error/lua_error, e.g. from a luaL_check* arg failure inside the wrapped
+// function) is a foreign exception class, not std::exception, so it passes
+// straight through this handler untouched -- preserving real Lua error messages.
+// A blanket catch(...) here would swallow that and break Lua error handling.
+template <lua_CFunction Fn>
+int guarded(lua_State* L) {
+  try {
+    return Fn(L);
+  } catch (const std::exception& e) {
+    // host_log allocates; never let a failure there mask the original fault.
+    try { host_log(4, std::string("uncaught native exception: ") + e.what()); }
+    catch (...) {}
+    return luaL_error(L, "internal error");
+  }
 }
 
 // Try to read one frame without blocking. Returns 1 on success,
@@ -1277,6 +1321,22 @@ int lua_ces_transfer(lua_State* L) {
   return 2;
 }
 
+// Minx config for a single outbound round-trip from this compute instance.
+// CesClient's default is server-sized: a Minx with DEFAULT_RECV_BUFFERS_SIZE
+// (16384) x 2KB recv buffers = ~32MB allocated up front. Constructing that per
+// call inside a child capped by RLIMIT_AS throws std::bad_alloc. A client doing
+// one blocking request needs only a small recv ring and none of the server's
+// PoW/spam machinery, so size it for what it is.
+minx::MinxConfig luaClientConfig() {
+  minx::MinxConfig c{"luacl"};
+  c.recvBuffersSize    = 256;   // one round-trip, not a server's inbound backlog
+  c.spamSampleRate     = 0;     // a client does not spam-score its own replies
+  c.randomXVMsToKeep   = 0;     // ping/query/transfer never verify PoW
+  c.randomXInitThreads = 0;
+  c.trustLoopback      = true;
+  return c;
+}
+
 // ces.remote_account_read(addr:string, account_pubkey:string(32))
 //   → balance, nonce, last_xfer_dest(8B), last_xfer_amount, last_xfer_time
 //     | nil, err
@@ -1311,21 +1371,28 @@ int lua_ces_remote_account_read(lua_State* L) {
   std::memcpy(pubkey.data(), pk, 32);
   ces::HashPrefix mapKey = ces::Account::getMapKey(pubkey);
 
-  ces::CesClient client(ep, /*useDataset=*/false);
-  if (!client.start(g_program_port) || !client.connect()) {
-    lua_pushnil(L);
-    lua_pushinteger(L, STATUS_INTERNAL);
-    return 2;
-  }
   int64_t balance = 0;
   uint32_t nonce = 0;
   ces::HashPrefix lastDest{};
   uint64_t lastAmt = 0;
   uint32_t lastTime = 0;
-  uint8_t rc = client.queryAccount(mapKey, balance, nonce,
-                                   lastDest, lastAmt, lastTime);
-  client.disconnect();
-  client.stop();
+  uint8_t rc;
+  try {
+    ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    if (!client.start(g_program_port) || !client.connect()) {
+      lua_pushnil(L);
+      lua_pushinteger(L, STATUS_INTERNAL);
+      return 2;
+    }
+    rc = client.queryAccount(mapKey, balance, nonce, lastDest, lastAmt, lastTime);
+    client.disconnect();
+    client.stop();
+  } catch (const std::exception& e) {
+    host_log(3, std::string("ces.remote_account_read: ") + e.what());
+    lua_pushnil(L);
+    lua_pushinteger(L, STATUS_INTERNAL);
+    return 2;
+  }
   if (rc != ces::CES_OK) {
     lua_pushnil(L);
     lua_pushinteger(L, rc);
@@ -1363,18 +1430,28 @@ int lua_ces_ping(lua_State* L) {
     lua_pushstring(L, "address resolve failed");
     return 2;
   }
-  ces::CesClient client(ep, /*useDataset=*/false);
-  client.setTries(1);  // fast-fail: a departed peer must not freeze the run loop
-  if (!client.start(g_program_port) || !client.connect()) {
+  minx::Hash serverKey;
+  uint16_t rpcPort = 0;
+  uint8_t minDiff = 0;
+  try {
+    ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    client.setTries(1);  // fast-fail: a departed peer must not freeze the loop
+    if (!client.start(g_program_port) || !client.connect()) {
+      lua_pushnil(L);
+      lua_pushstring(L, "unreachable");
+      return 2;
+    }
+    serverKey = client.getServerKey();
+    rpcPort = client.getServerRpcPort();
+    minDiff = client.getMinDifficulty();
+    client.disconnect();
+    client.stop();
+  } catch (const std::exception& e) {
+    host_log(3, std::string("ces.ping: ") + e.what());
     lua_pushnil(L);
-    lua_pushstring(L, "unreachable");
+    lua_pushstring(L, "ping failed");
     return 2;
   }
-  minx::Hash serverKey = client.getServerKey();
-  uint16_t rpcPort = client.getServerRpcPort();
-  uint8_t minDiff = client.getMinDifficulty();
-  client.disconnect();
-  client.stop();
   lua_newtable(L);
   lua_pushlstring(L, reinterpret_cast<const char*>(serverKey.data()), 32);
   lua_setfield(L, -2, "pubkey");
@@ -1426,17 +1503,25 @@ int lua_ces_remote_transfer(lua_State* L) {
   ces::Hash dest{};
   std::memcpy(dest.data(), pk, 32);
 
-  ces::CesClient client(ep, /*useDataset=*/false);
-  client.setKey(kp);
-  if (!client.start(g_program_port) || !client.connect()) {
+  int64_t newBal = 0;
+  uint8_t rc;
+  try {
+    ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    client.setKey(kp);
+    if (!client.start(g_program_port) || !client.connect()) {
+      lua_pushnil(L);
+      lua_pushinteger(L, STATUS_INTERNAL);
+      return 2;
+    }
+    rc = client.transfer(dest, amount, newBal);
+    client.disconnect();
+    client.stop();
+  } catch (const std::exception& e) {
+    host_log(3, std::string("ces.remote_transfer: ") + e.what());
     lua_pushnil(L);
     lua_pushinteger(L, STATUS_INTERNAL);
     return 2;
   }
-  int64_t newBal = 0;
-  uint8_t rc = client.transfer(dest, amount, newBal);
-  client.disconnect();
-  client.stop();
   if (rc != ces::CES_OK) {
     lua_pushnil(L);
     lua_pushinteger(L, rc);
@@ -1493,18 +1578,25 @@ int lua_ces_remote_cross_transfer(lua_State* L) {
   ces::Hash dest{};
   std::memcpy(dest.data(), pk, 32);
 
-  ces::CesClient client(ep, /*useDataset=*/false);
-  client.setKey(kp);
-  if (!client.start(g_program_port) || !client.connect()) {
+  int64_t newBal = 0;
+  uint8_t rc;
+  try {
+    ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    client.setKey(kp);
+    if (!client.start(g_program_port) || !client.connect()) {
+      lua_pushnil(L);
+      lua_pushinteger(L, STATUS_INTERNAL);
+      return 2;
+    }
+    rc = client.crossTransfer(dest, amount, std::string(dsrv, dsrv_len), newBal);
+    client.disconnect();
+    client.stop();
+  } catch (const std::exception& e) {
+    host_log(3, std::string("ces.remote_cross_transfer: ") + e.what());
     lua_pushnil(L);
     lua_pushinteger(L, STATUS_INTERNAL);
     return 2;
   }
-  int64_t newBal = 0;
-  uint8_t rc = client.crossTransfer(dest, amount,
-                                    std::string(dsrv, dsrv_len), newBal);
-  client.disconnect();
-  client.stop();
   if (rc != ces::CES_OK) {
     lua_pushnil(L);
     lua_pushinteger(L, rc);
@@ -1973,9 +2065,9 @@ int lua_ces_bucket_new(lua_State* L) {
   lua_newtable(L);
   lua_pushnumber(L, static_cast<lua_Number>(id));
   lua_setfield(L, -2, "id");
-  lua_pushcfunction(L, lua_ces_bucket_put);
+  lua_pushcfunction(L, guarded<lua_ces_bucket_put>);
   lua_setfield(L, -2, "put");
-  lua_pushcfunction(L, lua_ces_bucket_get);
+  lua_pushcfunction(L, guarded<lua_ces_bucket_get>);
   lua_setfield(L, -2, "get");
   return 1;
 }
@@ -2429,9 +2521,9 @@ void make_and_register_conn(lua_State* L, uint64_t conn_id,
   lua_setfield(L, -2, "pubkey");
   lua_pushboolean(L, 0);
   lua_setfield(L, -2, "closed");
-  lua_pushcfunction(L, lua_ces_conn_write);
+  lua_pushcfunction(L, guarded<lua_ces_conn_write>);
   lua_setfield(L, -2, "write");
-  lua_pushcfunction(L, lua_ces_conn_close);
+  lua_pushcfunction(L, guarded<lua_ces_conn_close>);
   lua_setfield(L, -2, "close");
   // Register in the live-conns table, keyed by the native id (the wire id the
   // dispatcher will look up on later DATA_IN / CLOSED frames).
@@ -2464,8 +2556,7 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
       lua_pushvalue(L, -2); // copy of conn
       // Stack: [listener, conn, on_open, conn_copy]
       if (lua_pcall(L, 1, 0, 0) != 0) {
-        std::fprintf(stderr, "cesluajitd: on_open error: %s\n",
-                     lua_tostring(L, -1));
+        host_log(3, std::string("conn on_open callback: ") + lua_err_str(L));
         lua_pop(L, 1);
       }
     } else {
@@ -2494,8 +2585,7 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
     }
     lua_pushlstring(L, reinterpret_cast<const char*>(data), dlen);
     if (lua_pcall(L, 2, 0, 0) != 0) {
-      std::fprintf(stderr, "cesluajitd: on_data error: %s\n",
-                   lua_tostring(L, -1));
+      host_log(3, std::string("conn on_data callback: ") + lua_err_str(L));
       lua_pop(L, 1);
     }
     lua_pop(L, 1); // listener table
@@ -2527,8 +2617,7 @@ bool dispatch_conn_frame(lua_State* L, Frame f) {
       // shape we need — call it directly. pcall pops both the
       // function and the arg, leaving [listener] on top.
       if (lua_pcall(L, 1, 0, 0) != 0) {
-        std::fprintf(stderr, "cesluajitd: on_close error: %s\n",
-                     lua_tostring(L, -1));
+        host_log(3, std::string("conn on_close callback: ") + lua_err_str(L));
         lua_pop(L, 1);
       }
     } else {
@@ -2616,8 +2705,7 @@ static void fire_due_timers(lua_State* L) {
     lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
     if (lua_isfunction(L, -1)) {
       if (lua_pcall(L, 0, 0, 0) != 0) {
-        std::fprintf(stderr, "cesluajitd: timer cb error: %s\n",
-                     lua_tostring(L, -1));
+        host_log(3, std::string("timer callback: ") + lua_err_str(L));
         lua_pop(L, 1);
       }
     } else {
@@ -2708,8 +2796,7 @@ static void drain_ready(lua_State* mainL) {
     int r = lua_resume(rc.co, rc.nargs);
     if (r == LUA_YIELD) continue;              // parked; nothing to do
     if (r != 0) {
-      std::fprintf(stderr, "cesluajitd: task error: %s\n",
-                   lua_tostring(rc.co, -1));
+      host_log(3, std::string("scheduled task: ") + lua_err_str(rc.co));
     }
     auto it = g_coro_refs.find(rc.co);
     if (it != g_coro_refs.end()) {
@@ -2876,9 +2963,9 @@ void make_luarpc_conn(lua_State* L, uint64_t id, const uint8_t* peer) {
   lua_setfield(L, -2, "pubkey");
   lua_pushboolean(L, 0);
   lua_setfield(L, -2, "closed");
-  lua_pushcfunction(L, lua_ces_luarpc_conn_write);
+  lua_pushcfunction(L, guarded<lua_ces_luarpc_conn_write>);
   lua_setfield(L, -2, "write");
-  lua_pushcfunction(L, lua_ces_luarpc_conn_close);
+  lua_pushcfunction(L, guarded<lua_ces_luarpc_conn_close>);
   lua_setfield(L, -2, "close");
   lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
   if (lua_istable(L, -1)) {
@@ -2908,8 +2995,7 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
     if (lua_isfunction(L, -1)) {
       lua_pushvalue(L, -2);  // conn
       if (lua_pcall(L, 1, 0, 0) != 0) {
-        std::fprintf(stderr, "cesluajitd: luarpc on_open error: %s\n",
-                     lua_tostring(L, -1));
+        host_log(3, std::string("luarpc on_open callback: ") + lua_err_str(L));
         lua_pop(L, 1);
       }
     } else {
@@ -2927,8 +3013,7 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
     if (lua_isnil(L, -1)) { lua_pop(L, 3); return; }
     lua_pushlstring(L, e.bytes.data(), e.bytes.size());
     if (lua_pcall(L, 2, 0, 0) != 0) {
-      std::fprintf(stderr, "cesluajitd: luarpc on_data error: %s\n",
-                   lua_tostring(L, -1));
+      host_log(3, std::string("luarpc on_data callback: ") + lua_err_str(L));
       lua_pop(L, 1);
     }
     lua_pop(L, 1);  // listener
@@ -2946,8 +3031,7 @@ void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
   lua_setfield(L, -2, "closed");
   if (hasCb) {
     if (lua_pcall(L, 1, 0, 0) != 0) {
-      std::fprintf(stderr, "cesluajitd: luarpc on_close error: %s\n",
-                   lua_tostring(L, -1));
+      host_log(3, std::string("luarpc on_close callback: ") + lua_err_str(L));
       lua_pop(L, 1);
     }
   } else {
@@ -3184,6 +3268,9 @@ int lua_fc_write(lua_State* L) {
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t offset = client_arg_u64(L, 3);
   size_t blen = 0; const char* b = luaL_checklstring(L, 4, &blen);
+  if (blen == 0 || blen > (1024 * 1024)) {
+    lua_pushnil(L); lua_pushstring(L, "data must be 1..1048576 bytes"); return 2;
+  }
   ces::Bytes content(reinterpret_cast<const uint8_t*>(b),
                      reinterpret_cast<const uint8_t*>(b) + blen);
   uint64_t fb = 0;
@@ -3198,7 +3285,11 @@ int lua_fc_read(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t offset = client_arg_u64(L, 3);
-  uint32_t length = static_cast<uint32_t>(client_arg_u64(L, 4));
+  uint64_t length64 = client_arg_u64(L, 4);
+  if (length64 == 0 || length64 > (1024 * 1024)) {
+    lua_pushnil(L); lua_pushstring(L, "length must be 1..1048576 bytes"); return 2;
+  }
+  uint32_t length = static_cast<uint32_t>(length64);
   ces::Bytes content;
   minx::Hash rangeHash{};
   uint8_t rc = e->fc->read(std::string(name, nlen), offset, length, content,
@@ -3216,6 +3307,9 @@ int lua_fc_append(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   size_t blen = 0; const char* b = luaL_checklstring(L, 3, &blen);
+  if (blen == 0 || blen > (1024 * 1024)) {
+    lua_pushnil(L); lua_pushstring(L, "data must be 1..1048576 bytes"); return 2;
+  }
   ces::Bytes content(reinterpret_cast<const uint8_t*>(b),
                      reinterpret_cast<const uint8_t*>(b) + blen);
   uint64_t fb = 0, newSize = 0;
@@ -3317,17 +3411,17 @@ int lua_fc_close(lua_State* L) {
 void push_file_handle(lua_State* L, uint64_t id) {
   lua_newtable(L);
   lua_pushnumber(L, static_cast<lua_Number>(id)); lua_setfield(L, -2, "id");
-  lua_pushcfunction(L, lua_fc_create);    lua_setfield(L, -2, "create");
-  lua_pushcfunction(L, lua_fc_write);     lua_setfield(L, -2, "write");
-  lua_pushcfunction(L, lua_fc_read);      lua_setfield(L, -2, "read");
-  lua_pushcfunction(L, lua_fc_append);    lua_setfield(L, -2, "append");
-  lua_pushcfunction(L, lua_fc_resize);    lua_setfield(L, -2, "resize");
-  lua_pushcfunction(L, lua_fc_deposit);   lua_setfield(L, -2, "deposit");
-  lua_pushcfunction(L, lua_fc_withdraw);  lua_setfield(L, -2, "withdraw");
-  lua_pushcfunction(L, lua_fc_set_price); lua_setfield(L, -2, "set_price");
-  lua_pushcfunction(L, lua_fc_delete);    lua_setfield(L, -2, "delete");
-  lua_pushcfunction(L, lua_fc_stat);      lua_setfield(L, -2, "stat");
-  lua_pushcfunction(L, lua_fc_close);     lua_setfield(L, -2, "close");
+  lua_pushcfunction(L, guarded<lua_fc_create>);    lua_setfield(L, -2, "create");
+  lua_pushcfunction(L, guarded<lua_fc_write>);     lua_setfield(L, -2, "write");
+  lua_pushcfunction(L, guarded<lua_fc_read>);      lua_setfield(L, -2, "read");
+  lua_pushcfunction(L, guarded<lua_fc_append>);    lua_setfield(L, -2, "append");
+  lua_pushcfunction(L, guarded<lua_fc_resize>);    lua_setfield(L, -2, "resize");
+  lua_pushcfunction(L, guarded<lua_fc_deposit>);   lua_setfield(L, -2, "deposit");
+  lua_pushcfunction(L, guarded<lua_fc_withdraw>);  lua_setfield(L, -2, "withdraw");
+  lua_pushcfunction(L, guarded<lua_fc_set_price>); lua_setfield(L, -2, "set_price");
+  lua_pushcfunction(L, guarded<lua_fc_delete>);    lua_setfield(L, -2, "delete");
+  lua_pushcfunction(L, guarded<lua_fc_stat>);      lua_setfield(L, -2, "stat");
+  lua_pushcfunction(L, guarded<lua_fc_close>);     lua_setfield(L, -2, "close");
 }
 
 int lua_ces_file_client(lua_State* L) {
@@ -3442,12 +3536,12 @@ int lua_cc_close(lua_State* L) {
 void push_compute_handle(lua_State* L, uint64_t id) {
   lua_newtable(L);
   lua_pushnumber(L, static_cast<lua_Number>(id)); lua_setfield(L, -2, "id");
-  lua_pushcfunction(L, lua_cc_launch);    lua_setfield(L, -2, "launch");
-  lua_pushcfunction(L, lua_cc_kill);      lua_setfield(L, -2, "kill");
-  lua_pushcfunction(L, lua_cc_stat);      lua_setfield(L, -2, "stat");
-  lua_pushcfunction(L, lua_cc_list);      lua_setfield(L, -2, "list");
-  lua_pushcfunction(L, lua_cc_instances); lua_setfield(L, -2, "instances");
-  lua_pushcfunction(L, lua_cc_close);     lua_setfield(L, -2, "close");
+  lua_pushcfunction(L, guarded<lua_cc_launch>);    lua_setfield(L, -2, "launch");
+  lua_pushcfunction(L, guarded<lua_cc_kill>);      lua_setfield(L, -2, "kill");
+  lua_pushcfunction(L, guarded<lua_cc_stat>);      lua_setfield(L, -2, "stat");
+  lua_pushcfunction(L, guarded<lua_cc_list>);      lua_setfield(L, -2, "list");
+  lua_pushcfunction(L, guarded<lua_cc_instances>); lua_setfield(L, -2, "instances");
+  lua_pushcfunction(L, guarded<lua_cc_close>);     lua_setfield(L, -2, "close");
 }
 
 int lua_ces_compute_client(lua_State* L) {
@@ -3516,61 +3610,61 @@ void install_ces_err_table(lua_State* L) {
 
 void install_ces_api(lua_State* L) {
   lua_newtable(L);
-  lua_pushcfunction(L, lua_ces_now);           lua_setfield(L, -2, "now");
-  lua_pushcfunction(L, lua_ces_sha256);        lua_setfield(L, -2, "sha256");
+  lua_pushcfunction(L, guarded<lua_ces_now>);           lua_setfield(L, -2, "now");
+  lua_pushcfunction(L, guarded<lua_ces_sha256>);        lua_setfield(L, -2, "sha256");
   // ces.log is operator-only: present solely for privileged (/s/) programs.
   if (g_privileged) {
-    lua_pushcfunction(L, lua_ces_log);         lua_setfield(L, -2, "log");
+    lua_pushcfunction(L, guarded<lua_ces_log>);         lua_setfield(L, -2, "log");
   }
-  lua_pushcfunction(L, lua_ces_sign);          lua_setfield(L, -2, "sign");
-  lua_pushcfunction(L, lua_ces_verify);        lua_setfield(L, -2, "verify");
-  lua_pushcfunction(L, lua_ces_every);         lua_setfield(L, -2, "every");
-  lua_pushcfunction(L, lua_ces_cancel);        lua_setfield(L, -2, "cancel");
-  lua_pushcfunction(L, lua_ces_spawn);         lua_setfield(L, -2, "spawn");
-  lua_pushcfunction(L, lua_ces_sleep);         lua_setfield(L, -2, "sleep");
-  lua_pushcfunction(L, lua_ces_client_recv);   lua_setfield(L, -2, "client_recv");
-  lua_pushcfunction(L, lua_ces_client_send);   lua_setfield(L, -2, "client_send");
-  lua_pushcfunction(L, lua_ces_prog_prefix);   lua_setfield(L, -2, "prog_prefix");
-  lua_pushcfunction(L, lua_ces_owner_pubkey);  lua_setfield(L, -2, "owner_pubkey");
-  lua_pushcfunction(L, lua_ces_program_pubkey);lua_setfield(L, -2, "program_pubkey");
-  lua_pushcfunction(L, lua_ces_rpc_port);      lua_setfield(L, -2, "rpc_port");
-  lua_pushcfunction(L, lua_ces_start_time);    lua_setfield(L, -2, "start_time");
-  lua_pushcfunction(L, lua_ces_transfer);      lua_setfield(L, -2, "transfer");
-  lua_pushcfunction(L, lua_ces_random_bytes);  lua_setfield(L, -2, "random_bytes");
-  lua_pushcfunction(L, lua_ces_account_read);  lua_setfield(L, -2, "account_read");
-  lua_pushcfunction(L, lua_ces_peers);         lua_setfield(L, -2, "peers");
+  lua_pushcfunction(L, guarded<lua_ces_sign>);          lua_setfield(L, -2, "sign");
+  lua_pushcfunction(L, guarded<lua_ces_verify>);        lua_setfield(L, -2, "verify");
+  lua_pushcfunction(L, guarded<lua_ces_every>);         lua_setfield(L, -2, "every");
+  lua_pushcfunction(L, guarded<lua_ces_cancel>);        lua_setfield(L, -2, "cancel");
+  lua_pushcfunction(L, guarded<lua_ces_spawn>);         lua_setfield(L, -2, "spawn");
+  lua_pushcfunction(L, guarded<lua_ces_sleep>);         lua_setfield(L, -2, "sleep");
+  lua_pushcfunction(L, guarded<lua_ces_client_recv>);   lua_setfield(L, -2, "client_recv");
+  lua_pushcfunction(L, guarded<lua_ces_client_send>);   lua_setfield(L, -2, "client_send");
+  lua_pushcfunction(L, guarded<lua_ces_prog_prefix>);   lua_setfield(L, -2, "prog_prefix");
+  lua_pushcfunction(L, guarded<lua_ces_owner_pubkey>);  lua_setfield(L, -2, "owner_pubkey");
+  lua_pushcfunction(L, guarded<lua_ces_program_pubkey>);lua_setfield(L, -2, "program_pubkey");
+  lua_pushcfunction(L, guarded<lua_ces_rpc_port>);      lua_setfield(L, -2, "rpc_port");
+  lua_pushcfunction(L, guarded<lua_ces_start_time>);    lua_setfield(L, -2, "start_time");
+  lua_pushcfunction(L, guarded<lua_ces_transfer>);      lua_setfield(L, -2, "transfer");
+  lua_pushcfunction(L, guarded<lua_ces_random_bytes>);  lua_setfield(L, -2, "random_bytes");
+  lua_pushcfunction(L, guarded<lua_ces_account_read>);  lua_setfield(L, -2, "account_read");
+  lua_pushcfunction(L, guarded<lua_ces_peers>);         lua_setfield(L, -2, "peers");
   // Peering CONTROL is operator-only: present solely for privileged (/s/)
   // programs. The supervisor enforces the same gate, so the boundary holds even
   // if the sandbox were bypassed.
   if (g_privileged) {
-    lua_pushcfunction(L, lua_ces_add_peer);        lua_setfield(L, -2, "add_peer");
-    lua_pushcfunction(L, lua_ces_remove_peer);     lua_setfield(L, -2, "remove_peer");
-    lua_pushcfunction(L, lua_ces_set_peer_target); lua_setfield(L, -2, "set_peer_target");
-    lua_pushcfunction(L, lua_ces_peer_target);     lua_setfield(L, -2, "peer_target");
+    lua_pushcfunction(L, guarded<lua_ces_add_peer>);        lua_setfield(L, -2, "add_peer");
+    lua_pushcfunction(L, guarded<lua_ces_remove_peer>);     lua_setfield(L, -2, "remove_peer");
+    lua_pushcfunction(L, guarded<lua_ces_set_peer_target>); lua_setfield(L, -2, "set_peer_target");
+    lua_pushcfunction(L, guarded<lua_ces_peer_target>);     lua_setfield(L, -2, "peer_target");
   }
-  lua_pushcfunction(L, lua_ces_ping);          lua_setfield(L, -2, "ping");
-  lua_pushcfunction(L, lua_ces_authentic_asset_create);
+  lua_pushcfunction(L, guarded<lua_ces_ping>);          lua_setfield(L, -2, "ping");
+  lua_pushcfunction(L, guarded<lua_ces_authentic_asset_create>);
   lua_setfield(L, -2, "authentic_asset_create");
-  lua_pushcfunction(L, lua_ces_bucket_new);    lua_setfield(L, -2, "bucket_new");
-  lua_pushcfunction(L, lua_ces_file_create);   lua_setfield(L, -2, "file_create");
-  lua_pushcfunction(L, lua_ces_file_write);    lua_setfield(L, -2, "file_write");
-  lua_pushcfunction(L, lua_ces_file_read);     lua_setfield(L, -2, "file_read");
-  lua_pushcfunction(L, lua_ces_file_stat);     lua_setfield(L, -2, "file_stat");
-  lua_pushcfunction(L, lua_ces_file_deposit);  lua_setfield(L, -2, "file_deposit");
-  lua_pushcfunction(L, lua_ces_file_withdraw); lua_setfield(L, -2, "file_withdraw");
-  lua_pushcfunction(L, lua_ces_file_set_price);lua_setfield(L, -2, "file_set_price");
-  lua_pushcfunction(L, lua_ces_file_delete);   lua_setfield(L, -2, "file_delete");
-  lua_pushcfunction(L, lua_ces_file_append);   lua_setfield(L, -2, "file_append");
-  lua_pushcfunction(L, lua_ces_file_resize);   lua_setfield(L, -2, "file_resize");
-  lua_pushcfunction(L, lua_ces_file_client);   lua_setfield(L, -2, "file_client");
-  lua_pushcfunction(L, lua_ces_compute_client);lua_setfield(L, -2, "compute_client");
-  lua_pushcfunction(L, lua_ces_remote_account_read);
+  lua_pushcfunction(L, guarded<lua_ces_bucket_new>);    lua_setfield(L, -2, "bucket_new");
+  lua_pushcfunction(L, guarded<lua_ces_file_create>);   lua_setfield(L, -2, "file_create");
+  lua_pushcfunction(L, guarded<lua_ces_file_write>);    lua_setfield(L, -2, "file_write");
+  lua_pushcfunction(L, guarded<lua_ces_file_read>);     lua_setfield(L, -2, "file_read");
+  lua_pushcfunction(L, guarded<lua_ces_file_stat>);     lua_setfield(L, -2, "file_stat");
+  lua_pushcfunction(L, guarded<lua_ces_file_deposit>);  lua_setfield(L, -2, "file_deposit");
+  lua_pushcfunction(L, guarded<lua_ces_file_withdraw>); lua_setfield(L, -2, "file_withdraw");
+  lua_pushcfunction(L, guarded<lua_ces_file_set_price>);lua_setfield(L, -2, "file_set_price");
+  lua_pushcfunction(L, guarded<lua_ces_file_delete>);   lua_setfield(L, -2, "file_delete");
+  lua_pushcfunction(L, guarded<lua_ces_file_append>);   lua_setfield(L, -2, "file_append");
+  lua_pushcfunction(L, guarded<lua_ces_file_resize>);   lua_setfield(L, -2, "file_resize");
+  lua_pushcfunction(L, guarded<lua_ces_file_client>);   lua_setfield(L, -2, "file_client");
+  lua_pushcfunction(L, guarded<lua_ces_compute_client>);lua_setfield(L, -2, "compute_client");
+  lua_pushcfunction(L, guarded<lua_ces_remote_account_read>);
   lua_setfield(L, -2, "remote_account_read");
-  lua_pushcfunction(L, lua_ces_remote_transfer);
+  lua_pushcfunction(L, guarded<lua_ces_remote_transfer>);
   lua_setfield(L, -2, "remote_transfer");
-  lua_pushcfunction(L, lua_ces_remote_cross_transfer);
+  lua_pushcfunction(L, guarded<lua_ces_remote_cross_transfer>);
   lua_setfield(L, -2, "remote_cross_transfer");
-  lua_pushcfunction(L, lua_ces_cross_transfer);
+  lua_pushcfunction(L, guarded<lua_ces_cross_transfer>);
   lua_setfield(L, -2, "cross_transfer");
 
   // ces.conn — the UNIFIED connection API: one listener + run loop + conn shape
@@ -3579,11 +3673,11 @@ void install_ces_api(lua_State* L) {
   // Inbound conns from either fan into one set of callbacks; tell them apart, if
   // you must, by conn.source (0 = relay, 1 = direct).
   lua_newtable(L);
-  lua_pushcfunction(L, lua_ces_conn_set_listener);
+  lua_pushcfunction(L, guarded<lua_ces_conn_set_listener>);
   lua_setfield(L, -2, "set_listener");
-  lua_pushcfunction(L, lua_ces_run);
+  lua_pushcfunction(L, guarded<lua_ces_run>);
   lua_setfield(L, -2, "run");
-  lua_pushcfunction(L, lua_ces_conn_connect);
+  lua_pushcfunction(L, guarded<lua_ces_conn_connect>);
   lua_setfield(L, -2, "connect");
   lua_setfield(L, -2, "conn");
 
@@ -3593,7 +3687,7 @@ void install_ces_api(lua_State* L) {
   lua_setfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
 
   // ces.run() — the unified event loop (ces.conn.run aliases it).
-  lua_pushcfunction(L, lua_ces_run);
+  lua_pushcfunction(L, guarded<lua_ces_run>);
   lua_setfield(L, -2, "run");
 
   // ces.err — error names → codes.

@@ -31,10 +31,10 @@ static constexpr uint64_t SERVER_TICKET_REFRESH_SECS = 15;
 static constexpr int POW_INIT_POLL_MS = 1000;
 
 CesClient::CesClient(const boost::asio::ip::udp::endpoint& serverEndpoint,
-                      bool useDataset) {
+                      bool useDataset, const minx::MinxConfig& config) {
   LOGTRACE << "CesClient (UDP)";
   transport_ =
-    std::make_unique<minx::MinxClientTransport>(this, serverEndpoint);
+    std::make_unique<minx::MinxClientTransport>(this, serverEndpoint, config);
   transport_->setUseDataset(useDataset);
 }
 

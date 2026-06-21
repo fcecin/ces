@@ -20,9 +20,12 @@ namespace ces {
 
 class CesClient : public minx::MinxListener {
 public:
-  /** Construct in UDP mode (direct connection to server). */
+  /** Construct in UDP mode (direct connection to server). The default Minx
+   *  config is server-sized (a ~32MB recv ring); a memory-constrained or
+   *  one-shot caller can pass a lighter config (e.g. a small recvBuffersSize). */
   CesClient(const boost::asio::ip::udp::endpoint& serverEndpoint,
-            bool useDataset = true);
+            bool useDataset = true,
+            const minx::MinxConfig& config = minx::MinxConfig{"cl"});
 
   /** Construct in TCP proxy mode (connection through a MinxProxy). */
   CesClient(const boost::asio::ip::tcp::endpoint& proxyEndpoint,

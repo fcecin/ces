@@ -144,6 +144,7 @@ constexpr uint8_t kIpcTagConnClose    = 0x08;  // child → server
 constexpr uint8_t kIpcTagListenOn     = 0x09;  // child → server
 constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
 constexpr uint8_t kIpcTagLog          = 0x0b;  // child → server (ces.log)
+constexpr uint8_t kIpcTagHostLog      = 0x0c;  // child → server (host C++)
 constexpr uint8_t kIpcTagNetUsage     = 0x0c;  // child -> server (channel usage)
 constexpr size_t  kLuaProgramLogMax   = 4096;  // cap a program log line
 
@@ -875,6 +876,24 @@ void emitProgramLog(uint64_t pid, const std::string& source,
   }
 }
 
+// Emit a log line from the C++ HOST side of a compute instance (cesluajitd's own
+// runtime -- e.g. a failed outbound ces.ping), as distinct from the program's
+// own ces.log. The "[host]" marker tells the operator this is the runtime
+// talking, not the deployed program. Same instance + source prefix; the level is
+// chosen host-side. Like program logs, gated to /s/ instances: a child controls
+// its IPC socket, so "[host]" attribution is only as trustworthy as the source.
+void emitHostLog(uint64_t pid, const std::string& source,
+                 uint8_t level, const char* msg, size_t len) {
+  std::string body(msg, len);
+  switch (level) {
+    case 0: LOGTRACE   << source << " pid " << pid << " [host]: " << body; break;
+    case 1: LOGDEBUG   << source << " pid " << pid << " [host]: " << body; break;
+    case 3: LOGWARNING << source << " pid " << pid << " [host]: " << body; break;
+    case 4: LOGERROR   << source << " pid " << pid << " [host]: " << body; break;
+    default: LOGINFO   << source << " pid " << pid << " [host]: " << body; break;
+  }
+}
+
 void handleChildFrame(std::shared_ptr<Instance> inst) {
   const auto& body = inst->rxBodyBuf;
   if (body.size() < 3) return;
@@ -922,6 +941,21 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     size_t mlen = body.size() - kIpcHdr - 1;
     if (mlen > kLuaProgramLogMax) mlen = kLuaProgramLogMax;
     emitProgramLog(
+      inst->pid, inst->sourceName, level,
+      reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
+    return;
+  }
+  if (tag == kIpcTagHostLog) {
+    // Payload: [u8 level][message bytes]. A log line from cesluajitd's own C++
+    // host (not the program's ces.log) -- e.g. an unexpected exception in an
+    // outbound ces.* call. Same gating + stamping as program logs; rendered
+    // with a "[host]" marker so the runtime is distinguishable from the program.
+    if (!isServerZone(inst->sourceName)) return;
+    if (body.size() < kIpcHdr + 1) return;
+    uint8_t level = body[kIpcHdr];
+    size_t mlen = body.size() - kIpcHdr - 1;
+    if (mlen > kLuaProgramLogMax) mlen = kLuaProgramLogMax;
+    emitHostLog(
       inst->pid, inst->sourceName, level,
       reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
     return;
