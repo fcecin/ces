@@ -4217,6 +4217,10 @@ struct ServerLedgerTxn : ces::LedgerTxn {
 
   uint8_t signerSpend(const minx::Hash& signer, uint64_t amount,
                       uint32_t reqNonce, int64_t errFee) override {
+    // A zero charge needs no account: an accountless signer can run a free op
+    // (e.g. a feeQuery-0 read of a donated /s/ file). Replay of free ops is
+    // bounded by the channel's own dedup, not the account.
+    if (amount == 0) return CES_OK;
     auto acc = s->accounts_.get(Account::getMapKey(signer));
     uint8_t rc = acc.validateSpend(amount, 0, reqNonce, errFee);
     if (rc != CES_OK) return rc;
