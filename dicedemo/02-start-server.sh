@@ -26,7 +26,7 @@ fi
   --cesplexmount /ces/file/1=builtin:file \
   --cesplexmount /ces/compute/1=builtin:compute \
   --cesplexmount /ces/lua/1=builtin:lua \
-  --builtin-app dice \
+  --extension dice \
   > "${SERVER_LOG}" 2>&1 &
 echo $! > "${SERVER_PID}"
 sleep 3
@@ -36,5 +36,5 @@ echo
 echo "--- last 25 lines of server.log ---"
 tail -25 "${SERVER_LOG}"
 echo
-echo "look for 'builtin_app launched dice'. if you see that, dice is up."
+echo "look for 'extension launched dice'. if you see that, dice is up."
 echo "next: ./03-wallet.sh"

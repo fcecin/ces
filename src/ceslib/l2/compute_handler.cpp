@@ -1966,7 +1966,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // no-ops on them (their file_balance is decorative), so the LAUNCH-time
   // upfront commitment must be waived too. Otherwise a /s/ program -- the
   // "ships standard" model (dht, dice) -- cannot be launched via the explicit
-  // verb at all, only via the internal builtin-app path.
+  // verb at all, only via the internal extension path.
   const bool serverZone = isServerZone(name);
 
   // Discounted slot rate for the upfront commitment (LAUNCH-time price).

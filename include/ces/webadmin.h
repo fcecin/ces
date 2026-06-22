@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * CesWeb — the CES server's localhost web dashboard.
+ * WebAdmin — the CES server's localhost web dashboard.
  *
  * A small, single-connection-at-a-time HTTP/1.1 server embedded in the
  * `ces` server binary. It is the operator's "experience center": peering,
@@ -39,7 +39,7 @@ namespace ces {
 class CesServer;
 
 // Bounded in-memory ring of recent server log lines. A Boost.Log sink that
-// CesWeb installs on the logging core pushes finished lines here; the web
+// WebAdmin installs on the logging core pushes finished lines here; the web
 // thread reads them for the live "Logs" tab. Thread-safe. Each line carries
 // a monotonic sequence number and a unix timestamp (seconds).
 class LogRing {
@@ -68,11 +68,11 @@ private:
   static constexpr size_t kCap = 2000;
 };
 
-class CesWebSession : public std::enable_shared_from_this<CesWebSession> {
+class WebAdminSession : public std::enable_shared_from_this<WebAdminSession> {
 public:
   using Socket = boost::asio::ip::tcp::socket;
 
-  CesWebSession(Socket socket, CesServer& server);
+  WebAdminSession(Socket socket, CesServer& server);
   void start();
 
 private:
@@ -97,10 +97,10 @@ private:
   bool responded_ = false;
 };
 
-class CesWeb {
+class WebAdmin {
 public:
-  CesWeb(boost::asio::io_context& io, CesServer& server);
-  ~CesWeb();
+  WebAdmin(boost::asio::io_context& io, CesServer& server);
+  ~WebAdmin();
 
   // Bind + start accepting. Returns true on success. Installs the log sink.
   bool listen(const std::string& bindAddr, uint16_t port);

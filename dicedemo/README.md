@@ -44,7 +44,7 @@ command at the end.
 | Step | Script | What it does |
 |------|--------|--------------|
 | 1 | `./01-setup.sh` | Wipe & recreate `./workspace`, generate the server keypair, copy `dice.lua` into the file store at `data/cesfilestore/s/dice.lua`. |
-| 2 | `./02-start-server.sh` | Launch `ces` in the background with all knobs as CLI flags (no TOML). Logs to `./workspace/server.log`. Verify `builtin_app launched dice` is in the tail. |
+| 2 | `./02-start-server.sh` | Launch `ces` in the background with all knobs as CLI flags (no TOML). Logs to `./workspace/server.log`. Verify `extension launched dice` is in the tail. |
 | 3 | `./03-wallet.sh` | Build the demo wallet — slot `@0` is a fresh client key (the dice player), slot `@1` is the server's privkey (so cesh can act as the bottomless donor). |
 | 4 | `./04-fund.sh` | Transfer 1B raw credits (~10 user-credits) from `@1` (server) to `@0` (client) with `--open`. No special "operator credit" command needed — the server is just another account in the wallet. |
 | 5 | `./05-play.sh` | Find the dice instance id, transfer 100 raw credits from `@0` to the house (= server pubkey), dial dice, send `play` then `quit`. Re-run to bet again. |

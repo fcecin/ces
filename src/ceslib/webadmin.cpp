@@ -1,11 +1,11 @@
 /**
- * cesweb.cpp — CES server localhost web dashboard.
+ * webadmin.cpp — CES server localhost web dashboard.
  *
- * See ces/cesweb.h for the security model (loopback + SSH tunnel, no auth)
+ * See ces/webadmin.h for the security model (loopback + SSH tunnel, no auth)
  * and architecture (one acceptor + per-connection session, like Cesco).
  */
 
-#include <ces/cesweb.h>
+#include <ces/webadmin.h>
 
 #include <ces/cesplex/meter.h>
 #include <ces/feemult.h>
@@ -195,7 +195,7 @@ uint64_t g_webStartUnix = 0;
 
 // Worker threads for the blocking remote ops (inspect/mine). They hold a
 // CesServer& and a session shared_ptr, so they must finish before the server
-// is torn down — joined in CesWeb::stop() rather than detached. A mine
+// is torn down — joined in WebAdmin::stop() rather than detached. A mine
 // respects ces::notInterrupted(), so a Ctrl-C unwinds these promptly.
 std::mutex g_workerMu;
 std::vector<std::thread> g_workers;
@@ -671,15 +671,15 @@ extern const char* kDashboardHtml;  // defined at the bottom of this file
 }  // namespace
 
 // =============================================================================
-// CesWebSession
+// WebAdminSession
 // =============================================================================
 
-CesWebSession::CesWebSession(Socket socket, CesServer& server)
+WebAdminSession::WebAdminSession(Socket socket, CesServer& server)
   : socket_(std::move(socket)), server_(server) {}
 
-void CesWebSession::start() { doRead(); }
+void WebAdminSession::start() { doRead(); }
 
-void CesWebSession::doRead() {
+void WebAdminSession::doRead() {
   auto self = shared_from_this();
   socket_.async_read_some(boost::asio::buffer(readChunk_),
     [this, self](boost::system::error_code ec, size_t n) {
@@ -694,7 +694,7 @@ void CesWebSession::doRead() {
     });
 }
 
-bool CesWebSession::requestComplete() {
+bool WebAdminSession::requestComplete() {
   if (headerEnd_ == 0) {
     auto pos = request_.find("\r\n\r\n");
     if (pos == std::string::npos) return false;
@@ -715,7 +715,7 @@ bool CesWebSession::requestComplete() {
   return request_.size() >= headerEnd_ + contentLength_;
 }
 
-void CesWebSession::handleRequest() {
+void WebAdminSession::handleRequest() {
   // Request line: METHOD SP TARGET SP HTTP/x
   std::string method, target;
   {
@@ -742,7 +742,7 @@ void CesWebSession::handleRequest() {
   }
 }
 
-void CesWebSession::route(const std::string& method, const std::string& path,
+void WebAdminSession::route(const std::string& method, const std::string& path,
                           const std::string& query, const std::string& body) {
   // ---- UI ----
   if (method == "GET" && (path == "/" || path == "/index.html")) {
@@ -964,7 +964,7 @@ void CesWebSession::route(const std::string& method, const std::string& path,
   respond(404, "application/json", "{\"error\":\"not found\"}");
 }
 
-void CesWebSession::runAsync(std::function<std::string()> work) {
+void WebAdminSession::runAsync(std::function<std::string()> work) {
   auto self = shared_from_this();
   addWorker(std::thread([this, self, work = std::move(work)]() {
     std::string body;
@@ -985,11 +985,11 @@ void CesWebSession::runAsync(std::function<std::string()> work) {
   }));
 }
 
-void CesWebSession::respondJson(const std::string& json) {
+void WebAdminSession::respondJson(const std::string& json) {
   respond(200, "application/json", json);
 }
 
-void CesWebSession::respond(int status, const std::string& contentType,
+void WebAdminSession::respond(int status, const std::string& contentType,
                             const std::string& body) {
   if (responded_) return;
   responded_ = true;
@@ -1020,15 +1020,15 @@ void CesWebSession::respond(int status, const std::string& contentType,
 }
 
 // =============================================================================
-// CesWeb
+// WebAdmin
 // =============================================================================
 
-CesWeb::CesWeb(boost::asio::io_context& io, CesServer& server)
+WebAdmin::WebAdmin(boost::asio::io_context& io, CesServer& server)
   : io_(io), server_(server) {}
 
-CesWeb::~CesWeb() { stop(); }
+WebAdmin::~WebAdmin() { stop(); }
 
-bool CesWeb::listen(const std::string& bindAddr, uint16_t port) {
+bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
   boost::system::error_code ec;
   auto addr = boost::asio::ip::make_address(bindAddr, ec);
   if (ec) {
@@ -1064,7 +1064,7 @@ bool CesWeb::listen(const std::string& bindAddr, uint16_t port) {
   }
 }
 
-void CesWeb::stop() {
+void WebAdmin::stop() {
   if (acceptor_) {
     boost::system::error_code ec;
     acceptor_->close(ec);
@@ -1079,7 +1079,7 @@ void CesWeb::stop() {
   }
 }
 
-void CesWeb::doAccept() {
+void WebAdmin::doAccept() {
   acceptor_->async_accept(
     [this](boost::system::error_code ec,
            boost::asio::ip::tcp::socket socket) {
@@ -1089,7 +1089,7 @@ void CesWeb::doAccept() {
         }
         return;
       }
-      std::make_shared<CesWebSession>(std::move(socket), server_)->start();
+      std::make_shared<WebAdminSession>(std::move(socket), server_)->start();
       doAccept();
     });
 }

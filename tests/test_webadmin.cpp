@@ -1,15 +1,15 @@
 /**
- * test_cesweb.cpp — CesWeb dashboard HTTP endpoints.
+ * test_webadmin.cpp — WebAdmin dashboard HTTP endpoints.
  *
- * In-process CesServer + CesWeb bound to 127.0.0.1:0; a tiny raw-TCP HTTP
+ * In-process CesServer + WebAdmin bound to 127.0.0.1:0; a tiny raw-TCP HTTP
  * client drives the endpoints. No simulator — this proves the admin surface
  * (status, mint/burn, peering, hello banner, lookups, logs, config) is live
- * and behaves correctly. Filter with: --test CesWebTests
+ * and behaves correctly. Filter with: --test WebAdminTests
  */
 
 #include "test_common.h"
 
-#include <ces/cesweb.h>
+#include <ces/webadmin.h>
 
 #include <boost/asio.hpp>
 
@@ -89,9 +89,9 @@ long long jnum(const std::string& body, const std::string& key) {
   return std::atoll(body.c_str() + p + key.size() + 3);
 }
 
-struct WebFix {
+struct WebAdminFix {
   std::unique_ptr<CesServer> server;
-  std::unique_ptr<ces::CesWeb> web;
+  std::unique_ptr<ces::WebAdmin> web;
   boost::asio::io_context webIO;
   std::thread webThread;
   fs::path tempDir;
@@ -99,7 +99,7 @@ struct WebFix {
   uint16_t mainPort = 0;
   KeyPair clientKey;
 
-  WebFix() {
+  WebAdminFix() {
     blog::init();
     tempDir = makeUniqueTempDir("ces_web_test");
     minx::Hash sp;
@@ -109,7 +109,7 @@ struct WebFix {
     server = std::make_unique<CesServer>(cfg);
     mainPort = server->start(0);
     BOOST_REQUIRE(mainPort > 0);
-    web = std::make_unique<ces::CesWeb>(webIO, *server);
+    web = std::make_unique<ces::WebAdmin>(webIO, *server);
     BOOST_REQUIRE(web->listen("127.0.0.1", 0));
     port = web->boundPort();
     BOOST_REQUIRE(port > 0);
@@ -117,7 +117,7 @@ struct WebFix {
     server->_brr(clientKey.getPublicKeyAsHash(), 5'000'000'000);
   }
 
-  ~WebFix() {
+  ~WebAdminFix() {
     if (web) web->stop();
     webIO.stop();
     if (webThread.joinable()) webThread.join();
@@ -132,7 +132,7 @@ struct WebFix {
 
 }  // namespace
 
-BOOST_FIXTURE_TEST_SUITE(CesWebTests, WebFix)
+BOOST_FIXTURE_TEST_SUITE(WebAdminTests, WebAdminFix)
 
 BOOST_AUTO_TEST_CASE(ServesDashboardHtml) {
   auto r = httpReq(port, "GET", "/");
@@ -347,7 +347,7 @@ BOOST_AUTO_TEST_CASE(L2FeeKnobsAndStatsEndpoints) {
 }
 
 BOOST_AUTO_TEST_CASE(FileStatActivePathWhenEnabled) {
-  // WebFix has the file feature off; stand one up with it on so /api/filestat
+  // WebAdminFix has the file feature off; stand one up with it on so /api/filestat
   // takes the active path (posts onto rpcTaskIO, runs execStat) not the gate.
   fs::path d = makeUniqueTempDir("ces_web_filestat");
   minx::Hash sp; sp.fill(0xAB);
@@ -361,7 +361,7 @@ BOOST_AUTO_TEST_CASE(FileStatActivePathWhenEnabled) {
   srv->start(0);
   BOOST_REQUIRE(srv->_rpcBoundPort() != 0);
   boost::asio::io_context io;
-  ces::CesWeb w(io, *srv);
+  ces::WebAdmin w(io, *srv);
   BOOST_REQUIRE(w.listen("127.0.0.1", 0));
   uint16_t p = w.boundPort();
   std::thread t([&] { io.run(); });

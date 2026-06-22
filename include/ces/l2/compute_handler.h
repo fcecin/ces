@@ -51,7 +51,7 @@ class CesServer;
 // removes the handler's work-dir scratch files.
 uint8_t computeHandlerBind(CesServer* server);
 
-// Boot-time launch path for /s/ builtin apps. Bypasses the
+// Boot-time launch path for /s/ extensions. Bypasses the
 // wire-auth/dedup/upfront-fee sequence used by dispatchLaunch — the
 // caller is the server itself. The source file at `name` must
 // already exist on disk (deploy via fileHandlerEnsureServerFile),

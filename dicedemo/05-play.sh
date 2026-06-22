@@ -32,7 +32,7 @@ INSTANCE=$( "${CESH_BIN}" \
 
 if [ -z "${INSTANCE}" ]; then
   echo "error: no /s/dice.lua instance found." >&2
-  echo "       check ./workspace/server.log for builtin_app launch failures." >&2
+  echo "       check ./workspace/server.log for extension launch failures." >&2
   exit 1
 fi
 echo "dice instance id: ${INSTANCE}"

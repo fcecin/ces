@@ -2645,7 +2645,7 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
 
     // Same per-file mint the on-access lazy path uses: one mechanism, two
     // callers. Boot eagerly walks the whole zone so already-deployed programs
-    // are stamped and topped up before launchBuiltinApps runs.
+    // are stamped and topped up before launchExtensions runs.
     Sidecar s{};
     reconcileOneServerZoneFile(server, dir, name, s);
   }

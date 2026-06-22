@@ -1268,12 +1268,12 @@ uint16_t CesServer::start(uint16_t serverPort) {
         // file/compute handlers above.
         luaHandlerBind(this);
 
-        // Deploy + launch /s/ builtin apps. Posted onto rpcTaskIO_
+        // Deploy + launch /s/ extensions. Posted onto rpcTaskIO_
         // (the supervisor strand); runs after the rpc threads spin
         // up. fileHandlerEnsureServerFile is idempotent; missing
         // file/compute prereqs surface as logged warnings.
         boost::asio::post(rpcTaskIO_,
-          [this]() { launchBuiltinApps(); });
+          [this]() { launchExtensions(); });
       }
     }
 
@@ -4002,8 +4002,8 @@ void CesServer::_brr(const minx::Hash& accountKey, int64_t amount) {
   }
 }
 
-// Boot-time autolaunch of /s/ builtin apps. For each name in
-// cfg_.builtinApps, calls computeHandlerLaunchInternal on
+// Boot-time autolaunch of /s/ extensions. For each name in
+// cfg_.extensions, calls computeHandlerLaunchInternal on
 // /s/<name>.lua. The file itself is operator-deployed: drop it into
 // <storeDir>/s/, the file handler's startup reconcile auto-generates
 // the sidecar before this runs. Source missing → WRN, skip; the
@@ -4012,16 +4012,16 @@ void CesServer::_brr(const minx::Hash& accountKey, int64_t amount) {
 // Runs on rpcTaskIO_ (caller posts it there). Posted after
 // fileHandlerStartupReconcile so reconcile has already filled in any
 // missing /s/ sidecars.
-void CesServer::launchBuiltinApps() {
-  for (const auto& name : cfg_.builtinApps) {
+void CesServer::launchExtensions() {
+  for (const auto& name : cfg_.extensions) {
     std::string path = "/s/" + name + ".lua";
     uint8_t rc = computeHandlerLaunchInternal(path);
     if (rc != CES_OK) {
-      LOGWARNING << "builtin_app: launch failed"
+      LOGWARNING << "extension: launch failed"
                  << SVAR(name) << SVAR(path) << VAR(int(rc));
       continue;
     }
-    LOGINFO << "builtin_app launched"
+    LOGINFO << "extension launched"
             << SVAR(name) << SVAR(path);
   }
 }

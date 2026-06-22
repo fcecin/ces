@@ -15,7 +15,7 @@
 #include <toml++/toml.hpp>
 
 #include <ces/cesco.h>
-#include <ces/cesweb.h>
+#include <ces/webadmin.h>
 #include <ces/util/ctrlc.h>
 #include <ces/util/log.h>
 #include <ces/util/helpers.h>
@@ -259,7 +259,7 @@ channel_idle_secs = 60
 # "/ces/file/1"    = "builtin:file"
 # "/ces/compute/1" = "builtin:compute"
 
-# /s/ builtin apps — operator-deployed Lua programs that get
+# /s/ extensions — operator-deployed Lua programs that get
 # autolaunched at boot. Drop dice.lua / chat.lua / etc. into
 # <storeDir>/s/; the server auto-generates the sidecar (owner =
 # server pubkey, file_balance = 0, /s/ is unmetered) and, for any
@@ -270,7 +270,7 @@ channel_idle_secs = 60
 # Names are arbitrary; the value just needs to be truthy.
 # Requires: rpc_port > 0, builtin:file with file_store_max_bytes > 0,
 # and builtin:compute with compute_max_instances > 0.
-# [builtin_app]
+# [extension]
 # dice = 1    # /s/dice.lua
 # chat = 1    # /s/chat.lua, etc.
 
@@ -359,10 +359,10 @@ int main(int argc, char* argv[]) {
   // Operators who want PATH lookup or an absolute path set it
   // explicitly via TOML or --computechildbinary.
   std::string optComputeChildBinary;
-  // /s/ builtin apps — operator-deployed Lua programs in
+  // /s/ extensions — operator-deployed Lua programs in
   // <storeDir>/s/<name>.lua, autolaunched at boot when enabled.
   // Names are arbitrary basenames; CLI flag is repeatable.
-  std::vector<std::string> optBuiltinApps;
+  std::vector<std::string> optExtensions;
   // CesPlex mounts — `proto=target` pairs. Target is
   // "builtin:<name>" (statically linked handler).
   std::vector<std::string> optCesplexMounts;
@@ -557,12 +557,12 @@ int main(int argc, char* argv[]) {
       "`cesluajitd` next to ces's own binary (/proc/self/exe), with "
       "bare-name PATH fallback. Set explicitly to bypass discovery.");
 
-    // --- /s/ builtin apps ---
-    // Repeatable: --builtin-app dice --builtin-app chat. Each entry
+    // --- /s/ extensions ---
+    // Repeatable: --extension dice --extension chat. Each entry
     // is the basename of a Lua file the operator deployed to
     // <storeDir>/s/<name>.lua; the server autolaunches one
     // cesluajitd instance per entry at boot.
-    app.add_option("--builtin-app", optBuiltinApps,
+    app.add_option("--extension", optExtensions,
       "Autolaunch /s/<name>.lua at boot (repeatable)");
 
     // -- Subcommands (mutually exclusive with running the server) --
@@ -723,19 +723,19 @@ int main(int argc, char* argv[]) {
       applyIfDefault("compute_child_binary",     optComputeChildBinary,
                      "--computechildbinary");
 
-      // /s/ builtin apps from config. Names are arbitrary; any
+      // /s/ extensions from config. Names are arbitrary; any
       // truthy entry enables autolaunch of /s/<name>.lua. CLI's
-      // repeatable --builtin-app overrides the TOML list when set.
-      //   [builtin_app]
+      // repeatable --extension overrides the TOML list when set.
+      //   [extension]
       //   dice = 1
       //   chat = 1
-      if (optBuiltinApps.empty()) {
-        if (auto t = tbl["builtin_app"].as_table()) {
+      if (optExtensions.empty()) {
+        if (auto t = tbl["extension"].as_table()) {
           for (auto& [k, v] : *t) {
             bool enabled = false;
             if (auto i = v.value<int64_t>()) enabled = (*i != 0);
             else if (auto b = v.value<bool>()) enabled = *b;
-            if (enabled) optBuiltinApps.push_back(std::string(k.str()));
+            if (enabled) optExtensions.push_back(std::string(k.str()));
           }
         }
       }
@@ -919,9 +919,9 @@ int main(int argc, char* argv[]) {
     }
   }
 
-  // /s/ builtin apps. Dedup via std::set semantics.
-  for (const auto& n : optBuiltinApps) {
-    if (!n.empty()) config.builtinApps.insert(n);
+  // /s/ extensions. Dedup via std::set semantics.
+  for (const auto& n : optExtensions) {
+    if (!n.empty()) config.extensions.insert(n);
   }
 
   // CesPlex mounts: parse "proto=target" entries, skip malformed ones
@@ -1057,11 +1057,11 @@ int main(int argc, char* argv[]) {
   // Start web dashboard if configured. Loopback only, no auth — reach it
   // over an SSH tunnel. Runs on its own io_context, like Cesco.
   boost::asio::io_context webIO;
-  std::unique_ptr<ces::CesWeb> cesweb;
+  std::unique_ptr<ces::WebAdmin> webadmin;
   std::vector<std::thread> webThreads;
   if (config.webPort != 0) {
-    cesweb = std::make_unique<ces::CesWeb>(webIO, *server);
-    if (cesweb->listen(config.webBind, config.webPort)) {
+    webadmin = std::make_unique<ces::WebAdmin>(webIO, *server);
+    if (webadmin->listen(config.webBind, config.webPort)) {
       // A small pool, not one thread: the dashboard's ledger reads block the
       // serving thread on a logicStrand_ hop, and a browser polls several
       // endpoints concurrently — a single thread stalls (dashboard "flicker")
@@ -1072,7 +1072,7 @@ int main(int argc, char* argv[]) {
         webThreads.emplace_back(
           [&webIO]() { ces::runGuardedThread([&webIO]{ webIO.run(); }, "webIO"); });
     } else {
-      cesweb.reset();
+      webadmin.reset();
     }
   }
 
@@ -1084,13 +1084,13 @@ int main(int argc, char* argv[]) {
   }
 
   LOGINFO << "ces stopping server";
-  if (cesweb) {
-    cesweb->stop();
+  if (webadmin) {
+    webadmin->stop();
     webIO.stop();
     for (auto& t : webThreads)
       if (t.joinable())
         t.join();
-    cesweb.reset();
+    webadmin.reset();
   }
   if (cesco) {
     cesco->stop();

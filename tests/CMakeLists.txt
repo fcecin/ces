@@ -14,7 +14,7 @@ target_link_libraries(cestests
 )
 
 # Repo root, so tests can read in-tree source assets (e.g. the shipped
-# /s/dice.lua under src/ceslib/builtin_apps/) instead of hardcoding a path
+# /s/dice.lua under src/ceslib/extensions/) instead of hardcoding a path
 # relative to the build dir.
 target_compile_definitions(cestests PRIVATE CES_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 

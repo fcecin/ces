@@ -382,12 +382,12 @@ struct CesConfig {
   uint16_t computePortBase  = 0;
   uint16_t computePortCount = 0;
 
-  // --- /s/ builtin apps ---
-  // Each name in `builtinApps` is the basename of a Lua program the
+  // --- /s/ extensions ---
+  // Each name in `extensions` is the basename of a Lua program the
   // operator dropped into <storeDir>/s/ (e.g. "dice" → /s/dice.lua).
   // /s/ is operator-controlled at the disk level — fileHandler's
   // startup reconcile auto-generates sidecars for any files the
-  // operator placed there. At boot, CesServer::launchBuiltinApps
+  // operator placed there. At boot, CesServer::launchExtensions
   // calls computeHandlerLaunchInternal("/s/<name>.lua") for each
   // entry: source missing → WRN, skip; otherwise one cesluajitd
   // instance is launched.
@@ -395,7 +395,7 @@ struct CesConfig {
   // cesFileStoreMaxBytes > 0, builtin:compute mounted with
   // computeMaxInstances > 0. If prereqs are missing the autolaunch
   // is skipped with a warning; the server otherwise runs fine.
-  std::set<std::string> builtinApps;
+  std::set<std::string> extensions;
 
   // --- CesPlex protocol mounts ---
   // The L2 bus (CesPlex) runs on the secondary port (rpcPort). Every
@@ -1443,13 +1443,13 @@ private:
   void deployBuiltinVmPrograms();
 
   // One-shot at boot, after CesPlex/file/compute handlers have all
-  // bound: deploy any [builtin_app] /s/<name>.lua sources to the file
+  // bound: deploy any [extension] /s/<name>.lua sources to the file
   // store (if missing) and launch one cesluajitd instance of each.
   // Posted onto rpcTaskIO_ — the file deploy uses the
   // fileHandlerEnsureServerFile cross-handler primitive; the launch
   // uses computeHandlerLaunchInternal. Skipped silently if any
   // prereq is missing (compute disabled, file disabled, etc.).
-  void launchBuiltinApps();
+  void launchExtensions();
 
   void reply(const SockAddr& addr, const MinxMessage& msg);
 

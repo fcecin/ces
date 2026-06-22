@@ -62,7 +62,7 @@ include/ces/util/   shared helpers — ctrlc, fileperm, hash, hex, log,
 src/ceslib/         static lib mirroring the include tree — top-level
                     server.cpp (incl. SYS_RPC outbound engine), cesvm.cpp,
                     ramfilestore.cpp, accounts/assets/client/clientasync/
-                    cesco; subdirs cesplex/, l2/, util/; builtin_apps/
+                    cesco; subdirs cesplex/, l2/, util/; extensions/
                     holds operator-deployable app sources (dice.lua)
 src/ces/main.cpp    server CLI: config, key gen, ces credit/debit/snapshot
 src/cesh/           shell client (main.cpp + dial.cpp/h)
@@ -210,7 +210,7 @@ Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser
 
 **cesluajitd**: one sandboxed LuaJIT VM per process — no `os`/`io`/`debug`/`require`/`loadstring`/`ffi`. The supervisor frames IPC over the UDS and hands the child a bootstrap frame with its identity (owner key + program keypair), its server-reserved ports (outbound CES client + the instance's own `/ces/luarpc/1` host; either may be 0), and the source. The Lua API surfaces client messaging, the file store (owner-authority, billed to the source's `file_balance`), `ces.transfer` / `account_read` / `random_bytes`, identity + time helpers, capacity-billed `bucket`s, and the unified `ces.conn` raw byte-stream API — **one** listener serving BOTH the server-relayed `/ces/lua/1` and this instance's own direct `/ces/luarpc/1`, plus outbound `ces.conn.connect` (see L2 lua / luarpc below). The program never owns the socket — the C++ host runs the packet processor and passes it the reserved port numbers.
 
-**[builtin_app]** auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchBuiltinApps` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is **operator-deployed, NOT embedded in the binary**: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source just logs a WRN and is skipped. Shipped: `dice` (`[builtin_app] dice = 1` / `--builtin-app-dice`) — fair-coin double-or-nothing whose house bankroll is the file's dedicated program account (`ces.program_pubkey()`), auto-funded on /s/ by the boot zone reconcile.
+**[extension]** auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is **operator-deployed, NOT embedded in the binary**: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source just logs a WRN and is skipped. Shipped: `dice` (`[extension] dice = 1` / `--extension-dice`) — fair-coin double-or-nothing whose house bankroll is the file's dedicated program account (`ces.program_pubkey()`), auto-funded on /s/ by the boot zone reconcile.
 
 ## L2 lua — `builtin:lua` (channel routing)
 
@@ -285,7 +285,7 @@ All numeric fees are raw uint64 credit values (no decimals; PRICE_UNIT is displa
 
 **Load-based fee discount (feemult).** Every named per-op fee (`feeTx`, `feeQuery`, VM gas, account/asset rent, compute slot/cpu/rss, bucket, net metering) is scaled by a per-FeeKind basis-points multiplier (0..10000) before it is charged. `feeDiscountEnabled` (compiled default `true`) drives each multiplier from a live load gauge measured against a lifetime throughput watermark: an idle server discounts toward 0 (an op can cost **literally 0** when its gauge genuinely reads idle), ramping to full fee as sustained load approaches the busiest the host has ever been. It is congestion pricing, not a fixed schedule. A gauge that is *undefined* (a required cap is 0, e.g. `maxAcc`/`maxAsset`/`netPeakBps`) snaps to full price, never 0, so a missing metric can never silently zero a fee. Disabled → all multipliers pinned at 10000 (full price). The anti-spam barrier is separate (MINX PoW tickets), so 0-fee at idle is not a spam hole.
 
-The **feature master-switches** (full template via `ces --config`): `rpc_port` (0 ⇒ CesPlex + SYS_RPC off), `web_port` (0 ⇒ dashboard off; loopback-only, no auth), `file_store_max_bytes` (0 ⇒ file feature off), `compute_max_instances` (0 ⇒ compute off, needs file), `compute_port_base`/`_count` (per-instance UDP range), `admin_socket` (cesco UDS), `min_difficulty`/`no_pow_engine`/`cache_only_pow` (PoW), plus the `[[peers]]`, `[cesplex_mounts]`, and `[builtin_app]` tables.
+The **feature master-switches** (full template via `ces --config`): `rpc_port` (0 ⇒ CesPlex + SYS_RPC off), `web_port` (0 ⇒ dashboard off; loopback-only, no auth), `file_store_max_bytes` (0 ⇒ file feature off), `compute_max_instances` (0 ⇒ compute off, needs file), `compute_port_base`/`_count` (per-instance UDP range), `admin_socket` (cesco UDS), `min_difficulty`/`no_pow_engine`/`cache_only_pow` (PoW), plus the `[[peers]]`, `[cesplex_mounts]`, and `[extension]` tables.
 
 ## Cesco admin console
 
@@ -293,16 +293,18 @@ Embedded in server; enabled via `admin_socket`. UDS REPL: `rlwrap socat - UNIX-C
 
 Commands: `snapshot`, `credit <amt> <pubkey>`, `debit <amt> <pubkey>` (clamped), `netbill` (per-channel snapshot), `help`/`h`, `quit`/`q`/`exit`/Ctrl-C. Same machinery as offline `ces credit`/`ces debit` but no shutdown required.
 
-## Web dashboard (`cesweb.h`/`cesweb.cpp`)
+## Web admin dashboard (`webadmin.h`/`webadmin.cpp`)
 
-Localhost HTTP admin UI embedded in the server, enabled via `web_port` (0 = disabled). **No authentication by design** — binds loopback only (`web_bind`, default `127.0.0.1`); reach it over an SSH tunnel. A 0-or-1-client Boost.Asio HTTP/1.1 server on its own io_context/thread (modeled on Cesco): one acceptor + per-connection session, serving the whole single-page UI as one embedded string. The operator's "experience center" — the things you'd otherwise open cesh/cesqt for while running a node:
+The in-server operator dashboard (class `WebAdmin`). **Distinct from `cesweb`** — that
+is the separate Node L2-file proxy/gateway (see Client tools); this is C++ embedded in
+the server itself. Localhost HTTP admin UI, enabled via `web_port` (0 = disabled). **No authentication by design** — binds loopback only (`web_bind`, default `127.0.0.1`); reach it over an SSH tunnel. A 0-or-1-client Boost.Asio HTTP/1.1 server on its own io_context/thread (modeled on Cesco): one acceptor + per-connection session, serving the whole single-page UI as one embedded string. The operator's "experience center" — the things you'd otherwise open cesh/cesqt for while running a node:
 
 - **Overview** — identity, live stat cards + load gauges, feature flags.
 - **Peers** — add/remove/list peers + runtime peer target (the marquee). Shows both directions: outbound (us→them) and inbound (their PoW to us).
 - **Inspect** — server-info a remote by address: free handshake → pubkey/min-difficulty/reachability, optional paid KV info; **Mine** to bootstrap a reserve; **Add as outbound peer**.
 - **Wallet** (transfer from server, credit/burn, snapshot), **Lookup** (account/asset/file), **Billing** (ChannelMeter), **Fees** (base-fee editors + live multipliers), **File** / **Compute** (L2 monitoring + fee/cap editors), **Logs** (live tail), **Config** (knobs, live fee multipliers, hello-banner editor).
 
-GET endpoints emit hand-rolled JSON; POST actions take form-urlencoded bodies. Ledger reads hop onto `logicStrand_` via a `std::future`; remote inspect/mine run on worker threads joined at `stop()` (never the io thread). The live log tail is a bounded in-memory `LogRing` fed by a Boost.Log sink CesWeb installs on the logging core. cesco stays for now; slated for deletion once the dashboard is proven. Tests: `tests/test_cesweb.cpp` (suite `CesWebTests`) drives every endpoint over raw TCP against an in-process server.
+GET endpoints emit hand-rolled JSON; POST actions take form-urlencoded bodies. Ledger reads hop onto `logicStrand_` via a `std::future`; remote inspect/mine run on worker threads joined at `stop()` (never the io thread). The live log tail is a bounded in-memory `LogRing` fed by a Boost.Log sink WebAdmin installs on the logging core. cesco stays for now; slated for deletion once the dashboard is proven. Tests: `tests/test_webadmin.cpp` (suite `WebAdminTests`) drives every endpoint over raw TCP against an in-process server.
 
 **Hello banner.** `<data_dir>/hello.txt` → a UTF-8 string capped at 160 bytes (trimmed on a codepoint boundary, never mid-sequence), seeded at boot and served in `CES_QUERY_SERVER_INFO` as the `hello` field. The dashboard's Config tab is the only other writer (it rewrites the file and the served value).
 
@@ -324,7 +326,7 @@ Offline ledger ops (no networking). Load stores, mutate, `_save()`, exit. Used b
 
 **cesbench** — in-process benchmark. Server + client in one binary. Tunes `threads`, `flush_value`.
 
-**cesweb** — HTTP gateway (Node) serving a server's L2 files to browsers, plus a `/dev` terminal into L2 programs; shells out to `cesh`. Lives in `cesweb/` with its own CLAUDE.md.
+**cesweb** — HTTP gateway (Node) serving a server's L2 files to browsers, plus a `/dev` terminal into L2 programs; shells out to `cesh`. Lives in `cesweb/` with its own CLAUDE.md. **Distinct from the in-server `webadmin` dashboard** (`webadmin.cpp`): cesweb is an external Node proxy to the L2 file store; webadmin is the embedded loopback operator UI.
 
 **cesluajitd** / **cescompmockd** — compute children; spawned by supervisor. Default `cesluajitd` (LuaJIT); `cescompmockd` is no-Lua plumbing-test stub.
 

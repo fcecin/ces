@@ -1,6 +1,6 @@
 # /s/dice.lua
 
-Fair-coin double-or-nothing, shipped as a CES builtin app.
+Fair-coin double-or-nothing, shipped as a CES extension.
 
 The server's own pubkey is the **house**. Bets are placed by
 transferring credits to the house, then typing `play` over a dial
@@ -29,11 +29,11 @@ compute_max_instances = 8           # any value > 0
 "/ces/compute/1" = "builtin:compute"
 "/ces/lua/1"     = "builtin:lua"
 
-[builtin_app]
+[extension]
 dice = 1
 ```
 
-Equivalent CLI flag: `--builtin-app dice` (repeatable).
+Equivalent CLI flag: `--extension dice` (repeatable).
 
 `cesluajitd` must be on the server's `PATH`, or set
 `compute_child_binary = "/abs/path/to/cesluajitd"`.
@@ -42,7 +42,7 @@ Equivalent CLI flag: `--builtin-app dice` (repeatable).
 level — copy or unpack the file directly into `<storeDir>/s/`:
 
 ```
-cp src/ceslib/builtin_apps/dice.lua <data_dir>/cesfilestore/s/dice.lua
+cp src/ceslib/extensions/dice.lua <data_dir>/cesfilestore/s/dice.lua
 ```
 
 `<storeDir>` is `file_store_dir` if set, otherwise
@@ -55,11 +55,11 @@ Look for these lines in the log:
 ```
 builtin:file /s/ sidecar generated   /s/dice.lua  size=...
 builtin:compute launched             id=1 ...
-builtin_app launched                 dice  /s/dice.lua
+extension launched                 dice  /s/dice.lua
 ```
 
 If `/s/dice.lua` is missing, you'll see
-`WRN builtin_app: launch failed dice /s/dice.lua` and the server
+`WRN extension: launch failed dice /s/dice.lua` and the server
 keeps running.
 
 ---
@@ -130,9 +130,9 @@ Inside the dial, `help`, `balance`, `quit` work as expected.
 - `dice.lua` — the program source (operator deploys this to /s/)
 - `dice.md` — this manual
 
-Adding a new builtin app is just two steps: drop `<name>.lua` into
+Adding a new extension is just two steps: drop `<name>.lua` into
 this directory (canonical source-tree home, ships in the repo), and
 arrange for the operator to copy it to `<storeDir>/s/<name>.lua` at
-deploy time. There's no per-app C++ knob — `[builtin_app] <name> = 1`
+deploy time. There's no per-app C++ knob — `[extension] <name> = 1`
 in the config triggers `computeHandlerLaunchInternal("/s/<name>.lua")`
 at boot, the file handler auto-sidecars the file, and you're live.
