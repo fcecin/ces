@@ -997,6 +997,7 @@ static uint8_t log_level_from_name(lua_State* L, const char* name) {
 }
 
 int lua_ces_log(lua_State* L) {
+  if (!g_privileged) return 0;  // no-op for non-/s/ instances (also gated server-side)
   uint8_t level = 2;  // info
   size_t n = 0;
   const char* s;
@@ -1459,6 +1460,73 @@ int lua_ces_ping(lua_State* L) {
   lua_setfield(L, -2, "rpc_port");
   lua_pushnumber(L, static_cast<lua_Number>(minDiff));
   lua_setfield(L, -2, "min_difficulty");
+  return 1;
+}
+
+// ces.peer_info(addr, index) -> {count, found, pubkey(32)|nil, address|nil}
+//   | nil, err. One slot of a remote server's public peer table (unsigned,
+//   unpaid CES_QUERY_PEER_INFO): the total count and the peer at index.
+int lua_ces_peer_info(lua_State* L) {
+  if (g_program_port == 0) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking permanently disabled (this instance has no compute port)");
+    return 2;
+  }
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 1, &addr_len);
+  lua_Number idx_n = luaL_checknumber(L, 2);
+  if (idx_n < 0 || idx_n > 65535) {
+    lua_pushnil(L);
+    lua_pushstring(L, "index must be 0..65535");
+    return 2;
+  }
+  uint16_t index = static_cast<uint16_t>(idx_n);
+  boost::asio::ip::udp::endpoint ep;
+  try {
+    ep = ces::Resolver::resolveUdp(std::string(addr, addr_len));
+  } catch (const std::exception&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "address resolve failed");
+    return 2;
+  }
+  uint16_t count = 0;
+  bool found = false;
+  ces::Hash pubkey{};
+  std::string paddr;
+  uint8_t rc;
+  try {
+    ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    client.setTries(1);  // fast-fail: a slow crawler must not block on a dead host
+    if (!client.start(g_program_port) || !client.connect()) {
+      lua_pushnil(L);
+      lua_pushstring(L, "unreachable");
+      return 2;
+    }
+    rc = client.queryPeerInfo(index, count, found, pubkey, paddr);
+    client.disconnect();
+    client.stop();
+  } catch (const std::exception& e) {
+    host_log(3, std::string("ces.peer_info: ") + e.what());
+    lua_pushnil(L);
+    lua_pushstring(L, "peer_info failed");
+    return 2;
+  }
+  if (rc != ces::CES_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, rc);
+    return 2;
+  }
+  lua_newtable(L);
+  lua_pushnumber(L, static_cast<lua_Number>(count));
+  lua_setfield(L, -2, "count");
+  lua_pushboolean(L, found ? 1 : 0);
+  lua_setfield(L, -2, "found");
+  if (found) {
+    lua_pushlstring(L, reinterpret_cast<const char*>(pubkey.data()), 32);
+    lua_setfield(L, -2, "pubkey");
+    lua_pushlstring(L, paddr.data(), paddr.size());
+    lua_setfield(L, -2, "address");
+  }
   return 1;
 }
 
@@ -3612,10 +3680,7 @@ void install_ces_api(lua_State* L) {
   lua_newtable(L);
   lua_pushcfunction(L, guarded<lua_ces_now>);           lua_setfield(L, -2, "now");
   lua_pushcfunction(L, guarded<lua_ces_sha256>);        lua_setfield(L, -2, "sha256");
-  // ces.log is operator-only: present solely for privileged (/s/) programs.
-  if (g_privileged) {
-    lua_pushcfunction(L, guarded<lua_ces_log>);         lua_setfield(L, -2, "log");
-  }
+  lua_pushcfunction(L, guarded<lua_ces_log>);           lua_setfield(L, -2, "log");
   lua_pushcfunction(L, guarded<lua_ces_sign>);          lua_setfield(L, -2, "sign");
   lua_pushcfunction(L, guarded<lua_ces_verify>);        lua_setfield(L, -2, "verify");
   lua_pushcfunction(L, guarded<lua_ces_every>);         lua_setfield(L, -2, "every");
@@ -3643,6 +3708,7 @@ void install_ces_api(lua_State* L) {
     lua_pushcfunction(L, guarded<lua_ces_peer_target>);     lua_setfield(L, -2, "peer_target");
   }
   lua_pushcfunction(L, guarded<lua_ces_ping>);          lua_setfield(L, -2, "ping");
+  lua_pushcfunction(L, guarded<lua_ces_peer_info>);     lua_setfield(L, -2, "peer_info");
   lua_pushcfunction(L, guarded<lua_ces_authentic_asset_create>);
   lua_setfield(L, -2, "authentic_asset_create");
   lua_pushcfunction(L, guarded<lua_ces_bucket_new>);    lua_setfield(L, -2, "bucket_new");

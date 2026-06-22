@@ -260,7 +260,8 @@ struct ComputeRemoteFixture {
 };
 
 // Command-driven driver. ops: 0 = report program pubkey; 1 = remote_account_read;
-// 2 = remote_transfer; 3 = cross_transfer; 4 = remote_cross_transfer.
+// 2 = remote_transfer; 3 = cross_transfer; 4 = remote_cross_transfer;
+// 5 = peer_info(addr, index).
 const char* kDriver =
   "local function be64(s, off)\n"
   "  local v = 0\n"
@@ -313,6 +314,16 @@ const char* kDriver =
   "      ces.client_send(pfx, 'OK ' .. string.format('%.0f', second))\n"
   "    else\n"
   "      ces.client_send(pfx, 'ERR ' .. tostring(second))\n"
+  "    end\n"
+  "  elseif op == 5 then\n"
+  "    local index = string.byte(msg, 2)\n"
+  "    local addr = string.sub(msg, 3)\n"
+  "    local r, err = ces.peer_info(addr, index)\n"
+  "    if r then\n"
+  "      ces.client_send(pfx, 'OK ' .. tostring(r.count) .. ' ' ..\n"
+  "                       tostring(r.found) .. ' ' .. (r.address or ''))\n"
+  "    else\n"
+  "      ces.client_send(pfx, 'ERR ' .. tostring(err))\n"
   "    end\n"
   "  end\n"
   "end\n";
@@ -547,6 +558,30 @@ BOOST_AUTO_TEST_CASE(RemoteCrossTransferSuccess) {
                       "expected OK for remote_cross_transfer, got '" << r << "'");
   int64_t da = pollBalance(serverA.get(), dest.getPublicKeyAsHash(), 3000);
   BOOST_CHECK_EQUAL(da, 3000);
+}
+
+BOOST_AUTO_TEST_CASE(PeerInfoReadsRemotePeerTable) {
+  setupPeering();   // serverB's peer table now holds A at localhost:<portA>
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/drv.lua";
+  uploadScript(path, kDriver);
+  BOOST_REQUIRE(launchScript(path) > 0);
+  auto prog = progPrefixOf(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+  std::string addr = bAddr();
+
+  // op 5: read serverB's peer-table slot 0 (B peers A at localhost:<portA>).
+  ces::Bytes c; c.push_back(5); c.push_back(0);
+  c.insert(c.end(), addr.begin(), addr.end());
+  std::string r = cmd(prog, c);
+  std::string want = "OK 1 true localhost:" + std::to_string(portA);
+  BOOST_CHECK_MESSAGE(r == want, "expected '" << want << "', got '" << r << "'");
+
+  // op 5 past the end: count still reported, found=false, no address.
+  ces::Bytes c2; c2.push_back(5); c2.push_back(99);
+  c2.insert(c2.end(), addr.begin(), addr.end());
+  std::string r2 = cmd(prog, c2);
+  BOOST_CHECK_MESSAGE(r2 == "OK 1 false ", "expected 'OK 1 false ', got '" << r2 << "'");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
