@@ -2282,13 +2282,13 @@ async function extConfigToggle(name,hasDefaults){
 }
 async function extConfigSave(name){
   const ta=$('#extCfgTa-'+cssid(name));if(!ta)return;
-  try{const r=await post('/api/extension_config_set',{name,text:ta.value});toast(r.ok?'config saved + pushed live':(r.error||'save failed'),r.ok?'ok':'err');}
+  try{const r=await post('/api/extension_config_set',{name,text:ta.value});toast(r.ok?'config saved + applied':(r.error||'save failed'),r.ok?'ok':'err');}
   catch(e){toast('server error','err');}
 }
 async function extConfigReset(name){
   try{const r=await post('/api/extension_config_reset',{name});
     if(!r.ok){toast(r.error||'reset failed','err');return;}
-    toast('reset to defaults + pushed live','ok');
+    toast('reset to defaults + applied','ok');
     const d=await api('/api/extension_config?name='+encodeURIComponent(name));
     const ta=$('#extCfgTa-'+cssid(name));if(ta)ta.value=d.text;}
   catch(e){toast('server error','err');}

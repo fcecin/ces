@@ -273,12 +273,28 @@ std::string extensionConfigGet(CesServer* server, const std::string& name) {
   return readFile(sConf(server, name));
 }
 
+// Make the on-disk /s/<name>.conf take effect on the running instance. Config is
+// read at launch, so a program that registered on_config hot-reloads live; one
+// that did not can only pick up the change by relaunching. Either way an edit
+// actually takes effect -- writing the file and changing nothing (a silent
+// no-op) is worse than having no editor. No-op if the extension is not running.
+void applyExtConfig(CesServer* server, const std::string& name) {
+  uint64_t pid = runningPid(name);
+  if (!pid) return;
+  ComputeExtInfo info;
+  if (computeHandlerExtInfo(pid, info) && (info.caps & kComputeExtCapOnConfig)) {
+    computeHandlerExtConfig(pid, readFile(sConf(server, name)));   // hot-reload
+  } else {
+    computeHandlerKillBySource(srcName(name));                     // relaunch:
+    computeHandlerLaunchInternal(srcName(name));                   // re-read at launch
+  }
+}
+
 bool extensionConfigSet(CesServer* server, const std::string& name,
                         const std::string& text) {
   if (!validName(name)) return false;
   if (!writeFile(sConf(server, name), text)) return false;
-  uint64_t pid = runningPid(name);
-  if (pid) computeHandlerExtConfig(pid, text);
+  applyExtConfig(server, name);
   return true;
 }
 
@@ -289,7 +305,7 @@ bool extensionConfigReset(CesServer* server, const std::string& name) {
   ComputeExtInfo info;
   if (!computeHandlerExtInfo(pid, info)) return false;
   if (!writeFile(sConf(server, name), info.configDefaults)) return false;
-  computeHandlerExtConfig(pid, info.configDefaults);
+  applyExtConfig(server, name);
   return true;
 }
 

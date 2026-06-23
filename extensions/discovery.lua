@@ -39,40 +39,47 @@ local cfg = conf.load("/s/discovery.conf")
 -- Our own server pubkey, so the registry recognizes and drops self.
 local me = ces.owner_pubkey and ces.owner_pubkey() or nil
 
-local reg = registry.open(me, conf.num(cfg, "dead_after", 10))
+-- Build the agent's option set from a config map (the conf.load shape). Used at
+-- launch AND on every live on_config push, so both paths share one set of
+-- defaults — a knob omitted from the file always reverts to the same default.
+local DEFAULT_SEEDS = { "ces.pubcom.org:53830" }  -- production rendezvous default
+local function build_opts(c)
+  return {
+    min_peer_target = conf.num(c, "min_peer_target", 100000000),  -- 1 credit floor
+    -- Auto-promote at most this many outbound peers. Deliberately well under the
+    -- host's peer-table size so discovery never fills it — it leaves headroom for
+    -- the operator's INTENTIONAL peer additions. 20 is a healthy default.
+    active_target   = conf.num(c, "active_target", 20),
+    crawl_ms        = conf.num(c, "crawl_ms", 3000),
+    maint_ms        = conf.num(c, "maint_ms", 10000),
+    save_ms         = conf.num(c, "save_ms", 300000),          -- full registry flush (~5 min)
+    pull_floor_ms   = conf.num(c, "pull_floor_ms", 60000),     -- 1 min when learning
+    pull_ceil_ms    = conf.num(c, "pull_ceil_ms", 1800000),    -- 30 min when converged
+    sample_k        = conf.num(c, "sample_k", 16),
+    probe_ms        = conf.num(c, "probe_ms", 3000),           -- per-ping reply wait (ces.ping)
+    dead_after      = conf.num(c, "dead_after", 10),           -- failed revalidations before give-up
+    peer_min_credit = conf.num(c, "peer_min_credit", 100000000),  -- floor balance per peer (1.0)
+    -- A "seeds = ..." line (including empty "seeds =") overrides the default.
+    -- Seeds are untrusted rumors, validated by the crawl's ces.ping.
+    seeds           = c.seeds ~= nil and conf.list(c, "seeds") or DEFAULT_SEEDS,
+  }
+end
 
--- Production rendezvous, used as the default when config gives no "seeds" key.
--- A "seeds = ..." line (including "seeds =", empty) overrides it. Seeds are
--- untrusted rumors, validated by the crawl's ces.ping.
-local DEFAULT_SEEDS = { "ces.pubcom.org:53830" }
-local seeds = cfg.seeds ~= nil and conf.list(cfg, "seeds") or DEFAULT_SEEDS
-for _, addr in ipairs(seeds) do reg:hear(addr, "seed") end
+local opts = build_opts(cfg)
+local reg = registry.open(me, opts.dead_after)
+for _, addr in ipairs(opts.seeds) do reg:hear(addr, "seed") end
 
 ces.log("discovery: up, registry=" .. reg:count())
 
-local agent = Agent.new(reg, {
-  min_peer_target = conf.num(cfg, "min_peer_target", 100000000),  -- 1 credit floor
-  -- Auto-promote at most this many outbound peers. Deliberately well under the
-  -- host's peer-table size so discovery never fills it — it leaves headroom for
-  -- the operator's INTENTIONAL peer additions. 20 is a healthy default; raise it
-  -- to let discovery manage more of the table.
-  active_target   = conf.num(cfg, "active_target", 20),
-  crawl_ms        = conf.num(cfg, "crawl_ms", 3000),
-  maint_ms        = conf.num(cfg, "maint_ms", 10000),
-  save_ms         = conf.num(cfg, "save_ms", 300000),          -- full registry flush (~5 min)
-  pull_floor_ms   = conf.num(cfg, "pull_floor_ms", 60000),     -- 1 min when learning
-  pull_ceil_ms    = conf.num(cfg, "pull_ceil_ms", 1800000),    -- 30 min when converged
-  sample_k        = conf.num(cfg, "sample_k", 16),
-  probe_ms        = conf.num(cfg, "probe_ms", 3000),            -- per-ping reply wait (ces.ping)
-  peer_min_credit = conf.num(cfg, "peer_min_credit", 100000000),  -- floor balance per peer (1.0 credit)
-})
+local agent = Agent.new(reg, opts)
 agent:start()
 
 admin.attach(reg)   -- observability over the relay (cesh dial); inbound-only, not a mesh
 
--- Extension contract: live registry stats on the dashboard, a dump command, and
--- the config defaults the editor seeds. Config is read from /s/discovery.conf at
--- launch (the editor writes that file; re-enable to apply a change).
+-- Extension contract: live registry stats on the dashboard, a dump command, the
+-- config defaults the editor seeds, and on_config for LIVE retuning — an edit in
+-- the dashboard reconfigures the running agent (re-arms cadences, updates knobs,
+-- folds in new seeds) with no restart.
 ces.extension_admin{
   status = function()
     local s = reg:stats()
@@ -89,10 +96,9 @@ ces.extension_admin{
   commands = { { id = "dump", label = "Log registry summary" } },
   on_command = function(id)
     if id == "dump" then
-      local s = reg:stats()
-      local line = string.format(
-        "registry=%d alive=%d heard=%d dark=%d from_samples=%d",
-        s.total, s.alive, s.heard, s.dark, s.sample)
+      -- Operator-triggered, so INFO is fine (the periodic heartbeat is trace).
+      -- Same canonical line as the heartbeat -- one formatter, no drift.
+      local line = agent:summary()
       ces.log("discovery: " .. line)
       return line
     end
@@ -109,6 +115,9 @@ ces.extension_admin{
     "probe_ms = 3000\n" ..          -- per-ping reply wait (lower to give up on dead hosts faster)
     "dead_after = 10\n" ..          -- failed re-validations before a host is given up
     "peer_min_credit = 100000000\n",   -- floor credits to keep funded at each peer (1.0)
+  -- Live reconfigure: the host pushes the edited config map here (no restart).
+  -- We rebuild the same opts the launch path uses and hand them to the agent.
+  on_config = function(c) agent:reconfigure(build_opts(c)) end,
 }
 
 ces.run()
@@ -570,11 +579,58 @@ function Agent:start()
     if cur < self.min_peer_target then ces.set_peer_target(self.min_peer_target) end
   end
   self:observe()   -- seed the registry from our own peer table so the crawl has roots
-  ces.every(self.crawl_ms,      function() self:guard("crawl", function() self:crawl() end) end)
-  ces.every(self.maint_ms,      function() self:guard("maint", function() self:maintain() end) end)
-  ces.every(self.save_ms,       function() self:guard("save",  function() self.reg:save() end) end)
-  ces.every(self.pull_floor_ms, function() self:guard("pull",  function() self:pull_tick() end) end)
-  ces.every(LOG_MS,             function() self:guard("log",   function() self:log_summary() end) end)
+  self.timers = {}
+  self:arm("crawl", self.crawl_ms,      function() self:guard("crawl", function() self:crawl() end) end)
+  self:arm("maint", self.maint_ms,      function() self:guard("maint", function() self:maintain() end) end)
+  self:arm("save",  self.save_ms,       function() self:guard("save",  function() self.reg:save() end) end)
+  self:arm("pull",  self.pull_floor_ms, function() self:guard("pull",  function() self:pull_tick() end) end)
+  self:arm("log",   LOG_MS,             function() self:guard("log",   function() self:log_summary() end) end)
+end
+
+-- Register a named periodic timer, remembering its handle + interval + closure so
+-- reconfigure() can re-arm it at a new cadence (ces.every returns a cancel handle).
+function Agent:arm(name, interval_ms, fn)
+  self.timers[name] = { handle = ces.every(interval_ms, fn), interval = interval_ms, fn = fn }
+end
+
+-- Re-arm a named timer at a new interval (cancel old, register new with the same
+-- closure). No-op if unchanged, or if this ces build lacks ces.cancel / returned
+-- no handle (then the old cadence stays rather than risk a duplicate timer).
+function Agent:rearm(name, interval_ms)
+  local t = self.timers[name]
+  if not t or t.interval == interval_ms then return end
+  if not (ces.cancel and t.handle) then return end
+  ces.cancel(t.handle)
+  t.handle = ces.every(interval_ms, t.fn)
+  t.interval = interval_ms
+end
+
+-- Live config update (ces.extension_admin on_config). `opts` has the SAME shape
+-- main.lua builds at launch. Read-on-use knobs (active_target, probe_ms, sample_k,
+-- peer_min_credit, dead_after, pull bounds) take effect on their next use; the
+-- timer cadences are re-armed; new seeds enter as HEARD rumors. So an operator
+-- retunes discovery from the dashboard with no restart.
+function Agent:reconfigure(opts)
+  self.min_peer_target = opts.min_peer_target
+  self.active_target   = opts.active_target
+  self.sample_k        = opts.sample_k
+  self.probe_ms        = opts.probe_ms
+  self.peer_min_credit = opts.peer_min_credit
+  self.pull_floor_ms   = opts.pull_floor_ms
+  self.pull_ceil_ms    = opts.pull_ceil_ms
+  self.pull_interval   = opts.pull_floor_ms        -- restart pacing from the floor
+  self.reg.dead_after  = opts.dead_after
+  for _, addr in ipairs(opts.seeds or {}) do self.reg:hear(addr, "seed") end
+  if ces.peer_target and ces.set_peer_target then
+    local cur = ces.peer_target() or 0
+    if cur < self.min_peer_target then ces.set_peer_target(self.min_peer_target) end
+  end
+  self:rearm("crawl", opts.crawl_ms)
+  self:rearm("maint", opts.maint_ms)
+  self:rearm("save",  opts.save_ms)
+  self:rearm("pull",  opts.pull_floor_ms)
+  -- Lifecycle (operator-triggered, infrequent): confirms the live edit took.
+  ces.log("discovery: reconfigured (live)")
 end
 
 -- Guard each cadence on its own: a fault in one must not kill its timer or block
@@ -773,11 +829,20 @@ function Agent:project()
   end
 end
 
-function Agent:log_summary()
+-- The canonical one-line registry summary, shared by the periodic log and the
+-- operator's "dump" command so they never drift apart.
+function Agent:summary()
   local s = self.reg:stats()
-  ces.log(string.format(
-    "discovery: registry=%d alive=%d verified=%d heard=%d dark=%d sample=%d",
-    s.total, s.alive, s.verified, s.heard, s.dark, s.sample))
+  return string.format(
+    "registry=%d alive=%d verified=%d heard=%d dark=%d sample=%d",
+    s.total, s.alive, s.verified, s.heard, s.dark, s.sample)
+end
+
+-- Periodic heartbeat: TRACE, not INFO -- on an idle node it would otherwise log
+-- the same line every minute forever. Enable the module's trace to see it; the
+-- dashboard status and the dump command surface the same numbers on demand.
+function Agent:log_summary()
+  ces.log("trace", "discovery: " .. self:summary())
 end
 
 return M
