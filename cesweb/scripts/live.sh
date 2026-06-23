@@ -105,7 +105,7 @@ JSON
 # --- drop the dice Lua program into /s/ so the dev terminal has something to
 #     dial (the binary auto-seeds /s/welcome; dice is a builtin app) ---
 mkdir -p "$DATADIR/cesfilestore/s"
-cp "$HERE/../src/ceslib/extensions/dice.lua" "$DATADIR/cesfilestore/s/dice.lua"
+cp "$HERE/../extensions/dice.lua" "$DATADIR/cesfilestore/s/dice.lua"
 
 # --- boot CES server (engine-free): file + compute + lua, dice autolaunched ---
 echo "booting CES server on :$CESPORT (rpc $RPCPORT), no PoW engine..."

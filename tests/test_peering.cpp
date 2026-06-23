@@ -10,8 +10,10 @@
 #include "test_common.h"
 
 #include <ces/buffer.h>
+#include <ces/util/resolver.h>
 #include <ces/util/wallet.h>
 #include <toml++/toml.hpp>
+#include <boost/asio/ip/address.hpp>
 #include <filesystem>
 
 // ces/wallet.h declares ces::fs = std::filesystem, which collides with
@@ -59,6 +61,44 @@ static void waitForBalance(const std::unique_ptr<CesServer>& srv,
 }
 
 BOOST_AUTO_TEST_SUITE(PeeringTests)
+
+// The anti-takeover primitive: an unsigned inbound PoW can never re-point a peer
+// key whose address we cryptographically verified. Unverified addresses brawl
+// (last claim wins, none trusted); a verified address is sticky to inbound PoW;
+// an operator/discovery update is authoritative and re-arms verification.
+BOOST_AUTO_TEST_CASE(VerifiedAddressStickyAgainstInboundPoW) {
+  bfs::path dir = makeUniqueTempDir("ces_peer_sticky");
+  minx::Hash priv; priv.fill(0xCC);
+  auto srv = std::make_unique<CesServer>(makePeeringConfig(dir, priv));
+
+  minx::Hash key; key.fill(0xAB);
+  auto entry = [&]() {
+    for (auto& p : srv->_peerSnapshot())
+      if (p.ckey == key) return std::make_pair(p.declaredAddress, p.verified);
+    return std::make_pair(std::string{}, false);
+  };
+
+  // Unverified candidate planted by inbound PoW, then a second inbound PoW with a
+  // different address overwrites it on sight.
+  srv->_upsertPeerForTest(key, "1.2.3.4:5000", 100);
+  BOOST_CHECK_EQUAL(entry().first, "1.2.3.4:5000");
+  BOOST_CHECK(!entry().second);
+  srv->_upsertPeerForTest(key, "9.9.9.9:5000", 100);
+  BOOST_CHECK_EQUAL(entry().first, "9.9.9.9:5000");      // newcomer won the brawl
+
+  // Now it's verified (as a signed server-info would mark it). An inbound PoW with
+  // yet another address must NOT move it.
+  BOOST_REQUIRE(srv->_setPeerVerifiedForTest(key, true));
+  srv->_upsertPeerForTest(key, "6.6.6.6:5000", 100);
+  BOOST_CHECK_EQUAL(entry().first, "9.9.9.9:5000");      // sticky: unchanged
+  BOOST_CHECK(entry().second);                            // still verified
+
+  // An operator/discovery update (inboundCredit == 0) is authoritative: it may
+  // re-point even a verified peer, and resets verification so it is re-proven.
+  srv->_upsertPeerForTest(key, "7.7.7.7:5000", 0);
+  BOOST_CHECK_EQUAL(entry().first, "7.7.7.7:5000");
+  BOOST_CHECK(!entry().second);
+}
 
 BOOST_AUTO_TEST_CASE(AutomatedBilateralPeering) {
   blog::init();
@@ -1110,6 +1150,59 @@ BOOST_AUTO_TEST_CASE(PeerReachabilityDetection) {
   boost::system::error_code ec;
   bfs::remove_all(dirA, ec);
   bfs::remove_all(dirB, ec);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// Resolver::fillHost — give an advertised peer address a routable host from the
+// observed packet source when the peer has no serverName (advertises ":port"),
+// and leave an operator-set serverName (has a host) untouched. Lives here next to
+// the peer-table tests because it's the peering address-resolution helper.
+BOOST_AUTO_TEST_SUITE(ResolverTests)
+
+BOOST_AUTO_TEST_CASE(FillHostLessFromIpv4Source) {
+  // ":41001" advertised + packet from 203.0.113.7 -> routable host filled in,
+  // listen port kept (the source PORT is ephemeral and must NOT be used).
+  BOOST_CHECK_EQUAL(
+    ces::Resolver::fillHost(":41001", boost::asio::ip::make_address("203.0.113.7")),
+    "203.0.113.7:41001");
+}
+
+BOOST_AUTO_TEST_CASE(FillHostLessUnwrapsV4MappedV6) {
+  // Loopback often arrives as an IPv4-mapped IPv6 address; unwrap to plain v4.
+  BOOST_CHECK_EQUAL(
+    ces::Resolver::fillHost(":41001",
+                            boost::asio::ip::make_address("::ffff:127.0.0.1")),
+    "127.0.0.1:41001");
+}
+
+BOOST_AUTO_TEST_CASE(FillHostLessBracketsIpv6Source) {
+  // A bare IPv6 source is bracketed so the result re-parses as host:port.
+  BOOST_CHECK_EQUAL(
+    ces::Resolver::fillHost(":41001", boost::asio::ip::make_address("2001:db8::1")),
+    "[2001:db8::1]:41001");
+  BOOST_CHECK_EQUAL(
+    ces::Resolver::fillHost(":41001", boost::asio::ip::make_address("::1")),
+    "[::1]:41001");
+}
+
+BOOST_AUTO_TEST_CASE(KeepsServerNameVerbatim) {
+  // A peer that set a real serverName already named its intentional external
+  // address — keep it exactly, never overwrite with the packet source.
+  auto src = boost::asio::ip::make_address("203.0.113.7");
+  BOOST_CHECK_EQUAL(ces::Resolver::fillHost("ces.pubcom.org:53830", src),
+                    "ces.pubcom.org:53830");
+  BOOST_CHECK_EQUAL(ces::Resolver::fillHost("198.51.100.4:53830", src),
+                    "198.51.100.4:53830");
+  BOOST_CHECK_EQUAL(ces::Resolver::fillHost("[2001:db8::99]:53830", src),
+                    "[2001:db8::99]:53830");
+}
+
+BOOST_AUTO_TEST_CASE(LeavesMalformedUntouched) {
+  // No port at all: nothing sane to do, leave it untouched.
+  BOOST_CHECK_EQUAL(
+    ces::Resolver::fillHost("41001", boost::asio::ip::make_address("203.0.113.7")),
+    "41001");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

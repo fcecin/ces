@@ -42,7 +42,7 @@ Equivalent CLI flag: `--extension dice` (repeatable).
 level — copy or unpack the file directly into `<storeDir>/s/`:
 
 ```
-cp src/ceslib/extensions/dice.lua <data_dir>/cesfilestore/s/dice.lua
+cp extensions/dice.lua <data_dir>/cesfilestore/s/dice.lua
 ```
 
 `<storeDir>` is `file_store_dir` if set, otherwise

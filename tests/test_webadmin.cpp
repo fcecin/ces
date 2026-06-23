@@ -199,8 +199,9 @@ BOOST_AUTO_TEST_CASE(AssetLookupMissing) {
 BOOST_AUTO_TEST_CASE(PeerAddListRemove) {
   // Point at the fixture's OWN server so the miner's first probe connects
   // instantly — a dead address would make connect() time out and stall
-  // teardown (stop() joins the probe-blocked miner thread).
-  std::string pk(64, 'b');
+  // teardown (stop() joins the probe-blocked miner thread). peer_add now
+  // verifies the key against the remote's handshake, so use the real one.
+  std::string pk = server->_serverKeyPair().getPublicKeyHexStr();
   std::string addr = "127.0.0.1:" + std::to_string(mainPort);
   auto add = httpReq(port, "POST", "/api/peer_add",
                      form({{"key", pk}, {"address", addr}}));
@@ -215,6 +216,21 @@ BOOST_AUTO_TEST_CASE(PeerAddListRemove) {
 
   auto list2 = httpReq(port, "GET", "/api/peers");
   BOOST_CHECK(!has(list2.body, addr));
+}
+
+BOOST_AUTO_TEST_CASE(PeerAddRejectsWrongKey) {
+  // A wrong key for a reachable server must be rejected (the handshake reports
+  // the real key) — otherwise the miner would burn PoW toward a key the server
+  // doesn't hold. Point at the fixture's own server with a bogus key.
+  std::string wrong(64, 'a');
+  std::string addr = "127.0.0.1:" + std::to_string(mainPort);
+  auto add = httpReq(port, "POST", "/api/peer_add",
+                     form({{"key", wrong}, {"address", addr}}));
+  BOOST_CHECK(!has(add.body, "\"ok\":true"));
+  BOOST_CHECK(has(add.body, "mismatch"));
+  // And it was not added.
+  auto list = httpReq(port, "GET", "/api/peers");
+  BOOST_CHECK(!has(list.body, addr));
 }
 
 BOOST_AUTO_TEST_CASE(PeerTargetStartsMiner) {
@@ -465,7 +481,8 @@ BOOST_AUTO_TEST_CASE(AddPeerStartsMinerAndProbes) {
   // peer's reachability is checked without committing to mining. We point it
   // at the fixture's OWN server so the probe connects instantly — a dead
   // address would make the miner's first connect time out and stall teardown.
-  std::string pk(64, 'f');
+  // peer_add verifies the key via handshake, so use the server's real key.
+  std::string pk = server->_serverKeyPair().getPublicKeyHexStr();
   std::string addr = "127.0.0.1:" + std::to_string(mainPort);
   auto add = httpReq(port, "POST", "/api/peer_add",
                      form({{"key", pk}, {"address", addr}}));

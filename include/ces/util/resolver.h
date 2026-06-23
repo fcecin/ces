@@ -44,6 +44,18 @@ public:
   static boost::asio::ip::address parseIp(const std::string& ip,
                                            boost::system::error_code& ec);
 
+  // Give an advertised peer address a routable host. A node with no serverName
+  // can't name its own external address, so it advertises only its listen port
+  // (":<port>"); the routable host then comes from the packet we received from
+  // it (srcIp) — routable by definition, since it just reached us — while the
+  // listen port stays the advertised one (the packet's source port is ephemeral
+  // and useless). If `advertised` already carries a host (an operator-set
+  // serverName: a DNS name or IP literal), it is the intentional external
+  // address and is returned unchanged. IPv4-mapped IPv6 sources are unwrapped
+  // and bare IPv6 hosts are bracketed so the result re-parses as host:port.
+  static std::string fillHost(const std::string& advertised,
+                              const boost::asio::ip::address& srcIp);
+
   // Result of probe(): auto-detected TCP-vs-UDP with pre-resolved endpoints.
   struct Probe {
     bool isTcp = false;

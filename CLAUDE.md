@@ -62,8 +62,7 @@ include/ces/util/   shared helpers — ctrlc, fileperm, hash, hex, log,
 src/ceslib/         static lib mirroring the include tree — top-level
                     server.cpp (incl. SYS_RPC outbound engine), cesvm.cpp,
                     ramfilestore.cpp, accounts/assets/client/clientasync/
-                    cesco; subdirs cesplex/, l2/, util/; extensions/
-                    holds operator-deployable app sources (dice.lua)
+                    cesco; subdirs cesplex/, l2/, util/
 src/ces/main.cpp    server CLI: config, key gen, ces credit/debit/snapshot
 src/cesh/           shell client (main.cpp + dial.cpp/h)
 src/cesluajitd/     compute child runtime (LuaJIT-hosted, default)
@@ -71,6 +70,11 @@ src/cescompmockd/   no-Lua mock child (regression-test plumbing only)
 src/cesproxy/       TCP↔UDP proxy with wire-level validation
 src/cesbench/       in-process benchmark
 src/cesqt/          Qt6 GUI: 11 tabs + JSON-RPC server (rpcserver.cpp)
+extensions/         committed catalog of operator-deployable /s/ Lua
+                    extensions (dice.lua + dice.md, discovery.lua +
+                    discovery.md); the default extensions_dir. Install
+                    copies one into a server's /s/. discovery.lua is a
+                    built cesdk bundle (source: cesdk apps/discovery).
 tests/              Boost.Test suites compiled into one `cestests` binary
                     (filter by suite name). test_common.h = CesFixture
                     (in-process server+client, 10B prefunded).
@@ -210,7 +214,7 @@ Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser
 
 **cesluajitd**: one sandboxed LuaJIT VM per process — no `os`/`io`/`debug`/`require`/`loadstring`/`ffi`. The supervisor frames IPC over the UDS and hands the child a bootstrap frame with its identity (owner key + program keypair), its server-reserved ports (outbound CES client + the instance's own `/ces/luarpc/1` host; either may be 0), and the source. The Lua API surfaces client messaging, the file store (owner-authority, billed to the source's `file_balance`), `ces.transfer` / `account_read` / `random_bytes`, identity + time helpers, capacity-billed `bucket`s, and the unified `ces.conn` raw byte-stream API — **one** listener serving BOTH the server-relayed `/ces/lua/1` and this instance's own direct `/ces/luarpc/1`, plus outbound `ces.conn.connect` (see L2 lua / luarpc below). The program never owns the socket — the C++ host runs the packet processor and passes it the reserved port numbers.
 
-**[extension]** auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is **operator-deployed, NOT embedded in the binary**: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source just logs a WRN and is skipped. Shipped: `dice` (`[extension] dice = 1` / `--extension-dice`) — fair-coin double-or-nothing whose house bankroll is the file's dedicated program account (`ces.program_pubkey()`), auto-funded on /s/ by the boot zone reconcile.
+**[extension]** auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is **operator-deployed, NOT embedded in the binary**: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source just logs a WRN and is skipped. Names are arbitrary (the repeatable flag is the generic `--extension <name>`; there is no per-app flag). Shipped: `dice` (`[extension] dice = 1`) — fair-coin double-or-nothing whose house bankroll is the file's dedicated program account (`ces.program_pubkey()`), auto-funded on /s/ by the boot zone reconcile; and `discovery` (`[extension] discovery = 1`) — the network registry crawler (a built cesdk bundle, source in cesdk `apps/discovery`) that keeps the host's peer table populated and gossips known servers via paid sample exchange.
 
 ## L2 lua — `builtin:lua` (channel routing)
 

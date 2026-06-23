@@ -14,7 +14,7 @@ ENV_FILE="${WORKSPACE}/env.sh"
 CES_ROOT="$(cd "${DEMO_DIR}/.." && pwd)"
 CES_BIN="${CES_ROOT}/build/debug/ces"
 CESH_BIN="${CES_ROOT}/build/debug/cesh"
-DICE_LUA="${CES_ROOT}/src/ceslib/extensions/dice.lua"
+DICE_LUA="${CES_ROOT}/extensions/dice.lua"
 
 CES_PORT=53830
 CES_RPC_PORT=53831

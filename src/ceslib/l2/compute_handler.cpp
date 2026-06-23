@@ -47,10 +47,14 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
+#include <ces/client.h>
 #include <ces/ramfilestore.h>
 #include <ces/keys.h>
 #include <ces/server.h>
 #include <ces/types.h>
+#include <ces/util/resolver.h>
+
+#include <thread>
 
 #include <minx/blog.h>
 #include <minx/bucketcache.h>
@@ -146,6 +150,17 @@ constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
 constexpr uint8_t kIpcTagLog          = 0x0b;  // child → server (ces.log)
 constexpr uint8_t kIpcTagHostLog      = 0x0c;  // child → server (host C++)
 constexpr uint8_t kIpcTagNetUsage     = 0x0c;  // child -> server (channel usage)
+
+// Extension contract (must match cesluajitd TAG_EXT_*).
+constexpr uint8_t kIpcTagExtRegister    = 0x0d;  // child → server
+constexpr uint8_t kIpcTagExtReq         = 0x0e;  // server → child (status/command)
+constexpr uint8_t kIpcTagExtRep         = 0x0f;  // child → server (reply)
+constexpr uint8_t kIpcTagExtConfig      = 0x10;  // server → child (on_config)
+constexpr uint8_t kIpcTagExtDisableSelf = 0x11;  // child → server
+constexpr uint8_t kIpcTagExtManifest    = 0x12;  // child → server (ces.manifest)
+
+constexpr uint8_t kExtReqStatus  = 0x00;
+constexpr uint8_t kExtReqCommand = 0x01;
 constexpr size_t  kLuaProgramLogMax   = 4096;  // cap a program log line
 
 constexpr uint16_t kApiMethodClientSend = 0x0001;
@@ -196,6 +211,10 @@ constexpr uint16_t kApiMethodPeerAdd       = 0x0231;
 constexpr uint16_t kApiMethodPeerRemove    = 0x0232;
 constexpr uint16_t kApiMethodPeerTargetSet = 0x0233;
 constexpr uint16_t kApiMethodPeerTargetGet = 0x0234;
+// ces.request_funds(addr, amount): petition the server to fund THIS program's key
+// at remote `addr` — a regular server-signed transfer at the remote (NOT
+// settlement), gated by the global funding rate. See local/extension_funding.md.
+constexpr uint16_t kApiMethodRequestFunds  = 0x0235;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -316,6 +335,16 @@ struct Instance : std::enable_shared_from_this<Instance> {
   std::array<uint8_t, 4> rxLenBuf{};
   ces::Bytes rxBodyBuf;
 
+  // Identity, reported live via ces.manifest{} (EXT_MANIFEST). Independent of the
+  // contract — a program may have a manifest with no contract (dice) or both.
+  std::string extName, extVersion, extDescription;
+  // Admin contract. Populated when the child sends EXT_REGISTER
+  // (ces.extension_admin{}); honored only for /s/ instances.
+  bool isExtension = false;
+  uint8_t extCaps = 0;
+  std::vector<std::pair<std::string, std::string>> extCommands;   // {id, label}
+  std::string extConfigDefaults;
+
   // /ces/lua/1 connection state. The accept gate (default closed) is
   // flipped by the child via TAG_LISTEN_ON / TAG_LISTEN_OFF. The
   // routing table for active connections is owned by the lua handler
@@ -358,6 +387,22 @@ std::map<uint64_t, std::shared_ptr<Instance>> gInstances;
 std::map<std::array<uint8_t, 8>, std::set<uint64_t>> gByPrefix;
 std::map<std::string, std::set<uint64_t>> gByName;
 uint64_t gNextPid = 1;
+
+// In-flight EXT_REQ correlation. The reply (EXT_REP) lands on rpcTaskIO_ in
+// handleChildFrame; the caller (e.g. the webadmin worker thread) blocks on the
+// shared state until it is filled or times out. corr_id is host-allocated for
+// this direction, separate from the child-allocated api_call corr_ids.
+struct ExtPending {
+  uint16_t corr = 0;
+  bool dead = false;           // timed out -> drop a late reply (rpcTaskIO_-only)
+  std::mutex m;
+  std::condition_variable cv;
+  bool done = false;
+  bool ok = false;
+  ces::Bytes reply;            // EXT_REP payload after the status byte
+};
+std::map<uint16_t, std::shared_ptr<ExtPending>> gExtPending;   // rpcTaskIO_-only
+uint16_t gExtCorr = 1;
 
 // In-flight LAUNCH reservations: launches admitted past the cap check
 // whose instance isn't in gInstances yet (the child is still connecting
@@ -765,6 +810,63 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
     makeFrame(kIpcTagApiReply, corr_id, body.data(), body.size()));
 }
 
+// ---- Extension funding worker. ces.request_funds reserves from the server's
+// global rate bucket (server->extFundingGrant) on the rpc strand, then a bounded
+// set of detached threads run the actual server-signed remote open-transfer
+// off-strand (CesClient is blocking) and reply to the child async. On failure the
+// reservation is refunded, so the granted amount the child sees is the CONFIRMED one.
+std::atomic<int> gFundingInFlight{0};
+constexpr int    kFundingMaxInFlight = 4;
+
+void fundingWorker(std::shared_ptr<Instance> inst, uint16_t corr,
+                   minx::Hash dest, uint64_t amount, std::string destServer,
+                   CesServer* server, ces::KeyPair serverKey) {
+  struct Guard { ~Guard() { gFundingInFlight.fetch_sub(1); } } guard;
+  bool ok = false;
+  try {
+    auto ep = ces::Resolver::resolveUdp(destServer);
+    // Lean client (one round-trip): small recv ring, no PoW/spam machinery —
+    // the server-sized default would alloc ~32MB per transfer.
+    minx::MinxConfig ccfg{"fundcl"};
+    ccfg.recvBuffersSize    = 256;
+    ccfg.spamSampleRate     = 0;
+    ccfg.randomXVMsToKeep   = 0;
+    ccfg.randomXInitThreads = 0;
+    ccfg.trustLoopback      = true;
+    ces::CesClient client(ep, /*useDataset=*/false, ccfg);
+    client.setKey(serverKey);
+    if (client.start(0) && client.connect()) {
+      int64_t newBal = 0;
+      // Open-transfer, not a safe transfer: the program's account almost never
+      // exists at the remote on the first grant, and a safe transfer rejects a
+      // missing destination (CES_ERROR_TARGET_NOT_FOUND). Open mode creates it.
+      // Still a direct signed op (origin = server's reserve there, dest =
+      // program), NOT a cross-transfer/settlement.
+      ok = (client.openTransfer(dest, amount, newBal) == CES_OK);
+      client.disconnect();
+    }
+    client.stop();
+  } catch (...) {
+    ok = false;
+  }
+  if (!ok) server->extFundingRefund(amount);            // failed -> give the rate back
+  uint64_t granted = ok ? amount : 0;
+  if (ok)
+    LOGINFO  << "ext funding: server sent " << amount
+             << " to a program account at " << destServer;
+  else
+    LOGDEBUG << "ext funding: transfer to " << destServer
+             << " failed; refunded " << amount;
+  try {
+    boost::asio::post(inst->peer->get_executor(), [inst, corr, granted]() {
+      ces::Bytes tail;
+      ces::Buffer::put<uint64_t>(tail, granted);
+      sendApiReplyWithBody(inst, corr, kApiStatusOk, tail);
+    });
+  } catch (...) {
+  }
+}
+
 // Send the bootstrap frame at LAUNCH time. Body layout:
 //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
 //   [32B program_privkey][2B client_port BE][2B rpc_port BE]
@@ -894,6 +996,24 @@ void emitHostLog(uint64_t pid, const std::string& source,
   }
 }
 
+// Read /s/<name>.conf for a /s/<name>.lua source ("" if absent). The startup
+// config push: an extension's persisted config is delivered to its on_config the
+// moment it registers, so its live state matches the file from the first tick.
+std::string readExtensionConfig(const std::string& sourceName) {
+  CesServer* server = gServer.load();
+  if (!server || sourceName.empty() || sourceName[0] != '/') return "";
+  auto dot = sourceName.rfind(".lua");
+  if (dot == std::string::npos) return "";
+  std::string conf = sourceName.substr(0, dot) + ".conf";   // "/s/<name>.conf"
+  std::filesystem::path p =
+    std::filesystem::path(server->_config().cesFileStoreDir) / conf.substr(1);
+  std::ifstream f(p, std::ios::binary);
+  if (!f) return "";
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
 void handleChildFrame(std::shared_ptr<Instance> inst) {
   const auto& body = inst->rxBodyBuf;
   if (body.size() < 3) return;
@@ -986,6 +1106,80 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
       fileHandlerDebitBalance(inst->sourceName, amount);  // outbound: instance pays
     else
       server->debitNetworkBill(payer, amount);            // inbound: caller pays
+    return;
+  }
+  if (tag == kIpcTagExtManifest) {
+    // ces.manifest{} -> store identity (name/version/description). Reported live;
+    // independent of the admin contract. /s/ only. Body: [lp name][lp ver][lp desc].
+    if (!isServerZone(inst->sourceName)) return;
+    size_t o = kIpcHdr;
+    auto getLp = [&](std::string& dst) -> bool {
+      if (body.size() < o + 2) return false;
+      uint16_t n = ces::Buffer::peek<uint16_t>(body.data() + o); o += 2;
+      if (body.size() < o + n) return false;
+      dst.assign(reinterpret_cast<const char*>(body.data() + o), n); o += n;
+      return true;
+    };
+    getLp(inst->extName); getLp(inst->extVersion); getLp(inst->extDescription);
+    return;
+  }
+  if (tag == kIpcTagExtRegister) {
+    // ces.extension_admin{} -> store caps + commands + defaults. /s/ only. No
+    // metadata here: name/version/description arrive via ces.manifest (above).
+    // Body after header: [u8 caps][u16 cmdCount]([lp id][lp label])*
+    //   [lp config_defaults].  lp = u16 len + bytes.
+    if (!isServerZone(inst->sourceName)) return;
+    size_t o = kIpcHdr;
+    if (body.size() < o + 1) return;
+    inst->extCaps = body[o]; o += 1;
+    auto getLp = [&](std::string& dst) -> bool {
+      if (body.size() < o + 2) return false;
+      uint16_t n = ces::Buffer::peek<uint16_t>(body.data() + o); o += 2;
+      if (body.size() < o + n) return false;
+      dst.assign(reinterpret_cast<const char*>(body.data() + o), n); o += n;
+      return true;
+    };
+    if (body.size() < o + 2) return;
+    uint16_t cmdCount = ces::Buffer::peek<uint16_t>(body.data() + o); o += 2;
+    inst->extCommands.clear();
+    for (uint16_t i = 0; i < cmdCount; i++) {
+      std::string id, label;
+      if (!getLp(id) || !getLp(label)) return;
+      inst->extCommands.emplace_back(std::move(id), std::move(label));
+    }
+    getLp(inst->extConfigDefaults);
+    inst->isExtension = true;
+    // Deliver the persisted config now so the extension's live state matches its
+    // /s/<name>.conf from the first tick (not only after a Save/Reset).
+    if (inst->extCaps & kComputeExtCapOnConfig) {
+      std::string cfg = readExtensionConfig(inst->sourceName);
+      if (!cfg.empty())
+        enqueueOutbound(inst, makeFrame(kIpcTagExtConfig, 0,
+          reinterpret_cast<const uint8_t*>(cfg.data()), cfg.size()));
+    }
+    LOGDEBUG << "extension registered"
+             << VAR(inst->pid) << SVAR(inst->sourceName) << VAR(int(inst->extCaps));
+    return;
+  }
+  if (tag == kIpcTagExtRep) {
+    // Reply to a host EXT_REQ: [u8 status][payload]. Match corr -> pending.
+    auto pit = gExtPending.find(corr);
+    if (pit == gExtPending.end()) return;
+    auto pend = pit->second;
+    gExtPending.erase(pit);
+    std::lock_guard<std::mutex> lk(pend->m);
+    if (!pend->dead) {
+      const uint8_t* p = body.data() + kIpcHdr;
+      size_t plen = body.size() - kIpcHdr;
+      pend->ok = (plen >= 1 && p[0] == kApiStatusOk);
+      if (plen >= 1) pend->reply.assign(p + 1, p + plen);
+      pend->done = true;
+      pend->cv.notify_all();
+    }
+    return;
+  }
+  if (tag == kIpcTagExtDisableSelf) {
+    killByPid(inst->pid);
     return;
   }
   if (tag != kIpcTagApiCall) {
@@ -1113,6 +1307,50 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
         sendApiReplyWithBody(inst_cap, corr_id, rc, tail);
       },
       inst->peer->get_executor());
+    return;
+  }
+
+  // ---- ces.request_funds(amount, dest_server): petition the server to fund THIS
+  // program's key at the remote. Reserve from the global rate bucket, then a
+  // detached worker does a server-signed REGULAR transfer at the remote (origin =
+  // server's reserve there, dest = program), replying with the CONFIRMED granted
+  // amount (the reservation is refunded if the transfer fails). NOT settlement.
+  // Args: [u64 amount][u8 srvLen][srv]. Reply: [u8 status][u64 BE granted].
+  if (method == kApiMethodRequestFunds) {
+    if (mlen < sizeof(uint64_t) + 1) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    uint64_t amount = ces::Buffer::peek<uint64_t>(mbody);
+    uint8_t srvLen = mbody[sizeof(uint64_t)];
+    if (srvLen == 0 || mlen < sizeof(uint64_t) + 1 + srvLen) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    std::string destServer(
+      reinterpret_cast<const char*>(mbody + sizeof(uint64_t) + 1), srvLen);
+    CesServer* server = gServer.load();
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    auto reply = [&](uint64_t g) {
+      ces::Bytes tail;
+      ces::Buffer::put<uint64_t>(tail, g);
+      sendApiReplyWithBody(inst, corr_id, kApiStatusOk, tail);
+    };
+    uint64_t granted = server->extFundingGrant(amount);
+    LOGDEBUG << "ext funding: petition " << amount << " at " << destServer
+             << " -> reserved " << granted;
+    if (granted == 0) { reply(0); return; }               // budget exhausted / off
+    if (gFundingInFlight.load() >= kFundingMaxInFlight) {  // busy -> back off
+      server->extFundingRefund(granted); reply(0); return;
+    }
+    minx::Hash dest{};
+    std::memcpy(dest.data(), inst->programPubkey.data(), 32);
+    gFundingInFlight.fetch_add(1);
+    try {
+      std::thread(fundingWorker, inst, corr_id, dest, granted, destServer,
+                  server, server->_serverKeyPair()).detach();
+    } catch (...) {
+      gFundingInFlight.fetch_sub(1);
+      server->extFundingRefund(granted); reply(0);
+    }
     return;
   }
 
@@ -2446,6 +2684,111 @@ ComputeHandler gComputeHandler;
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+// Read a running instance's extension metadata (manifest + caps + commands +
+// config defaults). Synchronous hop onto rpcTaskIO_. false if pid is unknown.
+bool computeHandlerExtInfo(uint64_t pid, ComputeExtInfo& out) {
+  CesServer* server = gServer.load();
+  if (!server) return false;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return false;
+  std::mutex m; std::condition_variable cv; bool done = false, found = false;
+  ComputeExtInfo info;
+  boost::asio::post(ex, [&]() {
+    auto it = gInstances.find(pid);
+    if (it != gInstances.end()) {
+      auto& inst = it->second;
+      info.name           = inst->extName;
+      info.version        = inst->extVersion;
+      info.description    = inst->extDescription;
+      info.isExtension    = inst->isExtension;
+      info.caps           = inst->extCaps;
+      info.commands       = inst->extCommands;
+      info.configDefaults = inst->extConfigDefaults;
+      found = true;
+    }
+    std::lock_guard<std::mutex> lk(m); done = true; cv.notify_all();
+  });
+  std::unique_lock<std::mutex> lk(m);
+  cv.wait(lk, [&]{ return done; });
+  if (found) out = std::move(info);
+  return found;
+}
+
+// Send an EXT_REQ (status/command) to a running extension and block for the
+// EXT_REP, up to timeoutMs. `out` is the reply payload (after the status byte).
+// false on timeout, unknown pid, non-extension, or a child-side error.
+bool computeHandlerExtRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
+                              ces::Bytes& out, int timeoutMs) {
+  CesServer* server = gServer.load();
+  if (!server) return false;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return false;
+  auto pend = std::make_shared<ExtPending>();
+  boost::asio::post(ex, [pend, pid, kind, in]() {
+    auto it = gInstances.find(pid);
+    if (it == gInstances.end() || !it->second->isExtension) {
+      std::lock_guard<std::mutex> lk(pend->m);
+      pend->done = true; pend->ok = false; pend->cv.notify_all();
+      return;
+    }
+    uint16_t corr = gExtCorr++; if (corr == 0) corr = gExtCorr++;
+    pend->corr = corr;
+    gExtPending[corr] = pend;
+    ces::Bytes b; b.reserve(1 + in.size());
+    b.push_back(kind);
+    b.insert(b.end(), in.begin(), in.end());
+    enqueueOutbound(it->second, makeFrame(kIpcTagExtReq, corr, b.data(), b.size()));
+  });
+  std::unique_lock<std::mutex> lk(pend->m);
+  bool got = pend->cv.wait_for(lk, std::chrono::milliseconds(timeoutMs),
+                               [&]{ return pend->done; });
+  bool ok = got && pend->ok;
+  if (ok) out = pend->reply;
+  lk.unlock();
+  if (!got) {
+    boost::asio::post(ex, [pend]() {
+      pend->dead = true;
+      if (pend->corr) gExtPending.erase(pend->corr);
+    });
+  }
+  return ok;
+}
+
+// Push a config blob to a running extension (one-way on_config). Best-effort.
+void computeHandlerExtConfig(uint64_t pid, const std::string& cfg) {
+  CesServer* server = gServer.load();
+  if (!server) return;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return;
+  boost::asio::post(ex, [pid, cfg]() {
+    auto it = gInstances.find(pid);
+    if (it == gInstances.end() || !it->second->isExtension) return;
+    enqueueOutbound(it->second, makeFrame(kIpcTagExtConfig, 0,
+      reinterpret_cast<const uint8_t*>(cfg.data()), cfg.size()));
+  });
+}
+
+void computeFundingDrain() {
+  // Bounded wait for in-flight ces.request_funds remote transfers (gFundingInFlight
+  // lives in this TU's anonymous namespace) so the CesServer isn't torn down under
+  // one. Each is bounded by CesClient's own network timeout anyway.
+  for (int i = 0; i < 100 && gFundingInFlight.load() > 0; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+}
+
+void computeHandlerKillBySource(const std::string& sourceName) {
+  CesServer* server = gServer.load();
+  if (!server) return;
+  auto io = server->_rpcTaskIOExecutor();
+  if (!io) return;
+  boost::asio::post(io, [sourceName]() {
+    auto it = gByName.find(sourceName);
+    if (it == gByName.end()) return;
+    std::vector<uint64_t> ids(it->second.begin(), it->second.end());
+    for (uint64_t pid : ids) killByPid(pid);
+  });
+}
 
 uint8_t computeHandlerBind(CesServer* server) {
   if (server == nullptr) {

@@ -185,6 +185,16 @@ channel_idle_secs = 60
 # Storage directory (empty = "<data_dir>/cesfilestore").
 # file_store_dir = ""
 #
+# Read-only catalog of installable extensions (single .lua files). The
+# Extensions page lists these as available; empty = no catalog.
+# extensions_dir = ""
+#
+# Extension funding budget: the GLOBAL rate (raw credit units per day, summed over
+# all extensions and remotes) the server will grant /s/ programs that petition via
+# ces.request_funds. 0 (default) = funding OFF; a program can spend nothing at
+# remotes until you open a budget. Set live on the dashboard's Extensions tab.
+# ext_funding_per_day = 0
+#
 # Three fee knobs mapping to three physical costs. -1 = use default.
 #   fee_file_rent  — retention (per byte per day)
 #   fee_file_write — network + SSD write (per KB at WRITE)
@@ -271,8 +281,9 @@ channel_idle_secs = 60
 # Requires: rpc_port > 0, builtin:file with file_store_max_bytes > 0,
 # and builtin:compute with compute_max_instances > 0.
 # [extension]
-# dice = 1    # /s/dice.lua
-# chat = 1    # /s/chat.lua, etc.
+# dice = 1         # /s/dice.lua
+# discovery = 1    # /s/discovery.lua (network registry crawler)
+# chat = 1         # /s/chat.lua, etc.
 
 # Peer servers
 # [[peers]]
@@ -311,6 +322,7 @@ int main(int argc, char* argv[]) {
   int64_t optFeeVmMult = -1;
   bool optGenerateKeyPair = false;
   bool optNoPowEngine = false;
+  bool optNoFeeDiscount = false;
   bool optCacheOnlyPoWEngine = false;
   int defaultOptTaskThreads =
     static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
@@ -339,6 +351,8 @@ int main(int argc, char* argv[]) {
   // File-storage feature (CesPlex builtin:file, v2).
   uint64_t optFileStoreMaxBytes = 0;
   std::string optFileStoreDir;
+  std::string optExtensionsDir;
+  uint64_t optExtFundingPerDay = 0;
   int64_t optFeeFileRent  = -1;
   int64_t optFeeFileWrite = -1;
   int64_t optFeeFileRead  = -1;
@@ -426,6 +440,9 @@ int main(int argc, char* argv[]) {
       "Don't create the RandomX verifier");
     app.add_flag("--cacheonlypowengine,-c", optCacheOnlyPoWEngine,
       "Cache-only RandomX verifier (slower, less RAM)");
+    app.add_flag("--nofeediscount", optNoFeeDiscount,
+      "Disable the load-based fee discount (pin every fee at full price). For "
+      "tests/benchmarks that need fees to actually bite.");
     app.add_option("--feeaccount", optFeeAccount, "Fee for account rent");
     app.add_option("--feeasset", optFeeAsset, "Fee for asset operations");
     app.add_option("--feetx", optFeeTx, "Fee for transactions");
@@ -510,6 +527,12 @@ int main(int argc, char* argv[]) {
     app.add_option("--filestoredir", optFileStoreDir,
       "File-storage directory (empty = <datadir>/cesfilestore/)")
       ->default_val("");
+    app.add_option("--extensionsdir", optExtensionsDir,
+      "Read-only extension catalog directory (empty = none)")
+      ->default_val("");
+    app.add_option("--extfundingperday", optExtFundingPerDay,
+      "Extension funding budget: global raw credit units/day the server grants "
+      "ces.request_funds petitions (0 = off)")->default_val("0");
     app.add_option("--feefilerent", optFeeFileRent,
       "File-storage rent fee (credits per byte per day, -1 = default)");
     app.add_option("--feefilewrite", optFeeFileWrite,
@@ -693,6 +716,9 @@ int main(int argc, char* argv[]) {
       applyIfDefault("file_store_max_bytes", optFileStoreMaxBytes,
                      "--filestoremaxbytes");
       applyIfDefault("file_store_dir", optFileStoreDir, "--filestoredir");
+      applyIfDefault("extensions_dir", optExtensionsDir, "--extensionsdir");
+      applyIfDefault("ext_funding_per_day", optExtFundingPerDay,
+                     "--extfundingperday");
       applyIfDefault("fee_file_rent",  optFeeFileRent,  "--feefilerent");
       applyIfDefault("fee_file_write", optFeeFileWrite, "--feefilewrite");
       applyIfDefault("fee_file_read",  optFeeFileRead,  "--feefileread");
@@ -838,6 +864,7 @@ int main(int argc, char* argv[]) {
   if (optFeeTx >= 0)      config.feeTx      = static_cast<uint64_t>(optFeeTx);
   if (optFeeQuery >= 0)   config.feeQuery   = static_cast<uint64_t>(optFeeQuery);
   if (optFeeVmMult >= 0)  config.feeVmMult  = static_cast<uint64_t>(optFeeVmMult);
+  if (optNoFeeDiscount)   config.feeDiscountEnabled = false;
 
   uint64_t now = minx::getSecsSinceEpoch();
   if (optPoWDelay > 0)
@@ -874,6 +901,8 @@ int main(int argc, char* argv[]) {
   // File-storage feature config.
   config.cesFileStoreMaxBytes = optFileStoreMaxBytes;
   config.cesFileStoreDir      = optFileStoreDir;
+  config.cesExtensionsDir     = optExtensionsDir;
+  config.extFundingPerDay     = optExtFundingPerDay;
   if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;
   if (optFeeFileWrite >= 0) config.feeFileWrite = optFeeFileWrite;
   if (optFeeFileRead  >= 0) config.feeFileRead  = optFeeFileRead;

@@ -93,7 +93,7 @@ bool CesClient::connect() {
       }
       if (i + 1 < tries_) {
         LOGTRACE << "connect failed; retrying..." << VAR(i) << VAR(tries_);
-        if (!ces::sleep(kRetryIntervalMs)) {
+        if (!ces::sleep(retryIntervalMs_)) {
           LOGTRACE << "connect interrupted";
           return false;
         }
@@ -132,7 +132,7 @@ bool CesClient::getInfo() {
     transport_->sendGetInfo(msg);
     LOGTRACE << "getInfo wait for reply";
     auto res =
-      ces::waitFor(kRetryIntervalMs, [&]() { return g < serverInfoGen_; });
+      ces::waitFor(retryIntervalMs_, [&]() { return g < serverInfoGen_; });
     switch (res) {
     case ces::WaitResult::Success:
       LOGTRACE << "getInfo got new info";
@@ -186,7 +186,7 @@ int CesClient::proveWork(const minx::MinxProveWork& msg,
     int staleCount = 0;
     while (staleCount < tries_) {
       auto res =
-        ces::waitFor(kRetryIntervalMs, [&]() { return g < proveWorkGen_; });
+        ces::waitFor(retryIntervalMs_, [&]() { return g < proveWorkGen_; });
 
       if (res == ces::WaitResult::Interrupted)
         return minx::MINX_SOLUTION_UNKNOWN;
@@ -245,7 +245,7 @@ int CesClient::proveWork(const minx::MinxProveWork& msg,
     int staleCount = 0;
     while (staleCount < tries_) {
       auto res =
-        ces::waitFor(kRetryIntervalMs, [&]() { return g < solQueryGen_; });
+        ces::waitFor(retryIntervalMs_, [&]() { return g < solQueryGen_; });
 
       if (res == ces::WaitResult::Interrupted) {
         LOGTRACE << "proveWork queryPoW interrupted";
@@ -297,7 +297,7 @@ uint8_t CesClient::queryAccount(const ces::HashPrefix& accountMapKey,
     transport_->sendMessage(msg);
     LOGTRACE << "query account waiting for reply";
     auto res =
-      ces::waitFor(kRetryIntervalMs, [&]() { return g < accQueryGen_; });
+      ces::waitFor(retryIntervalMs_, [&]() { return g < accQueryGen_; });
 
     switch (res) {
     case ces::WaitResult::Success:
@@ -811,7 +811,7 @@ uint8_t CesClient::queryAsset(const Hash& assetId, HashPrefix& outOwner,
 
   for (int i = 0; i < tries_; ++i) {
     transport_->sendMessage(msg);
-    auto res = ces::waitFor(kRetryIntervalMs,
+    auto res = ces::waitFor(retryIntervalMs_,
                             [&]() { return g < assetUnsignedQueryGen_; });
 
     switch (res) {
@@ -852,7 +852,7 @@ uint8_t CesClient::queryPeerInfo(uint16_t index, uint16_t& outCount, bool& outFo
 
   for (int i = 0; i < tries_; ++i) {
     transport_->sendMessage(msg);
-    auto res = ces::waitFor(kRetryIntervalMs,
+    auto res = ces::waitFor(retryIntervalMs_,
                             [&]() { return g < peerQueryGen_; });
     switch (res) {
     case ces::WaitResult::Success:

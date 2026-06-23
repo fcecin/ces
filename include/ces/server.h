@@ -196,6 +196,16 @@ struct CesConfig {
   // "<dataDir>/cesplex_files/". Operators can repoint for
   // bigger / faster / separately-provisioned storage.
   std::string cesFileStoreDir;
+  // Read-only catalog of installable extensions (single .lua files). The
+  // Extensions page lists these as available; Install copies one into /s/.
+  // Empty disables the catalog (already-installed /s/ extensions still show).
+  std::string cesExtensionsDir;
+  // Extension funding budget: the GLOBAL rate (raw credit units per day, summed
+  // over all extensions and all remotes) the server will grant to /s/ programs
+  // that petition via ces.request_funds. 0 (default) = funding off: a program
+  // can spend NOTHING at remotes until the operator opens a budget. The server
+  // enforces this; it never lives in Lua. See local/extension_funding.md.
+  uint64_t extFundingPerDay = 0;
   // Three fee knobs mapping to the three physical costs of file
   // storage:
   //   feeFileRent  = retention (byte sitting on disk over time)
@@ -728,6 +738,21 @@ public:
   // Remove a peer entirely. Returns true if an entry was erased.
   bool _removePeer(const minx::Hash& ckey);
 
+  // Test seams: drive the inbound-PoW peer-table path (inboundCredit > 0) and set
+  // the verified flag, so the address-claim policy (a verified address is sticky
+  // against an unsigned inbound claim; unverified entries are freely overwritten)
+  // can be unit-tested without real PoW + a live signed server-info exchange.
+  void _upsertPeerForTest(const minx::Hash& ckey, const std::string& address,
+                          uint64_t inboundCredit) {
+    upsertPeer(ckey, address, inboundCredit);
+  }
+  bool _setPeerVerifiedForTest(const minx::Hash& ckey, bool v) {
+    std::lock_guard<std::mutex> lock(peerTableMutex_);
+    for (auto& p : peerTable_)
+      if (p.ckey == ckey) { p.verified = v; return true; }
+    return false;
+  }
+
   // Runtime peer-credit target. Reading/writing goes through an atomic the
   // miner consults each cycle; setting it >0 starts the miner if it wasn't
   // already running (e.g. a server that booted with target 0). Note: this
@@ -746,10 +771,13 @@ public:
     bool mining = false;
     std::string peer;
     uint8_t difficulty = 0;
+    uint64_t startSecs = 0;   // unix secs this solve began (0 = not mining)
+    double hashRate = 0.0;    // smoothed H/s from completed solves (0 = unknown)
   };
   PeerMinerActivity _peerMinerActivity() const {
     std::lock_guard<std::mutex> lock(peerMinerActivityMutex_);
-    return {peerMinerMining_, peerMinerMiningPeer_, peerMinerMiningDiff_};
+    return {peerMinerMining_, peerMinerMiningPeer_, peerMinerMiningDiff_,
+            peerMinerMiningStartSecs_, peerMinerHashRate_};
   }
 
   // Export the current effective server config (knobs, with the LIVE runtime
@@ -946,6 +974,21 @@ public:
                          uint64_t lastXferAmount,
                          uint32_t lastXferTime)> cb,
       boost::asio::any_io_executor cbExecutor);
+
+  // ---- Extension funding rate gate (see local/extension_funding.md). A token
+  // bucket refilling at cfg_.extFundingPerDay raw units/day, capped at one day's
+  // worth. The grant is the only thing bounding what /s/ programs spend at remotes
+  // (the server account is bottomless), so it lives here, never in Lua.
+  // extFundingGrant RESERVES up to `requested` (returns what it could reserve);
+  // the caller does the remote transfer and either keeps it or extFundingRefunds
+  // on failure. Thread-safe (own mutex) — called off logicStrand_.
+  uint64_t extFundingGrant(uint64_t requested);
+  void     extFundingRefund(uint64_t amount);
+  uint64_t extFundingRemaining();              // live available, for the gauge
+  uint64_t extFundingPerDay() const {          // live rate (boot value, or last set)
+    std::lock_guard<std::mutex> lk(extFundingMu_); return extFundingRatePerDay_;
+  }
+  void     extFundingSetPerDay(uint64_t perDay);   // operator sets the rate
 
   // CesConfig accessor — the file handler needs the resolved
   // feeFile / fileMaxBytes / cesplexFileDir after start() has
@@ -1216,6 +1259,16 @@ private:
   std::atomic<uint64_t> txCount_{0};
 
   KeyPair serverKeyPair_;
+
+  // Extension funding token bucket (see extFundingGrant). ratePerDay_ is the live
+  // rate (cfg_.extFundingPerDay copied at start, then operator-settable);
+  // allowance_ in raw credit units; lastUs_ a steady-clock micros stamp. Mutex is
+  // mutable so the const extFundingPerDay() accessor can lock.
+  mutable std::mutex extFundingMu_;
+  uint64_t           extFundingRatePerDay_ = 0;
+  double             extFundingAllowance_ = 0.0;
+  int64_t            extFundingLastUs_ = 0;
+  void               extFundingRefillLocked();   // refill; caller holds the mutex
 
   // Operator hello banner (see _getHello/_setHello). Guarded by its own
   // mutex: read on the logic strand by queryServerInfo, written by the
@@ -1532,6 +1585,8 @@ private:
   bool peerMinerMining_ = false;
   std::string peerMinerMiningPeer_;
   uint8_t peerMinerMiningDiff_ = 0;
+  uint64_t peerMinerMiningStartSecs_ = 0;  // when the current solve began
+  double peerMinerHashRate_ = 0.0;         // EMA H/s from completed solves
 
   // Auto-nonce dedup table
   std::mutex dedupMutex_;

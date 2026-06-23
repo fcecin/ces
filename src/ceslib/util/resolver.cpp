@@ -73,6 +73,29 @@ Resolver::parseIp(const std::string& ip, boost::system::error_code& ec) {
   return boost::asio::ip::make_address(ip, ec);
 }
 
+std::string Resolver::fillHost(const std::string& advertised,
+                               const boost::asio::ip::address& srcIp) {
+  auto pos = advertised.find_last_of(':');
+  if (pos == std::string::npos)
+    return advertised;  // no port at all — malformed, leave untouched
+  std::string host = advertised.substr(0, pos);
+  std::string port = advertised.substr(pos + 1);
+  // A bracketed IPv6 host ("[..]") still counts as a host.
+  std::string inner = host;
+  if (inner.size() >= 2 && inner.front() == '[' && inner.back() == ']')
+    inner = inner.substr(1, inner.size() - 2);
+  if (!inner.empty())
+    return advertised;  // operator serverName present — intentional, verbatim
+  // Host-less (":port"): fill the host from the observed source IP.
+  std::string ip = srcIp.to_string();
+  const std::string kV4Mapped = "::ffff:";  // unwrap IPv4-mapped IPv6
+  if (ip.rfind(kV4Mapped, 0) == 0)
+    ip = ip.substr(kV4Mapped.size());
+  if (ip.find(':') != std::string::npos)
+    ip = "[" + ip + "]";  // bracket a bare IPv6 literal
+  return ip + ":" + port;
+}
+
 std::unique_ptr<CesClient>
 Resolver::Probe::makeClient(bool useDataset) const {
   if (isTcp)

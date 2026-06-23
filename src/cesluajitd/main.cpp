@@ -216,6 +216,24 @@ constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (ces.log, one-
 constexpr uint8_t  TAG_HOST_LOG      = 0x0c;  // child → server (host C++, one-way)
 constexpr uint8_t  TAG_NET_USAGE     = 0x0c;  // child -> server (one-way)
 
+// Extension contract (ces.extension_admin{}). REGISTER/REP/DISABLE_SELF flow child →
+// server; REQ/CONFIG flow server → child. EXT_REQ carries a corr_id the child
+// echoes in EXT_REP so the server can match the reply.
+constexpr uint8_t  TAG_EXT_REGISTER     = 0x0d;  // child → server
+constexpr uint8_t  TAG_EXT_REQ          = 0x0e;  // server → child (status/command)
+constexpr uint8_t  TAG_EXT_REP          = 0x0f;  // child → server (reply)
+constexpr uint8_t  TAG_EXT_CONFIG       = 0x10;  // server → child (on_config, one-way)
+constexpr uint8_t  TAG_EXT_DISABLE_SELF = 0x11;  // child → server
+constexpr uint8_t  TAG_EXT_MANIFEST     = 0x12;  // child → server (ces.manifest, one-way)
+
+constexpr uint8_t  EXT_REQ_STATUS  = 0x00;
+constexpr uint8_t  EXT_REQ_COMMAND = 0x01;
+
+constexpr uint8_t  EXT_CAP_STATUS          = 0x01;
+constexpr uint8_t  EXT_CAP_COMMANDS        = 0x02;
+constexpr uint8_t  EXT_CAP_CONFIG_DEFAULTS = 0x04;
+constexpr uint8_t  EXT_CAP_ON_CONFIG       = 0x08;
+
 constexpr uint16_t METHOD_CLIENT_SEND      = 0x0001;
 constexpr uint16_t METHOD_FILE_CREATE      = 0x0100;
 constexpr uint16_t METHOD_FILE_WRITE       = 0x0101;
@@ -240,6 +258,7 @@ constexpr uint16_t METHOD_PEER_ADD         = 0x0231;
 constexpr uint16_t METHOD_PEER_REMOVE      = 0x0232;
 constexpr uint16_t METHOD_PEER_TARGET_SET  = 0x0233;
 constexpr uint16_t METHOD_PEER_TARGET_GET  = 0x0234;
+constexpr uint16_t METHOD_REQUEST_FUNDS    = 0x0235;
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
@@ -1408,13 +1427,17 @@ int lua_ces_remote_account_read(lua_State* L) {
   return 5;
 }
 
-// ces.ping(addr) → {pubkey(32), rpc_port, min_difficulty} | nil, err
+// ces.ping(addr [, timeout_ms]) → {pubkey(32), rpc_port, min_difficulty} | nil, err
 //
 // Free MINX GetInfo handshake to a remote server: learns its public key and
 // the rpc port that reaches its CesPlex handlers (file/compute/luarpc). A P2P
 // node turns a peer's main address (from ces.peers) into the rpc endpoint where
 // the peer's DHT instance can be discovered and dialed. Ticketless, so it works
 // even against a no-PoW-engine peer.
+//
+// Optional timeout_ms overrides the single-try reply wait (the CesClient
+// default is 3000); a crawler with many hosts can lower it so a dead host fails
+// in well under the default 3s. Omitted/<=0 keeps the default.
 int lua_ces_ping(lua_State* L) {
   if (g_program_port == 0) {
     lua_pushnil(L);
@@ -1423,6 +1446,7 @@ int lua_ces_ping(lua_State* L) {
   }
   size_t alen = 0;
   const char* addr = luaL_checklstring(L, 1, &alen);
+  int timeoutMs = static_cast<int>(luaL_optinteger(L, 2, 0));
   boost::asio::ip::udp::endpoint ep;
   try {
     ep = ces::Resolver::resolveUdp(std::string(addr, alen));
@@ -1437,6 +1461,7 @@ int lua_ces_ping(lua_State* L) {
   try {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setTries(1);  // fast-fail: a departed peer must not freeze the loop
+    if (timeoutMs > 0) client.setRetryIntervalMs(timeoutMs);
     if (!client.start(g_program_port) || !client.connect()) {
       lua_pushnil(L);
       lua_pushstring(L, "unreachable");
@@ -1534,7 +1559,10 @@ int lua_ces_peer_info(lua_State* L) {
 //   → true, new_origin_balance | nil, err
 //
 // Resolves `addr` and signs a transfer from the program's own account on
-// that remote server with the program's private key.
+// that remote server with the program's private key. Open transfer: creates
+// the destination account if it does not exist there yet (safe mode, which
+// rejects a missing target, is for humans who mistype an address — a program
+// paying out to a fresh account wants it created, like the local ces.transfer).
 int lua_ces_remote_transfer(lua_State* L) {
   if (g_program_port == 0) {
     lua_pushnil(L);
@@ -1581,7 +1609,7 @@ int lua_ces_remote_transfer(lua_State* L) {
       lua_pushinteger(L, STATUS_INTERNAL);
       return 2;
     }
-    rc = client.transfer(dest, amount, newBal);
+    rc = client.openTransfer(dest, amount, newBal);
     client.disconnect();
     client.stop();
   } catch (const std::exception& e) {
@@ -1726,6 +1754,51 @@ int lua_ces_cross_transfer(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
   return 2;
+}
+
+// ces.request_funds(addr:string, amount:number) → granted:number | nil, err
+//
+// Petition the SERVER to fund THIS program's key at remote `addr` with up to
+// `amount` credits — a server-signed regular transfer AT the remote (origin = the
+// server's reserve there), gated by the operator's GLOBAL funding budget (off by
+// default). Returns the CONFIRMED granted amount (0..amount). A 0 is NOT an error
+// — budget exhausted/off, or the remote transfer failed; the caller backs off and
+// retries. The program holds no budget and no authority; it only asks.
+int lua_ces_request_funds(lua_State* L) {
+  size_t addr_len = 0;
+  const char* addr = luaL_checklstring(L, 1, &addr_len);
+  if (addr_len == 0 || addr_len > 255) {
+    lua_pushnil(L);
+    lua_pushstring(L, "addr length out of range");
+    return 2;
+  }
+  lua_Number amt_n = luaL_checknumber(L, 2);
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L);
+    lua_pushstring(L, "amount out of range");
+    return 2;
+  }
+  uint64_t amount = static_cast<uint64_t>(amt_n);
+
+  std::vector<uint8_t> args;
+  args.reserve(sizeof(uint64_t) + 1 + addr_len);
+  put_u64(args, amount);
+  args.push_back(static_cast<uint8_t>(addr_len));
+  put_bytes(args, addr, addr_len);
+
+  Frame reply;
+  if (!api_call(METHOD_REQUEST_FUNDS, args, reply)) return push_ipc_fail(L);
+  uint8_t st = reply.body[0];
+  if (st != STATUS_OK) {
+    lua_pushnil(L);
+    lua_pushinteger(L, st);
+    return 2;
+  }
+  if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
+    return push_file_err(L, STATUS_INTERNAL);
+  uint64_t granted = get_u64(reply.body.data() + 1);
+  lua_pushnumber(L, static_cast<lua_Number>(granted));
+  return 1;
 }
 
 // ces.authentic_asset_create(asset_id, recipient_pubkey, payload, days)
@@ -2853,6 +2926,254 @@ int lua_ces_sleep(lua_State* L) {
   return lua_yield(L, 0);
 }
 
+// ---------------------------------------------------------------------------
+// ces.extension_admin{} — the extension management contract. The program registers
+// callbacks; the host (ExtensionManager via the compute supervisor) invokes
+// them over IPC when the program runs as a /s/ extension. Registration ships
+// the host a manifest + capability bits + the command menu + config defaults in
+// one REGISTER frame; status/command requests round-trip via EXT_REQ/EXT_REP;
+// config edits arrive one-way via EXT_CONFIG.
+// ---------------------------------------------------------------------------
+int  g_ext_status_ref  = LUA_NOREF;
+int  g_ext_command_ref = LUA_NOREF;
+int  g_ext_config_ref  = LUA_NOREF;
+bool g_ext_registered  = false;
+
+std::string ext_str_field(lua_State* L, int tbl, const char* key) {
+  lua_getfield(L, tbl, key);
+  std::string s;
+  if (lua_isstring(L, -1)) {
+    size_t n = 0; const char* p = lua_tolstring(L, -1, &n); s.assign(p, n);
+  }
+  lua_pop(L, 1);
+  return s;
+}
+
+// Parse "key = value" lines (# comments, trimmed) into a fresh Lua table left on
+// the stack. Mirrors cesdk's conf.lua so on_config receives a string->string map.
+void push_config_table(lua_State* L, const uint8_t* data, size_t len) {
+  lua_newtable(L);
+  std::string s(reinterpret_cast<const char*>(data), len);
+  auto trim = [](std::string x) {
+    size_t a = x.find_first_not_of(" \t\r");
+    if (a == std::string::npos) return std::string();
+    size_t b = x.find_last_not_of(" \t\r");
+    return x.substr(a, b - a + 1);
+  };
+  size_t pos = 0;
+  while (pos <= s.size()) {
+    size_t nl = s.find('\n', pos);
+    std::string line = s.substr(pos, nl == std::string::npos ? s.size() - pos : nl - pos);
+    pos = (nl == std::string::npos) ? s.size() + 1 : nl + 1;
+    size_t hash = line.find('#');
+    if (hash != std::string::npos) line = line.substr(0, hash);
+    size_t eq = line.find('=');
+    if (eq == std::string::npos) continue;
+    std::string k = trim(line.substr(0, eq));
+    if (k.empty()) continue;
+    std::string v = trim(line.substr(eq + 1));
+    lua_pushlstring(L, v.data(), v.size());
+    lua_setfield(L, -2, k.c_str());
+  }
+}
+
+// Serialize a {k=v} table (string->string) as [u16 count]([lp k][lp v])*.
+void ext_serialize_status(lua_State* L, int tbl, std::vector<uint8_t>& out) {
+  std::vector<uint8_t> pairs;
+  uint16_t count = 0;
+  lua_pushnil(L);
+  while (lua_next(L, tbl) != 0) {
+    if (lua_type(L, -2) == LUA_TSTRING) {           // only string keys (lua_next-safe)
+      size_t kn = 0, vn = 0;
+      const char* k = lua_tolstring(L, -2, &kn);
+      const char* v = lua_tolstring(L, -1, &vn);    // string or number; nil otherwise
+      if (k && v) { put_name(pairs, k, kn); put_name(pairs, v, vn); count++; }
+    }
+    lua_pop(L, 1);
+  }
+  put_u16(out, count);
+  put_bytes(out, pairs.data(), pairs.size());
+}
+
+// Read the program's CES_MANIFEST global — a STATIC table the cesdk bundler
+// emits from project.lua (a hand-written /s/ program declares it directly) — and
+// report it to the host. Called once when the program enters its run loop. It's
+// data, not a call, so `--manifest` can harvest it without running the program.
+void send_manifest_from_global(lua_State* L) {
+  lua_getglobal(L, "CES_MANIFEST");
+  if (lua_istable(L, -1)) {
+    int t = lua_gettop(L);
+    std::string name    = ext_str_field(L, t, "name");
+    std::string version = ext_str_field(L, t, "version");
+    std::string desc    = ext_str_field(L, t, "description");
+    std::vector<uint8_t> body;
+    put_name(body, name.data(), name.size());
+    put_name(body, version.data(), version.size());
+    put_name(body, desc.data(), desc.size());
+    write_frame(TAG_EXT_MANIFEST, 0, body.data(), body.size());
+  }
+  lua_pop(L, 1);
+}
+
+// ces.extension_admin{ status=, commands=, on_command=, config_defaults=,
+// on_config= }. The spec arrives at stack index 2 (index 1 is the
+// ces.extension_admin table itself, via __call). NO metadata here: name/version/
+// description are declared via ces.manifest{} (bundler-generated), not here —
+// this call registers the admin contract only.
+int lua_ces_extension_admin(lua_State* L) {
+  luaL_checktype(L, 2, LUA_TTABLE);
+  std::vector<uint8_t> body;
+  body.push_back(0);                                // caps placeholder
+  uint8_t caps = 0;
+
+  lua_getfield(L, 2, "status");
+  if (lua_isfunction(L, -1)) {
+    if (g_ext_status_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, g_ext_status_ref);
+    g_ext_status_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    caps |= EXT_CAP_STATUS;
+  } else lua_pop(L, 1);
+
+  std::vector<uint8_t> cmds;
+  uint16_t cmdCount = 0;
+  lua_getfield(L, 2, "commands");
+  if (lua_istable(L, -1)) {
+    int n = static_cast<int>(lua_objlen(L, -1));
+    for (int i = 1; i <= n; i++) {
+      lua_rawgeti(L, -1, i);
+      if (lua_istable(L, -1)) {
+        int c = lua_gettop(L);
+        std::string id = ext_str_field(L, c, "id");
+        std::string label = ext_str_field(L, c, "label");
+        if (!id.empty()) {
+          put_name(cmds, id.data(), id.size());
+          put_name(cmds, label.data(), label.size());
+          cmdCount++;
+        }
+      }
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
+  put_u16(body, cmdCount);
+  put_bytes(body, cmds.data(), cmds.size());
+  if (cmdCount > 0) caps |= EXT_CAP_COMMANDS;
+
+  lua_getfield(L, 2, "on_command");
+  if (lua_isfunction(L, -1)) {
+    if (g_ext_command_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, g_ext_command_ref);
+    g_ext_command_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+  } else lua_pop(L, 1);
+
+  std::string defaults;
+  lua_getfield(L, 2, "config_defaults");
+  if (lua_isfunction(L, -1)) {
+    if (lua_pcall(L, 0, 1, 0) == 0 && lua_isstring(L, -1)) {
+      size_t n = 0; const char* p = lua_tolstring(L, -1, &n); defaults.assign(p, n);
+    }
+    lua_pop(L, 1);
+    caps |= EXT_CAP_CONFIG_DEFAULTS;
+  } else if (lua_isstring(L, -1)) {
+    size_t n = 0; const char* p = lua_tolstring(L, -1, &n); defaults.assign(p, n);
+    lua_pop(L, 1);
+    caps |= EXT_CAP_CONFIG_DEFAULTS;
+  } else lua_pop(L, 1);
+  if (defaults.size() > 65535) defaults.resize(65535);
+  put_name(body, defaults.data(), defaults.size());
+
+  lua_getfield(L, 2, "on_config");
+  if (lua_isfunction(L, -1)) {
+    if (g_ext_config_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, g_ext_config_ref);
+    g_ext_config_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    caps |= EXT_CAP_ON_CONFIG;
+  } else lua_pop(L, 1);
+
+  body[0] = caps;
+  write_frame(TAG_EXT_REGISTER, 0, body.data(), body.size());
+  g_ext_registered = true;
+  return 0;
+}
+
+// ces.extension_admin.disable_self() — the program-initiated Disable (kills this
+// instance; the /s/ file stays).
+int lua_ces_extension_admin_disable_self(lua_State* L) {
+  (void)L;
+  write_frame(TAG_EXT_DISABLE_SELF, 0, nullptr, 0);
+  return 0;
+}
+
+// Host -> program: EXT_CONFIG (one-way on_config) or EXT_REQ (status/command,
+// answered with EXT_REP echoing the corr_id). Returns false on a fatal socket
+// write error so the run loop can exit.
+bool dispatch_ext_frame(lua_State* L, Frame f) {
+  if (f.tag == TAG_EXT_CONFIG) {
+    if (g_ext_config_ref == LUA_NOREF) return true;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, g_ext_config_ref);
+    push_config_table(L, f.body.data(), f.body.size());
+    if (lua_pcall(L, 1, 0, 0) != 0) {
+      host_log(3, std::string("ces.extension_admin on_config: ") + lua_err_str(L));
+      lua_pop(L, 1);
+    }
+    return true;
+  }
+  if (f.tag != TAG_EXT_REQ || f.body.empty()) return true;
+  uint8_t kind = f.body[0];
+  std::vector<uint8_t> rep;
+  if (kind == EXT_REQ_STATUS) {
+    if (g_ext_status_ref == LUA_NOREF) {
+      rep.push_back(STATUS_INTERNAL);
+    } else {
+      lua_rawgeti(L, LUA_REGISTRYINDEX, g_ext_status_ref);
+      if (lua_pcall(L, 0, 1, 0) != 0) {
+        host_log(3, std::string("ces.extension_admin status: ") + lua_err_str(L));
+        lua_pop(L, 1);
+        rep.push_back(STATUS_INTERNAL);
+      } else {
+        rep.push_back(STATUS_OK);
+        if (lua_istable(L, -1)) ext_serialize_status(L, lua_gettop(L), rep);
+        else put_u16(rep, 0);
+        lua_pop(L, 1);
+      }
+    }
+  } else if (kind == EXT_REQ_COMMAND) {
+    if (g_ext_command_ref == LUA_NOREF) {
+      rep.push_back(STATUS_INTERNAL);
+    } else {
+      const uint8_t* p = f.body.data() + 1;
+      size_t left = f.body.size() - 1;
+      if (left < 2) { rep.push_back(STATUS_INTERNAL); }
+      else {
+        uint16_t idlen = (uint16_t(p[0]) << 8) | uint16_t(p[1]);
+        p += 2; left -= 2;
+        if (left < idlen) { rep.push_back(STATUS_INTERNAL); }
+        else {
+          std::string id(reinterpret_cast<const char*>(p), idlen);
+          const uint8_t* arg = p + idlen;
+          size_t arglen = left - idlen;
+          lua_rawgeti(L, LUA_REGISTRYINDEX, g_ext_command_ref);
+          lua_pushlstring(L, id.data(), id.size());
+          lua_pushlstring(L, reinterpret_cast<const char*>(arg), arglen);
+          if (lua_pcall(L, 2, 1, 0) != 0) {
+            host_log(3, std::string("ces.extension_admin on_command: ") + lua_err_str(L));
+            lua_pop(L, 1);
+            rep.push_back(STATUS_INTERNAL);
+          } else {
+            rep.push_back(STATUS_OK);
+            if (lua_isstring(L, -1)) {
+              size_t rn = 0; const char* r = lua_tolstring(L, -1, &rn);
+              put_bytes(rep, r, rn);
+            }
+            lua_pop(L, 1);
+          }
+        }
+      }
+    }
+  } else {
+    rep.push_back(STATUS_INTERNAL);
+  }
+  write_frame(TAG_EXT_REP, f.corr_id, rep.data(), rep.size());
+  return true;
+}
+
 // Resume every ready coroutine. A coroutine that yields parks (its waker -- a
 // sleep timer, later an I/O completion -- re-readies it); one that finishes or
 // errors is unreferenced. Spawns made while draining are picked up in the same
@@ -2882,6 +3203,8 @@ static void drain_ready(lua_State* mainL) {
 // only when the IPC socket dies. Pre-luarpc programs that call ces.conn.run
 // behave exactly as before (the bridge half just stays empty).
 int lua_ces_run(lua_State* L) {
+  static bool manifest_sent = false;
+  if (!manifest_sent) { manifest_sent = true; send_manifest_from_global(L); }
   for (;;) {
     // Drain everything already queued. CONN_* frames may have been parked by
     // an API call's wait_for_reply; luarpc events are queued by the endpoint
@@ -2959,6 +3282,8 @@ int lua_ces_run(lua_State* L) {
       if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
           f.tag == TAG_CONN_CLOSED) {
         if (!dispatch_conn_frame(L, std::move(f))) return 0;
+      } else if (f.tag == TAG_EXT_REQ || f.tag == TAG_EXT_CONFIG) {
+        if (!dispatch_ext_frame(L, std::move(f))) return 0;
       } else {
         route_to_queue(std::move(f));   // DELIVER → g_inbox, API_REPLY → reply_q
       }
@@ -3732,6 +4057,8 @@ void install_ces_api(lua_State* L) {
   lua_setfield(L, -2, "remote_cross_transfer");
   lua_pushcfunction(L, guarded<lua_ces_cross_transfer>);
   lua_setfield(L, -2, "cross_transfer");
+  lua_pushcfunction(L, guarded<lua_ces_request_funds>);
+  lua_setfield(L, -2, "request_funds");
 
   // ces.conn — the UNIFIED connection API: one listener + run loop + conn shape
   // over BOTH transports (relay /ces/lua/1, server-relayed; direct /ces/luarpc/1
@@ -3759,7 +4086,63 @@ void install_ces_api(lua_State* L) {
   // ces.err — error names → codes.
   install_ces_err_table(L);
 
+  // ces.extension_admin — a callable table: ces.extension_admin{...} registers
+  // the admin contract (via __call); ces.extension_admin.disable_self() turns
+  // this instance off.
+  lua_newtable(L);
+  lua_pushcfunction(L, guarded<lua_ces_extension_admin_disable_self>);
+  lua_setfield(L, -2, "disable_self");
+  lua_newtable(L);                                  // metatable
+  lua_pushcfunction(L, guarded<lua_ces_extension_admin>);
+  lua_setfield(L, -2, "__call");
+  lua_setmetatable(L, -2);
+  lua_setfield(L, -2, "extension_admin");
+
   lua_setglobal(L, "ces");
+}
+
+// `cesluajitd --manifest <file>`: harvest a program's CES_MANIFEST WITHOUT
+// running it as a service. Loads the file in a no-op sandbox — a stub `ces` whose
+// every index/call yields itself, so ces.run()/ces.transfer()/... do nothing —
+// runs it under a tight instruction budget, then reads the static CES_MANIFEST
+// global. CES_MANIFEST is the program's first statement, so it's set even if
+// later code aborts. No source-text parsing: the real Lua loader evaluates the
+// actual table. Prints name/version/description on three lines.
+void probe_budget_hook(lua_State* L, lua_Debug*) {
+  luaL_error(L, "manifest probe budget exceeded");
+}
+int probe_manifest(const char* path) {
+  std::FILE* fp = std::fopen(path, "rb");
+  if (!fp) return 1;
+  std::string src;
+  char rbuf[4096];
+  size_t n;
+  while ((n = std::fread(rbuf, 1, sizeof(rbuf), fp)) > 0) src.append(rbuf, n);
+  std::fclose(fp);
+  if (!src.empty() && static_cast<unsigned char>(src[0]) == 0x1b) return 1;  // no bytecode
+
+  lua_State* L = luaL_newstate();
+  if (!L) return 1;
+  load_safe_libs(L);
+  luaL_dostring(L,                                  // universal no-op `ces` stub
+    "local s; s = setmetatable({}, {__index=function() return s end,"
+    " __call=function() return s end}); ces = s");
+  lua_sethook(L, probe_budget_hook, LUA_MASKCOUNT, 2000000);
+
+  std::string name, version, desc;
+  if (luaL_loadbufferx(L, src.data(), src.size(), "=probe", "t") == 0)
+    lua_pcall(L, 0, 0, 0);                          // errors ignored; CES_MANIFEST set first
+  lua_sethook(L, nullptr, 0, 0);
+  lua_getglobal(L, "CES_MANIFEST");
+  if (lua_istable(L, -1)) {
+    int t = lua_gettop(L);
+    name    = ext_str_field(L, t, "name");
+    version = ext_str_field(L, t, "version");
+    desc    = ext_str_field(L, t, "description");
+  }
+  lua_close(L);
+  std::printf("%s\n%s\n%s\n", name.c_str(), version.c_str(), desc.c_str());
+  return 0;
 }
 
 } // namespace
@@ -3769,6 +4152,8 @@ void install_ces_api(lua_State* L) {
 // ---------------------------------------------------------------------------
 
 int main(int argc, char** argv) {
+  if (argc >= 3 && std::strcmp(argv[1], "--manifest") == 0)
+    return probe_manifest(argv[2]);
   if (argc < 2) {
     std::fprintf(stderr,
                  "usage: %s <ipc-socket-path> [drop-to-user] [mem-max-bytes]\n",

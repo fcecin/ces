@@ -411,7 +411,9 @@ BOOST_AUTO_TEST_CASE(RemoteTransferSuccess) {
   std::memcpy(progPk.data(), ppkStr.data(), 32);
   serverB->_brr(progPk, 10'000'000);
 
-  // A destination that exists on B (transfer is "safe": dest must exist).
+  // A destination that already exists on B. (ces.remote_transfer is an OPEN
+  // transfer and would create a missing dest — see RemoteTransferCreatesDest —
+  // but here Y pre-exists, so this checks the credit-existing path.)
   KeyPair y;
   serverB->_brr(y.getPublicKeyAsHash(), 1);
   wait_net();
@@ -435,6 +437,51 @@ BOOST_AUTO_TEST_CASE(RemoteTransferSuccess) {
   serverB->unsignedQueryAccount(Account::getMapKey(y.getPublicKeyAsHash()),
                                 ybal, yn, yld, yla, ylt);
   BOOST_CHECK_EQUAL(ybal, 1 + 3000);
+}
+
+// ces.remote_transfer is an OPEN transfer: a destination that does not yet
+// exist on the remote is created, not rejected. (The human-facing cesh transfer
+// stays "safe" — see test_cesh_e2e — but a program paying out wants the account
+// made, like the funding worker and the local ces.transfer.)
+BOOST_AUTO_TEST_CASE(RemoteTransferCreatesDest) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/drv.lua";
+  uploadScript(path, kDriver);
+  BOOST_REQUIRE(launchScript(path) > 0);
+  auto prog = progPrefixOf(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+  // Fund the program account on B generously: an open transfer that CREATES the
+  // dest also pays the account-creation cost (a few days of feeAccount), so the
+  // tight 10M used by the credit-existing case isn't enough here.
+  ces::Bytes probe; probe.push_back(0);
+  std::string ppkStr = cmd(prog, probe);
+  BOOST_REQUIRE_EQUAL(ppkStr.size(), 32u);
+  minx::Hash progPk{};
+  std::memcpy(progPk.data(), ppkStr.data(), 32);
+  serverB->_brr(progPk, 1'000'000'000);
+
+  // Y is NOT created on B; the open transfer must create it.
+  KeyPair y;
+  wait_net();
+
+  ces::Bytes c; c.push_back(2);
+  auto ypk = y.getPublicKeyAsHash();
+  c.insert(c.end(), ypk.data(), ypk.data() + 32);
+  auto amt = u64be(3000);
+  c.insert(c.end(), amt.begin(), amt.end());
+  std::string addr = bAddr();
+  c.insert(c.end(), addr.begin(), addr.end());
+
+  std::string r = cmd(prog, c);
+  BOOST_CHECK_MESSAGE(r.rfind("OK", 0) == 0,
+                      "expected OK creating dest, got '" << r << "'");
+
+  // Y now exists on B with exactly the transferred amount.
+  int64_t ybal = 0; uint32_t yn = 0; HashPrefix yld{};
+  uint64_t yla = 0; uint32_t ylt = 0;
+  serverB->unsignedQueryAccount(Account::getMapKey(y.getPublicKeyAsHash()),
+                                ybal, yn, yld, yla, ylt);
+  BOOST_CHECK_EQUAL(ybal, 3000);
 }
 
 BOOST_AUTO_TEST_CASE(RemoteTransferInsufficient) {

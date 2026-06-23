@@ -41,7 +41,7 @@ constexpr uint64_t kBet = 100;
 // a paraphrase. CES_SOURCE_DIR is the repo root (set by tests/CMakeLists.txt).
 std::string readDiceSource() {
   const std::string path =
-    std::string(CES_SOURCE_DIR) + "/src/ceslib/extensions/dice.lua";
+    std::string(CES_SOURCE_DIR) + "/extensions/dice.lua";
   std::ifstream f(path, std::ios::binary);
   BOOST_REQUIRE_MESSAGE(f.good(), "cannot open dice.lua at " + path);
   std::ostringstream ss;

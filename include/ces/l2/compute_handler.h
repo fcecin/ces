@@ -21,10 +21,12 @@
 #pragma once
 
 #include <ces/types.h>
+#include <ces/buffer.h>
 
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ces {
@@ -107,6 +109,49 @@ struct ComputeInstanceStat {
 // thread; runs on the CesPlex strand internally (blocking post+wait), so
 // it sees a consistent registry. Empty if the handler is unbound.
 std::vector<ComputeInstanceStat> computeHandlerSnapshot();
+
+// ---- Extension contract (ces.extension_admin{}). Read/drive a running /s/
+// extension through the management surface the ExtensionManager exposes to the
+// webadmin. Metadata (name/version/description) is NOT here — it comes from the
+// file's static manifest header; this contract is caps/commands/config only. ----
+constexpr uint8_t kComputeExtCapStatus         = 0x01;
+constexpr uint8_t kComputeExtCapCommands       = 0x02;
+constexpr uint8_t kComputeExtCapConfigDefaults = 0x04;
+constexpr uint8_t kComputeExtCapOnConfig       = 0x08;
+constexpr uint8_t kComputeExtReqStatus  = 0x00;
+constexpr uint8_t kComputeExtReqCommand = 0x01;
+
+struct ComputeExtInfo {
+  // Identity, reported live via ces.manifest{} (may be set even with no contract).
+  std::string name, version, description;
+  // Admin contract, from ces.extension_admin{}.
+  bool isExtension = false;
+  uint8_t caps = 0;            // kComputeExtCap* bits the program registered
+  std::vector<std::pair<std::string, std::string>> commands;  // {id, label}
+  std::string configDefaults;
+};
+
+// What a running instance reported: identity (ces.manifest) + the contract
+// (ces.extension_admin). false if pid unknown. Synchronous (CesPlex strand).
+bool computeHandlerExtInfo(uint64_t pid, ComputeExtInfo& out);
+
+// Round-trip a status/command request to a running extension; `out` is the
+// reply payload after the status byte. false on timeout / unknown / non-ext /
+// child error. For STATUS, out = [u16 count]([lp k][lp v])*; for COMMAND,
+// `in` = [u16 idLen][id][arg] and out = the command's string result.
+bool computeHandlerExtRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
+                              ces::Bytes& out, int timeoutMs);
+
+// Push a config blob (text) to a running extension's on_config. Best-effort.
+void computeHandlerExtConfig(uint64_t pid, const std::string& cfg);
+
+// Kill every running instance of `sourceName` (e.g. "/s/discovery.lua"). Async
+// (hops onto the CesPlex strand). The ExtensionManager's Disable.
+void computeHandlerKillBySource(const std::string& sourceName);
+
+// Bounded wait for in-flight ces.request_funds remote transfers to finish, so the
+// CesServer isn't destroyed under them. Call before compute teardown.
+void computeFundingDrain();
 
 // True iff `pid` is currently registered in the supervisor.
 // Used by the lua handler to disambiguate "no such instance" from

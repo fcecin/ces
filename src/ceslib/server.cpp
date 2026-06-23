@@ -909,6 +909,11 @@ CesServer::CesServer(const CesConfig& config)
   // Seed the runtime peer target from config. The miner reads this atomic
   // (not cfg_.peerTarget) so the dashboard can change it live.
   peerTarget_.store(cfg_.peerTarget, std::memory_order_relaxed);
+  // Seed the live extension-funding rate from config (the dashboard sets it live
+  // thereafter; the bucket reads this member, not cfg_). Start the bucket full so
+  // a boot-configured budget is available immediately, like a dashboard set.
+  extFundingRatePerDay_ = cfg_.extFundingPerDay;
+  extFundingAllowance_  = static_cast<double>(cfg_.extFundingPerDay);
   minx_ = std::make_unique<minx::Minx>(
     this, minx::MinxConfig{
       .instanceName = "sv",
@@ -1465,6 +1470,7 @@ void CesServer::stop(bool flushEvents) {
     // must run BEFORE its rpcTaskIO_ executor goes away — it cancels
     // the supervisor timer and SIGKILLs live instances.
     luaHandlerBind(nullptr);
+    computeFundingDrain();        // let in-flight ces.request_funds transfers finish
     computeHandlerBind(nullptr);
     fileHandlerBind(nullptr);
     cesplex_.reset();
@@ -3544,15 +3550,20 @@ void CesServer::incomingProveWork(const SockAddr& addr,
           msg.data.data(), msg.data.size(), appData);
         auto it = appData.find("server");
         if (it != appData.end() && !it->second.empty()) {
-          upsertPeer(msg.ckey, it->second, creditAmount);
+          // The peer advertises its listen port; the routable HOST comes from
+          // the packet we just received from it (addr) — never from anything it
+          // claims about itself. A peer with a real serverName is kept verbatim.
+          std::string peerAddr = Resolver::fillHost(it->second, addr.address());
+          upsertPeer(msg.ckey, peerAddr, creditAmount);
           // Start the peer miner (idempotent) so the discovered inbound peer is
           // probed for reachability and the table is persisted each cycle. A
           // pure-receiver node (peer_target 0) otherwise never runs the miner,
           // so every inbound discovery is in-memory only and lost on restart —
           // making the dashboard's inbound list look dead once mining stops.
           ensurePeerMinerStarted();
-          LOGDEBUG << "inbound peer PoW: " << it->second
-                   << " credited " << creditAmount;
+          LOGDEBUG << "inbound peer PoW: " << peerAddr
+                   << " (advertised " << it->second << ") credited "
+                   << creditAmount;
         }
       } catch (...) {
         // Invalid appData — ignore silently
@@ -4375,6 +4386,59 @@ void CesServer::_l2CrossTransfer(
     });
 }
 
+// ---- Extension funding rate gate. A token bucket refilling at
+// extFundingRatePerDay_ raw units/day, capped at one day's worth. Caller holds
+// extFundingMu_.
+void CesServer::extFundingRefillLocked() {
+  int64_t now = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
+  double cap = static_cast<double>(extFundingRatePerDay_);
+  if (extFundingLastUs_ == 0) {
+    extFundingLastUs_ = now;               // first touch: just stamp; start empty
+  } else {
+    double rate = static_cast<double>(extFundingRatePerDay_) / 86400.0 / 1e6;
+    double elapsed = static_cast<double>(now - extFundingLastUs_);
+    if (elapsed > 0) {
+      extFundingAllowance_ += elapsed * rate;
+      extFundingLastUs_ = now;
+    }
+  }
+  if (extFundingAllowance_ > cap) extFundingAllowance_ = cap;   // also clamps after a rate cut
+  if (extFundingAllowance_ < 0)   extFundingAllowance_ = 0;
+}
+
+uint64_t CesServer::extFundingGrant(uint64_t requested) {
+  std::lock_guard<std::mutex> lk(extFundingMu_);
+  extFundingRefillLocked();
+  uint64_t avail = static_cast<uint64_t>(extFundingAllowance_);
+  uint64_t granted = requested < avail ? requested : avail;
+  extFundingAllowance_ -= static_cast<double>(granted);
+  return granted;
+}
+
+void CesServer::extFundingRefund(uint64_t amount) {
+  std::lock_guard<std::mutex> lk(extFundingMu_);
+  extFundingAllowance_ += static_cast<double>(amount);
+  double cap = static_cast<double>(extFundingRatePerDay_);
+  if (extFundingAllowance_ > cap) extFundingAllowance_ = cap;
+}
+
+uint64_t CesServer::extFundingRemaining() {
+  std::lock_guard<std::mutex> lk(extFundingMu_);
+  extFundingRefillLocked();
+  return static_cast<uint64_t>(extFundingAllowance_);
+}
+
+void CesServer::extFundingSetPerDay(uint64_t perDay) {
+  std::lock_guard<std::mutex> lk(extFundingMu_);
+  extFundingRefillLocked();                // settle accrual at the old rate first
+  bool raised = perDay > extFundingRatePerDay_;
+  extFundingRatePerDay_ = perDay;
+  double cap = static_cast<double>(perDay);
+  if (raised) extFundingAllowance_ = cap;                       // enable/raise: full now
+  else if (extFundingAllowance_ > cap) extFundingAllowance_ = cap;   // lower: clamp now
+}
+
 void CesServer::createAssetAsync(
     const minx::Hash& originKey,
     const HashPrefix& ownerId,
@@ -4613,8 +4677,23 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
   std::lock_guard lock(peerTableMutex_);
   for (auto& p : peerTable_) {
     if (p.ckey == ckey) {
-      if (!address.empty())
+      // Address-claim policy. An UNVERIFIED entry's address is up for grabs:
+      // whatever PoW spoke last wins (unverified claims brawl to the death, and
+      // none is trusted while they do). But a VERIFIED address is STICKY — an
+      // inbound PoW (inboundCredit > 0) carries no proof of identity, so it must
+      // never move a binding we paid a signed server-info to confirm. That is
+      // the whole anti-takeover rule: you cannot re-point a known server key with
+      // unsigned work. Operator/discovery updates (inboundCredit == 0) stay
+      // authoritative. On any real address change, reset the probe state so the
+      // newcomer is re-checked — and re-verified — from scratch.
+      bool fromInbound = (inboundCredit > 0);
+      bool mayWrite = !address.empty() && (!fromInbound || !p.verified);
+      if (mayWrite && p.declaredAddress != address) {
         p.declaredAddress = address;
+        p.verified = false;
+        p.reachable = false;
+        p.lastCheckTime = 0;
+      }
       p.totalInboundPoW += inboundCredit;
       if (inboundCredit > 0) p.lastInboundTime = minx::getSecsSinceEpoch();
       return;
@@ -5364,6 +5443,7 @@ void CesServer::peerMinerLoop() {
         peer.resolvedEndpoint = ep;
         peer.resolvedEndpointValid = true;
         CesClient client(ep, false);
+        client.setKey(serverKeyPair_);  // to sign + pay for the verification query
         client.start(0);
         if (!client.connect()) {
           peer.reachable = false;
@@ -5379,30 +5459,52 @@ void CesServer::peerMinerLoop() {
           continue;
         }
 
-        // Verify server key from handshake matches expected peer key
+        // The connect/getInfo above is the FREE liveness probe — reachability,
+        // never trust. `verified` is deliberately NOT set from the key the peer
+        // merely CLAIMS in getInfo (a lying host can echo any pubkey); it flips
+        // true only via the signed server-info below, and stays sticky after.
         peer.reachable = true;
-        peer.verified = (client.getServerKey() == peer.ckey);
         // The handshake already carries the peer's rpc port; capture it so the
         // peer table (and ces.peers()) expose where to reach the peer's CesPlex
         // handlers, no separate ces.ping needed on the discovery hot path.
         peer.rpcPort = client.getServerRpcPort();
         peer.pingFailures = 0;
         peer.lastCheckTime = minx::getSecsSinceEpoch();
+
+        // Our reserve at the peer — the mining-progress reading AND the
+        // affordability gate for the paid verification below.
+        int64_t balance = 0;
+        uint32_t nonce = 0;
+        uint8_t rc = client.queryAccount(serverMapKey, balance, nonce);
+        peer.ourBalanceThere = (rc == CES_OK) ? balance : 0;
+
+        // Verification toll, paid once. A peer becomes `verified` only after a
+        // SIGNED, paid server-info whose reply authenticates against its key —
+        // proof the box actually holds the private half (an impostor that merely
+        // echoes the pubkey in getInfo can't sign the reply). Fire it only while
+        // still unverified, the claimed key matches what we expect, and we hold
+        // enough at the peer to cover the query fee; otherwise the free getInfo
+        // was liveness only. Once verified it is sticky — and upsertPeer won't let
+        // an unsigned inbound PoW move a verified address. So an inbound PoW can
+        // never bind a key to an address we didn't go confirm and pay to prove.
+        if (!peer.verified &&
+            client.getServerKey() == peer.ckey &&
+            peer.ourBalanceThere >=
+                static_cast<int64_t>(std::max<uint64_t>(cfg_.feeQuery, 1))) {
+          std::vector<ServerInfoEntry> entries;
+          if (client.queryServerInfo(entries) == CES_OK) {
+            peer.verified = true;
+            LOGINFO << "peer miner: verified " << peer.declaredAddress
+                    << " via signed server-info";
+          }
+        }
         if (!wasReachable || !everChecked) {
           LOGINFO << "peer miner: reachable " << peer.declaredAddress
                   << " verified=" << peer.verified;
         }
 
-        int64_t balance = 0;
-        uint32_t nonce = 0;
-        uint8_t rc = client.queryAccount(serverMapKey, balance, nonce);
         client.disconnect();
         client.stop();
-
-        if (rc == CES_OK)
-          peer.ourBalanceThere = balance;
-        else
-          peer.ourBalanceThere = 0;
 
       } catch (std::exception& e) {
         peer.reachable = false;
@@ -5496,11 +5598,24 @@ void CesServer::peerMinerLoop() {
               peerMinerMining_ = true;
               peerMinerMiningPeer_ = peer.declaredAddress;
               peerMinerMiningDiff_ = mineDiff;
+              peerMinerMiningStartSecs_ = minx::getSecsSinceEpoch();
             }
+            auto mineT0 = std::chrono::steady_clock::now();
             auto result = mineOnce(client, mineDiff - peerDiff, appData);
+            double mineSecs = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - mineT0).count();
             {
               std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
               peerMinerMining_ = false;
+              // Smoothed hash-rate estimate for the dashboard ETA: a solution at
+              // difficulty D takes ~2^D hashes in expectation, so rate ≈ 2^D /
+              // solve_time. EMA so one unlucky/lucky solve doesn't whipsaw it.
+              if (result.success && mineSecs > 0.0 && mineDiff < 64) {
+                double rate = std::ldexp(1.0, mineDiff) / mineSecs;  // 2^D / secs
+                peerMinerHashRate_ = peerMinerHashRate_ > 0.0
+                    ? 0.5 * peerMinerHashRate_ + 0.5 * rate
+                    : rate;
+              }
             }
             if (result.success) {
               LOGDEBUG << "peer miner: mined " << result.credit

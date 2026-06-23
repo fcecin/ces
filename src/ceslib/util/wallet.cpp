@@ -15,7 +15,8 @@ LOG_MODULE("ceslib");
 namespace ces {
 
 // mineOnce polling knobs. Kept local to this TU; the blocking client uses its
-// own CesClient::kRetryIntervalMs for network retries.
+// own configurable retry interval (CesClient::setRetryIntervalMs) for network
+// retries.
 static constexpr int MINE_POLL_INTERVAL_MS = 3000;
 static constexpr int MINE_UNKNOWN_RESPONSE_RETRIES = 3;
 

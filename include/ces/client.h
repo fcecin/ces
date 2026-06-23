@@ -36,6 +36,11 @@ public:
   void setKey(const KeyPair& keyPair);
   void setTries(int tries) { tries_ = tries > 0 ? tries : 1; }
   int getTries() const { return tries_; }
+  // Per-attempt reply timeout, which doubles as the sleep between connect
+  // retries (ms). Default 3000; a fast-fail caller (e.g. a crawler that must
+  // not block 3s on a dead host) lowers it. Clamped to >= 1.
+  void setRetryIntervalMs(int ms) { retryIntervalMs_ = ms > 0 ? ms : 1; }
+  int getRetryIntervalMs() const { return retryIntervalMs_; }
   bool start(uint16_t localPort = 0);
   bool stop();
   bool connect();
@@ -225,9 +230,6 @@ public:
 private:
   uint8_t getMyNonce(uint32_t& outNextNonce);
 
-  // Retry interval for outgoing requests (ms).
-  static constexpr int kRetryIntervalMs = 3000;
-
   // Send a signed request and wait for a matching response, with retries.
   // The caller is responsible for filling `req` completely (including
   // originId/ownerId, serverId, reqNonce, and op-specific fields) before
@@ -251,7 +253,7 @@ private:
 
     for (int i = 0; i < tries_; ++i) {
       transport_->sendMessage(msg);
-      auto res = ces::waitFor(kRetryIntervalMs, [&]() {
+      auto res = ces::waitFor(retryIntervalMs_, [&]() {
         return g < gen.load() && matchFn();
       });
       if (res == ces::WaitResult::Success) return resultCode;
@@ -263,6 +265,7 @@ private:
   std::unique_ptr<minx::MinxClientTransport> transport_;
   KeyPair keyPair_;
   int tries_ = 3;
+  int retryIntervalMs_ = 3000;
   ApplicationCallback appCallback_;
   bool connected_ = false;
   minx::Hash serverKey_;

@@ -8,6 +8,7 @@
 #include <ces/webadmin.h>
 
 #include <ces/cesplex/meter.h>
+#include <ces/extension_manager.h>
 #include <ces/feemult.h>
 #include <ces/keys.h>
 #include <ces/l2/compute_handler.h>
@@ -36,8 +37,13 @@
 #include <sstream>
 #include <streambuf>
 #include <string>
+#include <algorithm>
 #include <thread>
 #include <vector>
+
+#include <arpa/inet.h>
+#include <ifaddrs.h>
+#include <netinet/in.h>
 
 LOG_MODULE("web");
 
@@ -328,6 +334,40 @@ std::string getParam(const std::map<std::string, std::string>& m,
 // JSON endpoint builders
 // ---------------------------------------------------------------------------
 
+// Host unicast IP addresses, non-loopback first, so a node with no serverName
+// still shows where it is reachable (the bind is all-interfaces; getifaddrs is
+// the only way to know the concrete addresses). Linux/POSIX; runs once per
+// /api/status on the loopback-only dashboard, so cost is irrelevant.
+std::vector<std::string> hostIpList() {
+  std::vector<std::string> normal, loopback;
+  struct ifaddrs* ifa = nullptr;
+  if (getifaddrs(&ifa) != 0) return normal;
+  for (struct ifaddrs* p = ifa; p; p = p->ifa_next) {
+    if (!p->ifa_addr) continue;
+    char buf[INET6_ADDRSTRLEN] = {0};
+    bool isLoopback = false;
+    if (p->ifa_addr->sa_family == AF_INET) {
+      auto* a = reinterpret_cast<struct sockaddr_in*>(p->ifa_addr);
+      if (!inet_ntop(AF_INET, &a->sin_addr, buf, sizeof buf)) continue;
+      isLoopback = (ntohl(a->sin_addr.s_addr) & 0xFF000000u) == 0x7F000000u;
+    } else if (p->ifa_addr->sa_family == AF_INET6) {
+      auto* a = reinterpret_cast<struct sockaddr_in6*>(p->ifa_addr);
+      if (IN6_IS_ADDR_LINKLOCAL(&a->sin6_addr)) continue;  // not reachable alone
+      if (!inet_ntop(AF_INET6, &a->sin6_addr, buf, sizeof buf)) continue;
+      isLoopback = IN6_IS_ADDR_LOOPBACK(&a->sin6_addr);
+    } else {
+      continue;
+    }
+    std::string ip(buf);
+    auto& bucket = isLoopback ? loopback : normal;
+    if (std::find(bucket.begin(), bucket.end(), ip) == bucket.end())
+      bucket.push_back(ip);
+  }
+  freeifaddrs(ifa);
+  normal.insert(normal.end(), loopback.begin(), loopback.end());
+  return normal;
+}
+
 std::string buildStatus(CesServer& s) {
   const CesConfig& c = s._config();
   auto stats = s._adminStats();
@@ -338,6 +378,15 @@ std::string buildStatus(CesServer& s) {
   o << "{";
   o << "\"pubkey\":" << jstr(hexOfHash(s._serverKeyPair().getPublicKeyAsHash()));
   o << ",\"serverName\":" << jstr(c.serverName);
+  o << ",\"boundAddrs\":[";
+  {
+    auto ips = hostIpList();
+    for (size_t i = 0; i < ips.size(); ++i) {
+      if (i) o << ",";
+      o << jstr(ips[i]);
+    }
+  }
+  o << "]";
   o << ",\"version\":" << jstr(c.version);
   o << ",\"port\":" << s._boundPort();
   o << ",\"rpcPort\":" << s._rpcBoundPort();
@@ -387,6 +436,11 @@ std::string buildPeers(CesServer& s) {
     << ",\"miningActive\":" << (act.mining ? "true" : "false")
     << ",\"miningPeer\":" << jstr(act.peer)
     << ",\"miningDifficulty\":" << static_cast<int>(act.difficulty)
+    << ",\"miningElapsedSecs\":"
+    << ((act.mining && act.startSecs &&
+         minx::getSecsSinceEpoch() >= act.startSecs)
+            ? (minx::getSecsSinceEpoch() - act.startSecs) : 0)
+    << ",\"hashRate\":" << static_cast<uint64_t>(act.hashRate)
     << ",\"peers\":[";
   for (size_t i = 0; i < peers.size(); ++i) {
     const auto& p = peers[i];
@@ -534,6 +588,65 @@ std::string buildCompute(CesServer& s) {
   }
   o << "]}";
   return o.str();
+}
+
+// Global extension funding budget: the rate in effect + the live remaining
+// allowance (both raw units; the dashboard divides by PRICE_UNIT to show credits).
+std::string buildFunding(CesServer& s) {
+  std::ostringstream o;
+  o << "{\"perDay\":" << s.extFundingPerDay()
+    << ",\"remaining\":" << s.extFundingRemaining() << "}";
+  return o.str();
+}
+
+std::string buildExtensions(CesServer& s) {
+  std::ostringstream o;
+  o << "{\"catalog\":" << (s._config().cesExtensionsDir.empty() ? "false" : "true")
+    << ",\"items\":[";
+  bool first = true;
+  for (auto& it : extensionList(&s)) {
+    if (!first) o << ",";
+    first = false;
+    o << "{\"name\":" << jstr(it.name)
+      << ",\"displayName\":" << jstr(it.displayName)
+      << ",\"available\":" << (it.available ? "true" : "false")
+      << ",\"installed\":" << (it.installed ? "true" : "false")
+      << ",\"enabled\":" << (it.enabled ? "true" : "false")
+      << ",\"pid\":" << it.pid
+      << ",\"isExtension\":" << (it.isExtension ? "true" : "false")
+      << ",\"caps\":" << static_cast<int>(it.caps)
+      << ",\"version\":" << jstr(it.version)
+      << ",\"description\":" << jstr(it.description)
+      << ",\"commands\":[";
+    bool cf = true;
+    for (auto& cmd : it.commands) {
+      if (!cf) o << ",";
+      cf = false;
+      o << "{\"id\":" << jstr(cmd.first) << ",\"label\":" << jstr(cmd.second) << "}";
+    }
+    o << "]}";
+  }
+  o << "]}";
+  return o.str();
+}
+
+std::string buildExtensionStatus(CesServer& s, const std::string& name) {
+  std::vector<std::pair<std::string, std::string>> kv;
+  bool ok = extensionStatus(&s, name, kv);
+  std::ostringstream o;
+  o << "{\"ok\":" << (ok ? "true" : "false") << ",\"kv\":[";
+  bool f = true;
+  for (auto& p : kv) {
+    if (!f) o << ",";
+    f = false;
+    o << "[" << jstr(p.first) << "," << jstr(p.second) << "]";
+  }
+  o << "]}";
+  return o.str();
+}
+
+std::string buildExtensionConfig(CesServer& s, const std::string& name) {
+  return std::string("{\"text\":") + jstr(extensionConfigGet(&s, name)) + "}";
 }
 
 std::string buildAccount(CesServer& s, const std::string& keyHex) {
@@ -762,6 +875,16 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
     if (path == "/api/config")  { respondJson(buildConfig(server_)); return; }
     if (path == "/api/filestore") { respondJson(buildFileStore(server_)); return; }
     if (path == "/api/compute") { respondJson(buildCompute(server_)); return; }
+    if (path == "/api/extensions") { respondJson(buildExtensions(server_)); return; }
+    if (path == "/api/funding") { respondJson(buildFunding(server_)); return; }
+    if (path == "/api/extension_status") {
+      respondJson(buildExtensionStatus(server_, getParam(parseKV(query), "name")));
+      return;
+    }
+    if (path == "/api/extension_config") {
+      respondJson(buildExtensionConfig(server_, getParam(parseKV(query), "name")));
+      return;
+    }
     if (path == "/api/logs")    { respondJson(buildLogs(query)); return; }
     if (path == "/api/hello")   { respondJson(buildHello(server_)); return; }
     if (path == "/api/account") {
@@ -851,8 +974,28 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
         respondJson("{\"error\":\"address required\"}");
         return;
       }
-      server_._addOutboundPeer(key, address);
-      respondJson("{\"ok\":true,\"message\":\"peer added\"}");
+      // Verify the key against what the remote actually reports BEFORE adding.
+      // A wrong key is otherwise silent and costly: the peer is still mined
+      // toward, burning PoW to build a reserve under a key that isn't really
+      // the server's, which no cross-transfer can ever use. Free handshake on a
+      // worker thread (it blocks); reject a mismatch or an unreachable target.
+      runAsync([&server = server_, key, address]() -> std::string {
+        auto info = server._inspectRemoteServer(address, /*paid=*/false);
+        if (!info.reachable) {
+          return std::string("{\"error\":") +
+                 jstr("could not reach " + address +
+                      " to verify its key — not added") + "}";
+        }
+        if (!(info.serverKey == key)) {
+          return std::string("{\"error\":") +
+                 jstr("key mismatch: " + address + " reports " +
+                      hexOfHash(info.serverKey) +
+                      " — check the key; not added") + "}";
+        }
+        server._addOutboundPeer(key, address);
+        return std::string(
+          "{\"ok\":true,\"message\":\"key verified — peer added\"}");
+      });
       return;
     }
 
@@ -901,6 +1044,48 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
       bool ok = server_._setConfigKnob(key, value);
       respondJson(ok ? "{\"ok\":true}"
                      : "{\"ok\":false,\"error\":\"unknown or non-editable knob\"}");
+      return;
+    }
+
+    // ---- Extension lifecycle (dynamic; Config -> Export to persist enabled set).
+    if (path == "/api/extension_install" || path == "/api/extension_enable" ||
+        path == "/api/extension_disable" || path == "/api/extension_uninstall" ||
+        path == "/api/extension_config_reset") {
+      std::string name = getParam(form, "name");
+      bool ok = false;
+      if (path == "/api/extension_install")        ok = extensionInstall(&server_, name);
+      else if (path == "/api/extension_enable")    ok = extensionEnable(&server_, name);
+      else if (path == "/api/extension_disable")   ok = extensionDisable(&server_, name);
+      else if (path == "/api/extension_uninstall") ok = extensionUninstall(&server_, name);
+      else                                         ok = extensionConfigReset(&server_, name);
+      respondJson(ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"action failed\"}");
+      return;
+    }
+    if (path == "/api/extension_command") {
+      std::string out;
+      bool ok = extensionCommand(&server_, getParam(form, "name"),
+                                 getParam(form, "id"), getParam(form, "arg"), out);
+      respondJson(ok ? std::string("{\"ok\":true,\"result\":") + jstr(out) + "}"
+                     : "{\"ok\":false,\"error\":\"command failed\"}");
+      return;
+    }
+    if (path == "/api/extension_config_set") {
+      bool ok = extensionConfigSet(&server_, getParam(form, "name"),
+                                   getParam(form, "text"));
+      respondJson(ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"save failed\"}");
+      return;
+    }
+
+    // Set the global extension funding rate (raw units/day; the dashboard sends
+    // raw = credits × PRICE_UNIT). Operator-only by being on this loopback UI.
+    if (path == "/api/funding_set") {
+      uint64_t v = 0;
+      if (!parseU64(getParam(form, "perday"), v)) {
+        respondJson("{\"ok\":false,\"error\":\"perday must be a non-negative integer\"}");
+        return;
+      }
+      server_.extFundingSetPerDay(v);
+      respondJson("{\"ok\":true}");
       return;
     }
 
@@ -1194,6 +1379,30 @@ button.danger{background:var(--danger);color:#220505}
 button.ghost{background:transparent;border:1px solid var(--bd2);color:var(--tx)}
 button.sm{padding:5px 10px;font-size:12px}
 button:disabled{opacity:.5;cursor:not-allowed}
+/* click feedback: a quick geometry-neutral opacity dip on every button press. */
+@keyframes btnflash{0%{opacity:.4}100%{opacity:1}}
+button.flash{animation:btnflash .22s ease-out}
+
+/* extensions: table of rows, each expands into a control center */
+#extList{border:1px solid var(--bd);border-radius:12px;overflow:hidden;background:var(--panel)}
+.extrow{border-bottom:1px solid var(--bd)}
+.extrow:last-child{border-bottom:none}
+.extrow.open{background:var(--panel2)}
+.exthead{display:flex;align-items:center;gap:10px;padding:11px 14px}
+.extname{flex:1;display:flex;align-items:center;gap:9px;cursor:pointer;user-select:none;min-width:0}
+.extname:hover .extchev{color:var(--tx)}
+.extttl{font-weight:600}
+.extver{font-size:12px;color:var(--muted);font-weight:400}
+.extfile{font-size:12px;color:var(--muted);font-weight:400;opacity:.65}
+.extchev{width:11px;flex:none;color:var(--muted);font-size:11px}
+.extbadge{font-size:11px;padding:2px 9px;border-radius:20px;font-weight:500}
+.extbtns{display:flex;gap:7px;flex:none}
+.extbody{padding:2px 16px 16px 34px}
+.extbody h4{margin:16px 0 7px;font-size:11px;letter-spacing:.7px;text-transform:uppercase;color:var(--muted);font-weight:600}
+.extbody h4:first-child{margin-top:6px}
+.extbody .kvtable td:first-child{width:38%}
+.extcfg textarea{width:100%;height:140px;margin:6px 0;font-family:var(--mono);font-size:12.5px;resize:vertical}
+.extcmdout{margin-top:7px;color:var(--muted);font-size:12px;min-height:1em}
 
 /* tables */
 table.data{width:100%;border-collapse:collapse;font-size:13px}
@@ -1265,6 +1474,7 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
   <div class="tab" data-tab="fees">Fees</div>
   <div class="tab" data-tab="file">File</div>
   <div class="tab" data-tab="compute">Compute</div>
+  <div class="tab" data-tab="extensions">Extensions</div>
   <div class="tab" data-tab="logs">Logs</div>
   <div class="tab" data-tab="config">Config</div>
 </nav>
@@ -1480,6 +1690,21 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
     </div>
   </section>
 
+  <!-- EXTENSIONS -->
+  <section class="panel" id="panel-extensions">
+    <div id="extOff" class="hint"></div>
+    <div class="section" id="extFundingBox">
+      <h2>Funding budget <span class="sub">global — all extensions, all remotes</span></h2>
+      <div class="hint">Credits/day the server will grant programs that call <span class="mono">request_funds</span> to fund themselves at remote peers. <b>0 = off</b> (the secure default): a program can spend nothing until you open a budget.</div>
+      <div class="row" style="align-items:center">
+        <input id="fundRate" type="number" min="0" step="1" placeholder="credits / day" style="width:150px">
+        <button class="green sm" onclick="fundingApply()">Apply</button>
+        <span id="fundState" class="mono"></span>
+      </div>
+    </div>
+    <div id="extList"></div>
+  </section>
+
   <!-- CONFIG -->
   <section class="panel" id="panel-config">
     <div class="section">
@@ -1521,6 +1746,12 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
 
 <script>
 const $=s=>document.querySelector(s), $$=s=>[...document.querySelectorAll(s)];
+// A quick opacity dip on every button press, so a click that then blocks still
+// shows it registered.
+document.addEventListener('click',e=>{
+  const b=e.target.closest('button');
+  if(b){b.classList.remove('flash');void b.offsetWidth;b.classList.add('flash');}
+},true);
 async function api(p,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms||8000);
   try{const r=await fetch(p,{signal:c.signal});if(!r.ok)throw new Error('HTTP '+r.status);return await r.json();}finally{clearTimeout(t);}}
 async function post(p,o,ms){const c=new AbortController();const t=setTimeout(()=>c.abort(),ms||20000);
@@ -1540,22 +1771,32 @@ function esc(s){return (s+'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':
 function setLive(ok){const d=$('#liveDot');d.className='dot'+(ok?' ok':'');$('#liveTxt').textContent=ok?'live':'offline';}
 
 /* tabs */
-let activeTab='overview',timer=null;
-const REFRESH={overview:2000,peers:5000,wallet:3000,billing:3000,fees:3000,file:4000,compute:3000,logs:1500};
+let activeTab='overview',timer=null,extStatusTimer=null;
+const REFRESH={overview:2000,peers:5000,wallet:3000,billing:3000,fees:3000,file:4000,compute:3000,extensions:3000,logs:1500};
 function showTab(n){activeTab=n;try{history.replaceState(null,'','#'+n);}catch(e){}
   $$('.tab').forEach(t=>t.classList.toggle('active',t.dataset.tab===n));
   $$('.panel').forEach(p=>p.classList.toggle('active',p.id==='panel-'+n));
-  if(timer)clearInterval(timer);timer=null;loadTab(n);
-  if(REFRESH[n])timer=setInterval(()=>loadTab(n),REFRESH[n]);}
-function loadTab(n){({overview:loadOverview,peers:loadPeers,wallet:loadWallet,lookup:loadLookup,billing:loadBilling,fees:loadFees,file:loadFile,compute:loadCompute,logs:pollLogs,config:loadConfig}[n]||(()=>{}))();}
+  if(timer)clearInterval(timer);timer=null;
+  if(extStatusTimer)clearInterval(extStatusTimer);extStatusTimer=null;
+  loadTab(n);
+  if(REFRESH[n])timer=setInterval(()=>loadTab(n),REFRESH[n]);
+  // Status is cheap; poll expanded extension rows fast. Only while this tab is
+  // showing (timer torn down on switch) and only for expanded rows (extPollStatus
+  // iterates extExpanded). A collapsed or unseen card is never polled.
+  if(n==='extensions')extStatusTimer=setInterval(extPollStatus,500);}
+function loadTab(n){({overview:loadOverview,peers:loadPeers,wallet:loadWallet,lookup:loadLookup,billing:loadBilling,fees:loadFees,file:loadFile,compute:loadCompute,extensions:loadExtensions,logs:pollLogs,config:loadConfig}[n]||(()=>{}))();}
 $('#tabs').addEventListener('click',e=>{const t=e.target.closest('.tab');if(t)showTab(t.dataset.tab);});
 
 /* header + overview */
 // The header identity is static per server but must paint regardless of which
 // tab is open, so the always-on heartbeat drives it — not loadOverview alone.
+// A node with no serverName still has a usable identity: its first reachable
+// address (non-loopback first) and the main port.
+function boundAddrs(s){return (s.boundAddrs||[]).map(a=>a.indexOf(':')>=0?('['+a+']:'+s.port):(a+':'+s.port));}
 function setHeader(s){
-  $('#srvName').textContent=s.serverName||'(unnamed node)';
-  document.title=(s.serverName||'CES')+' · dashboard';
+  const ba=boundAddrs(s);
+  $('#srvName').textContent=s.serverName||ba[0]||'(unnamed node)';
+  document.title=(s.serverName||ba[0]||'CES')+' · dashboard';
   const k=$('#srvKey');k.textContent=shortKey(s.pubkey);k.onclick=()=>copy(s.pubkey);
   $('#srvVer').textContent=s.version?('v '+s.version):'';
   $('#srvPorts').textContent='udp '+s.port+(s.rpcPort?(' · rpc '+s.rpcPort):'');
@@ -1579,6 +1820,7 @@ async function loadOverview(){
   $('#ovIdent').innerHTML=`<table class="kvtable">
     <tr><td>public key</td><td class="mono" style="word-break:break-all">${esc(s.pubkey)}</td></tr>
     <tr><td>server name</td><td>${esc(s.serverName||'—')}</td></tr>
+    <tr><td>bound address</td><td class="mono">${(()=>{const b=boundAddrs(s);return b.length?b.map(esc).join('<br>'):'—';})()}</td></tr>
     <tr><td>version</td><td class="mono">${esc(s.version||'—')}</td></tr>
     <tr><td>CES / RPC ports</td><td class="num">${s.port} / ${s.rpcPort||'off'}</td></tr>
     <tr><td>peer target</td><td class="num">${fmtCredits(s.peerTarget)}${s.minerRunning?' <span class="muted">(miner on)</span>':''}</td></tr></table>`;
@@ -1600,7 +1842,14 @@ async function loadPeers(){
   $('#peerCount').textContent=d.peers.length+' peer(s)';
   const cOut=d.peers.filter(p=>p.outbound).length,cIn=d.peers.filter(p=>p.inbound).length,cRch=d.peers.filter(p=>p.reachable).length;
   const ms=$('#minerState');
-  if(d.miningActive){ms.textContent='⛏ mining '+esc(d.miningPeer)+' @ difficulty '+d.miningDifficulty;ms.style.color='var(--accent)';}
+  if(d.miningActive){
+    const D=d.miningDifficulty,iters=Math.pow(2,D);
+    const cn=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':Math.round(n).toString();
+    let t='⛏ mining '+esc(d.miningPeer)+' @ diff '+D+' · ~'+cn(iters)+' iters avg';
+    if(d.miningElapsedSecs!=null)t+=' · '+d.miningElapsedSecs+'s in';
+    if(d.hashRate>0){const exp=Math.max(1,Math.round(iters/d.hashRate));
+      t+=' · ~'+cn(d.hashRate)+' H/s · ~'+exp+'s expected'+(d.miningElapsedSecs>2*exp?' (unlucky!)':'');}
+    ms.textContent=t;ms.style.color='var(--accent)';}
   else if(d.minerRunning){ms.textContent='↻ loop alive · '+d.cycles+' cycles'+(d.lastCycle?(' · last '+ago(d.lastCycle)):' · starting…')+' · not hashing';ms.style.color='var(--muted)';}
   else if(cOut>0){ms.textContent='⚠ idle — set a target to start probing/mining';ms.style.color='var(--warn)';}
   else{ms.textContent='miner idle';ms.style.color='var(--muted)';}
@@ -1638,9 +1887,9 @@ async function setTarget(){
   finally{b.disabled=false;b.textContent='Set target';}}
 async function addPeer(){const key=$('#addKey').value.trim(),addr=$('#addAddr').value.trim();
   if(!key||!addr){toast('key and address required','err');return;}
-  const b=$('#addPeerBtn');b.disabled=true;b.textContent='Adding…';
+  const b=$('#addPeerBtn');b.disabled=true;b.textContent='Verifying…';
   try{const r=await post('/api/peer_add',{key,address:addr});
-    if(r.ok){toast('peer added','ok');$('#addKey').value='';$('#addAddr').value='';loadPeers();}else toast(r.error||'failed','err');}
+    if(r.ok){toast(r.message||'peer added','ok');$('#addKey').value='';$('#addAddr').value='';loadPeers();}else toast(r.error||'failed','err');}
   catch(e){toast('add peer failed — server not responding','err');}
   finally{b.disabled=false;b.textContent='Add peer';}}
 async function rmPeer(key){if(!confirm('Remove this peer?'))return;const r=await post('/api/peer_remove',{key});r.ok?toast('peer removed','ok'):toast(r.message||'not found','err');loadPeers();}
@@ -1918,7 +2167,134 @@ function onEnter(id,fn){const el=$('#'+id);if(el)el.addEventListener('keydown',e
 onEnter('inspAddr',doInspect);onEnter('accKey',lookupAccount);onEnter('astKey',lookupAsset);onEnter('fileLookupPath',lookupFile);
 onEnter('addAddr',addPeer);onEnter('addKey',addPeer);onEnter('peerTarget',setTarget);
 
-const TABS=['overview','peers','inspect','wallet','lookup','billing','fees','file','compute','logs','config'];
+/* extensions - table-like rows; each row expands inline into a control center */
+let extExpanded=new Set(), extSig='', extOpenConfig=null;
+function cssid(n){return (n+'').replace(/[^a-zA-Z0-9_-]/g,'_');}
+function extBadge(it){
+  const b=it.enabled?['enabled','#16351f','#5fd38a']:it.installed?['installed','#2a2410','#d9b44a']:['available','#1a2536','#7e94b4'];
+  return `<span class="extbadge" style="background:${b[1]};color:${b[2]}">${b[0]}</span>`;
+}
+function extRow(it){
+  const id=cssid(it.name), open=extExpanded.has(it.name);
+  // Title: the manifest name (falls back to filename), then version, then the
+  // backing .lua filename grayed in parens.
+  const title=`<b class="extttl">${esc(it.displayName||it.name)}</b>`
+    +(it.version?` <span class="extver">v${esc(it.version)}</span>`:'')
+    +` <span class="extfile">(${esc(it.name)}.lua)</span>`;
+  let btns='';
+  if(it.available&&!it.installed) btns+=`<button class="green sm" onclick="extAct('install','${esc(it.name)}')">Install</button>`;
+  if(it.installed&&!it.enabled) btns+=`<button class="green sm" onclick="extAct('enable','${esc(it.name)}')">Enable</button>`;
+  if(it.enabled) btns+=`<button class="warn sm" onclick="extAct('disable','${esc(it.name)}')">Disable</button>`;
+  if(it.installed) btns+=`<button class="danger sm" onclick="extAct('uninstall','${esc(it.name)}')">Uninstall</button>`;
+  let body;
+  if(it.enabled&&!it.isExtension){
+    body=`<div class="muted">Does not implement the extension contract — nothing to configure or command (N/A).</div>`;
+  }else if(it.enabled){
+    // Render only the sections this program actually registered (caps bits:
+    // 1=status 2=commands 4=config_defaults 8=on_config). No empty N/A sections.
+    body='';
+    if(it.caps&1) body+=`<h4>Status</h4><div id="extStatus-${id}"><span class="muted">…</span></div>`;
+    if(it.caps&2&&it.commands.length) body+=`<h4>Commands</h4><div class="row">${it.commands.map(c=>`<button class="sm" onclick="extCmd('${esc(it.name)}','${esc(c.id)}')">${esc(c.label||c.id)}</button>`).join('')}</div><div id="extCmdOut-${id}" class="extcmdout mono"></div>`;
+    if(it.caps&12) body+=`<h4>Config</h4><button class="green sm" onclick="extConfigToggle('${esc(it.name)}',${(it.caps&4)?1:0})">Edit</button><div class="extcfg" id="extCfg-${id}"></div>`;
+    if(!body) body=`<div class="muted">Running — implements no status, commands, or config.</div>`;
+  }else{
+    body=`<div class="muted">${it.installed?'Installed, not running — Enable to interact.':'Available — Install to use.'}</div>`;
+  }
+  const desc=it.description?`<div class="muted" style="margin-top:4px">${esc(it.description)}</div>`:'';
+  return `<div class="extrow${open?' open':''}">`
+    +`<div class="exthead">`
+    +`<div class="extname" onclick="extToggle('${esc(it.name)}')"><span class="extchev" id="extChev-${id}">${open?'▾':'▸'}</span>`
+    +`${title} ${extBadge(it)}${it.enabled?`<span class="mono extfile">pid ${it.pid}</span>`:''}</div>`
+    +`<div class="extbtns">${btns}</div></div>`
+    +`<div class="extbody" id="extBody-${id}" style="${open?'':'display:none'}">${desc}${body}</div></div>`;
+}
+function extFetchStatus(name){
+  api('/api/extension_status?name='+encodeURIComponent(name)).then(s=>{
+    const el=$('#extStatus-'+cssid(name));if(!el)return;
+    el.innerHTML=(s.ok&&s.kv.length)?`<table class="kvtable">${s.kv.map(p=>`<tr><td class="mono">${esc(p[0])}</td><td class="mono">${esc(p[1])}</td></tr>`).join('')}</table>`:'<span class="muted">no status</span>';
+  }).catch(()=>{});
+}
+// Global funding budget control (one knob, all extensions). Polls the rate + the
+// live remaining allowance; prefills the input once so the operator sees it.
+let fundPrefilled=false;
+async function loadFunding(){
+  let d;try{d=await api('/api/funding');}catch(e){return;}
+  const perDayC=Number(d.perDay)/PRICE_UNIT, remC=Number(d.remaining)/PRICE_UNIT;
+  $('#fundState').innerHTML = perDayC>0
+    ? `in effect: <b>${perDayC.toLocaleString()}</b> /day &middot; <b style="color:var(--accent)">${remC.toLocaleString(undefined,{maximumFractionDigits:4})}</b> remaining now`
+    : `<span style="color:var(--warn)">OFF</span> &mdash; programs cannot spend at remotes`;
+  const inp=$('#fundRate');
+  if(!fundPrefilled && document.activeElement!==inp){ inp.value = perDayC>0?perDayC:''; fundPrefilled=true; }
+}
+async function fundingApply(){
+  const c=Number($('#fundRate').value);
+  if(!(c>=0)){toast('enter credits/day (0 = off)','err');return;}
+  const raw=Math.round(c*PRICE_UNIT);
+  try{const r=await post('/api/funding_set',{perday:String(raw)});
+    toast(r.ok?(c>0?'funding budget set':'funding disabled'):(r.error||'failed'),r.ok?'ok':'err');}
+  catch(e){toast('server error','err');}
+  loadFunding();
+}
+async function loadExtensions(){
+  loadFunding();
+  let d;try{d=await api('/api/extensions');}catch(e){return;}
+  $('#extOff').innerHTML=d.catalog?'':'<b>No catalog.</b> Set <span class="mono">extensions_dir</span> to a folder of single-file .lua extensions to install from. Installed /s/ extensions still appear.';
+  // Rebuild the rows only on a real structural change (state/caps/pid), and NOT
+  // while a config editor is open (a rebuild would clobber the textarea). Status
+  // fetches below only touch the status divs, so they keep ticking live even
+  // with an editor open or a row collapsed.
+  const sig=d.items.map(it=>[it.name,it.available,it.installed,it.enabled,it.pid,it.caps].join(':')).join('|');
+  if(sig!==extSig && !extOpenConfig){$('#extList').innerHTML=d.items.length?d.items.map(extRow).join(''):'<p class="muted">No extensions found.</p>';extSig=sig;}
+  extPollStatus();
+}
+// Poll status for expanded rows only. The status div exists only for an enabled,
+// contract-implementing, status-capable row, so guarding on it means a collapsed
+// card (not in extExpanded) or a non-status row never issues a request.
+function extPollStatus(){
+  for(const name of extExpanded) if($('#extStatus-'+cssid(name))) extFetchStatus(name);
+}
+function extToggle(name){
+  const id=cssid(name), open=!extExpanded.has(name);
+  if(open) extExpanded.add(name); else extExpanded.delete(name);
+  const body=$('#extBody-'+id); if(body) body.style.display=open?'':'none';
+  const chev=$('#extChev-'+id); if(chev) chev.textContent=open?'▾':'▸';
+  const row=body&&body.closest('.extrow'); if(row) row.classList.toggle('open',open);
+  if(open) extFetchStatus(name);
+}
+async function extAct(action,name){
+  try{const r=await post('/api/extension_'+action,{name});toast(r.ok?action+' ok':(r.error||action+' failed'),r.ok?'ok':'err');}
+  catch(e){toast('server error','err');}
+  extOpenConfig=null;extSig='';setTimeout(loadExtensions,500);
+}
+async function extCmd(name,id){
+  const el=$('#extCmdOut-'+cssid(name));
+  try{const r=await post('/api/extension_command',{name,id,arg:''});
+    if(el)el.textContent=r.ok?(r.result||'(ok)'):(r.error||'failed');toast(r.ok?'command ok':'command failed',r.ok?'ok':'err');}
+  catch(e){if(el)el.textContent='server error';toast('server error','err');}
+}
+async function extConfigToggle(name,hasDefaults){
+  const id=cssid(name),el=$('#extCfg-'+id);if(!el)return;
+  if(extOpenConfig===name){el.innerHTML='';extOpenConfig=null;return;}
+  extOpenConfig=name;
+  let d;try{d=await api('/api/extension_config?name='+encodeURIComponent(name));}catch(e){d={text:''};}
+  const reset=hasDefaults?`<button class="green sm" onclick="extConfigReset('${esc(name)}')">Reset to defaults</button>`:'';
+  el.innerHTML=`<textarea id="extCfgTa-${id}" spellcheck="false">${esc(d.text)}</textarea><div class="row"><button class="green sm" onclick="extConfigSave('${esc(name)}')">Save</button>${reset}<button class="green sm" onclick="extConfigToggle('${esc(name)}',${hasDefaults?1:0})">Close</button></div>`;
+}
+async function extConfigSave(name){
+  const ta=$('#extCfgTa-'+cssid(name));if(!ta)return;
+  try{const r=await post('/api/extension_config_set',{name,text:ta.value});toast(r.ok?'config saved + pushed live':(r.error||'save failed'),r.ok?'ok':'err');}
+  catch(e){toast('server error','err');}
+}
+async function extConfigReset(name){
+  try{const r=await post('/api/extension_config_reset',{name});
+    if(!r.ok){toast(r.error||'reset failed','err');return;}
+    toast('reset to defaults + pushed live','ok');
+    const d=await api('/api/extension_config?name='+encodeURIComponent(name));
+    const ta=$('#extCfgTa-'+cssid(name));if(ta)ta.value=d.text;}
+  catch(e){toast('server error','err');}
+}
+
+const TABS=['overview','peers','inspect','wallet','lookup','billing','fees','file','compute','extensions','logs','config'];
 const initTab=(location.hash||'').slice(1);
 showTab(TABS.includes(initTab)?initTab:'overview');
 // Liveness heartbeat: always on, independent of the selected tab — 1 user on 1

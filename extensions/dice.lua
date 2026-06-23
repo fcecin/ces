@@ -1,6 +1,6 @@
 -- /s/dice.lua — fair-coin double-or-nothing.
 --
--- Deployed automatically when [builtin_app] dice = 1 is set on the
+-- Deployed automatically when [extension] dice = 1 is set on the
 -- server. The house bankroll is the file's dedicated program account
 -- (see HOUSE_PUBKEY below): bets are transferred into it and winnings
 -- are paid out of it. On /s/ the server auto-tops that account at boot;
@@ -30,6 +30,14 @@
 -- ces.transfer does not draw from, so bets sent there would never fund
 -- payouts.) On /s/ the server auto-tops this account at boot; other
 -- deployers fund it via `cesh file deposit`.
+-- Identity — a static global table (a hand-written /s/ program declares this
+-- directly; cesdk-built ones get it generated from project.lua). The host reads
+-- it at run-loop entry, and `cesluajitd --manifest` harvests it without running.
+-- dice declares a manifest but no ces.extension_admin contract, so it shows
+-- name/version but its admin cells read N/A.
+CES_MANIFEST = { name = "Double-or-Nothing Dice", version = "1.0",
+                 description = "Fair-coin double-or-nothing wager game (house bankroll = program account)." }
+
 local HOUSE_PUBKEY = ces.program_pubkey()
 local HOUSE_PREFIX = HOUSE_PUBKEY:sub(1, 8)
 
