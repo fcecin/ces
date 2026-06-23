@@ -30,8 +30,18 @@ static constexpr uint64_t SERVER_TICKET_REFRESH_SECS = 15;
 // initializing before `mine()` can call `proveWork()`.
 static constexpr int POW_INIT_POLL_MS = 1000;
 
+// Normalize to v4-mapped IPv6, the form inbound sender addresses take on the
+// dual-stack v6 socket, so the fence can compare addresses directly.
+static minx::SockAddr normalizeV6(const boost::asio::ip::udp::endpoint& ep) {
+  auto a = ep.address();
+  if (a.is_v4())
+    a = boost::asio::ip::make_address_v6(boost::asio::ip::v4_mapped, a.to_v4());
+  return minx::SockAddr(a, ep.port());
+}
+
 CesClient::CesClient(const boost::asio::ip::udp::endpoint& serverEndpoint,
-                      bool useDataset, const minx::MinxConfig& config) {
+                      bool useDataset, const minx::MinxConfig& config)
+  : currentTarget_(normalizeV6(serverEndpoint)) {
   LOGTRACE << "CesClient (UDP)";
   transport_ =
     std::make_unique<minx::MinxClientTransport>(this, serverEndpoint, config);
@@ -120,6 +130,36 @@ bool CesClient::disconnect() {
   serverTicketLastTime_ = 0;
   connected_ = false;
   return true;
+}
+
+bool CesClient::setRemoteEndpoint(
+  const boost::asio::ip::udp::endpoint& serverEndpoint) {
+  // Move the fence to the new server before redirecting sends.
+  {
+    std::lock_guard<std::mutex> lk(targetMutex_);
+    currentTarget_ = normalizeV6(serverEndpoint);
+  }
+  if (!transport_->setRemoteEndpoint(serverEndpoint))
+    return false;
+  // Drop per-peer session state; the next connect() re-handshakes.
+  disconnect();
+  return true;
+}
+
+bool CesClient::setRemoteEndpoint(
+  const boost::asio::ip::tcp::endpoint& proxyEndpoint) {
+  // TCP mode has no inbound address fence, so currentTarget_ is left alone.
+  if (!transport_->setRemoteEndpoint(proxyEndpoint))
+    return false;
+  disconnect();
+  return true;
+}
+
+bool CesClient::isCurrentPeer(const minx::SockAddr& addr) const {
+  // TCP proxy mode has a single fixed peer (the proxy); no address fence.
+  if (transport_ && transport_->isTcp()) return true;
+  std::lock_guard<std::mutex> lk(targetMutex_);
+  return normalizeV6(addr) == currentTarget_;
 }
 
 bool CesClient::getInfo() {
@@ -912,8 +952,10 @@ uint8_t CesClient::queryServerInfo(std::vector<ServerInfoEntry>& outEntries) {
 // MESSAGE DISPATCH
 // =============================================================================
 
-void CesClient::incomingInfo(const minx::SockAddr& /* addr */,
+void CesClient::incomingInfo(const minx::SockAddr& addr,
                              const minx::MinxInfo& msg) {
+  // INFO is unsigned and sets serverKey_; drop one from a previous server.
+  if (!isCurrentPeer(addr)) return;
   LOGTRACE << "incomingInfo" << VAR(msg.data.size());
   serverTicket_ = msg.gpassword;
   serverTicketLastTime_ = minx::getSecsSinceEpoch();
@@ -933,15 +975,18 @@ void CesClient::incomingInfo(const minx::SockAddr& /* addr */,
   ++serverInfoGen_;
 }
 
-void CesClient::incomingApplication(const minx::SockAddr& /* addr */,
+void CesClient::incomingApplication(const minx::SockAddr& addr,
                                     const uint8_t /* code */,
                                     const minx::Bytes& data) {
+  if (!isCurrentPeer(addr)) return;
   if (appCallback_ && !data.empty())
     appCallback_(reinterpret_cast<const uint8_t*>(data.data()), data.size());
 }
 
-void CesClient::incomingMessage(const minx::SockAddr& /* addr */,
+void CesClient::incomingMessage(const minx::SockAddr& addr,
                                 const minx::MinxMessage& msg) {
+  // Drop a straggler from a previous server before it clobbers serverTicket_.
+  if (!isCurrentPeer(addr)) return;
   LOGTRACE << "incomingMessage";
   serverTicket_ = msg.gpassword;
   serverTicketLastTime_ = minx::getSecsSinceEpoch();

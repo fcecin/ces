@@ -13,6 +13,7 @@
 #include <atomic>
 #include <limits>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -45,6 +46,14 @@ public:
   bool stop();
   bool connect();
   bool disconnect();
+
+  // Move this (started) client to a different remote, reusing the transport.
+  // The udp overload moves to a new server; the tcp overload reconnects to a
+  // new proxy. Both disconnect() to drop per-peer session state; the udp
+  // overload also moves the inbound fence (currentTarget_). Returns false in
+  // the wrong mode or, for tcp, on reconnect failure. Call connect() after.
+  bool setRemoteEndpoint(const boost::asio::ip::udp::endpoint& serverEndpoint);
+  bool setRemoteEndpoint(const boost::asio::ip::tcp::endpoint& proxyEndpoint);
   bool getInfo();
 
   int proveWork(const minx::MinxProveWork& msg, minx::Hash& beneficiary,
@@ -230,6 +239,11 @@ public:
 private:
   uint8_t getMyNonce(uint32_t& outNextNonce);
 
+  // True iff `addr` is the server currently pointed at; always true in TCP
+  // proxy mode. The incoming* handlers call it to drop a reply from a previous
+  // server, which the re-pointable open socket can still deliver.
+  bool isCurrentPeer(const minx::SockAddr& addr) const;
+
   // Send a signed request and wait for a matching response, with retries.
   // The caller is responsible for filling `req` completely (including
   // originId/ownerId, serverId, reqNonce, and op-specific fields) before
@@ -264,6 +278,13 @@ private:
 
   std::unique_ptr<minx::MinxClientTransport> transport_;
   KeyPair keyPair_;
+
+  // The server currently pointed at, normalized to v4-mapped IPv6 to match
+  // inbound sender addresses on the dual-stack v6 socket. Written by the ctor
+  // and setRemoteEndpoint on the caller thread, read by the incoming* handlers
+  // on the IO thread; the mutex guards that.
+  minx::SockAddr currentTarget_;
+  mutable std::mutex targetMutex_;
   int tries_ = 3;
   int retryIntervalMs_ = 3000;
   ApplicationCallback appCallback_;
