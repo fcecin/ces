@@ -3973,8 +3973,13 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
     doSnapshot("daily maintenance");
   });
 
-  // File-store rent is collected lazily (per-op + JIT GC on CREATE).
-  // No daily pass needed.
+  // Flat-file rent is collected lazily (per-op + JIT GC on CREATE), no daily
+  // pass. kv-stores differ: each key is a self-renting cell, charged by a
+  // per-key sweep the file service runs here. This runs on taskIO_, NOT the
+  // logicStrand: the sweep takes gKvMutex then hops to logicStrand to burn the
+  // rent (the lock order kv ops use), so running it inside the postLogic block
+  // above would invert that order and deadlock.
+  fileHandlerSweepKvRent(this);
 
   dailyTaskStartTimer();
 }

@@ -34,6 +34,7 @@ constexpr uint8_t kVerbSetPrice = 0x07;
 constexpr uint8_t kVerbDelete   = 0x08;
 constexpr uint8_t kVerbAppend   = 0x09;
 constexpr uint8_t kVerbResize   = 0x0a;
+constexpr uint8_t kVerbKvDeposit = 0x10;  // fund a key in a kv-store (any signer)
 
 constexpr const char* kFileProto = "/ces/file/1";
 
@@ -202,6 +203,26 @@ uint8_t CesFileClient::deposit(const std::string& name,
                                      nullptr, nullptr, {}, resp, body);
   if (rc != CES_OK) return rc;
   outFileBalance = ces::Buffer::peek<uint64_t>(resp.data());
+  return CES_OK;
+}
+
+// ---- KV_DEPOSIT (fund a key in a kv-store; any signer, no owner check) ----
+uint8_t CesFileClient::kvDeposit(const std::string& name, const ces::Bytes& key,
+                                 uint64_t amount, uint64_t& outCellBalance) {
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, amount);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(key.size()));
+  pre.insert(pre.end(), key.begin(), key.end());
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
+  pre.insert(pre.end(), name.begin(), name.end());
+  auto env = impl_->chan->buildEnvelope(kVerbKvDeposit, pre);
+
+  ces::Bytes resp, body;
+  uint8_t rc = impl_->chan->driveVerb(kVerbKvDeposit, env, /*respFixedPre=*/8,
+                                     nullptr, nullptr, {}, resp, body);
+  if (rc != CES_OK) return rc;
+  outCellBalance = ces::Buffer::peek<uint64_t>(resp.data());
   return CES_OK;
 }
 

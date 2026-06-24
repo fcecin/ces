@@ -46,6 +46,16 @@
 
 #include <toml++/toml.hpp>
 
+#include <logkv/store.h>
+#include <logkv/bytes.h>
+
+#include <boost/unordered/unordered_flat_map.hpp>
+
+#include <map>
+#include <memory>
+#include <mutex>
+#include <unordered_map>
+
 #include <cryptopp/sha.h>
 
 #include <boost/asio/buffer.hpp>
@@ -118,6 +128,30 @@ constexpr uint8_t kVerbSetPrice = 0x07;
 constexpr uint8_t kVerbDelete   = 0x08;
 constexpr uint8_t kVerbAppend   = 0x09;  // extend-write N bytes past size
 constexpr uint8_t kVerbResize   = 0x0a;  // set new size (sparse extend or truncate)
+
+// File types stored in the sidecar. A flat file is opaque bytes; a kv file is
+// a logkv key-value store whose content path is a directory of logkv files.
+constexpr uint8_t kFileTypeFlat = 0;
+constexpr uint8_t kFileTypeKv   = 1;
+
+// kv-file verbs. Exec-only except kVerbKvDeposit, which also has a wire path
+// (external funders bind /ces/file/1 and fund a key).
+constexpr uint8_t kVerbKvCreate  = 0x0b;
+constexpr uint8_t kVerbKvPut     = 0x0c;
+constexpr uint8_t kVerbKvGet     = 0x0d;
+constexpr uint8_t kVerbKvErase   = 0x0e;
+constexpr uint8_t kVerbKvIter    = 0x0f;
+constexpr uint8_t kVerbKvDeposit = 0x10;
+constexpr uint8_t kVerbKvRange   = 0x11;
+
+// Max kv key length (bytes). Values are bounded by kMaxWriteLen like a write.
+constexpr size_t kMaxKvKeyLen = 256;
+
+// Hard cap on a KV_RANGE response payload (sum of returned key+value bytes),
+// well under the IPC frame so the reply always fits. A caller's requested
+// budget is clamped to this; one in-range pair is always returned so a lone
+// oversized value can't stall a paginated scan.
+constexpr uint64_t kKvRangeMaxBytes = 8u * 1024 * 1024;
 
 constexpr uint16_t kMaxNameLen = 512;
 constexpr uint32_t kMaxWriteLen = 1024 * 1024; // 1 MB per WRITE
@@ -279,6 +313,133 @@ std::filesystem::path storeMetaPath(const std::string& dir) {
   return std::filesystem::path(dir) / kStoreMetaName;
 }
 
+// ---------------------------------------------------------------------------
+// kv file type: a logkv key-value store living in the file's content
+// directory. The file driver owns the directory (creation, billing, eviction)
+// the same way it owns flat files; logkv only uses the directory. Stores are
+// opened lazily and cached, keyed by file name; access is serialized by
+// gKvMutex (logkv::Store has no internal locking). Keys and values are byte
+// strings (logkv::Bytes); logkv treats an empty value as "absent", so a kv
+// PUT of an empty value is an erase and callers must not rely on storing one.
+// ---------------------------------------------------------------------------
+// Ordered backing (std::map, not unordered): keys iterate and bisect in sorted
+// byte order, so range queries are native (lower_bound/upper_bound) and RBSR
+// gets the sorted keyspace it needs. logkv::Store needs only standard
+// associative API, which std::map provides.
+//
+// The order is UNSIGNED byte order (memcmp). logkv::Bytes is vector<char> whose
+// default operator< compares signed chars, which would sort a 0x80-prefixed key
+// before a 0x00-prefixed one; DHT keys are hashes treated as unsigned, so the
+// comparator must match memcmp. A 2-arg alias carries the comparator through
+// logkv::Store's M<K,V> template parameter.
+struct KvKeyLess {
+  bool operator()(const logkv::Bytes& a, const logkv::Bytes& b) const {
+    size_t n = a.size() < b.size() ? a.size() : b.size();
+    int c = n ? std::memcmp(a.data(), b.data(), n) : 0;
+    if (c != 0) return c < 0;
+    return a.size() < b.size();
+  }
+};
+template <class K, class V> using KvMap = std::map<K, V, KvKeyLess>;
+using KvStore = logkv::Store<KvMap, logkv::Bytes, logkv::Bytes>;
+
+std::mutex gKvMutex;
+std::unordered_map<std::string, std::unique_ptr<KvStore>> gKvStores;
+
+// Open (or return the cached) logkv store for kv-file `name`. The content
+// directory must already exist (the driver creates it at CREATE). Returns
+// nullptr if the directory is missing or logkv fails to load. Caller holds
+// gKvMutex.
+KvStore* kvStoreOpenLocked(const std::string& dir, const std::string& name) {
+  auto cPath = resolveContentPath(dir, name);
+  // Cache key is the ABSOLUTE content path, not the bare CES name: two stores
+  // sharing a logical name across different store dirs (a stop/start with dir
+  // reuse, or two servers in one test process) must not alias.
+  std::string key = cPath.string();
+  std::error_code ec;
+  auto it = gKvStores.find(key);
+  if (it != gKvStores.end()) {
+    // A cached store whose directory was deleted (rent GC / DELETE) is stale:
+    // drop it (closes logkv's file handles) and fail. The op's sidecar read
+    // reports FILE_NOT_FOUND. This lazy check lets delete paths just
+    // remove_all the dir without taking gKvMutex (avoids a lock-order
+    // inversion with gcReclaim, which deletes under gStoreMetaMutex).
+    if (std::filesystem::is_directory(cPath, ec)) return it->second.get();
+    gKvStores.erase(it);
+    return nullptr;
+  }
+  if (!std::filesystem::is_directory(cPath, ec)) return nullptr;
+  try {
+    auto st = std::make_unique<KvStore>(cPath.string());   // loads existing data
+    KvStore* raw = st.get();
+    gKvStores.emplace(key, std::move(st));
+    return raw;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+// Flush and drop every cached kv store. Called on handler unbind (shutdown) so
+// logkv file handles are released and a rebind on the same process reloads from
+// disk. Each mutation already flushed, so the flush here is belt-and-braces.
+void kvStoresCloseAll() {
+  std::lock_guard<std::mutex> lk(gKvMutex);
+  for (auto& [k, st] : gKvStores) { try { st->flush(true); } catch (...) {} }
+  gKvStores.clear();
+}
+
+// ces::Bytes (vector<uint8_t>) <-> logkv::Bytes (vector<char>).
+inline logkv::Bytes toLogkvBytes(const ces::Bytes& b) {
+  const char* p = reinterpret_cast<const char*>(b.data());
+  return logkv::Bytes(p, p + b.size());
+}
+inline ces::Bytes fromLogkvBytes(const logkv::Bytes& b) {
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(b.data());
+  return ces::Bytes(p, p + b.size());
+}
+
+// ---------------------------------------------------------------------------
+// Per-cell billing header. Every kv value is stored as
+//   [balance u64 BE][last_charged_us u64 BE][user bytes]
+// The file service owns the 16-byte header: KV_DEPOSIT funds it, the daily
+// sweep charges rent against it and erases the key at balance 0, and GET strips
+// it (the program sees only its own bytes). Invariant: a store's program-account
+// balance equals the sum of its cell balances.
+// ---------------------------------------------------------------------------
+constexpr size_t kKvHeaderLen = 16;
+
+struct KvCell {
+  uint64_t balance = 0;
+  uint64_t lastChargedUs = 0;
+  const char* user = nullptr;   // pointer into the stored value (after header)
+  size_t userLen = 0;
+};
+
+// Parse a stored value into its header + user span. Returns false if the value
+// is too short to hold a header (the file service writes every kv value, so
+// this is a fail-safe).
+inline bool kvCellParse(const logkv::Bytes& v, KvCell& out) {
+  if (v.size() < kKvHeaderLen) return false;
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(v.data());
+  out.balance       = ces::Buffer::peek<uint64_t>(p);
+  out.lastChargedUs = ces::Buffer::peek<uint64_t>(p + 8);
+  out.user    = v.data() + kKvHeaderLen;
+  out.userLen = v.size() - kKvHeaderLen;
+  return true;
+}
+
+// Build a stored value from header fields + user bytes (raw pointer span).
+inline logkv::Bytes kvCellBuild(uint64_t balance, uint64_t lastChargedUs,
+                                const char* user, size_t userLen) {
+  logkv::Bytes v;
+  v.resize(kKvHeaderLen + userLen);
+  uint8_t* p = reinterpret_cast<uint8_t*>(v.data());
+  ces::Buffer::poke<uint64_t>(p, balance);
+  ces::Buffer::poke<uint64_t>(p + 8, lastChargedUs);
+  if (userLen) std::memcpy(v.data() + kKvHeaderLen, user, userLen);
+  return v;
+}
+
 // Verify that a CES name doesn't collide with an existing path.
 // Specifically: every prefix of the name's directory chain must
 // either not exist, or exist as a directory (not a file); and the
@@ -349,6 +510,10 @@ struct Sidecar {
   // on demand. Cleared back to all-zero by any content-mutating
   // verb (WRITE, APPEND, RESIZE) so the next mint recomputes.
   std::array<uint8_t, 32> program_hash{};
+  // kFileTypeFlat (opaque bytes) or kFileTypeKv (logkv key-value store whose
+  // content path is a directory). Optional in the sidecar; sidecars written
+  // before this field load as flat.
+  uint8_t type = kFileTypeFlat;
 };
 
 bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
@@ -372,6 +537,7 @@ bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
   tbl.insert_or_assign("last_rent_us", static_cast<int64_t>(s.last_rent_us));
   tbl.insert_or_assign("program_hash",
                        hexOf(s.program_hash.data(), s.program_hash.size()));
+  tbl.insert_or_assign("type", static_cast<int64_t>(s.type));
 
   std::filesystem::path tmp = path;
   tmp += ".tmp";
@@ -441,6 +607,10 @@ bool readSidecar(const std::filesystem::path& path, Sidecar& s) {
   } else {
     s.program_hash.fill(0);
   }
+  // type is optional (sidecars predating it load as flat).
+  uint64_t typeVal = kFileTypeFlat;
+  getU64("type", typeVal);
+  s.type = static_cast<uint8_t>(typeVal);
   s.version = kSidecarVersion;
   return true;
 }
@@ -727,7 +897,8 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
   if (dead) {
     // Dead. Delete and bump meta.
     std::error_code ec;
-    std::filesystem::remove(cPath, ec);
+    if (sc.type == kFileTypeKv) std::filesystem::remove_all(cPath, ec);
+    else                        std::filesystem::remove(cPath, ec);
     std::filesystem::remove(sPath, ec);
     // Best-effort rmdir of empty parents.
     {
@@ -813,6 +984,7 @@ uint8_t checkCapAndMaybeGc(const std::string& dir,
 void dispatchWrite  (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchRead   (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchKvDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchDelete (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
@@ -830,21 +1002,23 @@ public:
     // accepts() also gates "still bound?" - false on unbind stops the loop.
     proto.accepts = [](uint8_t verb) {
       return gServer.load() != nullptr &&
-             (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize));
+             (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize) ||
+              verb == kVerbKvDeposit);
     };
     proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
       switch (ctx->verb) {
-        case kVerbCreate:   dispatchCreate  (ctx, std::move(pre)); break;
-        case kVerbWrite:    dispatchWrite   (ctx, std::move(pre)); break;
-        case kVerbRead:     dispatchRead    (ctx, std::move(pre)); break;
-        case kVerbStat:     dispatchStat    (ctx, std::move(pre)); break;
-        case kVerbDeposit:  dispatchDeposit (ctx, std::move(pre)); break;
-        case kVerbWithdraw: dispatchWithdraw(ctx, std::move(pre)); break;
-        case kVerbSetPrice: dispatchSetPrice(ctx, std::move(pre)); break;
-        case kVerbDelete:   dispatchDelete  (ctx, std::move(pre)); break;
-        case kVerbAppend:   dispatchAppend  (ctx, std::move(pre)); break;
-        case kVerbResize:   dispatchResize  (ctx, std::move(pre)); break;
-        default:            ctx->error(CES_ERROR_BAD_INPUT); break;
+        case kVerbCreate:    dispatchCreate   (ctx, std::move(pre)); break;
+        case kVerbWrite:     dispatchWrite    (ctx, std::move(pre)); break;
+        case kVerbRead:      dispatchRead     (ctx, std::move(pre)); break;
+        case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
+        case kVerbDeposit:   dispatchDeposit  (ctx, std::move(pre)); break;
+        case kVerbWithdraw:  dispatchWithdraw (ctx, std::move(pre)); break;
+        case kVerbSetPrice:  dispatchSetPrice (ctx, std::move(pre)); break;
+        case kVerbDelete:    dispatchDelete   (ctx, std::move(pre)); break;
+        case kVerbAppend:    dispatchAppend   (ctx, std::move(pre)); break;
+        case kVerbResize:    dispatchResize   (ctx, std::move(pre)); break;
+        case kVerbKvDeposit: dispatchKvDeposit(ctx, std::move(pre)); break;
+        default:             ctx->error(CES_ERROR_BAD_INPUT); break;
       }
     };
     cesPlexServe(std::move(stream), std::move(bound), server,
@@ -1071,7 +1245,7 @@ struct CreateOutcome { uint8_t status; uint64_t fileBalance; uint64_t costDebite
 CreateOutcome createCore(CesServer* server, const std::string& name,
                          uint64_t size, uint64_t pricePerKb,
                          uint64_t initialDeposit, const minx::Hash& caller,
-                         const L2Billing& bill) {
+                         const L2Billing& bill, uint8_t type = kFileTypeFlat) {
   const auto& cfg = server->_config();
   uint8_t rc = checkPathConflict(cfg.cesFileStoreDir, name, /*createMode=*/true);
   if (rc != CES_OK) return { rc, 0, 0 };
@@ -1115,10 +1289,21 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   std::error_code ec;
   std::filesystem::create_directories(cPath.parent_path(), ec);
   if (ec) return { CES_ERROR_INTERNAL, 0, 0 };
-  { std::ofstream f(cPath, std::ios::binary | std::ios::trunc);
-    if (!f) return { CES_ERROR_INTERNAL, 0, 0 }; }
-  std::filesystem::resize_file(cPath, size, ec);
-  if (ec) return { CES_ERROR_INTERNAL, 0, 0 };
+  if (type == kFileTypeKv) {
+    // kv content is a directory: the driver creates it, logkv uses it.
+    std::filesystem::create_directory(cPath, ec);
+    if (ec) return { CES_ERROR_INTERNAL, 0, 0 };
+    std::lock_guard<std::mutex> lk(gKvMutex);
+    if (!kvStoreOpenLocked(cfg.cesFileStoreDir, name)) {
+      std::filesystem::remove_all(cPath, ec);
+      return { CES_ERROR_INTERNAL, 0, 0 };
+    }
+  } else {
+    { std::ofstream f(cPath, std::ios::binary | std::ios::trunc);
+      if (!f) return { CES_ERROR_INTERNAL, 0, 0 }; }
+    std::filesystem::resize_file(cPath, size, ec);
+    if (ec) return { CES_ERROR_INTERNAL, 0, 0 };
+  }
 
   Sidecar s{};
   s.version = kSidecarVersion;
@@ -1128,6 +1313,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   std::memcpy(s.program_privkey.data(), progPriv.data(), 32);
   s.price_per_kb = pricePerKb;
   s.size = size;
+  s.type = type;
   s.created_us = getMicrosSinceEpoch();
   s.modified_us = s.created_us;
   s.last_rent_us = s.created_us;
@@ -1745,7 +1931,8 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
   if (mutated) {
     uint64_t size = sc.size;
     std::error_code ec;
-    std::filesystem::remove(cPath, ec);
+    if (sc.type == kFileTypeKv) std::filesystem::remove_all(cPath, ec);
+    else                        std::filesystem::remove(cPath, ec);
     std::filesystem::remove(sPath, ec);
     if (!isServerZone(name)) {
       std::lock_guard lk(gStoreMetaMutex);
@@ -2036,6 +2223,333 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 }
 
 // ---------------------------------------------------------------------------
+// kv-file cores. Mirror the flat cores' billing exactly: rent rolls forward on
+// every op; a PUT that grows the logical size (sum key+value bytes) pays the
+// per-KB write cost and the 15-min upfront rent on the delta from the file's
+// own program account, plus feeQuery from the source. Logical size lives in
+// the sidecar (size). The logkv store is accessed under gKvMutex; the ledger
+// transaction is taken while holding it (no path takes gStoreMetaMutex then
+// gKvMutex, so the brief gStoreMetaMutex acquisitions here cannot deadlock).
+// ---------------------------------------------------------------------------
+
+struct KvPutOutcome     { uint8_t status; uint64_t balance; uint64_t size; };
+struct KvGetOutcome     { uint8_t status; ces::Bytes value; bool found; };
+struct KvEraseOutcome   { uint8_t status; uint64_t size; };
+struct KvIterOutcome    { uint8_t status; std::vector<ces::Bytes> keys; };
+struct KvDepositOutcome { uint8_t status; uint64_t balance; };
+struct KvRangeOutcome   { uint8_t status; ces::Bytes effectiveHi;
+                          std::vector<ces::Bytes> keys;
+                          std::vector<ces::Bytes> values; };
+
+// Store (or overwrite) a key's record, adding `deposit` to the cell's rent
+// balance. No whole-store rent here; the daily sweep charges rent. The funder
+// pays a one-time write cost (burned) plus `deposit` (moved into the store pot
+// and credited to the cell balance). An overwrite keeps the existing cell
+// balance and last-charged stamp, so funding survives content updates.
+KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
+                       const ces::Bytes& key, const ces::Bytes& value,
+                       const minx::Hash& caller, uint64_t deposit,
+                       const L2Billing& bill) {
+  if (key.empty() || key.size() > kMaxKvKeyLen) return { CES_ERROR_BAD_INPUT, 0, 0 };
+  if (value.empty() || value.size() > kMaxWriteLen) return { CES_ERROR_BAD_INPUT, 0, 0 };
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, 0, 0 };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0, 0 };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, 0, 0 };
+  if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
+    return { CES_ERROR_NOT_OWNER, 0, 0 };
+
+  const bool serverZone = isServerZone(name);
+  minx::Hash prog{};
+  std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
+  logkv::Bytes k = toLogkvBytes(key);
+  uint64_t now = getMicrosSinceEpoch();
+
+  std::lock_guard<std::mutex> kvLk(gKvMutex);
+  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  if (!st) return { CES_ERROR_INTERNAL, 0, 0 };
+
+  uint64_t cellBalance = 0, lastCharged = now, oldStored = 0;
+  { auto it = st->find(k);
+    if (it != st->end()) {
+      KvCell c{};
+      if (kvCellParse(it->second, c)) { cellBalance = c.balance; lastCharged = c.lastChargedUs; }
+      oldStored = key.size() + it->second.size();
+    } }
+  uint64_t newStored = key.size() + kKvHeaderLen + value.size();
+  int64_t storedDelta = static_cast<int64_t>(newStored) - static_cast<int64_t>(oldStored);
+  uint64_t grow = storedDelta > 0 ? static_cast<uint64_t>(storedDelta) : 0;
+
+  if (grow > 0 && !serverZone) {
+    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+    uint8_t capRc = checkCapAndMaybeGc(cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
+                                       cfg.feeFileRent, grow);
+    if (capRc != CES_OK) return { capRc, 0, 0 };
+  }
+  uint64_t writeCost = serverZone ? 0 : kbCeil(value.size()) * uint64_t(cfg.feeFileWrite);
+
+  uint8_t status = CES_ERROR_INTERNAL;
+  bool duplicate = false;
+  server->_l2Transact([&](ces::LedgerTxn& t) {
+    L2ChargeResult c = bill(t, static_cast<int64_t>(writeCost + deposit));
+    if (c.rc != CES_OK) { status = c.rc; return; }
+    if (c.duplicate) { duplicate = true; status = CES_OK; return; }
+    if (deposit > 0) t.credit(prog, static_cast<int64_t>(deposit));
+    status = CES_OK;
+  });
+  if (status != CES_OK) return { status, 0, 0 };
+  if (duplicate) return { CES_OK, cellBalance, sc.size };
+
+  cellBalance += deposit;
+  logkv::Bytes nv = kvCellBuild(cellBalance, lastCharged,
+      reinterpret_cast<const char*>(value.data()), value.size());
+  st->update(k, nv);
+  st->flush(true);
+
+  Sidecar sc2{};
+  if (!readSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
+  uint64_t base = sc2.size > oldStored ? sc2.size - oldStored : 0;
+  sc2.size = base + newStored;
+  sc2.modified_us = now;
+  if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
+  if (storedDelta != 0 && !serverZone) {
+    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+    adjustStoreMeta(cfg.cesFileStoreDir, 0, storedDelta);
+  }
+  return { CES_OK, cellBalance, sc2.size };
+}
+
+// Add `amount` to an existing key's rent balance. Any signer; no owner check.
+// Moves `amount` into the store pot and the cell balance. The key must already
+// exist.
+KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
+                               const ces::Bytes& key, uint64_t amount,
+                               const L2Billing& bill) {
+  if (key.empty() || key.size() > kMaxKvKeyLen) return { CES_ERROR_BAD_INPUT, 0 };
+  if (amount == 0) return { CES_ERROR_BAD_INPUT, 0 };
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, 0 };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, 0 };
+  minx::Hash prog{};
+  std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
+  logkv::Bytes k = toLogkvBytes(key);
+
+  std::lock_guard<std::mutex> kvLk(gKvMutex);
+  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  if (!st) return { CES_ERROR_INTERNAL, 0 };
+  auto it = st->find(k);
+  if (it == st->end()) return { CES_ERROR_FILE_NOT_FOUND, 0 };
+  KvCell c{};
+  if (!kvCellParse(it->second, c)) return { CES_ERROR_INTERNAL, 0 };
+  // Copy the user bytes before the update (c.user points into the stored value).
+  logkv::Bytes nv = kvCellBuild(c.balance + amount, c.lastChargedUs, c.user, c.userLen);
+
+  uint8_t status = CES_ERROR_INTERNAL;
+  bool duplicate = false;
+  server->_l2Transact([&](ces::LedgerTxn& t) {
+    L2ChargeResult ch = bill(t, static_cast<int64_t>(amount));
+    if (ch.rc != CES_OK) { status = ch.rc; return; }
+    if (ch.duplicate) { duplicate = true; status = CES_OK; return; }
+    t.credit(prog, static_cast<int64_t>(amount));
+    status = CES_OK;
+  });
+  if (status != CES_OK) return { status, 0 };
+  if (duplicate) return { CES_OK, c.balance };
+
+  st->update(k, nv);
+  st->flush(true);
+  return { CES_OK, c.balance + amount };
+}
+
+KvGetOutcome kvGetCore(CesServer* server, const std::string& name,
+                       const ces::Bytes& key, const L2Billing& bill) {
+  (void)bill;  // reads are free at the kv layer (bandwidth is billed at the channel)
+  if (key.empty() || key.size() > kMaxKvKeyLen) return { CES_ERROR_BAD_INPUT, {}, false };
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, {}, false };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, {}, false };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, {}, false };
+
+  std::lock_guard<std::mutex> kvLk(gKvMutex);
+  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  if (!st) return { CES_ERROR_INTERNAL, {}, false };
+  auto it = st->find(toLogkvBytes(key));
+  if (it == st->end()) return { CES_OK, {}, false };
+  KvCell c{};
+  if (!kvCellParse(it->second, c)) return { CES_ERROR_INTERNAL, {}, false };
+  ces::Bytes user(reinterpret_cast<const uint8_t*>(c.user),
+                  reinterpret_cast<const uint8_t*>(c.user) + c.userLen);
+  return { CES_OK, std::move(user), true };
+}
+
+KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
+                           const ces::Bytes& key, const minx::Hash& caller,
+                           const L2Billing& bill) {
+  (void)bill;  // erase is free at the kv layer
+  if (key.empty() || key.size() > kMaxKvKeyLen) return { CES_ERROR_BAD_INPUT, 0 };
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, 0 };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, 0 };
+  if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
+    return { CES_ERROR_NOT_OWNER, 0 };
+  const bool serverZone = isServerZone(name);
+
+  uint64_t oldStored = 0, forfeit = 0;
+  {
+    std::lock_guard<std::mutex> kvLk(gKvMutex);
+    KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+    if (!st) return { CES_ERROR_INTERNAL, 0 };
+    logkv::Bytes k = toLogkvBytes(key);
+    auto it = st->find(k);
+    if (it != st->end()) {
+      KvCell c{}; if (kvCellParse(it->second, c)) forfeit = c.balance;
+      oldStored = key.size() + it->second.size();
+      st->erase(k); st->flush(true);
+    }
+  }
+  // Burn the cell's forfeited balance from the store pot to keep the pot equal
+  // to the sum of live cell balances. gKvMutex is released; no lock is held
+  // across the logicStrand hop.
+  if (forfeit > 0 && !serverZone) debitProgramAccount(server, sc, forfeit);
+
+  Sidecar sc2{};
+  if (!readSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0 };
+  sc2.size = sc2.size > oldStored ? sc2.size - oldStored : 0;
+  sc2.modified_us = getMicrosSinceEpoch();
+  if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0 };
+  if (oldStored > 0 && !serverZone) {
+    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+    adjustStoreMeta(cfg.cesFileStoreDir, 0, -static_cast<int64_t>(oldStored));
+  }
+  return { CES_OK, sc2.size };
+}
+
+KvIterOutcome kvIterCore(CesServer* server, const std::string& name,
+                         const L2Billing& bill) {
+  (void)bill;  // iteration is free at the kv layer
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, {} };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, {} };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, {} };
+
+  std::lock_guard<std::mutex> kvLk(gKvMutex);
+  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  if (!st) return { CES_ERROR_INTERNAL, {} };
+  std::vector<ces::Bytes> keys;
+  for (auto& kv : st->getObjects()) keys.push_back(fromLogkvBytes(kv.first));
+  return { CES_OK, std::move(keys) };
+}
+
+// Ordered range scan: return sorted (key, value) pairs in [lo, hi) up to a byte
+// budget, with the effective upper bound covered. lo empty = start of store;
+// hi empty = end of store. effectiveHi == hi means the whole range was
+// delivered; effectiveHi < hi is the next undelivered key (resume point), so
+// the caller continues with range(effectiveHi, hi). At least one in-range pair
+// is always returned so a lone oversized value cannot stall a scan. Read-only,
+// unbilled at the kv layer (the channel meters the bytes).
+KvRangeOutcome kvRangeCore(CesServer* server, const std::string& name,
+                           const ces::Bytes& lo, const ces::Bytes& hi,
+                           uint64_t maxBytes) {
+  uint8_t rc = validateCesFileName(name);
+  if (rc != CES_OK) return { rc, {}, {}, {} };
+  const auto& cfg = server->_config();
+  auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+  Sidecar sc{};
+  if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, {}, {}, {} };
+  if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, {}, {}, {} };
+
+  if (maxBytes == 0 || maxBytes > kKvRangeMaxBytes) maxBytes = kKvRangeMaxBytes;
+  const bool hasHi = !hi.empty();
+  logkv::Bytes hiB = toLogkvBytes(hi);
+
+  std::lock_guard<std::mutex> kvLk(gKvMutex);
+  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  if (!st) return { CES_ERROR_INTERNAL, {}, {}, {} };
+  auto& m = st->getObjects();
+
+  KvRangeOutcome out{}; out.status = CES_OK;
+  out.effectiveHi = hi;                       // default: whole range delivered
+  uint64_t used = 0;
+  auto less = m.key_comp();                   // the map's unsigned-byte order
+  auto it = lo.empty() ? m.begin() : m.lower_bound(toLogkvBytes(lo));
+  for (; it != m.end(); ++it) {
+    if (hasHi && !less(it->first, hiB)) break; // reached hi (same order as the map)
+    KvCell c{};
+    if (!kvCellParse(it->second, c)) continue;
+    uint64_t entryBytes = it->first.size() + c.userLen;
+    if (!out.keys.empty() && used + entryBytes > maxBytes) {
+      out.effectiveHi = fromLogkvBytes(it->first);  // truncated: resume here
+      return out;
+    }
+    out.keys.push_back(fromLogkvBytes(it->first));
+    out.values.emplace_back(reinterpret_cast<const uint8_t*>(c.user),
+                            reinterpret_cast<const uint8_t*>(c.user) + c.userLen);
+    used += entryBytes;
+  }
+  return out;                                 // ran to hi or end of store
+}
+
+// Wire KV_DEPOSIT: a bound signer funds a key in a kv-store directly. Any
+// signer, no owner check. Preamble: u64 amount, u16 key_len, key, u16 name_len,
+// name. Defined here, after kvDepositCore, so KvDepositOutcome is in scope; the
+// serve switch reaches it through the forward declaration above.
+void dispatchKvDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t amount = 0;
+  ces::Bytes key;
+  std::string name;
+  try {
+    amount = buf.get<uint64_t>();
+    uint16_t klen = buf.get<uint16_t>();
+    if (klen == 0 || klen > kMaxKvKeyLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
+    }
+    key = buf.getBytes<ces::Bytes>(klen);
+    uint16_t nameLen = buf.get<uint16_t>();
+    if (nameLen == 0 || nameLen > kMaxNameLen) {
+      sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+    }
+    name = buf.getBytes<std::string>(nameLen);
+  } catch (const std::out_of_range&) {
+    sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return;
+  }
+  const auto& cfg = reqServer(ctx)->_config();
+  // kvDepositCore touches logkv, which throws on a disk error. The CesPlex
+  // dispatch path does not catch, so contain it here (other file dispatchers
+  // use error codes and never throw).
+  KvDepositOutcome out{};
+  try {
+    out = kvDepositCore(
+      reqServer(ctx), name, key, amount,
+      signerBilling(ctx->bound.boundPubkey, ctx->reqNonce, ctx->reqSigHash,
+                    static_cast<int64_t>(cfg.getFeeError())));
+  } catch (...) {
+    sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+  }
+  if (out.status != CES_OK) { sendErrorAndLoop(ctx, out.status); return; }
+  ces::Bytes resp;
+  ces::Buffer::put<uint64_t>(resp, out.balance);
+  sendResponseAndLoop(ctx, CES_OK, std::move(resp));
+}
+
+// ---------------------------------------------------------------------------
 // Rent + reconciliation (called from CesServer)
 // ---------------------------------------------------------------------------
 
@@ -2086,7 +2600,8 @@ uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
         // Dead. Delete content + sidecar. Best-effort rmdir of
         // empty parents.
         std::error_code ec;
-        std::filesystem::remove(cp, ec);
+        if (s.type == kFileTypeKv) std::filesystem::remove_all(cp, ec);
+        else                       std::filesystem::remove(cp, ec);
         std::filesystem::remove(sp, ec);
         std::filesystem::path p = cp.parent_path();
         std::filesystem::path base = dir;
@@ -2382,6 +2897,110 @@ void execCreate(CesServer* server, FileExecReq req,
   checkZoneOwnership(server, nameCopy, signerKey, cbEx, std::move(finish));
 }
 
+void execKvPut(CesServer* server, FileExecReq req,
+               std::function<void(FileExecResp)> cb,
+               boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
+      KvPutOutcome out = kvPutCore(server, req.name, req.key, req.value,
+                                   hashOf(req.ownerPubkey), req.amount, bill);
+      FileExecResp r; r.status = out.status; r.fileBalance = out.balance;
+      r.size = out.size; return r;
+    });
+}
+
+void execKvDeposit(CesServer* server, FileExecReq req,
+                   std::function<void(FileExecResp)> cb,
+                   boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
+      KvDepositOutcome out = kvDepositCore(server, req.name, req.key,
+                                           req.amount, bill);
+      FileExecResp r; r.status = out.status; r.fileBalance = out.balance;
+      return r;
+    });
+}
+
+void execKvGet(CesServer* server, FileExecReq req,
+               std::function<void(FileExecResp)> cb,
+               boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
+      KvGetOutcome out = kvGetCore(server, req.name, req.key, bill);
+      FileExecResp r; r.status = out.status; r.value = std::move(out.value);
+      r.found = out.found; return r;
+    });
+}
+
+void execKvErase(CesServer* server, FileExecReq req,
+                 std::function<void(FileExecResp)> cb,
+                 boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
+      KvEraseOutcome out = kvEraseCore(server, req.name, req.key,
+                                       hashOf(req.ownerPubkey), bill);
+      FileExecResp r; r.status = out.status; r.size = out.size; return r;
+    });
+}
+
+void execKvIter(CesServer* server, FileExecReq req,
+                std::function<void(FileExecResp)> cb,
+                boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
+      KvIterOutcome out = kvIterCore(server, req.name, bill);
+      FileExecResp r; r.status = out.status; r.keys = std::move(out.keys); return r;
+    });
+}
+
+void execKvRange(CesServer* server, FileExecReq req,
+                 std::function<void(FileExecResp)> cb,
+                 boost::asio::any_io_executor cbEx) {
+  execWithSource(server, req, cb, cbEx,
+    [&](L2Billing, minx::Hash, bool) -> FileExecResp {
+      KvRangeOutcome out = kvRangeCore(server, req.name, req.rangeLo,
+                                       req.rangeHi, req.amount);
+      FileExecResp r; r.status = out.status;
+      r.keys = std::move(out.keys); r.values = std::move(out.values);
+      r.rangeEnd = std::move(out.effectiveHi); return r;
+    });
+}
+
+// kv CREATE mirrors flat CREATE: zone-check, then createCore with type=kv and
+// size 0 (kv logical size starts empty and grows with PUT).
+void execKvCreate(CesServer* server, FileExecReq req,
+                  std::function<void(FileExecResp)> cb,
+                  boost::asio::any_io_executor cbEx) {
+  uint8_t rc = validateCesFileName(req.name);
+  if (rc != CES_OK) {
+    FileExecResp r; r.status = rc;
+    boost::asio::post(cbEx, [cb, r]() { cb(r); }); return;
+  }
+  std::array<uint8_t, 32> signerKey = req.ownerPubkey;
+  std::string nameCopy = req.name;
+  auto finish = [server, cb, cbEx, req = std::move(req)](uint8_t zoneRc) mutable {
+    if (zoneRc != CES_OK) {
+      FileExecResp r; r.status = zoneRc;
+      boost::asio::post(cbEx, [cb, r]() { cb(r); }); return;
+    }
+    minx::Hash srcProg{}; bool metered = false;
+    uint8_t srcRc = resolveSourceForBilling(server, req.sourceName, srcProg, metered);
+    if (srcRc != CES_OK) {
+      FileExecResp r; r.status = srcRc;
+      boost::asio::post(cbEx, [cb, r]() { cb(r); }); return;
+    }
+    bool sourceInsufficient = false;
+    CreateOutcome out = createCore(
+      server, req.name, /*size=*/0, req.pricePerKb, req.initialDeposit,
+      hashOf(req.ownerPubkey),
+      sourceBilling(srcProg, metered, &sourceInsufficient), kFileTypeKv);
+    if (sourceInsufficient && metered) deleteExhaustedSource(server, req.sourceName);
+    FileExecResp r; r.status = out.status; r.fileBalance = out.fileBalance;
+    boost::asio::post(cbEx, [cb, r]() { cb(r); });
+  };
+  checkZoneOwnership(server, nameCopy, signerKey, cbEx, std::move(finish));
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -2390,6 +3009,81 @@ void execCreate(CesServer* server, FileExecReq req,
 
 void fileHandlerBind(CesServer* server) {
   gServer.store(server);
+  if (!server) kvStoresCloseAll();   // unbind (shutdown): release kv handles
+}
+
+void fileHandlerSweepKvRent(CesServer* server) {
+  if (!server) server = gServer.load();
+  if (!server) return;
+  const auto& cfg = server->_config();
+  const int64_t feeRent = cfg.feeFileRent;
+  const uint64_t now = getMicrosSinceEpoch();
+
+  // Collect metered kv-store names first (the walk does not hold gKvMutex).
+  std::vector<std::string> stores;
+  walkFileStore(cfg.cesFileStoreDir,
+    [&](const std::filesystem::path&, const std::filesystem::path&, Sidecar& s) {
+      if (s.type == kFileTypeKv && !isServerZone(s.name)) stores.push_back(s.name);
+    });
+
+  for (const auto& name : stores) {
+    // logkv update/flush throw on a disk error. This runs on taskIO_, so an
+    // escaped throw would terminate the server; contain it per store (one bad
+    // store is skipped, the rest still sweep).
+    try {
+      auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
+      Sidecar sc{};
+      if (!readSidecar(sPath, sc)) continue;       // GC'd between walk and now
+      if (sc.type != kFileTypeKv) continue;
+
+      uint64_t totalCharge = 0;
+      int64_t sizeDelta = 0;
+      {
+        std::lock_guard<std::mutex> kvLk(gKvMutex);
+        KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+        if (!st) continue;
+        std::vector<logkv::Bytes> toErase;
+        std::vector<std::pair<logkv::Bytes, logkv::Bytes>> toUpdate;
+        for (auto& kv : st->getObjects()) {
+          KvCell c{};
+          if (!kvCellParse(kv.second, c)) continue;
+          uint64_t bytes = kv.first.size() + kv.second.size();
+          uint64_t owed = computeOwedRent(bytes, feeRent, c.lastChargedUs, now);
+          uint64_t charge = owed < c.balance ? owed : c.balance;
+          totalCharge += charge;
+          uint64_t nb = c.balance - charge;
+          if (nb == 0) {
+            toErase.push_back(kv.first);
+            sizeDelta -= static_cast<int64_t>(bytes);
+          } else {
+            // Copy user bytes now: c.user points into the stored value.
+            toUpdate.emplace_back(kv.first, kvCellBuild(nb, now, c.user, c.userLen));
+          }
+        }
+        for (auto& [k, v] : toUpdate) st->update(k, v);
+        for (auto& k : toErase) st->erase(k);
+        if (!toUpdate.empty() || !toErase.empty()) st->flush(true);
+      }
+      // Burn the rent from the store pot. gKvMutex is released, so the
+      // logicStrand hop holds no kv lock.
+      if (totalCharge > 0) debitProgramAccount(server, sc, totalCharge);
+      if (sizeDelta != 0) {
+        Sidecar sc2{};
+        if (readSidecar(sPath, sc2)) {
+          uint64_t dec = static_cast<uint64_t>(-sizeDelta);
+          sc2.size = sc2.size > dec ? sc2.size - dec : 0;
+          sc2.modified_us = now;
+          writeSidecar(sPath, sc2);
+          std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+          adjustStoreMeta(cfg.cesFileStoreDir, 0, sizeDelta);
+        }
+      }
+    } catch (const std::exception& e) {
+      LOGDEBUG << "kv rent sweep skipped a store" << SVAR(name) << SVAR(e.what());
+    } catch (...) {
+      LOGDEBUG << "kv rent sweep skipped a store" << SVAR(name);
+    }
+  }
 }
 
 bool fileHandlerReadProgramPubkey(
@@ -2585,22 +3279,40 @@ void fileHandlerExec(
     boost::asio::post(cbEx, [cb, r]() { cb(r); });
     return;
   }
-  switch (req.verb) {
-    case kVerbCreate:   execCreate  (server, req, cb, cbEx); return;
-    case kVerbWrite:    execWrite   (server, req, cb, cbEx); return;
-    case kVerbRead:     execRead    (server, req, cb, cbEx); return;
-    case kVerbStat:     execStat    (server, req, cb, cbEx); return;
-    case kVerbDeposit:  execDeposit (server, req, cb, cbEx); return;
-    case kVerbWithdraw: execWithdraw(server, req, cb, cbEx); return;
-    case kVerbSetPrice: execSetPrice(server, req, cb, cbEx); return;
-    case kVerbDelete:   execDelete  (server, req, cb, cbEx); return;
-    case kVerbAppend:   execAppend  (server, req, cb, cbEx); return;
-    case kVerbResize:   execResize  (server, req, cb, cbEx); return;
-    default: {
-      FileExecResp r; r.status = CES_ERROR_INTERNAL;
-      boost::asio::post(cbEx, [cb, r]() { cb(r); });
+  // The kv cores call into logkv, which throws std::runtime_error on any
+  // filesystem/write error (disk full, IO fault); the synchronous exec path
+  // runs on rpcTaskIO, so an escaped throw would std::terminate the server. A
+  // catch-all here converts it into an INTERNAL reply: the verb fails, the
+  // server lives. The flat cores never throw past their own narrow catches, so
+  // this is the real guard for the kv verbs.
+  try {
+    switch (req.verb) {
+      case kVerbCreate:   execCreate  (server, req, cb, cbEx); return;
+      case kVerbWrite:    execWrite   (server, req, cb, cbEx); return;
+      case kVerbRead:     execRead    (server, req, cb, cbEx); return;
+      case kVerbStat:     execStat    (server, req, cb, cbEx); return;
+      case kVerbDeposit:  execDeposit (server, req, cb, cbEx); return;
+      case kVerbWithdraw: execWithdraw(server, req, cb, cbEx); return;
+      case kVerbSetPrice: execSetPrice(server, req, cb, cbEx); return;
+      case kVerbDelete:   execDelete  (server, req, cb, cbEx); return;
+      case kVerbAppend:   execAppend  (server, req, cb, cbEx); return;
+      case kVerbResize:   execResize  (server, req, cb, cbEx); return;
+      case kVerbKvCreate: execKvCreate(server, req, cb, cbEx); return;
+      case kVerbKvPut:    execKvPut   (server, req, cb, cbEx); return;
+      case kVerbKvGet:    execKvGet   (server, req, cb, cbEx); return;
+      case kVerbKvErase:  execKvErase (server, req, cb, cbEx); return;
+      case kVerbKvIter:   execKvIter  (server, req, cb, cbEx); return;
+      case kVerbKvDeposit: execKvDeposit(server, req, cb, cbEx); return;
+      case kVerbKvRange:  execKvRange (server, req, cb, cbEx); return;
+      default: break;
     }
+  } catch (const std::exception& e) {
+    LOGDEBUG << "exec threw" << VAR((int)req.verb) << SVAR(e.what());
+  } catch (...) {
+    LOGDEBUG << "exec threw (non-std)" << VAR((int)req.verb);
   }
+  FileExecResp r; r.status = CES_ERROR_INTERNAL;
+  boost::asio::post(cbEx, [cb, r]() { cb(r); });
 }
 
 

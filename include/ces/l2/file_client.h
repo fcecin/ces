@@ -105,6 +105,12 @@ public:
   uint8_t deposit(const std::string& name,
                   uint64_t amount, uint64_t& outFileBalance);
 
+  // Fund a single key in a kv-store ("anyone funds any entry there"): adds
+  // `amount` to that key's rent balance. Any signer, no owner check. The key
+  // must already exist. Returns the key's new cell balance.
+  uint8_t kvDeposit(const std::string& name, const ces::Bytes& key,
+                    uint64_t amount, uint64_t& outCellBalance);
+
   uint8_t withdraw(const std::string& name,
                    uint64_t amount, uint64_t& outFileBalance);
 

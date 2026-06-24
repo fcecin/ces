@@ -50,6 +50,17 @@ void fileHandlerBind(CesServer* server);
 // Safe to call with no files present. No-op if not bound.
 void fileHandlerStartupReconcile();
 
+// Daily per-key rent sweep for kv-stores. Each kv key is a self-renting cell:
+// its value carries a [balance][last_charged] header the file service owns.
+// This walks every metered kv-store, charges each cell feeFileRent x
+// (key+value bytes) x elapsed (capped at its balance), evicts cells whose
+// balance hits 0, and burns the collected rent from the store's program
+// account. Transparent to any program using the store. The CES server calls
+// this from daily maintenance, alongside the account/asset sweeps. MUST run
+// OFF logicStrand_: it takes gKvMutex then hops to logicStrand for the burn,
+// the same lock order kv ops use. `server` may be null to use the bound one.
+void fileHandlerSweepKvRent(CesServer* server);
+
 // Read store-level stats from .store.toml (under the store mutex) for
 // monitoring. Returns false if the handler is unbound (feature off);
 // otherwise fills the totals (0/0 when the store is empty). Any-thread
@@ -175,8 +186,12 @@ struct FileExecReq {
   uint64_t size = 0;              // CREATE, RESIZE
   uint64_t pricePerKb = 0;        // CREATE, SET_PRICE
   uint64_t initialDeposit = 0;    // CREATE
-  uint64_t amount = 0;            // DEPOSIT, WITHDRAW
+  uint64_t amount = 0;            // DEPOSIT, WITHDRAW, KV_DEPOSIT, KV_RANGE byte budget
   ces::Bytes body;      // WRITE, APPEND
+  ces::Bytes key;       // KV_PUT, KV_GET, KV_ERASE, KV_DEPOSIT
+  ces::Bytes value;     // KV_PUT
+  ces::Bytes rangeLo;   // KV_RANGE (inclusive lower bound; empty = start of store)
+  ces::Bytes rangeHi;   // KV_RANGE (exclusive upper bound; empty = end of store)
 };
 
 struct FileExecResp {
@@ -190,6 +205,12 @@ struct FileExecResp {
   uint64_t refunded = 0;          // DELETE
   std::array<uint8_t, 32> ownerPubkey{};  // STAT
   ces::Bytes data;      // READ
+  ces::Bytes value;             // KV_GET
+  bool found = false;           // KV_GET
+  std::vector<ces::Bytes> keys; // KV_ITER, KV_RANGE (sorted; parallel to values)
+  std::vector<ces::Bytes> values; // KV_RANGE (parallel to keys)
+  ces::Bytes rangeEnd;          // KV_RANGE: == requested hi if complete, else
+                                // the next undelivered key (resume point)
 };
 
 void fileHandlerExec(

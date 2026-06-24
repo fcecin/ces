@@ -174,6 +174,15 @@ constexpr uint16_t kApiMethodFileSetPrice = 0x0106;
 constexpr uint16_t kApiMethodFileDelete   = 0x0107;
 constexpr uint16_t kApiMethodFileAppend   = 0x0108;
 constexpr uint16_t kApiMethodFileResize   = 0x0109;
+// kv-file (logkv-backed) bindings: the persistent key-value store a program
+// reaches via ces.store(path). Same in-process file path, kv verbs.
+constexpr uint16_t kApiMethodKvCreate     = 0x010a;
+constexpr uint16_t kApiMethodKvPut        = 0x010b;
+constexpr uint16_t kApiMethodKvGet        = 0x010c;
+constexpr uint16_t kApiMethodKvErase      = 0x010d;
+constexpr uint16_t kApiMethodKvIter       = 0x010e;
+constexpr uint16_t kApiMethodKvDeposit    = 0x010f;
+constexpr uint16_t kApiMethodKvRange      = 0x0110;
 // Ledger / RNG bindings exposed to the Lua sandbox:
 //   TRANSFER     — program-initiated transfer from owner's account.
 //                  /s/ programs see the server's account, which is
@@ -236,6 +245,13 @@ constexpr uint8_t kFileVerbSetPrice = 0x07;
 constexpr uint8_t kFileVerbDelete   = 0x08;
 constexpr uint8_t kFileVerbAppend   = 0x09;
 constexpr uint8_t kFileVerbResize   = 0x0a;
+constexpr uint8_t kFileVerbKvCreate = 0x0b;
+constexpr uint8_t kFileVerbKvPut    = 0x0c;
+constexpr uint8_t kFileVerbKvGet    = 0x0d;
+constexpr uint8_t kFileVerbKvErase  = 0x0e;
+constexpr uint8_t kFileVerbKvIter    = 0x0f;
+constexpr uint8_t kFileVerbKvDeposit = 0x10;
+constexpr uint8_t kFileVerbKvRange   = 0x11;
 
 constexpr uint8_t kApiStatusOk            = 0x00;
 constexpr uint8_t kApiStatusNotConnected  = 0x01;
@@ -1822,6 +1838,105 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       req.verb = kFileVerbResize;
       break;
     }
+    case kApiMethodKvCreate: {
+      // [u64 price_per_kb][u64 initial_deposit][u16 namelen][name]
+      if (mlen < sizeof(uint64_t) * 2) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.pricePerKb     = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      req.initialDeposit = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbKvCreate;
+      break;
+    }
+    case kApiMethodKvPut: {
+      // [u64 deposit][u16 keylen][key][u32 vallen][value][u16 namelen][name]
+      if (mlen < sizeof(uint64_t)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.amount = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      std::string keyStr;
+      if (!parseName(mbody, mlen, off, keyStr)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.key.assign(keyStr.begin(), keyStr.end());
+      if (off + 4 > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      uint32_t vlen = ces::Buffer::peek<uint32_t>(mbody + off); off += 4;
+      if (off + vlen > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.value.assign(mbody + off, mbody + off + vlen); off += vlen;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbKvPut;
+      break;
+    }
+    case kApiMethodKvDeposit: {
+      // [u64 amount][u16 keylen][key][u16 namelen][name]
+      if (mlen < sizeof(uint64_t)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.amount = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      std::string keyStr;
+      if (!parseName(mbody, mlen, off, keyStr)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.key.assign(keyStr.begin(), keyStr.end());
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbKvDeposit;
+      break;
+    }
+    case kApiMethodKvGet:
+    case kApiMethodKvErase: {
+      // [u16 keylen][key][u16 namelen][name]
+      std::string keyStr;
+      if (!parseName(mbody, mlen, off, keyStr)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.key.assign(keyStr.begin(), keyStr.end());
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = (method == kApiMethodKvGet)
+        ? kFileVerbKvGet : kFileVerbKvErase;
+      break;
+    }
+    case kApiMethodKvIter: {
+      // [u16 namelen][name]
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbKvIter;
+      break;
+    }
+    case kApiMethodKvRange: {
+      // [u16 lo_len][lo][u16 hi_len][hi][u64 limit][u16 namelen][name]
+      // lo/hi may be empty (start/end of store), so parse lengths inline.
+      auto parseOptBytes = [&](ces::Bytes& outB) -> bool {
+        if (off + 2 > mlen) return false;
+        uint16_t bl = ces::Buffer::peek<uint16_t>(mbody + off); off += 2;
+        if (off + bl > mlen) return false;
+        outB.assign(mbody + off, mbody + off + bl); off += bl;
+        return true;
+      };
+      if (!parseOptBytes(req.rangeLo) || !parseOptBytes(req.rangeHi) ||
+          off + 8 > mlen) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.amount = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      if (!parseName(mbody, mlen, off, req.name)) {
+        sendApiReply(inst, corr_id, kApiStatusInternal); return;
+      }
+      req.verb = kFileVerbKvRange;
+      break;
+    }
     default:
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
   }
@@ -1872,6 +1987,56 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
         case kApiMethodFileResize: {
           ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
           ces::Buffer::put<uint64_t>(tail, resp.size);
+          break;
+        }
+        case kApiMethodKvCreate: {
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          break;
+        }
+        case kApiMethodKvPut: {
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          ces::Buffer::put<uint64_t>(tail, resp.size);
+          break;
+        }
+        case kApiMethodKvGet: {
+          tail.push_back(resp.found ? 1 : 0);
+          ces::Buffer::put<uint32_t>(tail,
+            static_cast<uint32_t>(resp.value.size()));
+          tail.insert(tail.end(), resp.value.begin(), resp.value.end());
+          break;
+        }
+        case kApiMethodKvErase: {
+          ces::Buffer::put<uint64_t>(tail, resp.size);
+          break;
+        }
+        case kApiMethodKvDeposit: {
+          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
+          break;
+        }
+        case kApiMethodKvRange: {
+          ces::Buffer::put<uint16_t>(tail,
+            static_cast<uint16_t>(resp.rangeEnd.size()));
+          tail.insert(tail.end(), resp.rangeEnd.begin(), resp.rangeEnd.end());
+          ces::Buffer::put<uint32_t>(tail,
+            static_cast<uint32_t>(resp.keys.size()));
+          for (size_t i = 0; i < resp.keys.size(); ++i) {
+            ces::Buffer::put<uint16_t>(tail,
+              static_cast<uint16_t>(resp.keys[i].size()));
+            tail.insert(tail.end(), resp.keys[i].begin(), resp.keys[i].end());
+            ces::Buffer::put<uint32_t>(tail,
+              static_cast<uint32_t>(resp.values[i].size()));
+            tail.insert(tail.end(), resp.values[i].begin(), resp.values[i].end());
+          }
+          break;
+        }
+        case kApiMethodKvIter: {
+          ces::Buffer::put<uint32_t>(tail,
+            static_cast<uint32_t>(resp.keys.size()));
+          for (const auto& k : resp.keys) {
+            ces::Buffer::put<uint16_t>(tail,
+              static_cast<uint16_t>(k.size()));
+            tail.insert(tail.end(), k.begin(), k.end());
+          }
           break;
         }
         default: break;
