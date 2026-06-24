@@ -531,11 +531,13 @@ int createListenSocket(const std::string& path) {
 pid_t spawnChild(const std::string& binary,
                  const std::string& sockPath,
                  const std::string& dropUser,
-                 uint64_t memMaxBytes) {
+                 uint64_t memMaxBytes,
+                 uint32_t clientPoolSize) {
   // Build argv strings before fork — only async-signal-safe work may run
   // between fork and exec. dropUser is passed positionally ("" when no
   // drop is requested) so memMax lands at a fixed argv slot.
   std::string memMaxStr = std::to_string(memMaxBytes);
+  std::string poolStr = std::to_string(clientPoolSize);
   pid_t pid = ::fork();
   if (pid < 0) return -errno;
   if (pid == 0) {
@@ -546,7 +548,8 @@ pid_t spawnChild(const std::string& binary,
     const char* arg1 = sockPath.c_str();
     const char* arg2 = dropUser.c_str();   // "" = no privilege drop
     const char* arg3 = memMaxStr.c_str();  // RLIMIT_AS ceiling, bytes
-    ::execlp(arg0, arg0, arg1, arg2, arg3, nullptr);
+    const char* arg4 = poolStr.c_str();    // #3 verb-client worker pool size
+    ::execlp(arg0, arg0, arg1, arg2, arg3, arg4, nullptr);
     std::_Exit(127);
   }
   return pid;
@@ -2036,7 +2039,8 @@ void allocateAndSpawnInstance(
   pid_t ospid = spawnChild(cfg.cesComputeChildBinary,
                            inst->socketPath,
                            cfg.cesComputeUser,
-                           cfg.computeProcessMemMax);
+                           cfg.computeProcessMemMax,
+                           cfg.computeClientPoolSize);
   if (ospid <= 0) {
     LOGWARNING << "spawn failed"
                << VAR(ospid) << SVAR(cfg.cesComputeChildBinary);

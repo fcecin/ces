@@ -234,6 +234,11 @@ channel_idle_secs = 60
 # billed, not capped; the sandbox forbids forking.
 # compute_process_mem_max  = 268435456   # 256 MB ceiling per process
 #
+# Worker threads each Lua child uses for outbound ces.file_client /
+# ces.compute_client calls — how many such round-trips can be in flight before
+# more queue. The main-port client pool (ces.ping / ces.remote_*) is fixed at 1.
+# compute_client_pool_size = 4            # clamped 1..64
+#
 # Fees — credits per unit time / per byte. -1 = use default.
 #   fee_compute_cpu_sec     — CPU time, per second (unused in stub phase)
 #   fee_compute_rss_byte_day — RSS, per byte per second (unused in stub phase)
@@ -247,6 +252,13 @@ channel_idle_secs = 60
 # fee_compute_net_byte     = -1
 # fee_compute_slot_sec     = -1
 # fee_bucket_byte_sec      = -1   # ces.bucket_new committed-capacity rent
+#
+# ChannelMeter (CesPlex net metering) rates — what the host charges per bound
+# channel's raw usage. 0 = observe only (the default; no charge).
+# fee_net_byte_sent      = 0
+# fee_net_byte_received  = 0
+# fee_net_channel_sec    = 0
+# fee_net_mem_byte_day   = 0
 #
 # Storage dir for per-instance scratch / IPC sockets.
 # compute_work_dir = ""   # default "<data_dir>/cescompute/"
@@ -361,11 +373,16 @@ int main(int argc, char* argv[]) {
   uint16_t optComputePortBase        = 0;   // 0 = no range (network off)
   uint16_t optComputePortCount       = 0;   // ports in the range
   uint64_t optComputeProcessMemMax   = 268435456; // 256 MB
+  uint32_t optComputeClientPoolSize  = 4;   // #3 verb-client worker pool
   int64_t optFeeComputeCpuSec     = -1;
   int64_t optFeeComputeRssByteSec = -1;
   int64_t optFeeComputeNetByte    = -1;
   int64_t optFeeComputeSlotSec    = -1;
   int64_t optFeeBucketByteSec     = -1;
+  uint64_t optFeeNetByteSent      = 0;   // net meter (ChannelMeter); 0 = observe
+  uint64_t optFeeNetByteReceived  = 0;
+  uint64_t optFeeNetChannelSec    = 0;
+  uint64_t optFeeNetMemByteDay    = 0;
   std::string optComputeWorkDir;
   std::string optComputeUser = "cesluad";
   // Empty default → auto-discover next to /proc/self/exe at startup
@@ -557,6 +574,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--computeprocessmemmax", optComputeProcessMemMax,
       "Per-process memory ceiling in bytes (child RLIMIT_AS)")
       ->default_val(std::to_string(268435456ULL));
+    app.add_option("--computeclientpoolsize", optComputeClientPoolSize,
+      "Worker threads per Lua child for outbound file_client/compute_client "
+      "calls (concurrent in-flight verb round-trips; clamped 1..64)")
+      ->default_val("4");
     app.add_option("--feecomputecpusec", optFeeComputeCpuSec,
       "Compute fee for CPU time (credits per second, -1 = default)");
     app.add_option("--feecomputerssbyteday", optFeeComputeRssByteSec,
@@ -569,6 +590,14 @@ int main(int argc, char* argv[]) {
     app.add_option("--feebucketbytesec", optFeeBucketByteSec,
       "Bucket cache fee per byte per second of declared capacity "
       "(credits, -1 = derive from feeComputeRssByteDay)");
+    app.add_option("--feenetbytesent", optFeeNetByteSent,
+      "Net meter: credits per byte sent server->client (0 = observe only)");
+    app.add_option("--feenetbytereceived", optFeeNetByteReceived,
+      "Net meter: credits per byte received client->server (0 = observe only)");
+    app.add_option("--feenetchannelsec", optFeeNetChannelSec,
+      "Net meter: credits per channel-second open (0 = observe only)");
+    app.add_option("--feenetmembyteday", optFeeNetMemByteDay,
+      "Net meter: credits per RUDP-buffer byte-day (0 = observe only)");
     app.add_option("--computeworkdir", optComputeWorkDir,
       "Compute per-instance scratch / IPC socket dir "
       "(empty = <datadir>/cescompute/)")->default_val("");
@@ -732,6 +761,8 @@ int main(int argc, char* argv[]) {
                      "--computeportcount");
       applyIfDefault("compute_process_mem_max",  optComputeProcessMemMax,
                      "--computeprocessmemmax");
+      applyIfDefault("compute_client_pool_size", optComputeClientPoolSize,
+                     "--computeclientpoolsize");
       applyIfDefault("fee_compute_cpu_sec",      optFeeComputeCpuSec,
                      "--feecomputecpusec");
       applyIfDefault("fee_compute_rss_byte_day", optFeeComputeRssByteSec,
@@ -742,6 +773,14 @@ int main(int argc, char* argv[]) {
                      "--feecomputeslotsec");
       applyIfDefault("fee_bucket_byte_sec",      optFeeBucketByteSec,
                      "--feebucketbytesec");
+      applyIfDefault("fee_net_byte_sent",        optFeeNetByteSent,
+                     "--feenetbytesent");
+      applyIfDefault("fee_net_byte_received",    optFeeNetByteReceived,
+                     "--feenetbytereceived");
+      applyIfDefault("fee_net_channel_sec",      optFeeNetChannelSec,
+                     "--feenetchannelsec");
+      applyIfDefault("fee_net_mem_byte_day",     optFeeNetMemByteDay,
+                     "--feenetmembyteday");
       applyIfDefault("compute_work_dir",         optComputeWorkDir,
                      "--computeworkdir");
       applyIfDefault("compute_user",             optComputeUser,
@@ -912,6 +951,7 @@ int main(int argc, char* argv[]) {
   config.computePortBase       = optComputePortBase;
   config.computePortCount      = optComputePortCount;
   config.computeProcessMemMax  = optComputeProcessMemMax;
+  config.computeClientPoolSize = optComputeClientPoolSize;
   if (optFeeComputeCpuSec     >= 0)
     config.feeComputeCpuSec     = optFeeComputeCpuSec;
   if (optFeeComputeRssByteSec >= 0)
@@ -922,6 +962,10 @@ int main(int argc, char* argv[]) {
     config.feeComputeSlotSec    = optFeeComputeSlotSec;
   if (optFeeBucketByteSec     >= 0)
     config.feeBucketByteSec     = optFeeBucketByteSec;
+  config.feeNetByteSent       = optFeeNetByteSent;
+  config.feeNetByteReceived   = optFeeNetByteReceived;
+  config.feeNetChannelSec     = optFeeNetChannelSec;
+  config.feeNetMemByteDay     = optFeeNetMemByteDay;
   config.cesComputeWorkDir      = optComputeWorkDir;
   config.cesComputeUser         = optComputeUser;
   config.cesComputeChildBinary  = optComputeChildBinary;

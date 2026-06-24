@@ -228,6 +228,18 @@ User binds `/ces/lua/1`, sends one ATTACH naming a `pid` (a running instance —
 
 **Unified Lua surface — ONE `ces.conn` API for BOTH transports.** A program does not distinguish relay (`/ces/lua/1`) from direct (`/ces/luarpc/1`): bytes are bytes, and any multiplexing it does is data-based, not door-based. **listen** via `ces.conn.set_listener{on_open,on_data,on_close}` — a single call arms the relay accept gate AND lazy-opens this instance's direct endpoint (no-op if it got no rpc port); nil closes both. **dial out** (direct only — the relay is inbound-only, not an egress proxy) via `ces.conn.connect(addr, server_pubkey)` → conn. **run** via `ces.conn.run()` (= `ces.run()`), the one loop that pumps both. A conn is `{id, source, pubkey, write(bytes), close()}`: `conn.id` is a single host-owned uid, **unique across both transports** (safe as a program key — cesluajitd owns it; the two native conn-id counters, the supervisor's `nextConnId` and the endpoint's `g_luarpc_next_id`, stay private as the routing id); `conn.source` is `0` (relay) / `1` (direct) for **origin info only**, never routing or identity. Tested in `tests/test_luarpc.cpp` (program-to-program echo + file/compute clients over it; needs real Lua) and `tests/test_lua_conn.cpp` (relay).
 
+## L2 async — cesluajitd concurrency model
+
+One Lua thread, cooperative coroutine scheduler in the C++ host (`src/cesluajitd/main.cpp`); no preemption, no parallelism. Blocking-looking host calls (`ces.ping`, `ces.transfer`, `account_read`, file/compute client verbs, `ces.conn.connect`, …) **yield** the coroutine when called from one and **block inline** when called from the host thread — same value-return signature either way (`local x = ces.ping(...)`; the next line runs only once `x` is ready). No callbacks, no function coloring.
+
+Coroutine contexts (calls yield; VM keeps serving others): `ces.spawn(fn)`; conn handlers `on_open`/`on_data`/`on_close` (one live coroutine per conn, later frames queue while it is parked); `ces.every(ms, fn)` ticks (dispatched per fire as a coroutine, skip-if-busy — a tick still parked when the next is due is skipped, not queued). Host-thread contexts (calls block inline, cannot yield): the program main chunk and `ces.extension_admin` callbacks.
+
+`ces.sleep(ms)` (coroutine only) parks for `ms`; `ces.sleep(0)` is the voluntary yield — returns to the run loop, services pending inbound, then resumes.
+
+`ces.chan()` — CSP message channel (`ces.spawn` + `ces.chan`). `ch:send(v)` enqueues any Lua value, never blocks, returns `false` on a closed channel; `ch:recv([timeout_ms])` returns the next value or `nil,"timeout"` / `nil,"closed"` (default `10000`ms); `ch:close()` wakes parked recv-ers and drops later sends. Carries whole values, not bytes (hence `send`/`recv`, not the conn byte API's `read`/`write`). Native: `Channel` + `g_chan_waiters` + `drain_chan_timeouts`; queued values held as registry refs, freed at close/`__gc`. Tests: `ChanTests` / `AsyncTests` / `AsyncConnTests` in `tests/test_async.cpp`.
+
+Invariant: every wait has an external backstop — a network `timeout_ms`, the host reply, or process death. No primitive waits on a program-internal event that may never arrive; `recv`'s default timeout keeps channels inside that rule.
+
 ## Payment accounts
 
 Created via `CES_CREATE_PAYMENT`. Cost = `(2 + days) * feeAccount`. New account: `balance = -amount`, `nonce = 1 + days` (expiry countdown). Daily maintenance decrements nonce; deleted at nonce ≤ 1. `settlePayment`: incoming transfer must match exact `|balance|`; on match, balance set to amount, nonce cleared.

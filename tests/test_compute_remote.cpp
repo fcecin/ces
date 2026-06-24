@@ -104,12 +104,12 @@ struct ComputeRemoteFixture {
     cfgA.cesFileStoreMaxBytes = 16ull * 1024 * 1024;
     cfgA.feeFileRent = 1;
     cfgA.computeMaxInstances = 4;
-    // Static client-port range so the program's outbound CES client has a
-    // bound port (range 0 = networking disabled). Base below the OS
-    // ephemeral floor to avoid collisions; tests run sequentially so the
-    // small fixed range is safe.
-    cfgA.computePortBase = 28000;
+    // The program's outbound CES client needs a bound port range (range 0 =
+    // networking disabled). Probe for a verified-free range below the OS
+    // ephemeral floor -- a fixed range in the ephemeral band collides under
+    // load and silently disables the instance's networking.
     cfgA.computePortCount = 8;
+    cfgA.computePortBase = findFreeUdpPortRange(cfgA.computePortCount);
     cfgA.feeComputeSlotSec = 1;
     cfgA.cesComputeChildBinary = luajitBin;
     cfgA.cesComputeUser = "";

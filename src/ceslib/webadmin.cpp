@@ -517,6 +517,7 @@ std::string buildConfig(CesServer& s) {
   kv(o, "computeMaxInstances", c.computeMaxInstances, false);
   kv(o, "computePortBase", c.computePortBase, false);
   kv(o, "computePortCount", c.computePortCount, false);
+  kv(o, "computeClientPoolSize", static_cast<uint64_t>(c.computeClientPoolSize), false);
   kv(o, "feeNetByteSent", c.feeNetByteSent, false);
   kv(o, "feeNetByteReceived", c.feeNetByteReceived, false);
   kv(o, "feeNetChannelSec", c.feeNetChannelSec, false);
@@ -527,6 +528,7 @@ std::string buildConfig(CesServer& s) {
   kv(o, "feeComputeSlotSec", static_cast<uint64_t>(c.feeComputeSlotSec), false);
   kv(o, "feeComputeCpuSec", static_cast<uint64_t>(c.feeComputeCpuSec), false);
   kv(o, "feeComputeRssByteDay", static_cast<uint64_t>(c.feeComputeRssByteDay), false);
+  kv(o, "feeComputeNetByte", static_cast<uint64_t>(c.feeComputeNetByte), false);
   kv(o, "feeBucketByteSec", static_cast<uint64_t>(c.feeBucketByteSec), false);
   o << "},\"feeDiscountEnabled\":" << (c.feeDiscountEnabled ? "true" : "false");
   // Per-FeeKind live discount multipliers (basis points 0..10000).
@@ -1237,7 +1239,7 @@ bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
     g_webStartUnix = minx::getSecsSinceEpoch();
     installLogSink();
     logSinkInstalled_ = true;
-    LOGINFO << "web dashboard listening (NO AUTH — loopback + SSH tunnel only)"
+    LOGINFO << "web dashboard listening (NO AUTH)"
             << SVAR(bindAddr) << VAR(port);
     doAccept();
     return true;
@@ -2091,7 +2093,7 @@ async function helloLoad(){const r=await post('/api/hello_load',{});
 const FEES_BASE=[['fee_account','feeAccount','Account rent / day'],['fee_asset','feeAsset','Asset rent / day'],['fee_tx','feeTx','Per signed op'],['fee_query','feeQuery','Per signed query'],['fee_vm_mult','feeVmMult','VM gas multiplier']];
 const FEES_NET=[['fee_net_byte_sent','feeNetByteSent','Per byte sent (S→C)'],['fee_net_byte_received','feeNetByteReceived','Per byte received (C→S)'],['fee_net_channel_sec','feeNetChannelSec','Per channel-second open'],['fee_net_mem_byte_day','feeNetMemByteDay','Per RUDP mem byte-day']];
 const FEES_FILE=[['fee_file_rent','feeFileRent','Rent / byte-day'],['fee_file_write','feeFileWrite','Write / KB'],['fee_file_read','feeFileRead','Read / KB']];
-const FEES_COMPUTE=[['fee_compute_slot','feeComputeSlotSec','Slot / sec'],['fee_compute_cpu','feeComputeCpuSec','CPU / core-sec'],['fee_compute_rss','feeComputeRssByteDay','RSS / byte-day'],['fee_bucket_bytesec','feeBucketByteSec','Bucket / byte-sec']];
+const FEES_COMPUTE=[['fee_compute_slot_sec','feeComputeSlotSec','Slot / sec'],['fee_compute_cpu_sec','feeComputeCpuSec','CPU / core-sec'],['fee_compute_rss_byte_day','feeComputeRssByteDay','RSS / byte-day'],['fee_compute_net_byte','feeComputeNetByte','Net / byte'],['fee_bucket_byte_sec','feeBucketByteSec','Bucket / byte-sec']];
 // Render a fee-editor group; input id = fee_<camel>, config key shown in mono.
 function feeRows(fields){return fields.map(f=>`<div class="row" style="align-items:center;gap:8px;margin-bottom:6px"><label style="width:210px"><div class="mono">${f[0]}</div><div class="muted" style="font-size:11px">${f[2]}</div></label><input type="number" min="0" class="addr" id="fee_${f[1]}" style="flex:1"></div>`).join('');}
 function fillFees(knobs,fields){fields.forEach(f=>{const el=$('#fee_'+f[1]);if(el)el.value=knobs[f[1]];});}
@@ -2150,7 +2152,7 @@ async function loadCompute(){let cp,cfg;try{cp=await api('/api/compute');cfg=awa
     if(cp.enabled){$('#computeCapEdit').innerHTML=capEditorHtml('computeMaxInstances','capCompMax','applyComputeCap');$('#capCompMax').value=cp.maxInstances;}
     else $('#computeCapEdit').innerHTML='<p class="hint"><span class="mono">computeMaxInstances = 0</span> — compute off. The 0 boundary (enable/disable) binds the handler at boot, so crossing it needs a restart.</p>';
     computeReady=true;}
-  $('#computeCap').innerHTML=[['computePortBase',cfg.knobs.computePortBase],['computePortCount',cfg.knobs.computePortCount],['processMemMax',fmtBytes(cp.processMemMax)]].map(r=>`<tr><td class="mono">${r[0]}</td><td class="num">${typeof r[1]==='number'?fmtNum(r[1]):r[1]}</td></tr>`).join('');}
+  $('#computeCap').innerHTML=[['computePortBase',cfg.knobs.computePortBase],['computePortCount',cfg.knobs.computePortCount],['computeClientPoolSize',cfg.knobs.computeClientPoolSize],['processMemMax',fmtBytes(cp.processMemMax)]].map(r=>`<tr><td class="mono">${r[0]}</td><td class="num">${typeof r[1]==='number'?fmtNum(r[1]):r[1]}</td></tr>`).join('');}
 async function applyMinDiff(){const b=$('#cfgMinDiffBtn');b.disabled=true;b.textContent='Applying…';$('#cfgMinDiffState').textContent='';
   try{const v=$('#cfgMinDiff').value||'0';const r=await post('/api/config_set',{key:'min_difficulty',value:v});
     if(!r.ok)throw new Error(r.error||'min_difficulty');

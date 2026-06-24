@@ -717,10 +717,11 @@ struct PortServer {
   fs::path dir;
   std::unique_ptr<CesServer> server;
   uint16_t rpcPort = 0;
+  uint16_t portBase = 0;   // the probed compute_port_base (0 when count==0)
   KeyPair ownerKey;
   std::string src;
 
-  PortServer(uint16_t base, uint16_t count, uint32_t maxInst) {
+  PortServer(uint16_t count, uint32_t maxInst) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("compute_port");
@@ -736,8 +737,8 @@ struct PortServer {
     cfg.cesFileStoreMaxBytes = 16ull * 1024 * 1024;
     cfg.feeFileRent = 1;
     cfg.computeMaxInstances = maxInst;
-    cfg.computePortBase = base;
     cfg.computePortCount = count;
+    cfg.computePortBase = portBase = findFreeUdpPortRange(count);  // 0 when count==0
     cfg.feeComputeSlotSec = 1;
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cescompmockd");
     cfg.cesComputeWorkDir = (dir / "cescompute").string();
@@ -769,7 +770,7 @@ struct PortServer {
 // port — lowest-free first. KILL returns both to the pool; the next launch
 // reuses the freed pair.
 BOOST_AUTO_TEST_CASE(TwoPortsAllocatedAndReused) {
-  PortServer ps(/*base=*/41000, /*count=*/6, /*maxInst=*/8);
+  PortServer ps(/*count=*/6, /*maxInst=*/8);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
@@ -778,16 +779,16 @@ BOOST_AUTO_TEST_CASE(TwoPortsAllocatedAndReused) {
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));
   CES_REQUIRE_OK(cc.launch(ps.src, b, s));
   // Both of a's ports allocated, distinct, lowest-first; b takes the next pair.
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    41001);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), 41002);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),    41003);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    ps.portBase + 1);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), ps.portBase + 2);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),    ps.portBase + 3);
 
-  // Kill a → frees 41000+41001; the next launch reuses the lowest free pair.
+  // Kill a → frees the first pair; the next launch reuses the lowest free pair.
   CES_REQUIRE_OK(cc.kill(a));
   CES_REQUIRE_OK(cc.launch(ps.src, d, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), 41000);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(d)),    41001);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(d)),    ps.portBase + 1);
 
   cc.disconnect();
 }
@@ -796,14 +797,14 @@ BOOST_AUTO_TEST_CASE(TwoPortsAllocatedAndReused) {
 // leases are best-effort and independent, so a partial allocation still
 // launches.
 BOOST_AUTO_TEST_CASE(OnePortAllocated) {
-  PortServer ps(/*base=*/41000, /*count=*/1, /*maxInst=*/4);
+  PortServer ps(/*count=*/1, /*maxInst=*/4);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
 
   uint64_t a = 0, s = 0;
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 41000);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), ps.portBase + 0);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    0);
 
   cc.disconnect();
@@ -813,7 +814,7 @@ BOOST_AUTO_TEST_CASE(OnePortAllocated) {
 // reachable via the server's own rpc port); the child reads 0 as "no
 // network" / "hosts nothing".
 BOOST_AUTO_TEST_CASE(ZeroPortsAllocated) {
-  PortServer ps(/*base=*/0, /*count=*/0, /*maxInst=*/4);
+  PortServer ps(/*count=*/0, /*maxInst=*/4);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
@@ -831,18 +832,18 @@ BOOST_AUTO_TEST_CASE(ZeroPortsAllocated) {
 BOOST_AUTO_TEST_CASE(PortsDrainAcrossInstancesAllLaunch) {
   // 3 ports, 8 slots ⇒ instance 1 takes 2, instance 2 takes 1, instance 3
   // takes 0.
-  PortServer ps(/*base=*/41000, /*count=*/3, /*maxInst=*/8);
+  PortServer ps(/*count=*/3, /*maxInst=*/8);
   CesComputeClient cc;
   cc.setServerPubkey(ps.server->_serverKeyPair().getPublicKeyAsHash());
   CES_REQUIRE_OK(cc.connect("localhost", ps.rpcPort, ps.ownerKey));
 
   uint64_t a = 0, b = 0, cId = 0, s = 0;
-  CES_REQUIRE_OK(cc.launch(ps.src, a, s));    // 41000 + 41001
-  CES_REQUIRE_OK(cc.launch(ps.src, b, s));    // 41002 + 0
-  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));  // 0 + 0
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   41000);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),      41001);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   41002);
+  CES_REQUIRE_OK(cc.launch(ps.src, a, s));    // base+0, base+1
+  CES_REQUIRE_OK(cc.launch(ps.src, b, s));    // base+2, then 0
+  CES_REQUIRE_OK(cc.launch(ps.src, cId, s));  // 0, 0
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),      ps.portBase + 1);
+  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   ps.portBase + 2);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),      0);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 0);
   BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(cId)),    0);

@@ -332,7 +332,7 @@ BOOST_AUTO_TEST_CASE(L2FeeKnobsAndStatsEndpoints) {
                    form({{"key", k}, {"value", v}}));
   };
   BOOST_CHECK(has(setKnob("fee_file_rent", "321").body, "\"ok\":true"));
-  BOOST_CHECK(has(setKnob("fee_compute_slot", "654").body, "\"ok\":true"));
+  BOOST_CHECK(has(setKnob("fee_compute_slot_sec", "654").body, "\"ok\":true"));
   BOOST_CHECK(has(setKnob("fee_net_byte_sent", "9").body, "\"ok\":true"));
   auto cfg = httpReq(port, "GET", "/api/config").body;
   BOOST_CHECK_EQUAL(jnum(cfg, "feeFileRent"), 321);
@@ -474,6 +474,18 @@ BOOST_AUTO_TEST_CASE(ConfigExportWritesFile) {
   BOOST_CHECK(toml.find("peer_target") != std::string::npos);
   BOOST_CHECK(toml.find("server_key") != std::string::npos);
   BOOST_CHECK(toml.find("web_port") != std::string::npos);
+  // The export must dump the WHOLE effective config (no silent rot): one
+  // representative key from every section, all using canonical TOML names.
+  BOOST_CHECK(toml.find("fee_tx") != std::string::npos);              // base fees
+  BOOST_CHECK(toml.find("fee_discount_enabled") != std::string::npos);
+  BOOST_CHECK(toml.find("fee_file_rent") != std::string::npos);       // file fees
+  BOOST_CHECK(toml.find("fee_compute_slot_sec") != std::string::npos);// compute fees
+  BOOST_CHECK(toml.find("fee_compute_net_byte") != std::string::npos);
+  BOOST_CHECK(toml.find("fee_net_byte_sent") != std::string::npos);   // net metering
+  BOOST_CHECK(toml.find("rpc_max_pending") != std::string::npos);     // rpc backpressure
+  BOOST_CHECK(toml.find("compute_client_pool_size") != std::string::npos);
+  BOOST_CHECK(toml.find("ext_funding_per_day") != std::string::npos);
+  BOOST_CHECK(toml.find("[rpc_rudp]") != std::string::npos);          // tables
 }
 
 BOOST_AUTO_TEST_CASE(AddPeerStartsMinerAndProbes) {

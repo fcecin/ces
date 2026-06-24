@@ -58,9 +58,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cassert>
 #include <deque>
 #include <limits>
 #include <map>
+#include <functional>
+#include <set>
+#include <thread>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -100,6 +104,7 @@ extern "C" {
 #include <boost/asio/buffer.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/post.hpp>
+#include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 
 // ---------------------------------------------------------------------------
@@ -283,6 +288,44 @@ std::deque<Frame> g_inbox;       // pending DELIVER frames
 std::deque<Frame> g_reply_q;     // pending API_REPLY frames
 std::deque<Frame> g_conn_q;      // pending CONN_* frames (drained by run())
 
+// Cooperative I/O scheduler state (single-threaded: only the IPC thread that
+// runs run()/the main chunk touches these). A coroutine that calls a host
+// round-trip from inside the event loop parks here instead of spinning in
+// wait_for_reply: the verb sends its TAG_API_CALL, records itself by corr_id,
+// and yields; the run loop resumes it when the matching TAG_API_REPLY lands.
+// Main-chunk / non-coroutine callers cannot yield and keep blocking.
+using IoDecoder = std::function<int(lua_State*, const Frame&)>;
+struct IoWaiter { lua_State* co; IoDecoder decode; };
+std::set<lua_State*>         g_parked;      // coroutines suspended on a host call
+std::map<uint16_t, IoWaiter> g_io_waiters;  // corr_id -> parked coroutine + decoder
+std::deque<Frame>            g_io_ready;     // arrived replies for parked coroutines
+
+// Per-conn handler dispatch. Each inbound conn event (relay CONN_* frame or
+// direct /ces/luarpc/1 event) runs its listener callback (on_open/on_data/
+// on_close) in its OWN coroutine so the callback can make blocking-looking host
+// calls that transparently yield -- identically on both transports, as the
+// unified ces.conn API promises. Ordering within a conn is preserved: at most
+// ONE handler coroutine is live per conn; while it is parked, later events for
+// that conn wait in `pending` and run in arrival order. Different conns
+// interleave freely. The relay and direct id spaces are separate, so each
+// transport keeps its own exec/advance state (isLuarpc tells resume_coro which).
+struct ConnExec { std::deque<Frame> pending; bool busy = false; };
+struct HandlerCo { uint64_t id; bool isClose; bool isLuarpc; };
+std::map<uint64_t, ConnExec>    g_conn_exec;     // relay conn id -> serialized state
+std::map<lua_State*, HandlerCo> g_handler_co;    // handler coroutine -> its conn
+std::deque<uint64_t>            g_conn_advance;   // relay conns with an event ready
+std::map<lua_State*, int>       g_coro_refs;     // coroutine -> registry ref (keeps it alive)
+static void resume_coro(lua_State* mainL, lua_State* co, int nargs);
+static void conn_advance(lua_State* mainL, uint64_t id);
+static void luarpc_advance(lua_State* mainL, uint64_t id);
+static void drain_luarpc_advance(lua_State* mainL);
+static void drain_connect_done(lua_State* mainL);
+static void drain_offload_done(lua_State* mainL);
+void remove_luarpc_conn(lua_State* L, uint64_t id);
+void put_u16(std::vector<uint8_t>& o, uint16_t v);
+int io_call(lua_State* L, uint16_t method,
+            const std::vector<uint8_t>& args, IoDecoder decode);
+
 // Blocking read of exactly n bytes from g_sock_fd. Returns true on
 // success, false on EOF/error.
 bool read_exact(void* out, size_t n) {
@@ -413,7 +456,12 @@ int try_read_frame_nonblocking(Frame& out) {
 // callbacks never silently miss a connection event.
 void route_to_queue(Frame f) {
   if (f.tag == TAG_DELIVER) g_inbox.push_back(std::move(f));
-  else if (f.tag == TAG_API_REPLY) g_reply_q.push_back(std::move(f));
+  else if (f.tag == TAG_API_REPLY) {
+    if (g_io_waiters.find(f.corr_id) != g_io_waiters.end())
+      g_io_ready.push_back(std::move(f));   // a parked coroutine awaits this reply
+    else
+      g_reply_q.push_back(std::move(f));    // a blocking wait_for_reply (or stale)
+  }
   else if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
            f.tag == TAG_CONN_CLOSED) g_conn_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
@@ -484,29 +532,28 @@ int connect_unix_socket(const char* path) {
 bool drop_privileges_if_root(const char* user_name) {
   if (::geteuid() != 0) return true; // already non-root, nothing to do
   if (user_name == nullptr || user_name[0] == '\0') {
-    std::fprintf(stderr, "cesluajitd: running as root with no "
-                         "drop-to-user configured; refusing to run.\n");
+    host_log(4, "running as root with no drop-to-user configured; refusing");
     return false;
   }
   struct passwd* pw = ::getpwnam(user_name);
   if (!pw) {
-    std::fprintf(stderr, "cesluajitd: unknown user '%s'\n", user_name);
+    host_log(4, std::string("unknown drop-to-user '") + user_name + "'");
     return false;
   }
   if (::setgroups(0, nullptr) < 0) {
-    std::perror("cesluajitd: setgroups");
+    host_log(4, std::string("setgroups: ") + std::strerror(errno));
     return false;
   }
   if (::setgid(pw->pw_gid) < 0) {
-    std::perror("cesluajitd: setgid");
+    host_log(4, std::string("setgid: ") + std::strerror(errno));
     return false;
   }
   if (::setuid(pw->pw_uid) < 0) {
-    std::perror("cesluajitd: setuid");
+    host_log(4, std::string("setuid: ") + std::strerror(errno));
     return false;
   }
   if (::geteuid() == 0 || ::getegid() == 0) {
-    std::fprintf(stderr, "cesluajitd: privilege drop didn't stick\n");
+    host_log(4, "privilege drop didn't stick");
     return false;
   }
   return true;
@@ -668,6 +715,14 @@ std::mutex               g_luarpc_mx;
 std::deque<LuaRpcEvent>  g_luarpc_inq;     // endpoint pushes, run() drains
 int                      g_luarpc_wakefd = -1;  // eventfd; nudges run()'s poll
 
+// Per-conn serialized handler dispatch for direct (/ces/luarpc/1) conns -- the
+// direct-transport twin of g_conn_exec/g_conn_advance (see their comment). Kept
+// separate because the direct id space (g_luarpc_next_id) is independent of the
+// relay's.
+struct LuaRpcExec { std::deque<LuaRpcEvent> pending; bool busy = false; };
+std::map<uint64_t, LuaRpcExec> g_luarpc_exec;     // direct conn id -> serialized state
+std::deque<uint64_t>           g_luarpc_advance;  // direct conns with an event ready
+
 // Accept gate: set by ces.conn.set_listener (Lua), read by serve()
 // (endpoint). No listener → close-on-connect.
 std::atomic<bool> g_luarpc_listening{false};
@@ -787,15 +842,23 @@ struct LuaRpcConnectResult {
   std::array<uint8_t, 32> peer{};
 };
 
+// A finished ces.conn.connect awaiting its coroutine's resume. The endpoint
+// thread pushes (under g_luarpc_mx) + nudges g_luarpc_wakefd; the run loop
+// drains, builds the conn on the coroutine, and resumes it. The blocking
+// (main-chunk) connect path keeps its own promise instead.
+struct ConnectDelivery { lua_State* co; LuaRpcConnectResult res; };
+std::deque<ConnectDelivery> g_connect_done;
+
 // Endpoint strand: open an OUTBOUND /ces/luarpc/1 channel to `peer`, drive the
 // client bind (signed by the program key), verify the reply AND that the
 // server pubkey matches `expectPk` (the program knows who it dialed), and on
 // success register the bound stream as a raw conn + start pumping. Reports via
 // `pr`. Mirrors CesPlexClient::doSelect, but on the endpoint's own Rudp.
 void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
-                       std::shared_ptr<std::promise<LuaRpcConnectResult>> pr) {
+                       std::function<void(LuaRpcConnectResult)> done,
+                       int timeoutMs) {
   if (!g_luarpc_rudp || !g_luarpc_signer || !g_luarpc_io) {
-    pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}});
+    done({ces::CES_ERROR_INTERNAL, 0, {}});
     return;
   }
   // Seed Rudp's clock so the fresh channel isn't idle-GC'd on the next tick.
@@ -804,8 +867,23 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
   uint32_t channel = static_cast<uint32_t>(rd());
   auto stream = std::make_shared<minx::RudpStream>(g_luarpc_io->get_executor());
   if (!g_luarpc_rudp->registerChannel(peer, channel, stream)) {
-    pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}});
+    done({ces::CES_ERROR_INTERNAL, 0, {}});
     return;
+  }
+
+  // Bind-handshake timeout, bounded AT THE SOURCE: if no reply within
+  // timeoutMs, close the half-open stream so the pending read fails with ec ->
+  // done(error), the clean "connect failed" path. Cancelled the instant the
+  // bind resolves (so it never closes a now-live conn). Beats waiting on RUDP
+  // idle-GC (~60s), and there is no racing coroutine-side timer to leave an
+  // orphaned conn behind: a timeout fails before the conn is ever registered.
+  auto timer = std::make_shared<boost::asio::steady_timer>(*g_luarpc_io);
+  if (timeoutMs > 0) {
+    timer->expires_after(std::chrono::milliseconds(timeoutMs));
+    timer->async_wait([stream](const boost::system::error_code& tec) {
+      if (tec) return;   // cancelled: the bind already resolved
+      try { stream->close(); } catch (...) {}
+    });
   }
 
   static const std::string kProto = "/ces/luarpc/1";
@@ -822,15 +900,16 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
         std::span<const uint8_t>(pkArr.data(), pkArr.size())));
 
   boost::asio::async_write(*stream, boost::asio::buffer(*bindReq),
-    [stream, bindReq, clientDigest, pr, expectPk, peer, channel]
+    [stream, bindReq, clientDigest, done, expectPk, peer, channel, timer]
     (const boost::system::error_code& ec, std::size_t) {
-      if (ec) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
+      if (ec) { timer->cancel(); done({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
       auto reply = std::make_shared<
         std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
       boost::asio::async_read(*stream, boost::asio::buffer(*reply),
-        [stream, reply, clientDigest, pr, expectPk, peer, channel]
+        [stream, reply, clientDigest, done, expectPk, peer, channel, timer]
         (const boost::system::error_code& ec2, std::size_t) {
-          if (ec2) { pr->set_value({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
+          timer->cancel();   // bind resolved (ok or fail): disarm the timeout
+          if (ec2) { done({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
           ces::ParsedBindReply r = ces::parseBindReply(
             std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
               reply->data(), reply->size()));
@@ -840,7 +919,7 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
               clientDigest->data(), clientDigest->size())) &&
             std::memcmp(r.serverPubkey.data(), expectPk.data(), 32) == 0;
           if (!ok) {
-            pr->set_value({ces::CES_ERROR_PROTO_REJECTED, 0, {}});
+            done({ces::CES_ERROR_PROTO_REJECTED, 0, {}});
             return;
           }
           uint64_t id = g_luarpc_next_id++;
@@ -859,7 +938,7 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
           LuaRpcConnectResult res{ces::CES_OK, id, {}};
           std::memcpy(res.peer.data(), r.serverPubkey.data(), 32);
           luarpc_start_read(id, c);
-          pr->set_value(res);
+          done(res);
         });
     });
 }
@@ -967,8 +1046,7 @@ void luarpc_ensure_endpoint() {
     g_luarpc_rudp = g_luarpc_endpoint->rudp();
     g_luarpc_meter = g_luarpc_endpoint->meter();
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "cesluajitd: rpc endpoint setup failed: %s\n",
-                 e.what());
+    host_log(3, std::string("rpc endpoint setup failed: ") + e.what());
     g_luarpc_endpoint.reset();
     g_luarpc_host.reset();
     g_luarpc_signer.reset();
@@ -1115,7 +1193,7 @@ int lua_ces_client_recv(lua_State* L) {
       return pop_if_available();
     }
     if (f.tag == TAG_API_REPLY) {
-      g_reply_q.push_back(std::move(f));
+      route_to_queue(std::move(f));   // diverts a parked coroutine's reply to g_io_ready
       continue;
     }
     // Anything else: ignore and keep waiting.
@@ -1137,47 +1215,29 @@ int lua_ces_client_send(lua_State* L) {
     lua_pushstring(L, "payload too large (max 1024)");
     return 2;
   }
-  // Marshal API call body:
-  //   [u16 BE method][8B target_pfx][u16 BE len][bytes]
-  std::vector<uint8_t> body;
-  body.reserve(sizeof(uint16_t) + WIRE_PREFIX_LEN + sizeof(uint16_t)
-               + bytes_len);
-  body.push_back(uint8_t((METHOD_CLIENT_SEND >> 8) & 0xFF));
-  body.push_back(uint8_t( METHOD_CLIENT_SEND       & 0xFF));
-  body.insert(body.end(),
-              reinterpret_cast<const uint8_t*>(pfx),
+  // send_api_call prepends the u16 method; args = [8B target_pfx][u16 BE len][bytes].
+  std::vector<uint8_t> args;
+  args.reserve(WIRE_PREFIX_LEN + sizeof(uint16_t) + bytes_len);
+  args.insert(args.end(), reinterpret_cast<const uint8_t*>(pfx),
               reinterpret_cast<const uint8_t*>(pfx) + 8);
-  body.push_back(uint8_t((bytes_len >> 8) & 0xFF));
-  body.push_back(uint8_t( bytes_len       & 0xFF));
-  body.insert(body.end(),
-              reinterpret_cast<const uint8_t*>(bytes),
+  put_u16(args, static_cast<uint16_t>(bytes_len));
+  args.insert(args.end(), reinterpret_cast<const uint8_t*>(bytes),
               reinterpret_cast<const uint8_t*>(bytes) + bytes_len);
 
-  uint16_t corr = g_next_corr_id++;
-  if (!write_frame(TAG_API_CALL, corr, body.data(), body.size())) {
+  // Through io_call so it yields from a coroutine instead of freezing the VM on
+  // the host round-trip (the only request/response verb that still blocked).
+  return io_call(L, METHOD_CLIENT_SEND, args,
+                 [](lua_State* L, const Frame& reply) -> int {
+    uint8_t status = reply.body[0];
+    if (status == STATUS_OK) { lua_pushboolean(L, 1); return 1; }
     lua_pushnil(L);
-    lua_pushstring(L, "ipc write failed");
+    switch (status) {
+      case STATUS_NOT_CONNECTED:    lua_pushstring(L, "not_connected"); break;
+      case STATUS_INSUFFICIENT_BAL: lua_pushstring(L, "insufficient_balance"); break;
+      default:                      lua_pushstring(L, "internal"); break;
+    }
     return 2;
-  }
-
-  Frame reply;
-  if (!wait_for_reply(corr, reply) || reply.body.empty()) {
-    lua_pushnil(L);
-    lua_pushstring(L, "no reply from host");
-    return 2;
-  }
-  uint8_t status = reply.body[0];
-  if (status == STATUS_OK) {
-    lua_pushboolean(L, 1);
-    return 1;
-  }
-  lua_pushnil(L);
-  switch (status) {
-    case STATUS_NOT_CONNECTED:    lua_pushstring(L, "not_connected"); break;
-    case STATUS_INSUFFICIENT_BAL: lua_pushstring(L, "insufficient_balance"); break;
-    default:                      lua_pushstring(L, "internal"); break;
-  }
-  return 2;
+  });
 }
 
 // ces.prog_prefix() → string(8) — convenience so scripts can log
@@ -1265,20 +1325,17 @@ uint64_t get_u64(const uint8_t* p) {
   return v;
 }
 
-// Send an API call and get the reply. On success, `reply.body` is
-// [u8 status][tail...]. Returns false on socket / framing error.
-bool api_call(uint16_t method,
-              const std::vector<uint8_t>& args, Frame& reply) {
+// Build + send a TAG_API_CALL; returns its corr_id, or 0 on write failure.
+// corr_id 0 is reserved for one-way frames, so the counter skips it on wrap.
+uint16_t send_api_call(uint16_t method, const std::vector<uint8_t>& args) {
   std::vector<uint8_t> body;
   body.reserve(sizeof(uint16_t) + args.size());
   put_u16(body, method);
   body.insert(body.end(), args.begin(), args.end());
-  uint16_t corr = g_next_corr_id++;
-  if (!write_frame(TAG_API_CALL, corr, body.data(), body.size()))
-    return false;
-  if (!wait_for_reply(corr, reply)) return false;
-  if (reply.body.empty()) return false;
-  return true;
+  uint16_t corr;
+  do { corr = g_next_corr_id++; } while (corr == 0);
+  if (!write_frame(TAG_API_CALL, corr, body.data(), body.size())) return 0;
+  return corr;
 }
 
 // On API error, pushes (nil, err_code). On IPC failure, (nil,
@@ -1292,6 +1349,36 @@ int push_ipc_fail(lua_State* L) {
   lua_pushnil(L);
   lua_pushstring(L, "ipc_failure");
   return 2;
+}
+
+// True if the current call can suspend. Only a coroutine yields; the main
+// thread (the main chunk, and any handler dispatched on it) cannot. Same guard
+// ces.sleep uses.
+bool io_yieldable(lua_State* L) {
+  int isMain = lua_pushthread(L);
+  lua_pop(L, 1);
+  return isMain == 0;
+}
+
+// The host round-trip shared by every ces.* verb below. From a coroutine it
+// parks (no thread blocked) and resumes when the reply lands; from the main
+// thread it blocks in wait_for_reply -- the correct degenerate case, since
+// nothing else is running there. `decode` turns the reply body into the call's
+// Lua return values and runs either here (blocking path) or in the run loop at
+// resume (yield path), never spanning the yield. A reply with an empty body is
+// an IPC failure, handled here so decoders only ever see a real body.
+int io_call(lua_State* L, uint16_t method,
+            const std::vector<uint8_t>& args, IoDecoder decode) {
+  uint16_t corr = send_api_call(method, args);
+  if (corr == 0) return push_ipc_fail(L);
+  if (io_yieldable(L)) {
+    g_io_waiters[corr] = IoWaiter{L, std::move(decode)};
+    g_parked.insert(L);
+    return lua_yield(L, 0);
+  }
+  Frame reply;
+  if (!wait_for_reply(corr, reply) || reply.body.empty()) return push_ipc_fail(L);
+  return decode(L, reply);
 }
 
 // ces.transfer(target_pubkey:string(32), amount:number)
@@ -1324,8 +1411,7 @@ int lua_ces_transfer(lua_State* L) {
   put_bytes(args, pk, 32);
   put_u64(args, amount);
 
-  Frame reply;
-  if (!api_call(METHOD_TRANSFER, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_TRANSFER, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) {
     lua_pushnil(L);
@@ -1339,6 +1425,7 @@ int lua_ces_transfer(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
   return 2;
+  });
 }
 
 // Minx config for a single outbound round-trip from this compute instance.
@@ -1357,7 +1444,144 @@ minx::MinxConfig luaClientConfig() {
   return c;
 }
 
-// ces.remote_account_read(addr:string, account_pubkey:string(32))
+// ---------------------------------------------------------------------------
+// Blocking-call offload pools. The network verbs below wrap synchronous C++
+// (CesClient / CesPlexChannel), which would freeze the event loop if run on the
+// Lua thread from a coroutine. Instead a worker thread runs the blocking call,
+// the coroutine parks, and the run loop resumes it when the worker reports back
+// — the same park/yield/resume contract the IPC path uses, just woken by a
+// worker instead of a reply frame. Two pools (see the verb sites):
+//   g_pool_main   — 1 worker, the main-port CesClient (reused + re-pointed,
+//                   sharing the single leased outbound port).
+//   g_pool_client — N workers, the endpoint verb-clients (independent channels).
+// A saturated pool does NOT block the loop: the coroutine just stays parked
+// until a worker frees. Main-chunk callers (cannot yield) still block inline.
+// ---------------------------------------------------------------------------
+
+// A worker runs the job and returns a "deliver" closure that, on the run-loop
+// thread, pushes the call's Lua results and returns the count.
+using OffloadDeliver = std::function<int(lua_State*)>;
+using OffloadJob     = std::function<OffloadDeliver()>;
+
+struct OffloadDone { lua_State* co; OffloadDeliver deliver; };
+std::deque<OffloadDone> g_offload_done;   // workers push, run() drains
+std::mutex              g_offload_mx;
+
+// Worker → run loop: queue the result and nudge run()'s poll (the eventfd is
+// the endpoint's, reused here purely as a wakeup).
+void offload_complete(lua_State* co, OffloadDeliver deliver) {
+  {
+    std::lock_guard<std::mutex> lk(g_offload_mx);
+    g_offload_done.push_back(OffloadDone{co, std::move(deliver)});
+  }
+  if (g_luarpc_wakefd >= 0) {
+    uint64_t one = 1;
+    ssize_t w = ::write(g_luarpc_wakefd, &one, sizeof(one));
+    (void)w;
+  }
+}
+
+struct WorkerPool {
+  std::vector<std::thread> threads;
+  std::deque<std::pair<lua_State*, OffloadJob>> q;
+  std::mutex mx;
+  std::condition_variable cv;
+  bool stop = false;
+
+  void ensure(int n) {
+    if (!threads.empty()) return;   // lazy: started on first use
+    for (int i = 0; i < n; i++) threads.emplace_back([this]() { run(); });
+  }
+  void run() {
+    for (;;) {
+      std::pair<lua_State*, OffloadJob> item;
+      {
+        std::unique_lock<std::mutex> lk(mx);
+        cv.wait(lk, [this]() { return stop || !q.empty(); });
+        if (stop && q.empty()) return;
+        item = std::move(q.front());
+        q.pop_front();
+      }
+      OffloadDeliver deliver;
+      // A thrown job surfaces its reason to the program via the deliver (which
+      // runs on the Lua thread) -- never host_log from here: a worker must not
+      // write the IPC socket (it would race the main thread's frames).
+      try {
+        deliver = item.second();
+      } catch (const std::exception& e) {
+        std::string msg = e.what();
+        deliver = [msg](lua_State* L) {
+          lua_pushnil(L); lua_pushstring(L, msg.c_str()); return 2;
+        };
+      } catch (...) {
+        deliver = [](lua_State* L) {
+          lua_pushnil(L); lua_pushstring(L, "internal"); return 2;
+        };
+      }
+      offload_complete(item.first, std::move(deliver));
+    }
+  }
+  void submit(lua_State* co, OffloadJob job) {
+    {
+      std::lock_guard<std::mutex> lk(mx);
+      q.push_back({co, std::move(job)});
+    }
+    cv.notify_one();
+  }
+  void shutdown() {
+    { std::lock_guard<std::mutex> lk(mx); stop = true; }
+    cv.notify_all();
+    for (auto& t : threads) if (t.joinable()) t.join();
+    threads.clear();
+  }
+};
+
+WorkerPool g_pool_main;             // #4: main-port CesClient
+WorkerPool g_pool_client;           // #3: endpoint verb-clients
+// #3 worker count: operator knob (compute_client_pool_size), passed in via
+// argv on spawn. Read once at startup; clamped to a sane range. The single
+// pool-main worker (#4) is fixed at 1 (port-constrained), not configurable.
+int g_client_pool_size = 4;
+
+// The reused, re-pointable main-port client — one per g_pool_main worker (the
+// pool has exactly one). Created lazily, bound once to the instance's leased
+// outbound port. Re-points to `ep` and resets tries/retry on EVERY call: the
+// client persists across jobs, so its config must not leak between verbs (e.g.
+// a prior ces.ping's tries=1 must not weaken a later transfer). Null if the
+// port bind fails. Touched ONLY on the pool-main worker thread.
+ces::CesClient* poolMainClient(const boost::asio::ip::udp::endpoint& ep,
+                               int tries, int retryMs) {
+  // g_pool_main is one worker by design: the reused client is held thread_local
+  // and binds the single g_program_port (bindable once), so a second worker
+  // would only get a client whose start() fails on the taken port. Assert one
+  // caller thread so a future ensure(>1) on this pool trips loudly in debug.
+  static std::atomic<std::thread::id> owner{std::thread::id{}};
+  std::thread::id self = std::this_thread::get_id(), none{};
+  owner.compare_exchange_strong(none, self);
+  assert(owner.load() == self && "poolMainClient: g_pool_main must be 1 worker");
+  static thread_local std::unique_ptr<ces::CesClient> c;
+  if (!c) {
+    boost::asio::ip::udp::endpoint seed(
+      boost::asio::ip::address_v6::loopback(), 0);
+    c = std::make_unique<ces::CesClient>(seed, /*useDataset=*/false,
+                                         luaClientConfig());
+    if (!c->start(g_program_port)) { c.reset(); return nullptr; }
+  }
+  c->setRemoteEndpoint(ep);
+  c->setTries(tries);
+  c->setRetryIntervalMs(retryMs);
+  return c.get();
+}
+
+// Optional timeout_ms at Lua arg `argn` → the reused client's per-try reply
+// wait (default 3000, CesClient's own default). For single-try verbs (queries)
+// this is the whole wait; transfers apply it per retry.
+int optRetryMs(lua_State* L, int argn) {
+  int t = static_cast<int>(luaL_optinteger(L, argn, 0));
+  return t > 0 ? t : 3000;
+}
+
+// ces.remote_account_read(addr:string, account_pubkey:string(32) [, timeout_ms])
 //   → balance, nonce, last_xfer_dest(8B), last_xfer_amount, last_xfer_time
 //     | nil, err
 //
@@ -1390,6 +1614,37 @@ int lua_ces_remote_account_read(lua_State* L) {
   ces::Hash pubkey{};
   std::memcpy(pubkey.data(), pk, 32);
   ces::HashPrefix mapKey = ces::Account::getMapKey(pubkey);
+  int retryMs = optRetryMs(L, 3);   // optional timeout_ms (arg 3)
+
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_main.ensure(1);
+    g_pool_main.submit(co, [ep, mapKey, retryMs]() -> OffloadDeliver {
+      ces::CesClient* c = poolMainClient(ep, 1, retryMs);
+      auto fail = [](lua_State* L) {
+        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
+      };
+      if (!c) return fail;
+      if (!c->connect()) return fail;
+      int64_t bal = 0; uint32_t nonce = 0; ces::HashPrefix ld{};
+      uint64_t la = 0; uint32_t lt = 0;
+      uint8_t rc = c->queryAccount(mapKey, bal, nonce, ld, la, lt);
+      if (rc != ces::CES_OK)
+        return [rc](lua_State* L) {
+          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
+        };
+      return [bal, nonce, ld, la, lt](lua_State* L) -> int {
+        lua_pushnumber(L, static_cast<lua_Number>(bal));
+        lua_pushnumber(L, static_cast<lua_Number>(nonce));
+        lua_pushlstring(L, reinterpret_cast<const char*>(ld.data()), ld.size());
+        lua_pushnumber(L, static_cast<lua_Number>(la));
+        lua_pushnumber(L, static_cast<lua_Number>(lt));
+        return 5;
+      };
+    });
+    return lua_yield(L, 0);
+  }
 
   int64_t balance = 0;
   uint32_t nonce = 0;
@@ -1399,6 +1654,8 @@ int lua_ces_remote_account_read(lua_State* L) {
   uint8_t rc;
   try {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
+    client.setTries(1);
+    client.setRetryIntervalMs(retryMs);
     if (!client.start(g_program_port) || !client.connect()) {
       lua_pushnil(L);
       lua_pushinteger(L, STATUS_INTERNAL);
@@ -1455,6 +1712,46 @@ int lua_ces_ping(lua_State* L) {
     lua_pushstring(L, "address resolve failed");
     return 2;
   }
+  // Builds the {pubkey, rpc_port, min_difficulty} result table.
+  auto deliverInfo = [](minx::Hash key, uint16_t rpc, uint8_t md) {
+    return [key, rpc, md](lua_State* L) -> int {
+      lua_newtable(L);
+      lua_pushlstring(L, reinterpret_cast<const char*>(key.data()), 32);
+      lua_setfield(L, -2, "pubkey");
+      lua_pushnumber(L, static_cast<lua_Number>(rpc));
+      lua_setfield(L, -2, "rpc_port");
+      lua_pushnumber(L, static_cast<lua_Number>(md));
+      lua_setfield(L, -2, "min_difficulty");
+      return 1;
+    };
+  };
+  auto deliverErr = [](const char* msg) {
+    std::string m(msg);
+    return [m](lua_State* L) -> int {
+      lua_pushnil(L);
+      lua_pushlstring(L, m.data(), m.size());
+      return 2;
+    };
+  };
+
+  // From a coroutine: offload the round-trip to the single main-port worker
+  // (reused re-pointable client) and yield. Otherwise block inline.
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_main.ensure(1);
+    int retryMs = timeoutMs > 0 ? timeoutMs : 3000;
+    g_pool_main.submit(co, [ep, retryMs, deliverInfo, deliverErr]()
+                              -> OffloadDeliver {
+      ces::CesClient* c = poolMainClient(ep, 1, retryMs);
+      if (!c) return deliverErr("networking disabled");
+      if (!c->connect()) return deliverErr("unreachable");
+      return deliverInfo(c->getServerKey(), c->getServerRpcPort(),
+                         c->getMinDifficulty());
+    });
+    return lua_yield(L, 0);
+  }
+
   minx::Hash serverKey;
   uint16_t rpcPort = 0;
   uint8_t minDiff = 0;
@@ -1478,17 +1775,10 @@ int lua_ces_ping(lua_State* L) {
     lua_pushstring(L, "ping failed");
     return 2;
   }
-  lua_newtable(L);
-  lua_pushlstring(L, reinterpret_cast<const char*>(serverKey.data()), 32);
-  lua_setfield(L, -2, "pubkey");
-  lua_pushnumber(L, static_cast<lua_Number>(rpcPort));
-  lua_setfield(L, -2, "rpc_port");
-  lua_pushnumber(L, static_cast<lua_Number>(minDiff));
-  lua_setfield(L, -2, "min_difficulty");
-  return 1;
+  return deliverInfo(serverKey, rpcPort, minDiff)(L);
 }
 
-// ces.peer_info(addr, index) -> {count, found, pubkey(32)|nil, address|nil}
+// ces.peer_info(addr, index [, timeout_ms]) -> {count, found, pubkey(32)|nil, address|nil}
 //   | nil, err. One slot of a remote server's public peer table (unsigned,
 //   unpaid CES_QUERY_PEER_INFO): the total count and the peer at index.
 int lua_ces_peer_info(lua_State* L) {
@@ -1514,6 +1804,47 @@ int lua_ces_peer_info(lua_State* L) {
     lua_pushstring(L, "address resolve failed");
     return 2;
   }
+
+  int retryMs = optRetryMs(L, 3);   // optional timeout_ms (arg 3)
+
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_main.ensure(1);
+    g_pool_main.submit(co, [ep, index, retryMs]() -> OffloadDeliver {
+      ces::CesClient* c = poolMainClient(ep, 1, retryMs);
+      auto err = [](const char* m) {
+        std::string s(m);
+        return [s](lua_State* L) {
+          lua_pushnil(L); lua_pushlstring(L, s.data(), s.size()); return 2;
+        };
+      };
+      if (!c) return err("networking disabled");
+      if (!c->connect()) return err("unreachable");
+      uint16_t count = 0; bool found = false; ces::Hash pk{}; std::string paddr;
+      uint8_t rc = c->queryPeerInfo(index, count, found, pk, paddr);
+      if (rc != ces::CES_OK)
+        return [rc](lua_State* L) {
+          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
+        };
+      return [count, found, pk, paddr](lua_State* L) -> int {
+        lua_newtable(L);
+        lua_pushnumber(L, static_cast<lua_Number>(count));
+        lua_setfield(L, -2, "count");
+        lua_pushboolean(L, found ? 1 : 0);
+        lua_setfield(L, -2, "found");
+        if (found) {
+          lua_pushlstring(L, reinterpret_cast<const char*>(pk.data()), 32);
+          lua_setfield(L, -2, "pubkey");
+          lua_pushlstring(L, paddr.data(), paddr.size());
+          lua_setfield(L, -2, "address");
+        }
+        return 1;
+      };
+    });
+    return lua_yield(L, 0);
+  }
+
   uint16_t count = 0;
   bool found = false;
   ces::Hash pubkey{};
@@ -1522,6 +1853,7 @@ int lua_ces_peer_info(lua_State* L) {
   try {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setTries(1);  // fast-fail: a slow crawler must not block on a dead host
+    client.setRetryIntervalMs(retryMs);
     if (!client.start(g_program_port) || !client.connect()) {
       lua_pushnil(L);
       lua_pushstring(L, "unreachable");
@@ -1555,7 +1887,7 @@ int lua_ces_peer_info(lua_State* L) {
   return 1;
 }
 
-// ces.remote_transfer(addr:string, dest_pubkey:string(32), amount:number)
+// ces.remote_transfer(addr:string, dest_pubkey:string(32), amount:number [, timeout_ms])
 //   → true, new_origin_balance | nil, err
 //
 // Resolves `addr` and signs a transfer from the program's own account on
@@ -1598,12 +1930,41 @@ int lua_ces_remote_transfer(lua_State* L) {
   ces::KeyPair kp(priv, ces::KeyAlgo::ED25519);
   ces::Hash dest{};
   std::memcpy(dest.data(), pk, 32);
+  int retryMs = optRetryMs(L, 4);   // optional timeout_ms (arg 4)
+
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_main.ensure(1);
+    g_pool_main.submit(co, [ep, kp, dest, amount, retryMs]() -> OffloadDeliver {
+      ces::CesClient* c = poolMainClient(ep, 3, retryMs);
+      auto fail = [](lua_State* L) {
+        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
+      };
+      if (!c) return fail;
+      c->setKey(kp);
+      if (!c->connect()) return fail;
+      int64_t newBal = 0;
+      uint8_t rc = c->openTransfer(dest, amount, newBal);
+      if (rc != ces::CES_OK)
+        return [rc](lua_State* L) {
+          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
+        };
+      return [newBal](lua_State* L) -> int {
+        lua_pushboolean(L, 1);
+        lua_pushnumber(L, static_cast<lua_Number>(newBal));
+        return 2;
+      };
+    });
+    return lua_yield(L, 0);
+  }
 
   int64_t newBal = 0;
   uint8_t rc;
   try {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setKey(kp);
+    client.setRetryIntervalMs(retryMs);
     if (!client.start(g_program_port) || !client.connect()) {
       lua_pushnil(L);
       lua_pushinteger(L, STATUS_INTERNAL);
@@ -1629,7 +1990,7 @@ int lua_ces_remote_transfer(lua_State* L) {
 }
 
 // ces.remote_cross_transfer(addr:string, dest_pubkey:string(32),
-//                           amount:number, dest_server:string)
+//                           amount:number, dest_server:string [, timeout_ms])
 //   → true, new_origin_balance | nil, err
 //
 // Asks the remote server at `addr` to cross-transfer the program's funds
@@ -1673,12 +2034,43 @@ int lua_ces_remote_cross_transfer(lua_State* L) {
   ces::KeyPair kp(priv, ces::KeyAlgo::ED25519);
   ces::Hash dest{};
   std::memcpy(dest.data(), pk, 32);
+  std::string dsrvStr(dsrv, dsrv_len);
+  int retryMs = optRetryMs(L, 5);   // optional timeout_ms (arg 5)
+
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_main.ensure(1);
+    g_pool_main.submit(co, [ep, kp, dest, amount, dsrvStr, retryMs]()
+                              -> OffloadDeliver {
+      ces::CesClient* c = poolMainClient(ep, 3, retryMs);
+      auto fail = [](lua_State* L) {
+        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
+      };
+      if (!c) return fail;
+      c->setKey(kp);
+      if (!c->connect()) return fail;
+      int64_t newBal = 0;
+      uint8_t rc = c->crossTransfer(dest, amount, dsrvStr, newBal);
+      if (rc != ces::CES_OK)
+        return [rc](lua_State* L) {
+          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
+        };
+      return [newBal](lua_State* L) -> int {
+        lua_pushboolean(L, 1);
+        lua_pushnumber(L, static_cast<lua_Number>(newBal));
+        return 2;
+      };
+    });
+    return lua_yield(L, 0);
+  }
 
   int64_t newBal = 0;
   uint8_t rc;
   try {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setKey(kp);
+    client.setRetryIntervalMs(retryMs);
     if (!client.start(g_program_port) || !client.connect()) {
       lua_pushnil(L);
       lua_pushinteger(L, STATUS_INTERNAL);
@@ -1740,8 +2132,7 @@ int lua_ces_cross_transfer(lua_State* L) {
   args.push_back(static_cast<uint8_t>(dsrv_len));
   put_bytes(args, dsrv, dsrv_len);
 
-  Frame reply;
-  if (!api_call(METHOD_CROSS_TRANSFER, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_CROSS_TRANSFER, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) {
     lua_pushnil(L);
@@ -1754,6 +2145,7 @@ int lua_ces_cross_transfer(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
   return 2;
+  });
 }
 
 // ces.request_funds(addr:string, amount:number) → granted:number | nil, err
@@ -1786,8 +2178,7 @@ int lua_ces_request_funds(lua_State* L) {
   args.push_back(static_cast<uint8_t>(addr_len));
   put_bytes(args, addr, addr_len);
 
-  Frame reply;
-  if (!api_call(METHOD_REQUEST_FUNDS, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_REQUEST_FUNDS, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) {
     lua_pushnil(L);
@@ -1799,6 +2190,7 @@ int lua_ces_request_funds(lua_State* L) {
   uint64_t granted = get_u64(reply.body.data() + 1);
   lua_pushnumber(L, static_cast<lua_Number>(granted));
   return 1;
+  });
 }
 
 // ces.authentic_asset_create(asset_id, recipient_pubkey, payload, days)
@@ -1853,10 +2245,8 @@ int lua_ces_authentic_asset_create(lua_State* L) {
   if (pl_len > 0)
     put_bytes(args, pl, pl_len);
 
-  Frame reply;
-  if (!api_call(METHOD_AUTHENTIC_ASSET_CREATE, args, reply))
-    return push_ipc_fail(L);
-  if (reply.body.empty()) return push_file_err(L, STATUS_INTERNAL);
+  return io_call(L, METHOD_AUTHENTIC_ASSET_CREATE, args,
+    [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) {
     lua_pushnil(L);
@@ -1865,6 +2255,7 @@ int lua_ces_authentic_asset_create(lua_State* L) {
   }
   lua_pushboolean(L, 1);
   return 1;
+  });
 }
 
 // ces.random_bytes(n:integer) → string(n) | nil, err
@@ -1881,8 +2272,8 @@ int lua_ces_random_bytes(lua_State* L) {
   }
   std::vector<uint8_t> args;
   put_u16(args, static_cast<uint16_t>(n));
-  Frame reply;
-  if (!api_call(METHOD_RANDOM_BYTES, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_RANDOM_BYTES, args,
+    [n](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < sizeof(uint8_t) + size_t(n))
@@ -1891,6 +2282,7 @@ int lua_ces_random_bytes(lua_State* L) {
     reinterpret_cast<const char*>(reply.body.data() + 1),
     static_cast<size_t>(n));
   return 1;
+  });
 }
 
 // ces.account_read(pubkey:string(32))
@@ -1911,8 +2303,7 @@ int lua_ces_account_read(lua_State* L) {
   }
   std::vector<uint8_t> args;
   put_bytes(args, pk, 32);
-  Frame reply;
-  if (!api_call(METHOD_ACCOUNT_READ, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_ACCOUNT_READ, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   // Tail: [i64 BE balance][u32 BE nonce][8B last_xfer_dest]
@@ -1947,6 +2338,7 @@ int lua_ces_account_read(lua_State* L) {
   lua_pushnumber(L, static_cast<lua_Number>(lastTime));
   lua_setfield(L, -2, "last_xfer_time");
   return 1;
+  });
 }
 
 // ces.peers() → array of {pubkey(32), address, reachable, verified,
@@ -1956,8 +2348,7 @@ int lua_ces_account_read(lua_State* L) {
 //   then dials their instances over /ces/luarpc/1.
 int lua_ces_peers(lua_State* L) {
   std::vector<uint8_t> args;  // no arguments
-  Frame reply;
-  if (!api_call(METHOD_PEERS, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_PEERS, args, [](lua_State* L, const Frame& reply) -> int {
   if (reply.body.empty() || reply.body[0] != STATUS_OK)
     return push_file_err(L, reply.body.empty() ? STATUS_INTERNAL : reply.body[0]);
   const uint8_t* p = reply.body.data() + 1;
@@ -1987,6 +2378,7 @@ int lua_ces_peers(lua_State* L) {
     lua_rawseti(L, -2, i + 1);
   }
   return 1;
+  });
 }
 
 // Peering control (privileged: registered only for /s/ programs, and the
@@ -2010,12 +2402,12 @@ int lua_ces_add_peer(lua_State* L) {
   std::vector<uint8_t> args;
   put_bytes(args, pk, 32);
   put_bytes(args, addr, addr_len);
-  Frame reply;
-  if (!api_call(METHOD_PEER_ADD, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_PEER_ADD, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
   if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
   lua_pushboolean(L, 1);
   return 1;
+  });
 }
 
 // ces.remove_peer(pubkey(32)) -> removed(bool) | nil,err.
@@ -2027,12 +2419,12 @@ int lua_ces_remove_peer(lua_State* L) {
   }
   std::vector<uint8_t> args;
   put_bytes(args, pk, 32);
-  Frame reply;
-  if (!api_call(METHOD_PEER_REMOVE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_PEER_REMOVE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
   if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
   lua_pushboolean(L, reply.body.size() >= 2 && reply.body[1] != 0);
   return 1;
+  });
 }
 
 // ces.set_peer_target(units) -> true | nil,err. The reserve the peer miner
@@ -2046,20 +2438,19 @@ int lua_ces_set_peer_target(lua_State* L) {
   }
   std::vector<uint8_t> args;
   put_u64(args, static_cast<uint64_t>(n));
-  Frame reply;
-  if (!api_call(METHOD_PEER_TARGET_SET, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_PEER_TARGET_SET, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
   if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
   lua_pushboolean(L, 1);
   return 1;
+  });
 }
 
 // ces.peer_target() -> units(number) | nil,err. Raw internal units (see
 // ces.set_peer_target; PRICE_UNIT = 100000000 units per full credit).
 int lua_ces_peer_target(lua_State* L) {
   std::vector<uint8_t> args;  // no arguments
-  Frame reply;
-  if (!api_call(METHOD_PEER_TARGET_GET, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_PEER_TARGET_GET, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
   if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
   if (reply.body.size() < 1 + sizeof(uint64_t))
@@ -2067,6 +2458,7 @@ int lua_ces_peer_target(lua_State* L) {
   uint64_t target = get_u64(reply.body.data() + 1);
   lua_pushnumber(L, static_cast<lua_Number>(target));
   return 1;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2116,13 +2508,13 @@ int lua_ces_bucket_put(lua_State* L) {
   put_bytes(args, k, klen);
   put_u32(args, static_cast<uint32_t>(vlen));
   put_bytes(args, v, vlen);
-  Frame reply;
-  if (!api_call(METHOD_BUCKET_PUT, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_BUCKET_PUT, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st == STATUS_BUCKET_FULL) { lua_pushboolean(L, 0); return 1; }
   if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
+  });
 }
 
 int lua_ces_bucket_get(lua_State* L) {
@@ -2139,8 +2531,7 @@ int lua_ces_bucket_get(lua_State* L) {
   put_u32(args, id);
   put_u16(args, static_cast<uint16_t>(klen));
   put_bytes(args, k, klen);
-  Frame reply;
-  if (!api_call(METHOD_BUCKET_GET, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_BUCKET_GET, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   // Tail: [u8 found_flag][u32 BE vlen][v]
@@ -2159,6 +2550,7 @@ int lua_ces_bucket_get(lua_State* L) {
   lua_pushlstring(L,
     reinterpret_cast<const char*>(reply.body.data() + 6), vlen);
   return 1;
+  });
 }
 
 // ces.bucket_new(ttl_secs, max_entries, max_entry_bytes)
@@ -2195,8 +2587,7 @@ int lua_ces_bucket_new(lua_State* L) {
   put_u32(args, static_cast<uint32_t>(ttl));
   put_u32(args, static_cast<uint32_t>(maxE));
   put_u32(args, static_cast<uint32_t>(maxB));
-  Frame reply;
-  if (!api_call(METHOD_BUCKET_NEW, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_BUCKET_NEW, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < sizeof(uint8_t) + sizeof(uint32_t))
@@ -2211,6 +2602,7 @@ int lua_ces_bucket_new(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_bucket_get>);
   lua_setfield(L, -2, "get");
   return 1;
+  });
 }
 
 // ces.file_stat(name) → table | nil, err_code
@@ -2219,8 +2611,7 @@ int lua_ces_file_stat(lua_State* L) {
   const char* name = luaL_checklstring(L, 1, &nlen);
   std::vector<uint8_t> args;
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_STAT, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_STAT, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   // Tail: [32B owner][u64 fb][u64 ppk][u64 size]
@@ -2244,6 +2635,7 @@ int lua_ces_file_stat(lua_State* L) {
   lua_pushnumber(L, double(crUs)); lua_setfield(L, -2, "created_us");
   lua_pushnumber(L, double(mdUs)); lua_setfield(L, -2, "modified_us");
   return 1;
+  });
 }
 
 // ces.file_read(name, offset, length) → data | nil, err_code
@@ -2259,8 +2651,7 @@ int lua_ces_file_read(lua_State* L) {
   put_u64(args, uint64_t(off_n));
   put_u32(args, uint32_t(len_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_READ, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_READ, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   constexpr size_t kHdr = sizeof(uint8_t) + sizeof(uint32_t);  // status + len
@@ -2271,6 +2662,7 @@ int lua_ces_file_read(lua_State* L) {
   lua_pushlstring(L, reinterpret_cast<const char*>(reply.body.data() + kHdr),
                   dlen);
   return 1;
+  });
 }
 
 // ces.file_write(name, offset, data) → true, file_balance | nil, err_code
@@ -2287,8 +2679,7 @@ int lua_ces_file_write(lua_State* L) {
   put_name(args, name, nlen);
   put_u32(args, uint32_t(dlen));
   put_bytes(args, data, dlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_WRITE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_WRITE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2296,6 +2687,7 @@ int lua_ces_file_write(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(fb));
   return 2;
+  });
 }
 
 // ces.file_append(name, data) → true, file_balance, new_size | nil, err_code
@@ -2310,8 +2702,7 @@ int lua_ces_file_append(lua_State* L) {
   put_name(args, name, nlen);
   put_u32(args, uint32_t(dlen));
   put_bytes(args, data, dlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_APPEND, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_APPEND, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 17) return push_file_err(L, STATUS_INTERNAL);
@@ -2321,6 +2712,7 @@ int lua_ces_file_append(lua_State* L) {
   lua_pushnumber(L, double(fb));
   lua_pushnumber(L, double(ns));
   return 3;
+  });
 }
 
 // ces.file_create(name, size, price_per_kb, initial_deposit)
@@ -2339,8 +2731,7 @@ int lua_ces_file_create(lua_State* L) {
   put_u64(args, uint64_t(ppk_n));
   put_u64(args, uint64_t(dep_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_CREATE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_CREATE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2348,6 +2739,7 @@ int lua_ces_file_create(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(fb));
   return 2;
+  });
 }
 
 // ces.file_deposit(name, amount) → true, file_balance | nil, err_code
@@ -2359,8 +2751,7 @@ int lua_ces_file_deposit(lua_State* L) {
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(amt_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_DEPOSIT, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_DEPOSIT, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2368,6 +2759,7 @@ int lua_ces_file_deposit(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(fb));
   return 2;
+  });
 }
 
 // ces.file_withdraw(name, amount) → true, file_balance | nil, err_code
@@ -2379,8 +2771,7 @@ int lua_ces_file_withdraw(lua_State* L) {
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(amt_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_WITHDRAW, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_WITHDRAW, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2388,6 +2779,7 @@ int lua_ces_file_withdraw(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(fb));
   return 2;
+  });
 }
 
 // ces.file_set_price(name, price_per_kb) → true, new_price | nil, err_code
@@ -2399,8 +2791,7 @@ int lua_ces_file_set_price(lua_State* L) {
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(ppk_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_SET_PRICE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_SET_PRICE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2408,6 +2799,7 @@ int lua_ces_file_set_price(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(p));
   return 2;
+  });
 }
 
 // ces.file_delete(name) → true, refunded | nil, err_code
@@ -2416,8 +2808,7 @@ int lua_ces_file_delete(lua_State* L) {
   const char* name = luaL_checklstring(L, 1, &nlen);
   std::vector<uint8_t> args;
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_DELETE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_DELETE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
@@ -2425,6 +2816,7 @@ int lua_ces_file_delete(lua_State* L) {
   lua_pushboolean(L, 1);
   lua_pushnumber(L, double(r));
   return 2;
+  });
 }
 
 // ces.file_resize(name, new_size) → true, file_balance, new_size | nil, err_code
@@ -2436,8 +2828,7 @@ int lua_ces_file_resize(lua_State* L) {
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(sz_n));
   put_name(args, name, nlen);
-  Frame reply;
-  if (!api_call(METHOD_FILE_RESIZE, args, reply)) return push_ipc_fail(L);
+  return io_call(L, METHOD_FILE_RESIZE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 17) return push_file_err(L, STATUS_INTERNAL);
@@ -2447,6 +2838,7 @@ int lua_ces_file_resize(lua_State* L) {
   lua_pushnumber(L, double(fb));
   lua_pushnumber(L, double(ns));
   return 3;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -2678,105 +3070,132 @@ void make_and_register_conn(lua_State* L, uint64_t conn_id,
   // Stack-top: the conn table.
 }
 
-// Dispatch one inbound CONN_* frame to the listener handler.
-// `f` is consumed by-value to allow std::move into Lua strings.
-// Returns false to signal the run() loop to exit (e.g. socket dead).
-bool dispatch_conn_frame(lua_State* L, Frame f) {
-  if (f.tag == TAG_CONN_OPENED) {
-    if (f.body.size() < sizeof(uint64_t) + WIRE_KEY_LEN) return true;
-    uint64_t id = get_u64(f.body.data());
-    const uint8_t* pk = f.body.data() + sizeof(uint64_t);
-
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); return true; }
-    // Always register the conn so subsequent on_data lookups find it.
-    // on_open is optional — call it only if defined.
-    make_and_register_conn(L, id, pk);
-    lua_getfield(L, -2, "on_open");
-    if (lua_isfunction(L, -1)) {
-      lua_pushvalue(L, -2); // copy of conn
-      // Stack: [listener, conn, on_open, conn_copy]
-      if (lua_pcall(L, 1, 0, 0) != 0) {
-        host_log(3, std::string("conn on_open callback: ") + lua_err_str(L));
-        lua_pop(L, 1);
-      }
-    } else {
-      lua_pop(L, 1); // non-function on_open
-    }
-    lua_pop(L, 2); // conn + listener_table
-    return true;
+// Drop a relay conn from the live-conns registry (after on_close completes, or
+// when a CLOSED frame has no handler to run).
+void remove_conn(lua_State* L, uint64_t id) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegConnsTable);
+  if (lua_istable(L, -1)) {
+    lua_pushnumber(L, static_cast<lua_Number>(id));
+    lua_pushnil(L);
+    lua_rawset(L, -3);
   }
+  lua_pop(L, 1);
+}
+
+// Prepare coroutine `co` to run the listener callback for frame `f`: pushes
+// [callback, conn, (data)] onto co and returns the arg count (1 or 2), or -1 if
+// there is nothing to run (no listener, no callback, or the conn is gone). For
+// OPEN the conn is created+registered here (even when on_open is absent, so the
+// callback still finds it); for CLOSE the conn is marked closed before the
+// callback. Stack-neutral on mainL.
+int setup_handler_co(lua_State* mainL, lua_State* co, const Frame& f) {
+  if (f.body.size() < sizeof(uint64_t)) return -1;
+  uint64_t id = get_u64(f.body.data());
+  constexpr size_t dataHdr = sizeof(uint64_t) + sizeof(uint32_t);
+
+  // Per-tag frame validation up front.
+  if (f.tag == TAG_CONN_OPENED &&
+      f.body.size() < sizeof(uint64_t) + WIRE_KEY_LEN) return -1;
   if (f.tag == TAG_CONN_DATA_IN) {
-    constexpr size_t hdr = sizeof(uint64_t) + sizeof(uint32_t);
-    if (f.body.size() < hdr) return true;
-    uint64_t id = get_u64(f.body.data());
+    if (f.body.size() < dataHdr) return -1;
     uint32_t dlen = get_u32(f.body.data() + sizeof(uint64_t));
-    if (f.body.size() < hdr + dlen) return true;
-    const uint8_t* data = f.body.data() + hdr;
-
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); return true; }
-    lua_getfield(L, -1, "on_data");
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return true; }
-    push_conn_table(L, id);
-    if (lua_isnil(L, -1)) {
-      // Conn already gone (race with close); drop.
-      lua_pop(L, 3);
-      return true;
-    }
-    lua_pushlstring(L, reinterpret_cast<const char*>(data), dlen);
-    if (lua_pcall(L, 2, 0, 0) != 0) {
-      host_log(3, std::string("conn on_data callback: ") + lua_err_str(L));
-      lua_pop(L, 1);
-    }
-    lua_pop(L, 1); // listener table
-    return true;
+    if (f.body.size() < dataHdr + dlen) return -1;
   }
+  if (f.tag == TAG_CONN_CLOSED &&
+      f.body.size() < sizeof(uint64_t) + sizeof(uint8_t)) return -1;
+
+  lua_getfield(mainL, LUA_REGISTRYINDEX, kRegListenerTable);
+  if (!lua_istable(mainL, -1)) { lua_pop(mainL, 1); return -1; }
+
+  const char* cbname = (f.tag == TAG_CONN_OPENED)  ? "on_open"
+                     : (f.tag == TAG_CONN_DATA_IN) ? "on_data"
+                                                   : "on_close";
+
+  if (f.tag == TAG_CONN_OPENED) {
+    const uint8_t* pk = f.body.data() + sizeof(uint64_t);
+    make_and_register_conn(mainL, id, pk);    // mainL: [listener, conn]
+    lua_getfield(mainL, -2, cbname);           // [listener, conn, cb]
+    if (!lua_isfunction(mainL, -1)) { lua_pop(mainL, 3); return -1; }
+    lua_xmove(mainL, co, 1);                   // cb   -> co ; mainL: [listener, conn]
+    lua_xmove(mainL, co, 1);                   // conn -> co ; mainL: [listener]
+    lua_pop(mainL, 1);
+    return 1;
+  }
+
+  // DATA_IN / CLOSED: the conn must already exist.
+  lua_getfield(mainL, -1, cbname);             // [listener, cb]
+  bool hasCb = lua_isfunction(mainL, -1);
+  push_conn_table(mainL, id);                  // [listener, cb, conn] (conn or nil)
+  if (lua_isnil(mainL, -1)) { lua_pop(mainL, 3); return -1; }
   if (f.tag == TAG_CONN_CLOSED) {
-    if (f.body.size() < sizeof(uint64_t) + sizeof(uint8_t)) return true;
-    uint64_t id = get_u64(f.body.data());
-    // Reason byte at body[8] is informational; we don't surface it
-    // to v1 callbacks (the program just sees on_close fire).
-
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); return true; }
-    lua_getfield(L, -1, "on_close");
-    bool hasCb = lua_isfunction(L, -1);
-    if (!hasCb) lua_pop(L, 1);
-    push_conn_table(L, id);
-    if (lua_isnil(L, -1)) {
-      lua_pop(L, hasCb ? 3 : 2);
-      return true;
-    }
-    // Mark conn as closed BEFORE the callback so on_close can't call
-    // conn:write / conn:close.
-    lua_pushboolean(L, 1);
-    lua_setfield(L, -2, "closed");
-    if (hasCb) {
-      // Stack: [listener, on_close, conn]. pcall(1,0,0) wants the
-      // function at -2 and the arg at -1, so this is exactly the
-      // shape we need — call it directly. pcall pops both the
-      // function and the arg, leaving [listener] on top.
-      if (lua_pcall(L, 1, 0, 0) != 0) {
-        host_log(3, std::string("conn on_close callback: ") + lua_err_str(L));
-        lua_pop(L, 1);
-      }
-    } else {
-      lua_pop(L, 1); // pop conn (on_close was already popped above)
-    }
-    // Remove from live-conns.
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegConnsTable);
-    if (lua_istable(L, -1)) {
-      lua_pushnumber(L, static_cast<lua_Number>(id));
-      lua_pushnil(L);
-      lua_rawset(L, -3);
-    }
-    lua_pop(L, 1); // pop conns_table
-    lua_pop(L, 1); // pop listener
-    return true;
+    lua_pushboolean(mainL, 1);
+    lua_setfield(mainL, -2, "closed");         // close before callback: no write/close
   }
-  // Other tags get drained-but-routed elsewhere by the run loop.
+  if (!hasCb) { lua_pop(mainL, 3); return -1; }
+  lua_pushvalue(mainL, -2);                    // [listener, cb, conn, cb]
+  lua_xmove(mainL, co, 1);                     // cb   -> co ; mainL: [listener, cb, conn]
+  lua_xmove(mainL, co, 1);                     // conn -> co ; mainL: [listener, cb]
+  lua_pop(mainL, 2);
+  if (f.tag == TAG_CONN_DATA_IN) {
+    uint32_t dlen = get_u32(f.body.data() + sizeof(uint64_t));
+    lua_pushlstring(co, reinterpret_cast<const char*>(f.body.data() + dataHdr),
+                    dlen);
+    return 2;
+  }
+  return 1;
+}
+
+// Start the next pending frame for conn `id` as a fresh handler coroutine, if
+// one is not already live. A frame with nothing to run (no callback / conn
+// gone) is skipped; a CLOSED frame so skipped still tears the conn down. Called
+// when a frame arrives and when a handler finishes (re-queued via g_conn_advance
+// so the resume chain stays flat, never recursive).
+static void conn_advance(lua_State* mainL, uint64_t id) {
+  auto it = g_conn_exec.find(id);
+  if (it == g_conn_exec.end()) return;
+  ConnExec& ce = it->second;
+  if (ce.busy || ce.pending.empty()) return;
+  Frame f = std::move(ce.pending.front());
+  ce.pending.pop_front();
+  bool isClose = (f.tag == TAG_CONN_CLOSED);
+
+  lua_State* co = lua_newthread(mainL);
+  int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);
+  int nargs = setup_handler_co(mainL, co, f);
+  if (nargs < 0) {
+    luaL_unref(mainL, LUA_REGISTRYINDEX, ref);  // nothing to run; drop the thread
+    if (isClose) { remove_conn(mainL, id); g_conn_exec.erase(id); return; }
+    g_conn_advance.push_back(id);                // try the next pending frame
+    return;
+  }
+  g_coro_refs[co] = ref;
+  ce.busy = true;
+  g_handler_co[co] = HandlerCo{id, isClose, false};
+  resume_coro(mainL, co, nargs);
+}
+
+// Route one inbound CONN_* frame into its conn's serialized queue and request a
+// dispatch. The handler runs (as a coroutine) in conn_advance, drained by the
+// run loop. Always returns true; framing/socket errors are handled by the
+// caller's read path.
+bool dispatch_conn_frame(lua_State* L, Frame f) {
+  if (f.body.size() < sizeof(uint64_t)) return true;
+  uint64_t id = get_u64(f.body.data());
+  g_conn_exec[id].pending.push_back(std::move(f));
+  g_conn_advance.push_back(id);
+  (void)L;
   return true;
+}
+
+// Drain conns with a ready frame. Flat: a handler that finishes synchronously
+// re-queues its conn via resume_coro, so this while-loop (not C recursion)
+// walks a burst. Runs only from the run loop.
+static void drain_conn_advance(lua_State* mainL) {
+  while (!g_conn_advance.empty()) {
+    uint64_t id = g_conn_advance.front();
+    g_conn_advance.pop_front();
+    conn_advance(mainL, id);
+  }
 }
 
 // Forward decl — the unified loop below dispatches luarpc bridge events whose
@@ -2795,6 +3214,8 @@ struct LuaTimer {
   int ref;              // registry ref to the Lua cb (ces.every), or LUA_NOREF
   lua_State* resume_co; // coroutine to resume (ces.sleep), or nullptr
   bool active;
+  lua_State* busy_co = nullptr;  // periodic tick coroutine in flight, or nullptr.
+                                 // Skip-if-busy: never lap a still-parked tick.
 };
 std::vector<LuaTimer> g_timers;
 
@@ -2805,8 +3226,27 @@ std::vector<LuaTimer> g_timers;
 // ONLY from the run loop, and a primitive yields from leaf Lua, so there is no
 // cross-C-boundary yield (LuaJIT's one constraint stays satisfied).
 struct ReadyCoro { lua_State* co; int nargs; };
-std::deque<ReadyCoro>     g_ready;      // coroutines to resume now
-std::map<lua_State*, int> g_coro_refs;  // coro -> registry ref (keeps it alive)
+std::deque<ReadyCoro>     g_ready;      // coroutines to resume now (g_coro_refs above)
+
+// ces.chan — CSP message channel. Carries whole Lua VALUES (held as registry
+// refs while queued), not bytes: send a table, recv that table. recv parks the
+// caller with a timeout backstop (default 10s) so a channel can never introduce
+// an unbounded wait -- the property the rest of the async surface guarantees.
+// send never blocks (unbounded) and drops on a closed channel. Cleanup: queued
+// values are unref'd at close or __gc; a parked recv-er can't pin a channel past
+// its timeout, so abandoned channels GC cleanly.
+struct Channel {
+  std::deque<int>        queue;     // registry refs of sent values (FIFO)
+  std::deque<lua_State*> recvers;   // coroutines parked in recv (FIFO)
+  bool                   closed = false;
+};
+struct ChanWaiter { Channel* ch; uint64_t deadline_us; };
+std::map<lua_State*, ChanWaiter> g_chan_waiters;  // co parked on recv -> chan+deadline
+
+static void chan_remove_recver(Channel* ch, lua_State* co) {
+  for (auto it = ch->recvers.begin(); it != ch->recvers.end(); ++it)
+    if (*it == co) { ch->recvers.erase(it); return; }
+}
 
 static uint64_t timer_now_us() {
   return static_cast<uint64_t>(
@@ -2820,6 +3260,10 @@ static int next_timer_timeout_ms() {
   bool any = false;
   for (auto& t : g_timers) {
     if (t.active) { any = true; if (t.next_us < next) next = t.next_us; }
+  }
+  for (auto& kv : g_chan_waiters) {   // a parked recv must wake on its timeout
+    any = true;
+    if (kv.second.deadline_us < next) next = kv.second.deadline_us;
   }
   if (!any) return -1;
   uint64_t now = timer_now_us();
@@ -2843,16 +3287,27 @@ static void fire_due_timers(lua_State* L) {
       continue;
     }
     int ref = g_timers[i].ref;
-    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-    if (lua_isfunction(L, -1)) {
-      if (lua_pcall(L, 0, 0, 0) != 0) {
-        host_log(3, std::string("timer callback: ") + lua_err_str(L));
+    // Periodic ces.every: run the callback in its OWN coroutine (like a conn
+    // handler) so a blocking-looking call inside it parks instead of freezing
+    // the VM -- while a tick waits on the network, inbound conns still get
+    // serviced. Skip the fire if the previous tick is still parked (busy_co):
+    // queueing periodic fires would build an unbounded backlog; a poke wants
+    // "fire if free, else skip".
+    if (!g_timers[i].busy_co) {
+      lua_rawgeti(L, LUA_REGISTRYINDEX, ref);             // L: [cb]
+      if (lua_isfunction(L, -1)) {
+        lua_State* co = lua_newthread(L);                  // L: [cb, co]
+        g_coro_refs[co] = luaL_ref(L, LUA_REGISTRYINDEX);  // pop+ref co; L: [cb]
+        lua_xmove(L, co, 1);                                // cb -> co; co: [cb]
+        g_timers[i].busy_co = co;
+        resume_coro(L, co, 0);                               // cb() runs; finishes or parks
+      } else {
         lua_pop(L, 1);
       }
-    } else {
-      lua_pop(L, 1);
     }
-    // Re-index (vector may have grown); a callback may have cancelled this one.
+    // Re-index (vector may have grown; resume_coro re-entered Lua); advance the
+    // grid whether the tick fired or was skipped, so a long tick never
+    // busy-spins. A callback may have cancelled this timer.
     if (i < g_timers.size() && g_timers[i].ref == ref && g_timers[i].active) {
       g_timers[i].next_us += g_timers[i].interval_us;
       if (g_timers[i].next_us <= now)
@@ -2866,6 +3321,29 @@ static void fire_due_timers(lua_State* L) {
     std::remove_if(g_timers.begin(), g_timers.end(),
                    [](const LuaTimer& t) { return !t.active; }),
     g_timers.end());
+}
+
+// Wake recv-ers whose timeout elapsed: deliver (nil, "timeout") to each, unless
+// a send/close already woke it (g_parked guards the double-resume). Snapshot
+// first -- resuming a coroutine may itself recv/send and mutate g_chan_waiters.
+static void drain_chan_timeouts(lua_State* mainL) {
+  if (g_chan_waiters.empty()) return;
+  uint64_t now = timer_now_us();
+  std::vector<lua_State*> due;
+  for (auto& kv : g_chan_waiters)
+    if (kv.second.deadline_us <= now) due.push_back(kv.first);
+  for (lua_State* co : due) {
+    auto it = g_chan_waiters.find(co);
+    if (it == g_chan_waiters.end()) continue;
+    Channel* ch = it->second.ch;
+    g_chan_waiters.erase(it);
+    if (!g_parked.erase(co)) continue;          // already woken by send/close
+    chan_remove_recver(ch, co);
+    lua_checkstack(co, 2);
+    lua_pushnil(co);
+    lua_pushstring(co, "timeout");
+    resume_coro(mainL, co, 2);
+  }
 }
 
 // ces.every(ms, fn) -> id. Calls fn() every ms from the run loop. Returns a
@@ -2924,6 +3402,113 @@ int lua_ces_sleep(lua_State* L) {
   uint64_t iv = static_cast<uint64_t>(ms * 1000.0);
   g_timers.push_back({timer_now_us() + iv, 0, LUA_NOREF, L, true});
   return lua_yield(L, 0);
+}
+
+// ---------------------------------------------------------------------------
+// ces.chan — CSP message channel (Hoare; same model as Go's chan). The struct +
+// scheduler glue (g_chan_waiters, drain_chan_timeouts) live up by the timers.
+//   ch = ces.chan()
+//   ch:send(v)                -- enqueue v (any Lua value); never blocks;
+//                                returns false if the channel is closed (drop)
+//   v = ch:recv([timeout_ms]) -- next value, else nil,"timeout" / nil,"closed".
+//                                default 10000ms; recv from a coroutine; a
+//                                queued value wins immediately (no park)
+//   ch:close()                -- wake parked recv-ers (nil,"closed"); later sends drop
+// ---------------------------------------------------------------------------
+static const char* kChanMT = "ces.chan.mt";
+
+static Channel* check_chan(lua_State* L, int idx) {
+  void* ud = luaL_checkudata(L, idx, kChanMT);
+  Channel* ch = ud ? *static_cast<Channel**>(ud) : nullptr;
+  if (!ch) { luaL_error(L, "invalid channel"); }
+  return ch;
+}
+
+int lua_chan_new(lua_State* L) {
+  Channel** ud = static_cast<Channel**>(lua_newuserdata(L, sizeof(Channel*)));
+  *ud = new Channel();
+  luaL_getmetatable(L, kChanMT);
+  lua_setmetatable(L, -2);
+  return 1;
+}
+
+int lua_chan_send(lua_State* L) {
+  Channel* ch = check_chan(L, 1);
+  if (ch->closed) { lua_pushboolean(L, 0); return 1; }   // dropped
+  // Hand directly to the oldest parked recv-er, if one is still waiting.
+  while (!ch->recvers.empty()) {
+    lua_State* co = ch->recvers.front();
+    ch->recvers.pop_front();
+    if (g_parked.erase(co)) {
+      g_chan_waiters.erase(co);
+      lua_checkstack(co, 1);
+      lua_pushvalue(L, 2);                 // the value
+      lua_xmove(L, co, 1);                 // -> co's stack
+      g_ready.push_back({co, 1});          // resumed in drain_ready with it
+      lua_pushboolean(L, 1);
+      return 1;
+    }
+    // co was already woken (timed out): drop it, try the next recv-er
+  }
+  // No waiter: enqueue. A registry ref keeps the value alive until recv/gc.
+  lua_pushvalue(L, 2);
+  ch->queue.push_back(luaL_ref(L, LUA_REGISTRYINDEX));
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int lua_chan_recv(lua_State* L) {
+  Channel* ch = check_chan(L, 1);
+  int timeoutMs = static_cast<int>(luaL_optinteger(L, 2, 10000));
+  // A queued value wins immediately -- even on a closed channel, drain first.
+  if (!ch->queue.empty()) {
+    int ref = ch->queue.front();
+    ch->queue.pop_front();
+    lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
+    luaL_unref(L, LUA_REGISTRYINDEX, ref);
+    return 1;
+  }
+  if (ch->closed) { lua_pushnil(L); lua_pushstring(L, "closed"); return 2; }
+  // Empty + open: park with a timeout backstop. The main chunk can't yield, and
+  // timeout<=0 is a non-blocking poll -- both return an immediate "timeout".
+  if (!io_yieldable(L) || timeoutMs <= 0) {
+    lua_pushnil(L); lua_pushstring(L, "timeout"); return 2;
+  }
+  g_parked.insert(L);
+  ch->recvers.push_back(L);
+  g_chan_waiters[L] = ChanWaiter{
+    ch, timer_now_us() + static_cast<uint64_t>(timeoutMs) * 1000ULL};
+  return lua_yield(L, 0);
+}
+
+int lua_chan_close(lua_State* L) {
+  Channel* ch = check_chan(L, 1);
+  ch->closed = true;
+  while (!ch->recvers.empty()) {
+    lua_State* co = ch->recvers.front();
+    ch->recvers.pop_front();
+    if (g_parked.erase(co)) {
+      g_chan_waiters.erase(co);
+      lua_checkstack(co, 2);
+      lua_pushnil(co);
+      lua_pushstring(co, "closed");
+      g_ready.push_back({co, 2});
+    }
+  }
+  return 0;
+}
+
+// __gc: release the refs of any never-received values, then free the Channel.
+// No recv-er can be parked here -- a parked recv-er holds the userdata alive.
+int lua_chan_gc(lua_State* L) {
+  void* ud = lua_touserdata(L, 1);
+  if (!ud) return 0;
+  Channel* ch = *static_cast<Channel**>(ud);
+  if (!ch) return 0;
+  for (int ref : ch->queue) luaL_unref(L, LUA_REGISTRYINDEX, ref);
+  delete ch;
+  *static_cast<Channel**>(ud) = nullptr;
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -3174,24 +3759,89 @@ bool dispatch_ext_frame(lua_State* L, Frame f) {
   return true;
 }
 
-// Resume every ready coroutine. A coroutine that yields parks (its waker -- a
-// sleep timer, later an I/O completion -- re-readies it); one that finishes or
-// errors is unreferenced. Spawns made while draining are picked up in the same
-// pass, so a burst of spawns all start before the loop blocks again.
+// Resume one coroutine with `nargs` results already on its stack. A coroutine
+// that yields again parks (its waker re-readies it); one that finishes or errors
+// is unreferenced.
+static void resume_coro(lua_State* mainL, lua_State* co, int nargs) {
+  int r = lua_resume(co, nargs);
+  if (r == LUA_YIELD) return;                  // parked again; nothing to do
+  if (r != 0)
+    host_log(3, std::string("scheduled task: ") + lua_err_str(co));
+  auto it = g_coro_refs.find(co);
+  if (it != g_coro_refs.end()) {
+    luaL_unref(mainL, LUA_REGISTRYINDEX, it->second);
+    g_coro_refs.erase(it);
+  }
+  // If this was a periodic-timer tick, free the timer so its next fire can run
+  // (skip-if-busy lifts here). Matched by coroutine pointer, not the registry
+  // ref, so a cancelled-and-reused ref can't clear the wrong timer.
+  for (auto& t : g_timers) {
+    if (t.busy_co == co) { t.busy_co = nullptr; break; }
+  }
+  // If this was a conn handler coroutine, free the conn so its next queued
+  // frame can run -- or, for on_close, tear the conn down now that it is done.
+  auto h = g_handler_co.find(co);
+  if (h != g_handler_co.end()) {
+    uint64_t id = h->second.id;
+    bool isClose = h->second.isClose, isLuarpc = h->second.isLuarpc;
+    g_handler_co.erase(h);
+    if (isLuarpc) {
+      auto le = g_luarpc_exec.find(id);
+      if (le != g_luarpc_exec.end()) {
+        le->second.busy = false;
+        if (isClose) { remove_luarpc_conn(mainL, id); g_luarpc_exec.erase(id); }
+        else g_luarpc_advance.push_back(id);
+      }
+    } else {
+      auto ce = g_conn_exec.find(id);
+      if (ce != g_conn_exec.end()) {
+        ce->second.busy = false;
+        if (isClose) { remove_conn(mainL, id); g_conn_exec.erase(id); }
+        else g_conn_advance.push_back(id);
+      }
+    }
+  }
+}
+
+// Resume every ready coroutine (spawn starts, sleep wakeups). Spawns made while
+// draining are picked up in the same pass, so a burst of spawns all start before
+// the loop blocks again.
 static void drain_ready(lua_State* mainL) {
   while (!g_ready.empty()) {
     ReadyCoro rc = g_ready.front();
     g_ready.pop_front();
-    int r = lua_resume(rc.co, rc.nargs);
-    if (r == LUA_YIELD) continue;              // parked; nothing to do
-    if (r != 0) {
-      host_log(3, std::string("scheduled task: ") + lua_err_str(rc.co));
+    resume_coro(mainL, rc.co, rc.nargs);
+  }
+}
+
+// Resume coroutines whose host reply has arrived. Runs ONLY from the run loop:
+// a reply read by a nested blocking wait_for_reply just waits in g_io_ready
+// until control returns here, so there is no nested resume. The decoder pushes
+// the call's Lua results onto the coroutine, then we resume it with that many
+// values -- mirroring how a normal verb returns. lua_checkstack guards the push;
+// a true allocation failure there kills this (RLIMIT_AS-bounded) child, which is
+// the intended out-of-memory behavior and cannot harm the host.
+static void drain_io_completions(lua_State* mainL) {
+  while (!g_io_ready.empty()) {
+    Frame f = std::move(g_io_ready.front());
+    g_io_ready.pop_front();
+    auto it = g_io_waiters.find(f.corr_id);
+    if (it == g_io_waiters.end()) continue;
+    lua_State* co = it->second.co;
+    IoDecoder decode = std::move(it->second.decode);
+    g_io_waiters.erase(it);
+    if (!g_parked.erase(co)) continue;         // already resumed by another waker
+    int n;
+    if (f.body.empty()) {
+      lua_checkstack(co, 2);
+      lua_pushnil(co);
+      lua_pushstring(co, "ipc_failure");
+      n = 2;
+    } else {
+      lua_checkstack(co, LUA_MINSTACK);
+      n = decode(co, f);
     }
-    auto it = g_coro_refs.find(rc.co);
-    if (it != g_coro_refs.end()) {
-      luaL_unref(mainL, LUA_REGISTRYINDEX, it->second);
-      g_coro_refs.erase(it);
-    }
+    resume_coro(mainL, co, n);
   }
 }
 
@@ -3205,6 +3855,13 @@ static void drain_ready(lua_State* mainL) {
 int lua_ces_run(lua_State* L) {
   static bool manifest_sent = false;
   if (!manifest_sent) { manifest_sent = true; send_manifest_from_global(L); }
+  // Ensure the wakeup eventfd exists before the loop blocks: worker pools and
+  // ces.conn.connect nudge it on completion to wake the poll. Without it, an
+  // offloaded call from an otherwise-idle program would park forever (the poll
+  // has no other event to wake on). luarpc_ensure_endpoint also creates it, but
+  // a program using only main-port verbs (ces.ping/remote_*) never goes there.
+  if (g_luarpc_wakefd < 0)
+    g_luarpc_wakefd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
   for (;;) {
     // Drain everything already queued. CONN_* frames may have been parked by
     // an API call's wait_for_reply; luarpc events are queued by the endpoint
@@ -3244,9 +3901,16 @@ int lua_ces_run(lua_State* L) {
       write_frame(TAG_NET_USAGE, 0, nb.data(), nb.size());
     }
 
-    // Fire any due periodic timers (ces.every) + sleep wakeups, then run every
-    // ready coroutine (spawn/sleep) before blocking again.
+    // Fire due periodic timers (ces.every) + sleep wakeups, resume coroutines
+    // whose host reply arrived, dispatch ready conn handlers, then run every
+    // ready coroutine before blocking.
     fire_due_timers(L);
+    drain_chan_timeouts(L);
+    drain_io_completions(L);
+    drain_connect_done(L);
+    drain_offload_done(L);
+    drain_conn_advance(L);
+    drain_luarpc_advance(L);
     drain_ready(L);
 
     // Block until the next event on either source, or the next timer deadline.
@@ -3262,7 +3926,9 @@ int lua_ces_run(lua_State* L) {
       pfds[1].revents = 0;
       nfds = 2;
     }
-    int pr = ::poll(pfds, nfds, g_ready.empty() ? next_timer_timeout_ms() : 0);
+    bool workPending = !g_ready.empty() || !g_conn_advance.empty() ||
+                       !g_luarpc_advance.empty();
+    int pr = ::poll(pfds, nfds, workPending ? 0 : next_timer_timeout_ms());
     if (pr < 0) {
       if (errno == EINTR) continue;
       return 0;
@@ -3378,74 +4044,159 @@ void push_luarpc_conn(lua_State* L, uint64_t id) {
   lua_remove(L, -2);  // drop live table, leave conn-or-nil on top
 }
 
-// Dispatch one bridge event to the listener. Mirrors dispatch_conn_frame.
-void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
-  if (e.type == LuaRpcEvent::Type::Opened) {
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
-    make_luarpc_conn(L, e.connId, e.peer.data());
-    lua_getfield(L, -2, "on_open");
-    if (lua_isfunction(L, -1)) {
-      lua_pushvalue(L, -2);  // conn
-      if (lua_pcall(L, 1, 0, 0) != 0) {
-        host_log(3, std::string("luarpc on_open callback: ") + lua_err_str(L));
-        lua_pop(L, 1);
-      }
-    } else {
-      lua_pop(L, 1);  // non-function on_open
-    }
-    lua_pop(L, 2);  // conn + listener
-    return;
-  }
-  if (e.type == LuaRpcEvent::Type::Data) {
-    lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-    if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
-    lua_getfield(L, -1, "on_data");
-    if (!lua_isfunction(L, -1)) { lua_pop(L, 2); return; }
-    push_luarpc_conn(L, e.connId);
-    if (lua_isnil(L, -1)) { lua_pop(L, 3); return; }
-    lua_pushlstring(L, e.bytes.data(), e.bytes.size());
-    if (lua_pcall(L, 2, 0, 0) != 0) {
-      host_log(3, std::string("luarpc on_data callback: ") + lua_err_str(L));
-      lua_pop(L, 1);
-    }
-    lua_pop(L, 1);  // listener
-    return;
-  }
-  // Closed.
-  lua_getfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
-  if (!lua_istable(L, -1)) { lua_pop(L, 1); return; }
-  lua_getfield(L, -1, "on_close");
-  bool hasCb = lua_isfunction(L, -1);
-  if (!hasCb) lua_pop(L, 1);
-  push_luarpc_conn(L, e.connId);
-  if (lua_isnil(L, -1)) { lua_pop(L, hasCb ? 3 : 2); return; }
-  lua_pushboolean(L, 1);
-  lua_setfield(L, -2, "closed");
-  if (hasCb) {
-    if (lua_pcall(L, 1, 0, 0) != 0) {
-      host_log(3, std::string("luarpc on_close callback: ") + lua_err_str(L));
-      lua_pop(L, 1);
-    }
-  } else {
-    lua_pop(L, 1);  // conn
-  }
+// Drop a direct conn from the live-conns registry (after on_close, or when a
+// close event has no handler to run).
+void remove_luarpc_conn(lua_State* L, uint64_t id) {
   lua_getfield(L, LUA_REGISTRYINDEX, kRegLuaRpcConns);
   if (lua_istable(L, -1)) {
-    lua_pushnumber(L, static_cast<lua_Number>(e.connId));
+    lua_pushnumber(L, static_cast<lua_Number>(id));
     lua_pushnil(L);
     lua_rawset(L, -3);
   }
-  lua_pop(L, 1);  // live table
-  lua_pop(L, 1);  // listener
+  lua_pop(L, 1);
 }
 
-// ces.conn.connect(addr, server_pubkey(32)) → conn | nil, err. Dials a remote
-// (or this) lua host's /ces/luarpc/1 out the instance's OWN rpc socket — the
-// only outbound path (the relay is inbound-only: the server brings users in, it
-// is not a generic egress proxy). Blocks on the bind; on success returns a
-// source=1 conn whose inbound data flows to the unified listener's on_data like
-// any other. (Listen + run are unified — see ces.conn.set_listener / ces.run.)
+// Direct-transport twin of setup_handler_co: prepares coroutine `co` to run the
+// listener callback for bridge event `e`. Same contract (pushes [cb, conn,
+// (data)], returns arg count or -1).
+int setup_luarpc_handler_co(lua_State* mainL, lua_State* co,
+                            const LuaRpcEvent& e) {
+  lua_getfield(mainL, LUA_REGISTRYINDEX, kRegListenerTable);
+  if (!lua_istable(mainL, -1)) { lua_pop(mainL, 1); return -1; }
+
+  if (e.type == LuaRpcEvent::Type::Opened) {
+    make_luarpc_conn(mainL, e.connId, e.peer.data());  // [listener, conn]
+    lua_getfield(mainL, -2, "on_open");                 // [listener, conn, cb]
+    if (!lua_isfunction(mainL, -1)) { lua_pop(mainL, 3); return -1; }
+    lua_xmove(mainL, co, 1);                            // cb   -> co
+    lua_xmove(mainL, co, 1);                            // conn -> co
+    lua_pop(mainL, 1);
+    return 1;
+  }
+
+  const char* cbname =
+    (e.type == LuaRpcEvent::Type::Data) ? "on_data" : "on_close";
+  lua_getfield(mainL, -1, cbname);                      // [listener, cb]
+  bool hasCb = lua_isfunction(mainL, -1);
+  push_luarpc_conn(mainL, e.connId);                    // [listener, cb, conn]
+  if (lua_isnil(mainL, -1)) { lua_pop(mainL, 3); return -1; }
+  if (e.type == LuaRpcEvent::Type::Closed) {
+    lua_pushboolean(mainL, 1);
+    lua_setfield(mainL, -2, "closed");
+  }
+  if (!hasCb) { lua_pop(mainL, 3); return -1; }
+  lua_pushvalue(mainL, -2);                             // dup cb
+  lua_xmove(mainL, co, 1);                              // cb   -> co
+  lua_xmove(mainL, co, 1);                              // conn -> co
+  lua_pop(mainL, 2);
+  if (e.type == LuaRpcEvent::Type::Data) {
+    lua_pushlstring(co, e.bytes.data(), e.bytes.size());
+    return 2;
+  }
+  return 1;
+}
+
+// Direct-transport twin of conn_advance.
+static void luarpc_advance(lua_State* mainL, uint64_t id) {
+  auto it = g_luarpc_exec.find(id);
+  if (it == g_luarpc_exec.end()) return;
+  LuaRpcExec& ce = it->second;
+  if (ce.busy || ce.pending.empty()) return;
+  LuaRpcEvent e = std::move(ce.pending.front());
+  ce.pending.pop_front();
+  bool isClose = (e.type == LuaRpcEvent::Type::Closed);
+
+  lua_State* co = lua_newthread(mainL);
+  int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);
+  int nargs = setup_luarpc_handler_co(mainL, co, e);
+  if (nargs < 0) {
+    luaL_unref(mainL, LUA_REGISTRYINDEX, ref);
+    if (isClose) { remove_luarpc_conn(mainL, id); g_luarpc_exec.erase(id); return; }
+    g_luarpc_advance.push_back(id);
+    return;
+  }
+  g_coro_refs[co] = ref;
+  ce.busy = true;
+  g_handler_co[co] = HandlerCo{id, isClose, true};
+  resume_coro(mainL, co, nargs);
+}
+
+// Direct-transport twin of drain_conn_advance.
+static void drain_luarpc_advance(lua_State* mainL) {
+  while (!g_luarpc_advance.empty()) {
+    uint64_t id = g_luarpc_advance.front();
+    g_luarpc_advance.pop_front();
+    luarpc_advance(mainL, id);
+  }
+}
+
+// Resume coroutines whose ces.conn.connect finished (endpoint thread delivered
+// the result). Conn construction touches Lua state, so it happens here on the
+// run-loop thread, not on the endpoint thread.
+static void drain_connect_done(lua_State* mainL) {
+  for (;;) {
+    ConnectDelivery d;
+    {
+      std::lock_guard<std::mutex> lk(g_luarpc_mx);
+      if (g_connect_done.empty()) break;
+      d = std::move(g_connect_done.front());
+      g_connect_done.pop_front();
+    }
+    if (!g_parked.erase(d.co)) continue;   // already resumed (future timeout)
+    int n;
+    if (d.res.status != ces::CES_OK) {
+      lua_checkstack(d.co, 2);
+      lua_pushnil(d.co);
+      lua_pushstring(d.co, d.res.status == ces::CES_ERROR_PROTO_REJECTED
+                             ? "bind rejected or wrong peer"
+                             : "connect failed (network)");
+      n = 2;
+    } else {
+      lua_checkstack(d.co, 2);
+      make_luarpc_conn(d.co, d.res.connId, d.res.peer.data());
+      n = 1;
+    }
+    resume_coro(mainL, d.co, n);
+  }
+}
+
+// Resume coroutines whose offloaded blocking call (a worker-pool job) finished.
+// The worker delivered a "deliver" closure that pushes the Lua results here, on
+// the run-loop thread.
+static void drain_offload_done(lua_State* mainL) {
+  for (;;) {
+    OffloadDone d;
+    {
+      std::lock_guard<std::mutex> lk(g_offload_mx);
+      if (g_offload_done.empty()) break;
+      d = std::move(g_offload_done.front());
+      g_offload_done.pop_front();
+    }
+    if (!g_parked.erase(d.co)) continue;
+    lua_checkstack(d.co, LUA_MINSTACK);
+    int n = d.deliver(d.co);
+    resume_coro(mainL, d.co, n);
+  }
+}
+
+// Route one bridge event into its conn's serialized queue and request dispatch;
+// the handler runs (as a coroutine) in luarpc_advance, drained by the run loop.
+void dispatch_luarpc_event(lua_State* L, LuaRpcEvent e) {
+  uint64_t id = e.connId;
+  g_luarpc_exec[id].pending.push_back(std::move(e));
+  g_luarpc_advance.push_back(id);
+  (void)L;
+}
+
+// ces.conn.connect(addr, server_pubkey(32) [, timeout_ms]) → conn | nil, err.
+// Dials a remote (or this) lua host's /ces/luarpc/1 out the instance's OWN rpc
+// socket — the only outbound path (the relay is inbound-only: the server brings
+// users in, it is not a generic egress proxy). From a coroutine it yields; on
+// success returns a source=1 conn whose inbound data flows to the unified
+// listener's on_data like any other. Optional timeout_ms bounds the bind
+// handshake at the source (default 15000); a dead peer fails in ~timeout_ms
+// rather than waiting on RUDP idle-GC. (Listen + run are unified — see
+// ces.conn.set_listener / ces.run.)
 int lua_ces_conn_connect(lua_State* L) {
   size_t alen = 0;
   const char* addr = luaL_checklstring(L, 1, &alen);
@@ -3456,6 +4207,8 @@ int lua_ces_conn_connect(lua_State* L) {
     lua_pushstring(L, "server pubkey must be 32 bytes");
     return 2;
   }
+  int timeoutMs = static_cast<int>(luaL_optinteger(L, 3, 15000));
+  if (timeoutMs < 0) timeoutMs = 0;   // 0 = no bind timeout (RUDP idle-GC only)
   luarpc_ensure_endpoint();   // lazy-open the port for dialing
   if (!g_luarpc_io || !g_luarpc_rudp || !g_luarpc_signer) {
     lua_pushnil(L);
@@ -3480,10 +4233,36 @@ int lua_ces_conn_connect(lua_State* L) {
   std::array<uint8_t, 32> expectPk{};
   std::memcpy(expectPk.data(), spk, 32);
 
+  // From a coroutine: park and let the endpoint's io thread drive the bind,
+  // then resume on completion via g_connect_done. The loop never freezes; the
+  // bind is bounded at the source by timeoutMs (see luarpc_do_connect).
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    boost::asio::post(*g_luarpc_io, [peer, expectPk, co, timeoutMs]() {
+      luarpc_do_connect(peer, expectPk, [co](LuaRpcConnectResult res) {
+        {
+          std::lock_guard<std::mutex> lk(g_luarpc_mx);
+          g_connect_done.push_back(ConnectDelivery{co, std::move(res)});
+        }
+        if (g_luarpc_wakefd >= 0) {
+          uint64_t one = 1;
+          ssize_t w = ::write(g_luarpc_wakefd, &one, sizeof(one));
+          (void)w;
+        }
+      }, timeoutMs);
+    });
+    return lua_yield(L, 0);
+  }
+
+  // Main chunk (cannot yield): block on the round-trip -- the degenerate case.
   auto pr = std::make_shared<std::promise<LuaRpcConnectResult>>();
   auto fut = pr->get_future();
-  boost::asio::post(*g_luarpc_io,
-    [peer, expectPk, pr]() { luarpc_do_connect(peer, expectPk, pr); });
+  boost::asio::post(*g_luarpc_io, [peer, expectPk, pr, timeoutMs]() {
+    luarpc_do_connect(peer, expectPk,
+      [pr](LuaRpcConnectResult res) { pr->set_value(std::move(res)); },
+      timeoutMs);
+  });
   if (fut.wait_for(std::chrono::seconds(15)) != std::future_status::ready) {
     lua_pushnil(L);
     lua_pushstring(L, "connect timeout");
@@ -3522,13 +4301,23 @@ int lua_ces_rpc_port(lua_State* L) {
 // the channel ON the endpoint strand (its RudpStream is touched there).
 // ---------------------------------------------------------------------------
 
+// inflight: an offloaded verb is running on a worker thread (set/cleared only on
+// the Lua thread). At most one in flight per handle — a second verb on a busy
+// handle errors instead of racing a second worker on the same client. closePending:
+// close() was called while inflight; the close is deferred to completion so the
+// worker's raw client pointer can't be freed under it. Together these stop a
+// program from corrupting the host by sharing a handle across coroutines.
 struct LuaFileClientEntry {
   std::unique_ptr<ces::CesPlexChannel> ch;
   std::unique_ptr<ces::CesFileClient> fc;
+  bool inflight = false;
+  bool closePending = false;
 };
 struct LuaComputeClientEntry {
   std::unique_ptr<ces::CesPlexChannel> ch;
   std::unique_ptr<ces::CesComputeClient> cc;
+  bool inflight = false;
+  bool closePending = false;
 };
 std::map<uint64_t, LuaFileClientEntry>    g_file_clients;     // Lua-thread-only
 std::map<uint64_t, LuaComputeClientEntry> g_compute_clients;  // Lua-thread-only
@@ -3556,10 +4345,13 @@ int client_push_err(lua_State* L, uint8_t rc) {
 
 // Lazy-open the endpoint, resolve addr, build + bind a CesPlexChannel for
 // `proto`, signed by the program key. Null + err on any failure.
+// Resolve + bind a CesPlexChannel for `proto`. The caller MUST have called
+// luarpc_ensure_endpoint() first (on the Lua thread) — this is safe to run on a
+// worker thread (the offload path) precisely because it does not touch the lazy
+// endpoint setup, only the already-built g_luarpc_io/rudp/signer.
 std::unique_ptr<ces::CesPlexChannel> client_open_channel(
     const std::string& addr, const uint8_t* pk, const char* proto,
     std::string& err) {
-  luarpc_ensure_endpoint();
   if (!g_luarpc_io || !g_luarpc_rudp || !g_luarpc_signer) {
     err = "networking disabled: instance has no rpc port";
     return nullptr;
@@ -3637,6 +4429,50 @@ void client_close(Map& reg, uint64_t id) {
   // else: no endpoint → entry destroyed here (harmless; can't really happen).
 }
 
+// Run a verb-client round-trip. The handle is arg 1; its entry + arg parse
+// happen on the Lua thread BEFORE this (the registry is Lua-thread-only), and
+// `job` captures the raw client pointer + by-value args. From a coroutine the
+// blocking call is offloaded to the worker pool and the coroutine yields;
+// otherwise it runs inline (main-chunk degenerate case).
+//
+// The raw pointer the worker holds stays valid because this serializes per
+// handle: at most one offloaded verb in flight per handle (a second verb on a
+// busy handle returns "busy", never a second worker on the same client), and a
+// close() that arrives while a verb is in flight is DEFERRED (closePending) to
+// completion. So a program sharing a handle across coroutines can never free the
+// client under a worker or run two workers on one client. inflight/closePending
+// are touched only on the Lua thread (here + the deliver + close).
+template <typename Map>
+int client_call(lua_State* L, Map& reg, OffloadJob job) {
+  uint64_t id = client_handle_id(L, 1);
+  auto it = reg.find(id);
+  if (it == reg.end()) return client_push_closed(L);
+  if (io_yieldable(L)) {
+    if (it->second.inflight) {
+      lua_pushnil(L);
+      lua_pushstring(L, "busy");
+      return 2;
+    }
+    it->second.inflight = true;
+    g_parked.insert(L);
+    g_pool_client.ensure(g_client_pool_size);
+    g_pool_client.submit(L, [job = std::move(job), &reg, id]() -> OffloadDeliver {
+      OffloadDeliver d = job();                       // worker: the blocking verb
+      return [d = std::move(d), &reg, id](lua_State* L) -> int {
+        auto it = reg.find(id);                        // Lua thread (at resume)
+        if (it != reg.end()) {
+          it->second.inflight = false;
+          if (it->second.closePending) client_close(reg, id);  // deferred close
+        }
+        return d(L);                                   // verb results (no client ref)
+      };
+    });
+    return lua_yield(L, 0);
+  }
+  OffloadDeliver deliver = job();
+  return deliver(L);
+}
+
 // ---- ces.file_client verbs ----
 
 int lua_fc_create(lua_State* L) {
@@ -3646,13 +4482,19 @@ int lua_fc_create(lua_State* L) {
   uint64_t size = client_arg_u64(L, 3);
   uint64_t price = client_arg_u64(L, 4);
   uint64_t deposit = client_arg_u64(L, 5);
-  uint64_t fb = 0, cost = 0;
-  uint8_t rc = e->fc->create(std::string(name, nlen), size, price, deposit,
-                             fb, cost);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(fb));
-  lua_pushnumber(L, static_cast<lua_Number>(cost));
-  return 2;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen), size, price,
+                         deposit]() -> OffloadDeliver {
+    uint64_t fb = 0, cost = 0;
+    uint8_t rc = fc->create(nm, size, price, deposit, fb, cost);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [fb, cost](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(fb));
+      lua_pushnumber(L, static_cast<lua_Number>(cost));
+      return 2;
+    };
+  });
 }
 
 int lua_fc_write(lua_State* L) {
@@ -3666,11 +4508,17 @@ int lua_fc_write(lua_State* L) {
   }
   ces::Bytes content(reinterpret_cast<const uint8_t*>(b),
                      reinterpret_cast<const uint8_t*>(b) + blen);
-  uint64_t fb = 0;
-  uint8_t rc = e->fc->write(std::string(name, nlen), offset, content, fb);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(fb));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen), offset,
+                         content]() -> OffloadDeliver {
+    uint64_t fb = 0;
+    uint8_t rc = fc->write(nm, offset, content, fb);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [fb](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(fb)); return 1;
+    };
+  });
 }
 
 int lua_fc_read(lua_State* L) {
@@ -3683,16 +4531,22 @@ int lua_fc_read(lua_State* L) {
     lua_pushnil(L); lua_pushstring(L, "length must be 1..1048576 bytes"); return 2;
   }
   uint32_t length = static_cast<uint32_t>(length64);
-  ces::Bytes content;
-  minx::Hash rangeHash{};
-  uint8_t rc = e->fc->read(std::string(name, nlen), offset, length, content,
-                           rangeHash);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushlstring(L, reinterpret_cast<const char*>(content.data()),
-                  content.size());
-  lua_pushlstring(L, reinterpret_cast<const char*>(rangeHash.data()),
-                  rangeHash.size());
-  return 2;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen), offset,
+                         length]() -> OffloadDeliver {
+    ces::Bytes content;
+    minx::Hash rangeHash{};
+    uint8_t rc = fc->read(nm, offset, length, content, rangeHash);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [content, rangeHash](lua_State* L) -> int {
+      lua_pushlstring(L, reinterpret_cast<const char*>(content.data()),
+                      content.size());
+      lua_pushlstring(L, reinterpret_cast<const char*>(rangeHash.data()),
+                      rangeHash.size());
+      return 2;
+    };
+  });
 }
 
 int lua_fc_append(lua_State* L) {
@@ -3705,12 +4559,19 @@ int lua_fc_append(lua_State* L) {
   }
   ces::Bytes content(reinterpret_cast<const uint8_t*>(b),
                      reinterpret_cast<const uint8_t*>(b) + blen);
-  uint64_t fb = 0, newSize = 0;
-  uint8_t rc = e->fc->append(std::string(name, nlen), content, fb, newSize);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(fb));
-  lua_pushnumber(L, static_cast<lua_Number>(newSize));
-  return 2;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen),
+                         content]() -> OffloadDeliver {
+    uint64_t fb = 0, newSize = 0;
+    uint8_t rc = fc->append(nm, content, fb, newSize);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [fb, newSize](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(fb));
+      lua_pushnumber(L, static_cast<lua_Number>(newSize));
+      return 2;
+    };
+  });
 }
 
 int lua_fc_resize(lua_State* L) {
@@ -3718,11 +4579,17 @@ int lua_fc_resize(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t newSize = client_arg_u64(L, 3);
-  uint64_t outSize = 0;
-  uint8_t rc = e->fc->resize(std::string(name, nlen), newSize, outSize);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(outSize));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen),
+                         newSize]() -> OffloadDeliver {
+    uint64_t outSize = 0;
+    uint8_t rc = fc->resize(nm, newSize, outSize);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [outSize](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(outSize)); return 1;
+    };
+  });
 }
 
 int lua_fc_deposit(lua_State* L) {
@@ -3730,11 +4597,17 @@ int lua_fc_deposit(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t amount = client_arg_u64(L, 3);
-  uint64_t fb = 0;
-  uint8_t rc = e->fc->deposit(std::string(name, nlen), amount, fb);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(fb));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen),
+                         amount]() -> OffloadDeliver {
+    uint64_t fb = 0;
+    uint8_t rc = fc->deposit(nm, amount, fb);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [fb](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(fb)); return 1;
+    };
+  });
 }
 
 int lua_fc_withdraw(lua_State* L) {
@@ -3742,11 +4615,17 @@ int lua_fc_withdraw(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t amount = client_arg_u64(L, 3);
-  uint64_t fb = 0;
-  uint8_t rc = e->fc->withdraw(std::string(name, nlen), amount, fb);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(fb));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen),
+                         amount]() -> OffloadDeliver {
+    uint64_t fb = 0;
+    uint8_t rc = fc->withdraw(nm, amount, fb);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [fb](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(fb)); return 1;
+    };
+  });
 }
 
 int lua_fc_set_price(lua_State* L) {
@@ -3754,50 +4633,71 @@ int lua_fc_set_price(lua_State* L) {
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
   uint64_t newPrice = client_arg_u64(L, 3);
-  uint64_t outPrice = 0;
-  uint8_t rc = e->fc->setPrice(std::string(name, nlen), newPrice, outPrice);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(outPrice));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen),
+                         newPrice]() -> OffloadDeliver {
+    uint64_t outPrice = 0;
+    uint8_t rc = fc->setPrice(nm, newPrice, outPrice);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [outPrice](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(outPrice)); return 1;
+    };
+  });
 }
 
 int lua_fc_delete(lua_State* L) {
   auto* e = file_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
-  uint64_t refunded = 0;
-  uint8_t rc = e->fc->deleteFile(std::string(name, nlen), refunded);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(refunded));
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen)]() -> OffloadDeliver {
+    uint64_t refunded = 0;
+    uint8_t rc = fc->deleteFile(nm, refunded);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [refunded](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(refunded)); return 1;
+    };
+  });
 }
 
 int lua_fc_stat(lua_State* L) {
   auto* e = file_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
-  ces::CesFileClient::StatInfo info;
-  uint8_t rc = e->fc->stat(std::string(name, nlen), info);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_newtable(L);
-  lua_pushlstring(L, reinterpret_cast<const char*>(info.ownerPubkey.data()),
-                  info.ownerPubkey.size());
-  lua_setfield(L, -2, "owner_pubkey");
-  lua_pushnumber(L, static_cast<lua_Number>(info.fileBalance));
-  lua_setfield(L, -2, "file_balance");
-  lua_pushnumber(L, static_cast<lua_Number>(info.pricePerKb));
-  lua_setfield(L, -2, "price_per_kb");
-  lua_pushnumber(L, static_cast<lua_Number>(info.size));
-  lua_setfield(L, -2, "size");
-  lua_pushnumber(L, static_cast<lua_Number>(info.createdUs));
-  lua_setfield(L, -2, "created_us");
-  lua_pushnumber(L, static_cast<lua_Number>(info.modifiedUs));
-  lua_setfield(L, -2, "modified_us");
-  return 1;
+  ces::CesFileClient* fc = e->fc.get();
+  return client_call(L, g_file_clients, [fc, nm = std::string(name, nlen)]() -> OffloadDeliver {
+    ces::CesFileClient::StatInfo info;
+    uint8_t rc = fc->stat(nm, info);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [info](lua_State* L) -> int {
+      lua_newtable(L);
+      lua_pushlstring(L, reinterpret_cast<const char*>(info.ownerPubkey.data()),
+                      info.ownerPubkey.size());
+      lua_setfield(L, -2, "owner_pubkey");
+      lua_pushnumber(L, static_cast<lua_Number>(info.fileBalance));
+      lua_setfield(L, -2, "file_balance");
+      lua_pushnumber(L, static_cast<lua_Number>(info.pricePerKb));
+      lua_setfield(L, -2, "price_per_kb");
+      lua_pushnumber(L, static_cast<lua_Number>(info.size));
+      lua_setfield(L, -2, "size");
+      lua_pushnumber(L, static_cast<lua_Number>(info.createdUs));
+      lua_setfield(L, -2, "created_us");
+      lua_pushnumber(L, static_cast<lua_Number>(info.modifiedUs));
+      lua_setfield(L, -2, "modified_us");
+      return 1;
+    };
+  });
 }
 
 int lua_fc_close(lua_State* L) {
-  client_close(g_file_clients, client_handle_id(L, 1));
+  uint64_t id = client_handle_id(L, 1);
+  auto it = g_file_clients.find(id);
+  if (it == g_file_clients.end()) return 0;
+  if (it->second.inflight) { it->second.closePending = true; return 0; }  // defer
+  client_close(g_file_clients, id);
   return 0;
 }
 
@@ -3817,20 +4717,69 @@ void push_file_handle(lua_State* L, uint64_t id) {
   lua_pushcfunction(L, guarded<lua_fc_close>);     lua_setfield(L, -2, "close");
 }
 
+// Dial `proto` and build a verb-client handle. The blocking bind (ch->select)
+// is offloaded to the client pool from a coroutine, so dialing never freezes
+// the loop; from the main chunk it binds inline. `makeHandle` registers the
+// bound channel and pushes the Lua handle — it always runs on the Lua thread
+// (inline, or in the deliver). The half-open channel on a bind failure is
+// destroyed inside client_open_channel on the endpoint strand.
+using ChannelHandleFn =
+  std::function<int(lua_State*, std::unique_ptr<ces::CesPlexChannel>)>;
+int client_dial(lua_State* L, const std::string& addr, const uint8_t* pk,
+                const char* proto, ChannelHandleFn makeHandle) {
+  luarpc_ensure_endpoint();   // Lua thread: lazy endpoint setup (idempotent)
+  if (!g_luarpc_io || !g_luarpc_rudp || !g_luarpc_signer) {
+    lua_pushnil(L);
+    lua_pushstring(L, "networking disabled: instance has no rpc port");
+    return 2;
+  }
+  std::array<uint8_t, 32> pkbuf{};
+  bool hasPk = (pk != nullptr);
+  if (hasPk) std::memcpy(pkbuf.data(), pk, 32);
+  std::string protoStr(proto);
+
+  if (io_yieldable(L)) {
+    lua_State* co = L;
+    g_parked.insert(co);
+    g_pool_client.ensure(g_client_pool_size);
+    g_pool_client.submit(co, [addr, pkbuf, hasPk, protoStr, makeHandle]()
+                                -> OffloadDeliver {
+      std::string err;
+      auto ch = client_open_channel(addr, hasPk ? pkbuf.data() : nullptr,
+                                    protoStr.c_str(), err);
+      if (!ch)
+        return [err](lua_State* L) {
+          lua_pushnil(L); lua_pushlstring(L, err.data(), err.size()); return 2;
+        };
+      auto holder =
+        std::make_shared<std::unique_ptr<ces::CesPlexChannel>>(std::move(ch));
+      return [holder, makeHandle](lua_State* L) -> int {
+        return makeHandle(L, std::move(*holder));
+      };
+    });
+    return lua_yield(L, 0);
+  }
+
+  std::string err;
+  auto ch = client_open_channel(addr, pk, proto, err);
+  if (!ch) { lua_pushnil(L); lua_pushstring(L, err.c_str()); return 2; }
+  return makeHandle(L, std::move(ch));
+}
+
 int lua_ces_file_client(lua_State* L) {
   std::string addr; const uint8_t* pk = nullptr; uint8_t pkbuf[32];
   if (!client_read_dial_args(L, addr, &pk, pkbuf)) return 2;
-  std::string err;
-  auto ch = client_open_channel(addr, pk, "/ces/file/1", err);
-  if (!ch) { lua_pushnil(L); lua_pushstring(L, err.c_str()); return 2; }
-  auto fc = std::make_unique<ces::CesFileClient>();
-  fc->attach(*ch);
-  uint64_t id = g_client_next_id++;
-  auto& e = g_file_clients[id];
-  e.ch = std::move(ch);
-  e.fc = std::move(fc);
-  push_file_handle(L, id);
-  return 1;
+  return client_dial(L, addr, pk, "/ces/file/1",
+    [](lua_State* L, std::unique_ptr<ces::CesPlexChannel> ch) -> int {
+      auto fc = std::make_unique<ces::CesFileClient>();
+      fc->attach(*ch);
+      uint64_t id = g_client_next_id++;
+      auto& e = g_file_clients[id];
+      e.ch = std::move(ch);
+      e.fc = std::move(fc);
+      push_file_handle(L, id);
+      return 1;
+    });
 }
 
 // ---- ces.compute_client verbs ----
@@ -3863,66 +4812,94 @@ int lua_cc_launch(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   size_t nlen = 0; const char* name = luaL_checklstring(L, 2, &nlen);
-  uint64_t id = 0, startedAt = 0;
-  uint8_t rc = e->cc->launch(std::string(name, nlen), id, startedAt);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushnumber(L, static_cast<lua_Number>(id));
-  lua_pushnumber(L, static_cast<lua_Number>(startedAt));
-  return 2;
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc, nm = std::string(name, nlen)]() -> OffloadDeliver {
+    uint64_t id = 0, startedAt = 0;
+    uint8_t rc = cc->launch(nm, id, startedAt);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [id, startedAt](lua_State* L) -> int {
+      lua_pushnumber(L, static_cast<lua_Number>(id));
+      lua_pushnumber(L, static_cast<lua_Number>(startedAt));
+      return 2;
+    };
+  });
 }
 
 int lua_cc_kill(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   uint64_t id = client_arg_u64(L, 2);
-  uint8_t rc = e->cc->kill(id);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_pushboolean(L, 1);
-  return 1;
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc, id]() -> OffloadDeliver {
+    uint8_t rc = cc->kill(id);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [](lua_State* L) -> int { lua_pushboolean(L, 1); return 1; };
+  });
 }
 
 int lua_cc_stat(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   uint64_t id = client_arg_u64(L, 2);
-  ces::CesComputeClient::InstanceInfo info;
-  uint8_t rc = e->cc->stat(id, info);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  push_instance_info(L, info);
-  return 1;
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc, id]() -> OffloadDeliver {
+    ces::CesComputeClient::InstanceInfo info;
+    uint8_t rc = cc->stat(id, info);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [info](lua_State* L) -> int { push_instance_info(L, info); return 1; };
+  });
 }
 
 int lua_cc_list(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
-  std::vector<ces::CesComputeClient::InstanceInfo> infos;
-  uint8_t rc = e->cc->list(infos);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_newtable(L);
-  for (size_t i = 0; i < infos.size(); ++i) {
-    push_instance_info(L, infos[i]);
-    lua_rawseti(L, -2, static_cast<int>(i + 1));
-  }
-  return 1;
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc]() -> OffloadDeliver {
+    std::vector<ces::CesComputeClient::InstanceInfo> infos;
+    uint8_t rc = cc->list(infos);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [infos](lua_State* L) -> int {
+      lua_newtable(L);
+      for (size_t i = 0; i < infos.size(); ++i) {
+        push_instance_info(L, infos[i]);
+        lua_rawseti(L, -2, static_cast<int>(i + 1));
+      }
+      return 1;
+    };
+  });
 }
 
 int lua_cc_instances(lua_State* L) {
   auto* e = compute_entry(client_handle_id(L, 1));
   if (!e) return client_push_closed(L);
   size_t plen = 0; const char* path = luaL_checklstring(L, 2, &plen);
-  std::vector<ces::CesComputeClient::InstanceInfo> infos;
-  uint8_t rc = e->cc->instances(std::string(path, plen), infos);
-  if (rc != ces::CES_OK) return client_push_err(L, rc);
-  lua_newtable(L);
-  for (size_t i = 0; i < infos.size(); ++i) {
-    push_instance_info(L, infos[i]);
-    lua_rawseti(L, -2, static_cast<int>(i + 1));
-  }
-  return 1;
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc, p = std::string(path, plen)]() -> OffloadDeliver {
+    std::vector<ces::CesComputeClient::InstanceInfo> infos;
+    uint8_t rc = cc->instances(p, infos);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [infos](lua_State* L) -> int {
+      lua_newtable(L);
+      for (size_t i = 0; i < infos.size(); ++i) {
+        push_instance_info(L, infos[i]);
+        lua_rawseti(L, -2, static_cast<int>(i + 1));
+      }
+      return 1;
+    };
+  });
 }
 
 int lua_cc_close(lua_State* L) {
-  client_close(g_compute_clients, client_handle_id(L, 1));
+  uint64_t id = client_handle_id(L, 1);
+  auto it = g_compute_clients.find(id);
+  if (it == g_compute_clients.end()) return 0;
+  if (it->second.inflight) { it->second.closePending = true; return 0; }  // defer
+  client_close(g_compute_clients, id);
   return 0;
 }
 
@@ -3940,17 +4917,17 @@ void push_compute_handle(lua_State* L, uint64_t id) {
 int lua_ces_compute_client(lua_State* L) {
   std::string addr; const uint8_t* pk = nullptr; uint8_t pkbuf[32];
   if (!client_read_dial_args(L, addr, &pk, pkbuf)) return 2;
-  std::string err;
-  auto ch = client_open_channel(addr, pk, "/ces/compute/1", err);
-  if (!ch) { lua_pushnil(L); lua_pushstring(L, err.c_str()); return 2; }
-  auto cc = std::make_unique<ces::CesComputeClient>();
-  cc->attach(*ch);
-  uint64_t id = g_client_next_id++;
-  auto& e = g_compute_clients[id];
-  e.ch = std::move(ch);
-  e.cc = std::move(cc);
-  push_compute_handle(L, id);
-  return 1;
+  return client_dial(L, addr, pk, "/ces/compute/1",
+    [](lua_State* L, std::unique_ptr<ces::CesPlexChannel> ch) -> int {
+      auto cc = std::make_unique<ces::CesComputeClient>();
+      cc->attach(*ch);
+      uint64_t id = g_client_next_id++;
+      auto& e = g_compute_clients[id];
+      e.ch = std::move(ch);
+      e.cc = std::move(cc);
+      push_compute_handle(L, id);
+      return 1;
+    });
 }
 
 // ces.err — CES error names → codes, for legible error checks.
@@ -4012,6 +4989,15 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_cancel>);        lua_setfield(L, -2, "cancel");
   lua_pushcfunction(L, guarded<lua_ces_spawn>);         lua_setfield(L, -2, "spawn");
   lua_pushcfunction(L, guarded<lua_ces_sleep>);         lua_setfield(L, -2, "sleep");
+  lua_pushcfunction(L, guarded<lua_chan_new>);          lua_setfield(L, -2, "chan");
+  // ces.chan metatable (methods + __gc), created once.
+  luaL_newmetatable(L, kChanMT);
+  lua_pushvalue(L, -1); lua_setfield(L, -2, "__index");
+  lua_pushcfunction(L, guarded<lua_chan_send>);  lua_setfield(L, -2, "send");
+  lua_pushcfunction(L, guarded<lua_chan_recv>);  lua_setfield(L, -2, "recv");
+  lua_pushcfunction(L, guarded<lua_chan_close>); lua_setfield(L, -2, "close");
+  lua_pushcfunction(L, lua_chan_gc);             lua_setfield(L, -2, "__gc");
+  lua_pop(L, 1);
   lua_pushcfunction(L, guarded<lua_ces_client_recv>);   lua_setfield(L, -2, "client_recv");
   lua_pushcfunction(L, guarded<lua_ces_client_send>);   lua_setfield(L, -2, "client_send");
   lua_pushcfunction(L, guarded<lua_ces_prog_prefix>);   lua_setfield(L, -2, "prog_prefix");
@@ -4170,6 +5156,14 @@ int main(int argc, char** argv) {
     unsigned long long v = std::strtoull(argv[3], &end, 10);
     if (end != argv[3] && v > 0) mem_max_bytes = static_cast<size_t>(v);
   }
+  // argv[4]: #3 verb-client worker-pool size, from the server's
+  // compute_client_pool_size. Absent/unparsable → keep the default; clamp to
+  // [1, 64] so a bad value can neither disable offload nor spawn a thread storm.
+  if (argc >= 5) {
+    char* end = nullptr;
+    long v = std::strtol(argv[4], &end, 10);
+    if (end != argv[4] && v >= 1 && v <= 64) g_client_pool_size = static_cast<int>(v);
+  }
 
   g_sock_fd = connect_unix_socket(sock_path);
   if (g_sock_fd < 0) return 1;
@@ -4183,7 +5177,7 @@ int main(int argc, char** argv) {
   //   [32B program_privkey][8B start_time_us BE][u32 BE src_len][src bytes]
   Frame bs;
   if (!read_frame(bs) || bs.tag != TAG_BOOTSTRAP) {
-    std::fprintf(stderr, "cesluajitd: bad bootstrap frame\n");
+    host_log(4, "bad bootstrap frame");
     return 1;
   }
   // Field offsets within the bootstrap body (must match
@@ -4199,7 +5193,7 @@ int main(int argc, char** argv) {
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
-    std::fprintf(stderr, "cesluajitd: bootstrap too short\n");
+    host_log(4, "bootstrap too short");
     return 1;
   }
   std::memcpy(g_prog_prefix,     bs.body.data() + kOffPrefix,  WIRE_PREFIX_LEN);
@@ -4212,7 +5206,7 @@ int main(int argc, char** argv) {
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {
-    std::fprintf(stderr, "cesluajitd: bootstrap truncated\n");
+    host_log(4, "bootstrap truncated");
     return 1;
   }
   const char* src =
@@ -4225,13 +5219,13 @@ int main(int argc, char** argv) {
   // never reach the bytecode path: reject a bytecode marker here, and load
   // with the explicit text-only mode below.
   if (src_len > 0 && static_cast<unsigned char>(src[0]) == 0x1b) {
-    std::fprintf(stderr, "cesluajitd: refusing bytecode program (text only)\n");
+    host_log(4, "refusing bytecode program (text only)");
     return 1;
   }
 
   lua_State* L = luaL_newstate();
   if (!L) {
-    std::fprintf(stderr, "cesluajitd: luaL_newstate failed\n");
+    host_log(4, "luaL_newstate failed");
     return 1;
   }
   load_safe_libs(L);
@@ -4244,17 +5238,18 @@ int main(int argc, char** argv) {
   // "t" = text only: a second barrier that refuses bytecode even if the
   // leading-byte guard above is bypassed.
   if (luaL_loadbufferx(L, src, src_len, "=program", "t") != 0) {
-    std::fprintf(stderr, "cesluajitd: load failed: %s\n",
-                 lua_tostring(L, -1));
+    host_log(4, std::string("load failed: ") + lua_err_str(L));
     lua_close(L);
     return 1;
   }
   if (lua_pcall(L, 0, 0, 0) != 0) {
-    std::fprintf(stderr, "cesluajitd: run failed: %s\n",
-                 lua_tostring(L, -1));
+    host_log(4, std::string("run failed: ") + lua_err_str(L));
     lua_close(L);
     return 1;
   }
+  g_pool_main.shutdown();
+  g_pool_client.shutdown();
+  if (g_luarpc_wakefd >= 0) { ::close(g_luarpc_wakefd); g_luarpc_wakefd = -1; }
   lua_close(L);
   return 0;
 }

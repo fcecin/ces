@@ -5076,11 +5076,13 @@ bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
     else if (key == "fee_file_rent")  { cfg_.feeFileRent  = static_cast<int64_t>(value); ok = true; }
     else if (key == "fee_file_write") { cfg_.feeFileWrite = static_cast<int64_t>(value); ok = true; }
     else if (key == "fee_file_read")  { cfg_.feeFileRead  = static_cast<int64_t>(value); ok = true; }
-    // L2 compute fees, live on the supervisor tick.
-    else if (key == "fee_compute_slot")    { cfg_.feeComputeSlotSec    = static_cast<int64_t>(value); ok = true; }
-    else if (key == "fee_compute_cpu")     { cfg_.feeComputeCpuSec     = static_cast<int64_t>(value); ok = true; }
-    else if (key == "fee_compute_rss")     { cfg_.feeComputeRssByteDay = static_cast<int64_t>(value); ok = true; }
-    else if (key == "fee_bucket_bytesec")  { cfg_.feeBucketByteSec     = static_cast<int64_t>(value); ok = true; }
+    // L2 compute fees, live on the supervisor tick. Keys are the TOML keys
+    // verbatim (no token-dropping drift): the switch IS the config name.
+    else if (key == "fee_compute_slot_sec")     { cfg_.feeComputeSlotSec    = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_compute_cpu_sec")      { cfg_.feeComputeCpuSec     = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_compute_rss_byte_day") { cfg_.feeComputeRssByteDay = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_compute_net_byte")     { cfg_.feeComputeNetByte    = static_cast<int64_t>(value); ok = true; }
+    else if (key == "fee_bucket_byte_sec")      { cfg_.feeBucketByteSec     = static_cast<int64_t>(value); ok = true; }
     // ChannelMeter (net metering) rates, live on the meter tick.
     else if (key == "fee_net_byte_sent")     { cfg_.feeNetByteSent     = value; ok = true; }
     else if (key == "fee_net_byte_received") { cfg_.feeNetByteReceived = value; ok = true; }
@@ -5127,6 +5129,11 @@ std::string CesServer::_exportConfig(std::string* errReason) {
       << "# Peers persist in peerdata.toml and the hello banner in hello.txt;\n"
       << "# both load automatically and are intentionally NOT duplicated here.\n\n";
 
+    // The WHOLE live effective config, so a re-feed reproduces the running
+    // server and set-vs-default is never ambiguous. Every key is exactly the
+    // TOML/CLI name (the switch IS the config name — no drift). Top-level
+    // scalars first; [table]s last (TOML scoping). Add new CesConfig fields
+    // here when you add them, or the export silently rots.
     o << "data_dir = \"" << cfg_.dataDir.string() << "\"\n";
     o << "port = " << boundPort_ << "\n";
     o << "# server_key is the 32-byte private key (same identity on re-feed).\n";
@@ -5142,17 +5149,44 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "max_assets = " << cfg_.maxAsset << "\n";
     o << "flush_value = " << cfg_.flushValue << "\n";
     o << "max_log_size_gb = "
-      << (cfg_.maxLogBytes / (1024ULL * 1024 * 1024)) << "\n";
+      << (cfg_.maxLogBytes / (1024ULL * 1024 * 1024)) << "\n\n";
+
+    o << "# Boot/engine flags (no_pow_engine, cache_only_pow, pow_delay,\n"
+         "# log_level) are launch-time choices not held in the live config;\n"
+         "# carry them over from your launch flags / base config if you used them.\n\n";
+
+    o << "# Base fees\n";
     o << "fee_account = " << cfg_.feeAccount << "\n";
     o << "fee_asset = " << cfg_.feeAsset << "\n";
     o << "fee_tx = " << cfg_.feeTx << "\n";
     o << "fee_query = " << cfg_.feeQuery << "\n";
-    o << "fee_vm_mult = " << cfg_.feeVmMult << "\n\n";
+    o << "fee_vm_mult = " << cfg_.feeVmMult << "\n";
+    o << "fee_discount_enabled = "
+      << (cfg_.feeDiscountEnabled ? "true" : "false") << "\n\n";
 
-    o << "# Peering — peer_target is the LIVE runtime value (the dashboard's\n";
-    o << "# edits land here on export).\n";
+    o << "# L2 file-store fees\n";
+    o << "fee_file_rent = "  << cfg_.feeFileRent  << "\n";
+    o << "fee_file_write = " << cfg_.feeFileWrite << "\n";
+    o << "fee_file_read = "  << cfg_.feeFileRead  << "\n\n";
+
+    o << "# L2 compute fees\n";
+    o << "fee_compute_slot_sec = "     << cfg_.feeComputeSlotSec    << "\n";
+    o << "fee_compute_cpu_sec = "      << cfg_.feeComputeCpuSec     << "\n";
+    o << "fee_compute_rss_byte_day = " << cfg_.feeComputeRssByteDay << "\n";
+    o << "fee_compute_net_byte = "     << cfg_.feeComputeNetByte    << "\n";
+    o << "fee_bucket_byte_sec = "      << cfg_.feeBucketByteSec     << "\n\n";
+
+    o << "# ChannelMeter net-metering rates (0 = observe only)\n";
+    o << "fee_net_byte_sent = "     << cfg_.feeNetByteSent     << "\n";
+    o << "fee_net_byte_received = " << cfg_.feeNetByteReceived << "\n";
+    o << "fee_net_channel_sec = "   << cfg_.feeNetChannelSec   << "\n";
+    o << "fee_net_mem_byte_day = "  << cfg_.feeNetMemByteDay   << "\n\n";
+
+    o << "# Peering — peer_target is the LIVE runtime value (dashboard edits land here).\n";
     o << "peer_target = " << peerTarget_.load() << "\n";
     o << "peer_miner_interval = " << cfg_.peerMinerIntervalSecs << "\n";
+    o << "peer_pow_inbound_reciprocation_bps = "
+      << cfg_.peerPowInboundReciprocationBps << "\n";
     o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n\n";
 
     o << "# Interfaces\n";
@@ -5160,7 +5194,13 @@ std::string CesServer::_exportConfig(std::string* errReason) {
       o << "admin_socket = \"" << cfg_.adminSocket << "\"\n";
     o << "web_port = " << cfg_.webPort << "\n";
     o << "web_bind = \"" << cfg_.webBind << "\"\n";
-    o << "rpc_port = " << cfg_.rpcPort << "\n\n";
+    o << "rpc_port = " << cfg_.rpcPort << "\n";
+    o << "rpc_max_pending = "        << cfg_.rpcMaxPending        << "\n";
+    o << "rpc_max_request_bytes = "  << cfg_.rpcMaxRequestBytes   << "\n";
+    o << "rpc_max_response_bytes = " << cfg_.rpcMaxResponseBytes  << "\n";
+    o << "rpc_response_timeout_ms = "<< cfg_.rpcResponseTimeoutMs << "\n";
+    o << "rpc_rudp_bytes_per_second = " << cfg_.rpcRudpBytesPerSecond << "\n";
+    o << "rpc_rudp_burst_bytes = "      << cfg_.rpcRudpBurstBytes     << "\n\n";
 
     o << "# File store / compute\n";
     o << "file_store_max_bytes = " << cfg_.cesFileStoreMaxBytes << "\n";
@@ -5169,6 +5209,37 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "compute_max_instances = " << cfg_.computeMaxInstances << "\n";
     o << "compute_port_base = " << cfg_.computePortBase << "\n";
     o << "compute_port_count = " << cfg_.computePortCount << "\n";
+    o << "compute_process_mem_max = " << cfg_.computeProcessMemMax << "\n";
+    o << "compute_client_pool_size = " << cfg_.computeClientPoolSize << "\n";
+    if (!cfg_.cesComputeUser.empty())
+      o << "compute_user = \"" << cfg_.cesComputeUser << "\"\n";
+    if (!cfg_.cesComputeWorkDir.empty())
+      o << "compute_work_dir = \"" << cfg_.cesComputeWorkDir << "\"\n";
+    if (!cfg_.cesComputeChildBinary.empty())
+      o << "compute_child_binary = \"" << cfg_.cesComputeChildBinary << "\"\n";
+    if (!cfg_.cesExtensionsDir.empty())
+      o << "extensions_dir = \"" << cfg_.cesExtensionsDir << "\"\n";
+    o << "ext_funding_per_day = " << extFundingPerDay() << "\n\n";
+
+    // Tables last (everything after a [table] header belongs to that table).
+    if (!cfg_.cesplexMounts.empty()) {
+      o << "[cesplex_mounts]\n";
+      for (const auto& [proto, handler] : cfg_.cesplexMounts)
+        o << "\"" << proto << "\" = \"" << handler << "\"\n";
+      o << "\n";
+    }
+
+    o << "[rpc_rudp]\n";
+    o << "max_channels_per_peer = " << cfg_.rpcRudpMaxChannelsPerPeer << "\n";
+    o << "max_reorder_bytes_per_channel = "
+      << cfg_.rpcRudpMaxReorderBytesPerChannel << "\n";
+    o << "max_reorder_msgs_per_channel = "
+      << cfg_.rpcRudpMaxReorderMsgsPerChannel << "\n";
+    o << "channel_idle_secs = " << cfg_.rpcRudpChannelIdleSecs << "\n\n";
+
+    o << "# The [extension] enabled set + [[peers]] are dynamic (dashboard /\n";
+    o << "# peerdata.toml) and not captured here; peers reload from\n";
+    o << "# peerdata.toml automatically. Re-add any [extension] <name> = 1 you rely on.\n";
 
     std::ofstream f(path, std::ios::trunc);
     f << o.str();

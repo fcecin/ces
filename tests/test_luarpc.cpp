@@ -75,7 +75,7 @@ struct LuaRpcFixture {
     cfg.cesFileStoreMaxBytes = 16ull * 1024 * 1024;
     cfg.feeFileRent = 1;
     cfg.computeMaxInstances = 8;
-    cfg.computePortBase = 39200;
+    cfg.computePortBase = findFreeUdpPortRange(portCount);
     cfg.computePortCount = portCount;
     cfg.feeComputeSlotSec = 1;
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cesluajitd");
@@ -199,6 +199,131 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
+// Same path, but the client dials from inside a ces.spawn coroutine — so
+// ces.conn.connect runs under the event loop and must transparently YIELD
+// (park, endpoint drives the bind, resume on completion) rather than block.
+// The echo + beacon transfer only happens if the coroutine connect resumes
+// with a live conn.
+BOOST_FIXTURE_TEST_CASE(ConnectFromCoroutineYields, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string serverPath = "/h/" + ownerHex + "/echo2.bin";
+  const std::string serverSrc =
+    "ces.conn.set_listener({ on_data = function(c, b) c:write(b) end })\n"
+    "ces.conn.run()\n";
+  const auto serverPk = deploy(serverPath, serverSrc);
+  const uint64_t serverId = launch(serverPath);
+
+  uint16_t serverRpc = 0;
+  for (int i = 0; i < 100 && serverRpc == 0; i++) {
+    serverRpc = _computeTestInstanceRpcPort(serverId);
+    if (serverRpc == 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_REQUIRE_MESSAGE(serverRpc != 0, "echo server got no rpc port");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  const std::string clientSrc =
+    "ces.conn.set_listener({ on_data = function(c, b)\n"
+    "  if b == 'PINGPONG' then ces.transfer('"
+      + luaBytes(beaconPk.data(), 32) + "', 7) end\n"
+    "end })\n"
+    "ces.spawn(function()\n"
+    "  local conn = ces.conn.connect('127.0.0.1:" + std::to_string(serverRpc)
+      + "', '" + luaBytes(serverPk.data(), 32) + "')\n"
+    "  if conn then conn:write('PINGPONG') end\n"
+    "end)\n"
+    "ces.conn.run()\n";
+  const std::string clientPath = "/h/" + ownerHex + "/client2.bin";
+  const auto clientPk = deploy(clientPath, clientSrc);
+  server->_brr(clientPk, 1'000'000'000);
+  launch(clientPath);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 8; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// ces.conn.connect bounds the bind at the SOURCE: dialing a dead /ces/luarpc/1
+// target (the server's MAIN port speaks no luarpc) with a 300ms timeout must
+// fail in ~that time, not park ~60s for RUDP idle-GC. The coroutine ships the
+// sentinel on the nil result; the SHORT (~10s) poll budget would fail if the
+// timeout did not fire.
+BOOST_FIXTURE_TEST_CASE(ConnectTimeoutFailsFast, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 13
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/ctmo.bin";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "ces.spawn(function()\n"
+    "  local c = ces.conn.connect('127.0.0.1:" + std::to_string(mainPort)
+      + "', string.rep('\\0', 32), 300)\n"
+    "  if c == nil then ces.transfer(B, 13) end\n"
+    "end)\n"
+    "ces.conn.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 1'000'000'000);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 14; i++) {   // ~10s budget << 60s idle-GC
+    bal = balanceOf(beaconPk);
+    if (bal < 14) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 14);
+}
+
+// Main-port verbs (ces.ping / remote_account_read / remote_transfer) called
+// from a coroutine must offload to the single reused-client worker and YIELD —
+// proven by exercising all three (distinct deliver shapes: table, multi-value,
+// bool+number) in one coroutine against this fixture's own server, signalling
+// success by a remote_transfer of 7 to the beacon. Any staged failure tops the
+// beacon with a small code instead, so only the full path yields beacon == 8.
+BOOST_FIXTURE_TEST_CASE(MainPortVerbsFromCoroutineYield, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string mp = std::to_string(mainPort);
+  const std::string B = luaBytes(beaconPk.data(), 32);
+
+  const std::string path = "/h/" + ownerHex + "/mpverbs.bin";
+  // progPk is the program's own account; fund it so remote_transfer has funds.
+  const auto progPk = deploy(path,
+    "local B = '" + B + "'\n"
+    "ces.spawn(function()\n"
+    // Each call passes an explicit timeout_ms (parity with ces.ping); the
+    // target is live so they succeed well within it -- proving the arg is
+    // accepted + plumbed without breaking the happy path.
+    "  local r = ces.ping('127.0.0.1:" + mp + "', 4000)\n"
+    "  if not (r and #r.pubkey == 32) then ces.transfer(B, 2); return end\n"
+    "  local bal = ces.remote_account_read('127.0.0.1:" + mp + "', "
+      "ces.program_pubkey(), 4000)\n"
+    "  if not (bal and bal > 0) then ces.transfer(B, 3); return end\n"
+    "  local ok = ces.remote_transfer('127.0.0.1:" + mp + "', B, 7, 4000)\n"
+    "  if not ok then ces.transfer(B, 4); return end\n"
+    "end)\n"
+    "ces.conn.run()\n");
+  server->_brr(progPk, 1'000'000'000);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 8; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ===========================================================================
@@ -252,6 +377,96 @@ BOOST_FIXTURE_TEST_CASE(ProgramFileClient, LuaRpcFixture) {
     if (bal < 78) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
   BOOST_CHECK_EQUAL(bal, 78);
+}
+
+// file_client verbs called from a coroutine must offload to the client worker
+// pool and YIELD. The handle is dialed in the main chunk (blocking bind, fine),
+// then create/write/read run inside a ces.spawn coroutine; success ships 33 to
+// the beacon (1 + 33 = 34). A staged failure tops with a small code instead.
+BOOST_FIXTURE_TEST_CASE(FileClientVerbsFromCoroutineYield, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+  const auto serverPk = server->_serverKeyPair().getPublicKeyAsHash();
+
+  const std::string path = "/h/" + ownerHex + "/fcco.bin";
+  // The dial (ces.file_client → blocking bind) AND the verbs all run inside the
+  // coroutine, so both the constructor bind and each verb offload + yield.
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "ces.spawn(function()\n"
+    "  local fc = ces.file_client('127.0.0.1:" + rpc + "', '"
+      + luaBytes(serverPk.data(), 32) + "')\n"
+    "  if not fc then ces.transfer(B, 2); return end\n"
+    "  if not fc:create('/p/co3', 5, 0, 100000000) then ces.transfer(B,3); return end\n"
+    "  if not fc:write('/p/co3', 0, 'hello') then ces.transfer(B,4); return end\n"
+    "  if fc:read('/p/co3', 0, 5) ~= 'hello' then ces.transfer(B,5); return end\n"
+    "  fc:close()\n"
+    "  ces.transfer(B, 33)\n"
+    "end)\n"
+    "ces.conn.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 34; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 34) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 34);
+}
+
+// Regression: a program must not be able to corrupt the host by SHARING a
+// verb-client handle across coroutines. Coroutine A offloads a read (in flight);
+// while A is parked, B runs in the same scheduler pass (A's completion can't be
+// processed until the next loop turn, so A is guaranteed still in flight) and
+// (1) issues a concurrent verb on the same handle and (2) closes it. Pre-fix
+// this freed the client under A's worker (UAF -> the cestests process would
+// crash). Post-fix: the concurrent verb returns "busy" (serialized, no second
+// worker on one client) and the close is DEFERRED to A's completion. Sentinel 55
+// requires A's read to have completed AND the concurrent verb to have seen "busy".
+BOOST_FIXTURE_TEST_CASE(SharedHandleConcurrentVerbAndCloseNoUAF, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // expect 1 + 55
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+  const auto serverPk = server->_serverKeyPair().getPublicKeyAsHash();
+
+  const std::string path = "/h/" + ownerHex + "/uaf.bin";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "local fc = ces.file_client('127.0.0.1:" + rpc + "', '"
+      + luaBytes(serverPk.data(), 32) + "')\n"
+    "if not fc then ces.transfer(B, 2); return end\n"
+    "if not fc:create('/p/uaf', 5, 0, 100000000) then ces.transfer(B, 3); return end\n"
+    "if not fc:write('/p/uaf', 0, 'hello') then ces.transfer(B, 4); return end\n"
+    "local readResult, busySeen = nil, false\n"
+    "ces.spawn(function() readResult = fc:read('/p/uaf', 0, 5) end)\n"
+    "ces.spawn(function()\n"
+    "  local r, err = fc:read('/p/uaf', 0, 5)\n"   // A still in flight -> "busy"
+    "  if r == nil and err == 'busy' then busySeen = true end\n"
+    "  fc:close()\n"                                // close while A in flight -> deferred
+    "end)\n"
+    "ces.spawn(function()\n"
+    "  ces.sleep(800)\n"
+    "  if readResult == 'hello' and busySeen then ces.transfer(B, 55)\n"
+    "  else ces.transfer(B, 9) end\n"
+    "end)\n"
+    "ces.conn.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 56; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 56) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 56);
 }
 
 // compute_client: the program file_client-creates + funds a noop source it

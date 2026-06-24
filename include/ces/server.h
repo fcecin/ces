@@ -288,6 +288,12 @@ struct CesConfig {
   // shared by the scheduler; the process cap above is the CPU bound. No
   // pids cap — the sandbox exposes no fork/exec, so a child is one process.
   uint64_t computeProcessMemMax   = 268435456; // 256 MB
+  // Worker threads each Lua child uses for OUTBOUND verb-client calls
+  // (ces.file_client / ces.compute_client): how many such round-trips can be in
+  // flight concurrently before further ones queue. Bounds the child's blocking
+  // pool; the main-port client pool (ces.ping / ces.remote_*) is fixed at 1
+  // (one leased outbound port). Passed to the child on spawn; clamped [1, 64].
+  uint32_t computeClientPoolSize  = 4;
   // Fee knobs for compute — credits per unit time / per byte.
   // Every non-zero on a tick is accumulated against the source file's
   // file_balance. 0 = "derive default" at bind time. The four knobs:
