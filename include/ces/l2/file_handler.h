@@ -50,6 +50,19 @@ void fileHandlerBind(CesServer* server);
 // Safe to call with no files present. No-op if not bound.
 void fileHandlerStartupReconcile();
 
+// Daily per-extension local-budget sweep: top every /s/ program account up to the
+// server's extLocalBudget (deficit only). Called from dailyTaskTick. No-op if the
+// file feature is off, the budget is 0, or the handler is not bound.
+void fileHandlerSweepExtensionBudget(CesServer* server);
+
+// /s/ file read/write/remove for L2 cross-handler use (the extension manager), so
+// callers do no raw file I/O. A /s/ file is content-on-disk plus a reconcile-stamped
+// sidecar; the write is atomic (temp+rename) and re-stamps it. name = canonical
+// "/s/<...>". Read returns "" and write/remove false if not /s/ or not bound.
+std::string fileHandlerReadServerFile(const std::string& name);
+bool fileHandlerWriteServerFile(const std::string& name, const std::string& content);
+bool fileHandlerRemoveServerFile(const std::string& name);
+
 // Daily per-key rent sweep for kv-stores. Each kv key is a self-renting cell:
 // its value carries a [balance][last_charged] header the file service owns.
 // This walks every metered kv-store, charges each cell feeFileRent x

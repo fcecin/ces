@@ -189,11 +189,14 @@ channel_idle_secs = 60
 # Extensions page lists these as available; empty = no catalog.
 # extensions_dir = ""
 #
-# Extension funding budget: the GLOBAL rate (raw credit units per day, summed over
-# all extensions and remotes) the server will grant /s/ programs that petition via
-# ces.request_funds. 0 (default) = funding OFF; a program can spend nothing at
-# remotes until you open a budget. Set live on the dashboard's Extensions tab.
-# ext_funding_per_day = 0
+# Extension funding budget: the global rate (raw credit units per day, over all
+# extensions and remotes) the server grants /s/ programs that call ces.request_funds
+# to spend at remotes. The discovery extension needs it. 0 = off.
+# ext_funding_per_day = 500000000
+#
+# Local extension budget: raw credit units each /s/ program account is topped up to
+# (per extension) on boot and at daily maintenance. 0 = off.
+# ext_local_budget = 100000000000
 #
 # Three fee knobs mapping to three physical costs. -1 = use default.
 #   fee_file_rent  — retention (per byte per day)
@@ -364,7 +367,8 @@ int main(int argc, char* argv[]) {
   uint64_t optFileStoreMaxBytes = 0;
   std::string optFileStoreDir;
   std::string optExtensionsDir;
-  uint64_t optExtFundingPerDay = 0;
+  uint64_t optExtFundingPerDay = 500'000'000;
+  uint64_t optExtLocalBudget = 100'000'000'000;
   int64_t optFeeFileRent  = -1;
   int64_t optFeeFileWrite = -1;
   int64_t optFeeFileRead  = -1;
@@ -549,7 +553,10 @@ int main(int argc, char* argv[]) {
       ->default_val("");
     app.add_option("--extfundingperday", optExtFundingPerDay,
       "Extension funding budget: global raw credit units/day the server grants "
-      "ces.request_funds petitions (0 = off)")->default_val("0");
+      "ces.request_funds petitions (0 = off)")->default_val("500000000");
+    app.add_option("--extlocalbudget", optExtLocalBudget,
+      "Local extension budget: raw credit units each /s/ program account is topped "
+      "up to on boot and daily (0 = off)")->default_val("100000000000");
     app.add_option("--feefilerent", optFeeFileRent,
       "File-storage rent fee (credits per byte per day, -1 = default)");
     app.add_option("--feefilewrite", optFeeFileWrite,
@@ -748,6 +755,8 @@ int main(int argc, char* argv[]) {
       applyIfDefault("extensions_dir", optExtensionsDir, "--extensionsdir");
       applyIfDefault("ext_funding_per_day", optExtFundingPerDay,
                      "--extfundingperday");
+      applyIfDefault("ext_local_budget", optExtLocalBudget,
+                     "--extlocalbudget");
       applyIfDefault("fee_file_rent",  optFeeFileRent,  "--feefilerent");
       applyIfDefault("fee_file_write", optFeeFileWrite, "--feefilewrite");
       applyIfDefault("fee_file_read",  optFeeFileRead,  "--feefileread");
@@ -942,6 +951,7 @@ int main(int argc, char* argv[]) {
   config.cesFileStoreDir      = optFileStoreDir;
   config.cesExtensionsDir     = optExtensionsDir;
   config.extFundingPerDay     = optExtFundingPerDay;
+  config.extLocalBudget       = optExtLocalBudget;
   if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;
   if (optFeeFileWrite >= 0) config.feeFileWrite = optFeeFileWrite;
   if (optFeeFileRead  >= 0) config.feeFileRead  = optFeeFileRead;

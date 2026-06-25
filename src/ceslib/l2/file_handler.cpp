@@ -774,11 +774,17 @@ void creditProgramAccount(CesServer* server, const Sidecar& sc, uint64_t amount)
   server->_l2CreditProgramAccountSync(pubkey, static_cast<int64_t>(amount));
 }
 
-// Top-up the server credits to each /s/ file's program account on every
-// reconcile (boot scan) or first on-access mint. /s/ programs are operator
-// donated; the server keeps the account funded (~100 user-credits at default
-// fees).
-constexpr int64_t kServerZoneProgramAccountTopUp = 10'000'000'000LL;
+// Top up a /s/ program account to the server's per-extension local budget (credit
+// only the deficit, never burn). Shared by the boot/lazy reconcile and the daily
+// sweep. cap 0 = off. Returns true if it credited.
+static bool topUpProgramAccountToCap(CesServer* server, const Sidecar& sc) {
+  if (!server || !sidecarHasProgramAccount(sc)) return false;
+  uint64_t cap = server->extLocalBudget();
+  if (cap == 0) return false;
+  uint64_t bal = readProgramAccountBalance(server, sc);
+  if (bal < cap) { creditProgramAccount(server, sc, cap - bal); return true; }
+  return false;
+}
 
 // Reconcile one /s/ file: ensure it has a valid server-owned sidecar (minting a
 // fresh program keypair on first sight, preserving an existing one across
@@ -846,11 +852,8 @@ bool reconcileOneServerZoneFile(CesServer* server, const std::string& dir,
     out = s;
   }
 
-  // Top up the program account from thin air. _brrInner creates the account if
-  // missing (e.g., recovered from rent exhaustion) and credits otherwise.
-  minx::Hash pubkey{};
-  std::memcpy(pubkey.data(), programPubkey.data(), 32);
-  server->_l2CreditProgramAccountSync(pubkey, kServerZoneProgramAccountTopUp);
+  // Top up the program account to the per-extension local budget (deficit only).
+  topUpProgramAccountToCap(server, out);
   return true;
 }
 
@@ -3363,6 +3366,38 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
   }
 }
 
+// Daily per-extension local-budget sweep: top every /s/ program account up to the
+// server's extLocalBudget (deficit only). Runs off logicStrand_ (the top-up
+// sync-hops to it), called from dailyTaskTick. No-op if the file feature or the
+// budget is off.
+void fileHandlerSweepExtensionBudget(CesServer* server) {
+  if (!server) return;
+  const auto& cfg = server->_config();
+  if (cfg.cesFileStoreMaxBytes == 0) return;
+  if (server->extLocalBudget() == 0) return;
+  namespace fs = std::filesystem;
+  const std::string& dir = cfg.cesFileStoreDir;
+  fs::path sRoot = fs::path(dir) / "s";
+  std::error_code ec;
+  if (!fs::exists(sRoot, ec)) return;
+  const std::string suffix = kSidecarSuffix;
+  size_t topped = 0;
+  for (auto it = fs::recursive_directory_iterator(sRoot, ec);
+       !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+    if (!it->is_regular_file()) continue;
+    std::string fn = it->path().filename().string();
+    if (fn.size() >= suffix.size() &&
+        fn.compare(fn.size() - suffix.size(), suffix.size(), suffix) == 0) continue;
+    fs::path rel = fs::relative(it->path(), fs::path(dir));
+    std::string name = "/" + rel.generic_string();
+    if (name == kServerIndexName || isBuiltinSitePath(name)) continue;
+    Sidecar sc{};
+    if (!loadSidecar(dir, name, sc)) continue;
+    if (topUpProgramAccountToCap(server, sc)) ++topped;
+  }
+  LOGINFO << "extension budget swept" << VAR(topped);
+}
+
 // Publish the bundled /s/welcome site into the file store. Forced by the file
 // feature (no switch) and overwritten on every boot, so the served demo always
 // matches the binary. Pure disk on the file/rpc strand (like
@@ -3429,6 +3464,55 @@ void fileHandlerStartupReconcile() {
   writeStoreMeta(storeMetaPath(dir), m);
   LOGINFO << "store reconciled"
           << VAR(m.total_files) << VAR(m.total_bytes);
+}
+
+// --- /s/ file read/write/remove for L2 cross-handler use (the extension manager) -
+// A /s/ file is content-on-disk plus a reconcile-stamped sidecar. The write is
+// atomic and re-stamps the sidecar; it runs off logicStrand_ (its reconcile
+// sync-hops to it), like the boot scan.
+
+std::string fileHandlerReadServerFile(const std::string& name) {
+  CesServer* server = gServer.load();
+  if (!server || !isServerZone(name)) return "";
+  std::ifstream f(resolveContentPath(server->_config().cesFileStoreDir, name),
+                  std::ios::binary);
+  if (!f) return "";
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  return ss.str();
+}
+
+bool fileHandlerWriteServerFile(const std::string& name, const std::string& content) {
+  CesServer* server = gServer.load();
+  if (!server || !isServerZone(name)) return false;
+  const std::string& dir = server->_config().cesFileStoreDir;
+  auto cPath = resolveContentPath(dir, name);
+  std::error_code ec;
+  std::filesystem::create_directories(cPath.parent_path(), ec);
+  // Atomic temp + rename: a crash mid-write never leaves a half file.
+  auto tmp = cPath; tmp += ".tmp";
+  {
+    std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+    if (!f) return false;
+    f.write(content.data(), static_cast<std::streamsize>(content.size()));
+    if (!f.good()) return false;
+  }
+  std::filesystem::rename(tmp, cPath, ec);
+  if (ec) return false;
+  // Re-stamp the sidecar to the new content (reconcileOneServerZoneFile).
+  Sidecar sc{};
+  reconcileOneServerZoneFile(server, dir, name, sc);
+  return true;
+}
+
+bool fileHandlerRemoveServerFile(const std::string& name) {
+  CesServer* server = gServer.load();
+  if (!server || !isServerZone(name)) return false;
+  const std::string& dir = server->_config().cesFileStoreDir;
+  std::error_code ec;
+  std::filesystem::remove(resolveContentPath(dir, name), ec);
+  std::filesystem::remove(resolveSidecarPath(dir, name), ec);
+  return true;
 }
 
 bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes) {

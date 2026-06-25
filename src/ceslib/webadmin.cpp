@@ -597,7 +597,8 @@ std::string buildCompute(CesServer& s) {
 std::string buildFunding(CesServer& s) {
   std::ostringstream o;
   o << "{\"perDay\":" << s.extFundingPerDay()
-    << ",\"remaining\":" << s.extFundingRemaining() << "}";
+    << ",\"remaining\":" << s.extFundingRemaining()
+    << ",\"localBudget\":" << s.extLocalBudget() << "}";
   return o.str();
 }
 
@@ -1087,6 +1088,19 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
         return;
       }
       server_.extFundingSetPerDay(v);
+      respondJson("{\"ok\":true}");
+      return;
+    }
+
+    // Set the per-extension local budget (raw units; credits x PRICE_UNIT). Takes
+    // effect on the next boot/daily top-up.
+    if (path == "/api/local_budget_set") {
+      uint64_t v = 0;
+      if (!parseU64(getParam(form, "budget"), v)) {
+        respondJson("{\"ok\":false,\"error\":\"budget must be a non-negative integer\"}");
+        return;
+      }
+      server_.extLocalBudgetSet(v);
       respondJson("{\"ok\":true}");
       return;
     }
@@ -1695,14 +1709,25 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
   <!-- EXTENSIONS -->
   <section class="panel" id="panel-extensions">
     <div id="extOff" class="hint"></div>
-    <div class="section" id="extFundingBox">
+    <div class="row" style="align-items:stretch;gap:14px;flex-wrap:wrap;margin-bottom:18px">
+    <div class="section" id="extFundingBox" style="flex:1;min-width:300px;margin:0">
       <h2>Funding budget <span class="sub">global — all extensions, all remotes</span></h2>
-      <div class="hint">Credits/day the server will grant programs that call <span class="mono">request_funds</span> to fund themselves at remote peers. <b>0 = off</b> (the secure default): a program can spend nothing until you open a budget.</div>
+      <div class="hint">A daily-refilling token bucket (capped at one day's worth) that programs draw from via <span class="mono">request_funds</span> to spend at remote peers; "remaining" below is the current level. The discovery extension needs it. <b>0 = off</b>.</div>
       <div class="row" style="align-items:center">
         <input id="fundRate" type="number" min="0" step="1" placeholder="credits / day" style="width:150px">
         <button class="green sm" onclick="fundingApply()">Apply</button>
-        <span id="fundState" class="mono"></span>
       </div>
+      <div id="fundState" class="mono" style="margin-top:8px"></div>
+    </div>
+    <div class="section" id="extLocalBudgetBox" style="flex:1;min-width:300px;margin:0">
+      <h2>Local budget <span class="sub">per extension</span></h2>
+      <div class="hint">Credits each <span class="mono">/s/</span> program account is topped up to, on boot and daily. <b>0 = off</b>.</div>
+      <div class="row" style="align-items:center">
+        <input id="localBudget" type="number" min="0" step="1" placeholder="credits / extension" style="width:150px">
+        <button class="green sm" onclick="localBudgetApply()">Apply</button>
+      </div>
+      <div id="localBudgetState" class="mono" style="margin-top:8px"></div>
+    </div>
     </div>
     <div id="extList"></div>
   </section>
@@ -1864,10 +1889,10 @@ async function loadPeers(){
   const dir=p=>{let b='';if(p.outbound)b+='<span class="badge out">OUT</span> ';if(p.inbound)b+='<span class="badge in">IN</span>';return b||'<span class="muted">—</span>';};
   $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th></th></tr>`+
     (d.peers.length?d.peers.map(p=>`<tr>
-      <td>${dir(p)}</td>
+      <td style="white-space:nowrap">${dir(p)}</td>
       <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${esc(p.key)}','${esc(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
       <td class="mono copy" title="${esc(p.key)}" onclick="copy('${esc(p.key)}')">${shortKey(p.key)}</td>
-      <td>${reachCell(p)}</td>
+      <td style="white-space:nowrap">${reachCell(p)}</td>
       <td class="num">${p.ourBalanceThere<0?'<span class="muted">?</span>':fmtCredits(p.ourBalanceThere)}</td>
       <td class="num">${fmtCredits(p.theirBalanceHere)}</td>
       <td class="num">${fmtCredits(p.totalOutboundPoW)}</td>
@@ -2219,6 +2244,7 @@ function extFetchStatus(name){
 // Global funding budget control (one knob, all extensions). Polls the rate + the
 // live remaining allowance; prefills the input once so the operator sees it.
 let fundPrefilled=false;
+let localBudgetPrefilled=false;
 async function loadFunding(){
   let d;try{d=await api('/api/funding');}catch(e){return;}
   const perDayC=Number(d.perDay)/PRICE_UNIT, remC=Number(d.remaining)/PRICE_UNIT;
@@ -2227,6 +2253,11 @@ async function loadFunding(){
     : `<span style="color:var(--warn)">OFF</span> &mdash; programs cannot spend at remotes`;
   const inp=$('#fundRate');
   if(!fundPrefilled && document.activeElement!==inp){ inp.value = perDayC>0?perDayC:''; fundPrefilled=true; }
+  const inl=$('#localBudget'), lbC=Number(d.localBudget)/PRICE_UNIT;
+  $('#localBudgetState').innerHTML = lbC>0
+    ? `in effect: <b>${lbC.toLocaleString()}</b> / extension`
+    : `<span style="color:var(--warn)">OFF</span>`;
+  if(!localBudgetPrefilled && document.activeElement!==inl){ inl.value = lbC>0?lbC:''; localBudgetPrefilled=true; }
 }
 async function fundingApply(){
   const c=Number($('#fundRate').value);
@@ -2234,6 +2265,15 @@ async function fundingApply(){
   const raw=Math.round(c*PRICE_UNIT);
   try{const r=await post('/api/funding_set',{perday:String(raw)});
     toast(r.ok?(c>0?'funding budget set':'funding disabled'):(r.error||'failed'),r.ok?'ok':'err');}
+  catch(e){toast('server error','err');}
+  loadFunding();
+}
+async function localBudgetApply(){
+  const c=Number($('#localBudget').value);
+  if(!(c>=0)){toast('enter credits (0 = off)','err');return;}
+  const raw=Math.round(c*PRICE_UNIT);
+  try{const r=await post('/api/local_budget_set',{budget:String(raw)});
+    toast(r.ok?(c>0?'local budget set':'local budget disabled'):(r.error||'failed'),r.ok?'ok':'err');}
   catch(e){toast('server error','err');}
   loadFunding();
 }

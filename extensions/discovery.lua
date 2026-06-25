@@ -799,9 +799,12 @@ function Agent:project()
   if not ces.peers then return end
   local me = ces.owner_pubkey and ces.owner_pubkey() or nil
 
+  -- Key the active set by pubkey, not address: a peer is one server whatever
+  -- address representation it is known by (a hostname vs the IP it resolves to), so
+  -- it is never promoted twice or churned. Promotable entries always carry a pubkey.
   local outbound = {}
   for _, p in ipairs(ces.peers() or {}) do
-    if p.outbound then outbound[p.address] = p end
+    if p.outbound and p.pubkey and #p.pubkey == 32 then outbound[p.pubkey] = p end
   end
   local count = 0
   for _ in pairs(outbound) do count = count + 1 end
@@ -809,9 +812,9 @@ function Agent:project()
   if count < self.active_target and ces.add_peer then
     for _, r in ipairs(self.reg:promotable()) do
       if count >= self.active_target then break end
-      if not outbound[r.addr] and r.pubkey ~= me then
+      if not outbound[r.pubkey] and r.pubkey ~= me then
         if ces.add_peer(r.pubkey, r.addr) then
-          outbound[r.addr] = { address = r.addr, pubkey = r.pubkey }
+          outbound[r.pubkey] = { address = r.addr, pubkey = r.pubkey, inbound = false }
           count = count + 1
         end
       end

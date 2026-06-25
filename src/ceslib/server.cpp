@@ -914,6 +914,7 @@ CesServer::CesServer(const CesConfig& config)
   // a boot-configured budget is available immediately, like a dashboard set.
   extFundingRatePerDay_ = cfg_.extFundingPerDay;
   extFundingAllowance_  = static_cast<double>(cfg_.extFundingPerDay);
+  extLocalBudget_.store(cfg_.extLocalBudget, std::memory_order_relaxed);
   minx_ = std::make_unique<minx::Minx>(
     this, minx::MinxConfig{
       .instanceName = "sv",
@@ -3980,6 +3981,7 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
   // rent (the lock order kv ops use), so running it inside the postLogic block
   // above would invert that order and deadlock.
   fileHandlerSweepKvRent(this);
+  fileHandlerSweepExtensionBudget(this);
 
   dailyTaskStartTimer();
 }
@@ -4671,6 +4673,19 @@ CesClientAsync* CesServer::getOrCreateSettlementClient(
 // Peer Table
 // =============================================================================
 
+// Split "host:port" (and "[ipv6]:port") on the last colon into host + port. False
+// if there is no port. No-throw, for comparing address representations.
+static bool splitHostPort(const std::string& a,
+                          std::string& host, std::string& port) {
+  auto pos = a.find_last_of(':');
+  if (pos == std::string::npos || pos == 0 || pos + 1 >= a.size()) return false;
+  host = a.substr(0, pos);
+  port = a.substr(pos + 1);
+  if (host.size() >= 2 && host.front() == '[' && host.back() == ']')
+    host = host.substr(1, host.size() - 2);
+  return !host.empty();
+}
+
 void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
                             uint64_t inboundCredit) {
   // NOTE: this runs on the logic strand (incomingProveWork posts here with an
@@ -4693,7 +4708,19 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
       // newcomer is re-checked — and re-verified — from scratch.
       bool fromInbound = (inboundCredit > 0);
       bool mayWrite = !address.empty() && (!fromInbound || !p.verified);
-      if (mayWrite && p.declaredAddress != address) {
+      // A peer re-added under a different address representation (a hostname vs the
+      // IP it resolves to) is not a real change: keep the binding so a re-add never
+      // resets/re-verifies a settled entry. Resolution stays off-strand (resolvedIP
+      // is set by the miner); compare the incoming host to it on the same port.
+      bool addrChanged = p.declaredAddress != address;
+      if (addrChanged && !p.resolvedIP.is_unspecified()) {
+        std::string nh, np, dh, dp;
+        if (splitHostPort(address, nh, np) &&
+            splitHostPort(p.declaredAddress, dh, dp) &&
+            nh == p.resolvedIP.to_string() && np == dp)
+          addrChanged = false;
+      }
+      if (mayWrite && addrChanged) {
         p.declaredAddress = address;
         p.verified = false;
         p.reachable = false;
@@ -4897,7 +4924,6 @@ void CesServer::_addOutboundPeer(const minx::Hash& ckey,
     for (auto& p : peerTable_) {
       if (p.ckey == ckey) {
         p.outbound = true;
-        if (!address.empty()) p.declaredAddress = address;
         break;
       }
     }
@@ -5224,7 +5250,8 @@ std::string CesServer::_exportConfig(std::string* errReason) {
       o << "compute_child_binary = \"" << cfg_.cesComputeChildBinary << "\"\n";
     if (!cfg_.cesExtensionsDir.empty())
       o << "extensions_dir = \"" << cfg_.cesExtensionsDir << "\"\n";
-    o << "ext_funding_per_day = " << extFundingPerDay() << "\n\n";
+    o << "ext_funding_per_day = " << extFundingPerDay() << "\n";
+    o << "ext_local_budget = " << extLocalBudget() << "\n\n";
 
     // Tables last (everything after a [table] header belongs to that table).
     if (!cfg_.cesplexMounts.empty()) {

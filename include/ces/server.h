@@ -200,12 +200,14 @@ struct CesConfig {
   // Extensions page lists these as available; Install copies one into /s/.
   // Empty disables the catalog (already-installed /s/ extensions still show).
   std::string cesExtensionsDir;
-  // Extension funding budget: the GLOBAL rate (raw credit units per day, summed
-  // over all extensions and all remotes) the server will grant to /s/ programs
-  // that petition via ces.request_funds. 0 (default) = funding off: a program
-  // can spend NOTHING at remotes until the operator opens a budget. The server
-  // enforces this; it never lives in Lua. See local/extension_funding.md.
-  uint64_t extFundingPerDay = 0;
+  // Extension funding budget: the global rate (raw credit units per day, over all
+  // extensions and remotes) the server grants /s/ programs that call
+  // ces.request_funds to spend at remotes. The discovery extension needs it.
+  // 0 = off. Enforced here, never in Lua.
+  uint64_t extFundingPerDay = 500'000'000;   // 5 credits
+  // Local extension budget: raw credit units each /s/ program account is topped up
+  // to (per extension) on boot and at daily maintenance. 0 = off (no auto top-up).
+  uint64_t extLocalBudget = 100'000'000'000;   // 1000 credits
   // Three fee knobs mapping to the three physical costs of file
   // storage:
   //   feeFileRent  = retention (byte sitting on disk over time)
@@ -996,6 +998,15 @@ public:
   }
   void     extFundingSetPerDay(uint64_t perDay);   // operator sets the rate
 
+  // Local extension budget (raw units): each /s/ program account is topped up to
+  // this on boot and daily. Live-settable from the dashboard.
+  uint64_t extLocalBudget() const {
+    return extLocalBudget_.load(std::memory_order_relaxed);
+  }
+  void     extLocalBudgetSet(uint64_t v) {
+    extLocalBudget_.store(v, std::memory_order_relaxed);
+  }
+
   // CesConfig accessor — the file handler needs the resolved
   // feeFile / fileMaxBytes / cesplexFileDir after start() has
   // defaulted them.
@@ -1270,6 +1281,7 @@ private:
   // rate (cfg_.extFundingPerDay copied at start, then operator-settable);
   // allowance_ in raw credit units; lastUs_ a steady-clock micros stamp. Mutex is
   // mutable so the const extFundingPerDay() accessor can lock.
+  std::atomic<uint64_t> extLocalBudget_{0};   // seeded from cfg_.extLocalBudget at boot
   mutable std::mutex extFundingMu_;
   uint64_t           extFundingRatePerDay_ = 0;
   double             extFundingAllowance_ = 0.0;

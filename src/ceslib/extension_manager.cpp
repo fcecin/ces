@@ -4,6 +4,7 @@
 
 #include <ces/buffer.h>
 #include <ces/l2/compute_handler.h>
+#include <ces/l2/file_handler.h>
 #include <ces/server.h>
 #include <ces/types.h>
 
@@ -20,8 +21,6 @@ namespace fs = std::filesystem;
 
 namespace ces {
 namespace {
-
-constexpr const char* kSidecarSuffix = ".sidecar.toml";
 
 // A name must be a bare basename: letters/digits/._- only, no "..". Keeps every
 // derived path inside the catalog or /s/.
@@ -45,9 +44,6 @@ fs::path catalogLua(CesServer* s, const std::string& n) {
 fs::path sLua(CesServer* s, const std::string& n) {
   return storeSDir(s) / (n + ".lua");
 }
-fs::path sConf(CesServer* s, const std::string& n) {
-  return storeSDir(s) / (n + ".conf");
-}
 std::string srcName(const std::string& n) { return "/s/" + n + ".lua"; }
 
 // Pid of the running instance of /s/<name>.lua, or 0.
@@ -58,21 +54,8 @@ uint64_t runningPid(const std::string& name) {
   return 0;
 }
 
-std::string readFile(const fs::path& p) {
-  std::ifstream f(p, std::ios::binary);
-  if (!f) return "";
-  std::ostringstream ss;
-  ss << f.rdbuf();
-  return ss.str();
-}
-bool writeFile(const fs::path& p, const std::string& data) {
-  std::error_code ec;
-  fs::create_directories(p.parent_path(), ec);
-  std::ofstream f(p, std::ios::binary | std::ios::trunc);
-  if (!f) return false;
-  f.write(data.data(), static_cast<std::streamsize>(data.size()));
-  return f.good();
-}
+// /s/ file I/O is in the file handler: fileHandlerReadServerFile /
+// fileHandlerWriteServerFile / fileHandlerRemoveServerFile.
 
 struct ProbedManifest { std::string name, version, description; };
 
@@ -193,20 +176,20 @@ bool extensionInstall(CesServer* server, const std::string& name) {
   if (!validName(name) || catalogDir(server).empty()) return false;
   std::error_code ec;
   if (!fs::exists(catalogLua(server, name), ec)) return false;
-  fs::create_directories(storeSDir(server), ec);
-  fs::copy_file(catalogLua(server, name), sLua(server, name),
-                fs::copy_options::overwrite_existing, ec);
-  return !ec;
+  // The catalog is an external operator directory, not the file store: read it
+  // directly, then hand the bytes to the file store to land in /s/.
+  std::ifstream in(catalogLua(server, name), std::ios::binary);
+  if (!in) return false;
+  std::ostringstream ss;
+  ss << in.rdbuf();
+  return fileHandlerWriteServerFile("/s/" + name + ".lua", ss.str());
 }
 
 bool extensionUninstall(CesServer* server, const std::string& name) {
+  (void)server;
   if (!validName(name)) return false;
   computeHandlerKillBySource(srcName(name));
-  std::error_code ec;
-  fs::remove(sLua(server, name), ec);
-  fs::path sidecar = sLua(server, name);
-  sidecar += kSidecarSuffix;
-  fs::remove(sidecar, ec);
+  fileHandlerRemoveServerFile("/s/" + name + ".lua");
   return true;
 }
 
@@ -269,8 +252,9 @@ bool extensionCommand(CesServer* server, const std::string& name,
 }
 
 std::string extensionConfigGet(CesServer* server, const std::string& name) {
+  (void)server;
   if (!validName(name)) return "";
-  return readFile(sConf(server, name));
+  return fileHandlerReadServerFile("/s/" + name + ".conf");
 }
 
 // Make the on-disk /s/<name>.conf take effect on the running instance. Config is
@@ -279,11 +263,12 @@ std::string extensionConfigGet(CesServer* server, const std::string& name) {
 // actually takes effect -- writing the file and changing nothing (a silent
 // no-op) is worse than having no editor. No-op if the extension is not running.
 void applyExtConfig(CesServer* server, const std::string& name) {
+  (void)server;
   uint64_t pid = runningPid(name);
   if (!pid) return;
   ComputeExtInfo info;
   if (computeHandlerExtInfo(pid, info) && (info.caps & kComputeExtCapOnConfig)) {
-    computeHandlerExtConfig(pid, readFile(sConf(server, name)));   // hot-reload
+    computeHandlerExtConfig(pid, fileHandlerReadServerFile("/s/" + name + ".conf"));  // hot-reload
   } else {
     computeHandlerKillBySource(srcName(name));                     // relaunch:
     computeHandlerLaunchInternal(srcName(name));                   // re-read at launch
@@ -293,7 +278,7 @@ void applyExtConfig(CesServer* server, const std::string& name) {
 bool extensionConfigSet(CesServer* server, const std::string& name,
                         const std::string& text) {
   if (!validName(name)) return false;
-  if (!writeFile(sConf(server, name), text)) return false;
+  if (!fileHandlerWriteServerFile("/s/" + name + ".conf", text)) return false;
   applyExtConfig(server, name);
   return true;
 }
@@ -304,7 +289,7 @@ bool extensionConfigReset(CesServer* server, const std::string& name) {
   if (!pid) return false;
   ComputeExtInfo info;
   if (!computeHandlerExtInfo(pid, info)) return false;
-  if (!writeFile(sConf(server, name), info.configDefaults)) return false;
+  if (!fileHandlerWriteServerFile("/s/" + name + ".conf", info.configDefaults)) return false;
   applyExtConfig(server, name);
   return true;
 }
