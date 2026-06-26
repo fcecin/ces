@@ -182,6 +182,17 @@ void computeSendConnDataIn(uint64_t pid, uint64_t connId,
 void computeSendConnClosed(uint64_t pid, uint64_t connId,
                             uint8_t reason);
 
+// Deliver a flooded gossip message to EVERY local compute instance (each child
+// calls its program's on_gossip handler if defined). Called for gossip received
+// from the mesh and for gossip this node originates itself, so local programs
+// see the node's own messages too. Must run on the compute supervisor thread
+// (rpcTaskIO_) — it touches the instance map. No-op if compute is disabled.
+void computeHandlerDeliverGossip(const minx::Hash& author,
+                                 const minx::Hash& sender,
+                                 const minx::Hash& msgId,
+                                 const minx::Hash& dest,
+                                 const uint8_t* msg, std::size_t len);
+
 // Test hook: reads CPU ticks (utime + stime from /proc/<pid>/stat)
 // and resident-set-size bytes (resident × PAGESIZE from
 // /proc/<pid>/statm) for the given pid. Returns false if /proc is

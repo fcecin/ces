@@ -260,6 +260,18 @@ int main(int argc, char* argv[]) {
   cmd_cross->add_option("server", cross_server_arg,
     "Destination server address (host:port)")->required();
 
+  // ---- Subcommand: gossip ----
+
+  std::string gossip_msg_arg, gossip_dest_arg;
+  uint64_t gossip_budget_arg = 0;
+  auto* cmd_gossip = app.add_subcommand(
+    "gossip", "Flood a message across the server mesh (paid per hop)");
+  cmd_gossip->add_option("msg", gossip_msg_arg, "Message text")->required();
+  cmd_gossip->add_option("budget", gossip_budget_arg,
+    "Propagation budget (whole credits)")->required();
+  cmd_gossip->add_option("dest", gossip_dest_arg,
+    "Target server pubkey (64-hex); omit = broadcast to all");
+
   // ---- Subcommand: server-info ----
 
   auto* cmd_sinfo =
@@ -978,7 +990,8 @@ int main(int argc, char* argv[]) {
     (cmd_squery->parsed() || cmd_transfer->parsed() || cmd_payment->parsed() ||
      cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
-     cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed());
+     cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
+     cmd_gossip->parsed());
 
   if (!needs_actor)
     return 0;
@@ -2192,6 +2205,29 @@ int main(int argc, char* argv[]) {
         std::cout << "Success.\n";
       } else {
         std::cerr << "Cross-Transfer Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+    }
+
+    else if (cmd_gossip->parsed()) {
+      minx::Hash dest{};  // all-zero = broadcast
+      if (!gossip_dest_arg.empty())
+        minx::stringToHash(dest, wallet.resolveKey(gossip_dest_arg));
+      ces::Bytes msgBytes(gossip_msg_arg.begin(), gossip_msg_arg.end());
+      uint8_t rc = cc.gossip(msgBytes, gossip_budget_arg, dest);
+      if (rc == CES_OK) {
+        if (g_quiet) {
+          std::cout << "{\"ok\":true}\n";
+        } else {
+          print_header("Gossip Sent");
+          print_field("Bytes", (uint64_t)msgBytes.size());
+          print_field("Budget", gossip_budget_arg);
+          print_field("Dest", gossip_dest_arg.empty() ? "broadcast"
+                                                       : gossip_dest_arg);
+          std::cout << "Success.\n";
+        }
+      } else {
+        std::cerr << "Gossip Failed: " << errorString(rc) << "\n";
         return 1;
       }
     }

@@ -36,7 +36,8 @@ enum op_code_t : uint8_t {
   CES_CREATE_PAYMENT = 0x11,     // create payment account
   CES_CROSS_TRANSFER = 0x12,     // inter-server transfer via peer
   CES_RUN_ASSET = 0x13,           // execute asset bytecode (CesVM)
-  CES_QUERY_PEER_INFO = 0x14           // unsigned: peer-table slot lookup (discovery)
+  CES_QUERY_PEER_INFO = 0x14,          // unsigned: peer-table slot lookup (discovery)
+  CES_GOSSIP = 0x15                    // signed: flood/route a message across the server mesh
 };
 
 /**
@@ -79,6 +80,7 @@ enum result_code_t : uint8_t {
   CES_CROSS_TRANSFER_RESULT = 0x12,
   CES_RUN_ASSET_RESULT = 0x13,
   CES_QUERY_PEER_INFO_RESULT = 0x14,
+  CES_GOSSIP_RESULT = 0x15,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };
@@ -160,6 +162,11 @@ enum error_code_t : uint8_t {
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
 static constexpr uint32_t CES_NONCELESS = UINT32_MAX;
+
+/// Time window for CES_NONCELESS time-based dedup. A request whose timestamp is
+/// older than this is rejected as Stale. The settlement give-up deadline binds
+/// to it: a retry past this window can no longer be accepted by the receiver.
+static constexpr uint64_t CES_NONCELESS_DEDUP_WINDOW_US = 3600ULL * 1000000;
 
 /// Microseconds since epoch (UTC). Used for dedup time fields.
 inline uint64_t getMicrosSinceEpoch() {

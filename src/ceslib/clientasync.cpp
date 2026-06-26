@@ -52,6 +52,12 @@ void CesClientAsync::openTransfer(const Hash& destKey, uint64_t amount, Callback
     op.destKey = destKey;
     op.amount = amount;
     op.cb = std::move(cb);
+    // Give up after the receiver's dedup window: past it, a retry is rejected
+    // stale anyway, so retrying is pointless. A bounded sender-side deadline also
+    // covers a half-up peer (answers handshakes, never replies to the op). Giving
+    // up is conserved -- the amount stays parked in the vostro, no reversal.
+    op.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(SETTLEMENT_DEADLINE_MS);
 
     CesOpenTransfer msg;
     msg.originId = keyPair_.getPublicKeyAsHash();
@@ -61,6 +67,47 @@ void CesClientAsync::openTransfer(const Hash& destKey, uint64_t amount, Callback
     msg.amount = amount;
     msg.time = ces::getMicrosSinceEpoch();
     op.signedPayload = msg.toBytes(keyPair_);
+
+    queue_.push_back(std::move(op));
+    dispatch();
+  });
+}
+
+void CesClientAsync::gossip(const Hash& authorId, const Hash& msgId,
+                            const Hash& dest, uint64_t budget,
+                            const ces::Bytes& msg, GossipCallback cb) {
+  boost::asio::post(io_, [this, authorId, msgId, dest, budget, msg,
+                          cb = std::move(cb)]() mutable {
+    if (closed_) { cb(CES_ERROR_INTERNAL, 0); return; }
+    if (queue_.size() >= MAX_QUEUE) { cb(CES_ERROR_QUEUE_FULL, 0); return; }
+    // Gossip yields to settlement: ride this client only when nothing is backed
+    // up waiting for a channel. Any settlement backlog rules gossip off this peer
+    // (best-effort burn, paid 0) so cross-transfers own the channels. In-flight
+    // ops do not count: a saturated but not overflowing client still carries
+    // gossip; the first op that cannot get a channel shuts gossip out.
+    if (!queue_.empty()) {
+      cb(CES_ERROR_QUEUE_FULL, 0);
+      return;
+    }
+    ++pendingCount_;
+
+    QueuedOp op;
+    op.kind = OpKind::Gossip;
+    op.gcb = std::move(cb);
+    op.deadline = std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(GOSSIP_DEADLINE_MS);
+
+    CesGossip m;
+    m.originId = keyPair_.getPublicKeyAsHash();
+    m.serverId = Account::getMapKey(peerServerKey_);
+    m.reqNonce = CES_NONCELESS;
+    m.authorId = authorId;
+    m.msgId = msgId;
+    m.dest = dest;
+    m.budget = budget;
+    m.time = ces::getMicrosSinceEpoch();
+    m.msg = msg;
+    op.signedPayload = m.toBytes(keyPair_);
 
     queue_.push_back(std::move(op));
     dispatch();
@@ -201,25 +248,45 @@ void CesClientAsync::handleMessage(const uint8_t* data, size_t len) {
   parseMinxEnvelope(buf, gpass, spass);
 
   auto cesData = buf.getRemainingBytesSpan();
-  if (cesData.empty() || cesData[0] != CES_OPEN_TRANSFER_RESULT) return;
+  if (cesData.empty()) return;
+  uint8_t opcode = cesData[0];
+  if (opcode != CES_OPEN_TRANSFER_RESULT && opcode != CES_GOSSIP_RESULT) return;
 
   for (auto& ch : channels_) {
     if (ch.state != ChState::Busy || ch.sentGPass != spass) continue;
 
     PublicKey verifier(ch.serverKey);
-    CesOpenTransferResult res;
     minx::Bytes cesBytes(cesData.begin(), cesData.end());
-    if (!res.fromBytes(cesBytes, verifier)) {
-      LOGDEBUG << "CesClientAsync: ch" << chIdx(ch) << " sig verify failed";
-      return;
+    uint8_t rcode = CES_ERROR_INTERNAL;
+    uint64_t paid = 0;
+
+    if (opcode == CES_OPEN_TRANSFER_RESULT &&
+        ch.currentOp.kind == OpKind::OpenTransfer) {
+      CesOpenTransferResult res;
+      if (!res.fromBytes(cesBytes, verifier)) {
+        LOGDEBUG << "CesClientAsync: ch" << chIdx(ch) << " sig verify failed";
+        return;
+      }
+      rcode = res.rcode;
+    } else if (opcode == CES_GOSSIP_RESULT &&
+               ch.currentOp.kind == OpKind::Gossip) {
+      CesGossipResult res;
+      if (!res.fromBytes(cesBytes, verifier)) {
+        LOGDEBUG << "CesClientAsync: ch" << chIdx(ch) << " sig verify failed";
+        return;
+      }
+      rcode = res.rcode;
+      paid = res.paid;
+    } else {
+      return;  // response opcode does not match the in-flight op kind
     }
 
     ch.ticket = gpass;
     ch.state = ChState::Ready;
     --pendingCount_;
-    auto cb = std::move(ch.currentOp.cb);
+    QueuedOp done = std::move(ch.currentOp);
     ch.currentOp = {};
-    if (cb) cb(res.rcode);
+    fireOpCallback(done, rcode, paid);
     dispatch();
     return;
   }
@@ -249,14 +316,27 @@ void CesClientAsync::sweep() {
 
     else if (ch.state == ChState::Busy) {
       anyActive = true;
-      if (now - ch.sentAt <= std::chrono::milliseconds(RETRY_MS))
+      bool isGossip = ch.currentOp.kind == OpKind::Gossip;
+      // Give the op up at its deadline (gossip ~5s, settlement ~1h); unset
+      // deadline (epoch) means retry within reachability indefinitely.
+      if (ch.currentOp.deadline != std::chrono::steady_clock::time_point{} &&
+          now >= ch.currentOp.deadline) {
+        --pendingCount_;
+        QueuedOp done = std::move(ch.currentOp);
+        ch.currentOp = {};
+        ch.state = ChState::Idle;
+        fireOpCallback(done, CES_ERROR_TIMEOUT, 0);
+        continue;
+      }
+      int retryMs = isGossip ? GOSSIP_RETRY_MS : RETRY_MS;
+      if (now - ch.sentAt <= std::chrono::milliseconds(retryMs))
         continue;
       if (++ch.retries >= maxRetries_) {
         --pendingCount_;
-        auto cb = std::move(ch.currentOp.cb);
+        QueuedOp done = std::move(ch.currentOp);
         ch.currentOp = {};
         ch.state = ChState::Idle;
-        if (cb) cb(CES_ERROR_TIMEOUT);
+        fireOpCallback(done, CES_ERROR_TIMEOUT, 0);
       } else {
         queue_.push_front(std::move(ch.currentOp));
         ch.currentOp = {};
@@ -283,15 +363,14 @@ void CesClientAsync::startSweepTimer() {
 
 void CesClientAsync::failAll(uint8_t rc) {
   for (auto& ch : channels_) {
-    if (ch.state == ChState::Busy && ch.currentOp.cb)
-      ch.currentOp.cb(rc);
+    if (ch.state == ChState::Busy)
+      fireOpCallback(ch.currentOp, rc, 0);
     ch.state = ChState::Idle;
     ch.currentOp = {};
   }
   while (!queue_.empty()) {
-    auto cb = std::move(queue_.front().cb);
+    fireOpCallback(queue_.front(), rc, 0);
     queue_.pop_front();
-    if (cb) cb(rc);
   }
   pendingCount_.store(0, std::memory_order_relaxed);
 }

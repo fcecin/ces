@@ -219,7 +219,7 @@ constexpr uint8_t  TAG_LISTEN_ON     = 0x09;  // child → server
 constexpr uint8_t  TAG_LISTEN_OFF    = 0x0a;  // child → server
 constexpr uint8_t  TAG_LOG           = 0x0b;  // child → server (ces.log, one-way)
 constexpr uint8_t  TAG_HOST_LOG      = 0x0c;  // child → server (host C++, one-way)
-constexpr uint8_t  TAG_NET_USAGE     = 0x0c;  // child -> server (one-way)
+constexpr uint8_t  TAG_NET_USAGE     = 0x15;  // child -> server (channel usage, one-way)
 
 // Extension contract (ces.extension_admin{}). REGISTER/REP/DISABLE_SELF flow child →
 // server; REQ/CONFIG flow server → child. EXT_REQ carries a corr_id the child
@@ -230,6 +230,9 @@ constexpr uint8_t  TAG_EXT_REP          = 0x0f;  // child → server (reply)
 constexpr uint8_t  TAG_EXT_CONFIG       = 0x10;  // server → child (on_config, one-way)
 constexpr uint8_t  TAG_EXT_DISABLE_SELF = 0x11;  // child → server
 constexpr uint8_t  TAG_EXT_MANIFEST     = 0x12;  // child → server (ces.manifest, one-way)
+
+constexpr uint8_t  TAG_GOSSIP_IN        = 0x13;  // server → child (a flooded message)
+constexpr uint8_t  TAG_GOSSIP_OUT       = 0x14;  // child → server (ces.gossip.send)
 
 constexpr uint8_t  EXT_REQ_STATUS  = 0x00;
 constexpr uint8_t  EXT_REQ_COMMAND = 0x01;
@@ -294,6 +297,7 @@ int g_sock_fd = -1;              // host IPC socket
 std::deque<Frame> g_inbox;       // pending DELIVER frames
 std::deque<Frame> g_reply_q;     // pending API_REPLY frames
 std::deque<Frame> g_conn_q;      // pending CONN_* frames (drained by run())
+std::deque<Frame> g_gossip_q;    // pending GOSSIP_IN frames (drained by run())
 
 // Cooperative I/O scheduler state (single-threaded: only the IPC thread that
 // runs run()/the main chunk touches these). A coroutine that calls a host
@@ -471,6 +475,7 @@ void route_to_queue(Frame f) {
   }
   else if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
            f.tag == TAG_CONN_CLOSED) g_conn_q.push_back(std::move(f));
+  else if (f.tag == TAG_GOSSIP_IN) g_gossip_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
 }
 
@@ -3666,6 +3671,39 @@ int lua_ces_spawn(lua_State* L) {
   return 0;
 }
 
+// ces.gossip.send(msg, budget [, dest]) — flood a message across the server
+// mesh. One-way: the home server originates it and pays the flood out of its
+// own peer reserves. dest is a 32-byte server pubkey, or nil/absent to
+// broadcast to everyone.
+int lua_ces_gossip_send(lua_State* L) {
+  size_t mlen = 0;
+  const char* m = luaL_checklstring(L, 1, &mlen);
+  // The CesGossip wire caps the payload at 1024 bytes; reject oversize here so
+  // the message can't deliver locally yet get truncated + sig-rejected on peers.
+  if (mlen > 1024)
+    return luaL_error(L, "ces.gossip.send: msg exceeds 1024 bytes");
+  lua_Number budget = luaL_checknumber(L, 2);
+  if (budget < 0) budget = 0;
+  uint8_t zero[32] = {0};
+  const uint8_t* dest = zero;
+  if (!lua_isnoneornil(L, 3)) {
+    size_t dlen = 0;
+    const char* d = luaL_checklstring(L, 3, &dlen);
+    if (dlen != 32)
+      return luaL_error(L, "ces.gossip.send: dest must be a 32-byte key");
+    dest = reinterpret_cast<const uint8_t*>(d);
+  }
+  // Body: [u64 budget BE][32 dest][u32 len BE][msg].
+  std::vector<uint8_t> body;
+  put_u64(body, static_cast<uint64_t>(budget));
+  body.insert(body.end(), dest, dest + 32);
+  put_u32(body, static_cast<uint32_t>(mlen));
+  body.insert(body.end(), m, m + mlen);
+  write_frame(TAG_GOSSIP_OUT, 0, body.data(), body.size());
+  return 0;
+}
+
+
 // ces.sleep(ms) - looks blocking, isn't: suspends THIS behavior for ms while
 // the run loop services the rest. Only valid inside spawn() (a coroutine), not
 // in the main chunk or an event handler (those run on the host thread and
@@ -4082,6 +4120,44 @@ static void resume_coro(lua_State* mainL, lua_State* co, int nargs) {
   }
 }
 
+// Dispatch each pending inbound gossip as its own handler coroutine (like
+// ces.spawn), if the program defined a global on_gossip. Frame body:
+//   [32 author][32 sender][32 msgId][32 dest][u32 len][msg]
+// The handler runs on_gossip(msg, {author, sender, msgid, dest}); frames are
+// independent, so unlike conn there is no per-key ordering to preserve. No
+// on_gossip => the program just doesn't receive gossip.
+static void drain_gossip(lua_State* mainL) {
+  constexpr size_t H = 4 * WIRE_KEY_LEN + sizeof(uint32_t);
+  while (!g_gossip_q.empty()) {
+    Frame f = std::move(g_gossip_q.front());
+    g_gossip_q.pop_front();
+    if (f.body.size() < H) continue;
+    uint32_t mlen = get_u32(f.body.data() + 4 * WIRE_KEY_LEN);
+    if (f.body.size() < H + mlen) continue;
+
+    lua_getglobal(mainL, "on_gossip");
+    if (!lua_isfunction(mainL, -1)) { lua_pop(mainL, 1); continue; }
+
+    lua_State* co = lua_newthread(mainL);            // mainL: [handler, co]
+    int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);    // pop co, ref it; mainL: [handler]
+    g_coro_refs[co] = ref;
+    lua_xmove(mainL, co, 1);                          // handler -> co; co: [handler]
+
+    const uint8_t* b = f.body.data();
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + H), mlen);  // arg1: msg
+    lua_createtable(co, 0, 4);                                        // arg2: meta
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + 0 * WIRE_KEY_LEN),
+                    WIRE_KEY_LEN); lua_setfield(co, -2, "author");
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + 1 * WIRE_KEY_LEN),
+                    WIRE_KEY_LEN); lua_setfield(co, -2, "sender");
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + 2 * WIRE_KEY_LEN),
+                    WIRE_KEY_LEN); lua_setfield(co, -2, "msgid");
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + 3 * WIRE_KEY_LEN),
+                    WIRE_KEY_LEN); lua_setfield(co, -2, "dest");
+    g_ready.push_back({co, 2});
+  }
+}
+
 // Resume every ready coroutine (spawn starts, sleep wakeups). Spawns made while
 // draining are picked up in the same pass, so a burst of spawns all start before
 // the loop blocks again.
@@ -4190,6 +4266,7 @@ int lua_ces_run(lua_State* L) {
     drain_offload_done(L);
     drain_conn_advance(L);
     drain_luarpc_advance(L);
+    drain_gossip(L);
     drain_ready(L);
 
     // Block until the next event on either source, or the next timer deadline.
@@ -5339,6 +5416,16 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_conn_connect>);
   lua_setfield(L, -2, "connect");
   lua_setfield(L, -2, "conn");
+
+  // ces.gossip — flood/route messaging over the server mesh. send(msg, budget
+  // [, dest]) originates a flood; inbound is delivered by calling the program's
+  // global on_gossip(msg, {author,sender,msgid,dest}) if it defined one. A node
+  // delivers its own originated gossip to its own programs too, so local
+  // extensions stay in step with the swarm.
+  lua_newtable(L);
+  lua_pushcfunction(L, guarded<lua_ces_gossip_send>);
+  lua_setfield(L, -2, "send");
+  lua_setfield(L, -2, "gossip");
 
   // Direct-transport live-conn registry (the relay's is created lazily in
   // set_listener).

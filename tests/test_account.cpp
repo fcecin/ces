@@ -431,11 +431,11 @@ BOOST_AUTO_TEST_CASE(Test22_QueryServerInfo) {
 
 // Total credits tracker is consistent through operations (exact accounting)
 BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
-  constexpr int64_t TX = BASE_FEE_TRANSACTION;  //    320,000
+  constexpr int64_t TX = BASE_FEE_TRANSACTION;  //     32,000
   constexpr int64_t RENT = BASE_FEE_ACCOUNT;    //  6,400,000
-  constexpr int64_t QRY = BASE_FEE_QUERY;       //     80,000
-  constexpr int64_t ERR = BASE_FEE_QUERY;       //     80,000
-  constexpr int64_t AST = BASE_FEE_ASSET;       // 38,400,000
+  constexpr int64_t QRY = BASE_FEE_QUERY;       //      2,000
+  constexpr int64_t ERR = BASE_FEE_QUERY;       //      2,000
+  constexpr int64_t AST = BASE_FEE_ASSET;       // 25,600,000
   constexpr int64_t CREATE3 = 3 * RENT;         // 19,200,000
 
   int64_t expected = 10'000'000'000;

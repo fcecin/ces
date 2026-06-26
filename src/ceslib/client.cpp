@@ -806,6 +806,39 @@ uint8_t CesClient::runAsset(const Hash& assetId, uint64_t budget,
   return rc;
 }
 
+uint8_t CesClient::gossip(const ces::Bytes& msg, uint64_t budget,
+                          const Hash& dest) {
+  LOGTRACE << "gossip";
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+
+  CesGossip req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = CES_NONCELESS;  // gossip dedups by msgId, not nonce
+  req.authorId = myFullKey;
+  req.dest = dest;
+  req.budget = budget;
+  req.time = getMicrosSinceEpoch();
+  req.msg = msg;
+
+  // Stable msgId = sha256(author || time || msg) so a retried send dedups
+  // server-side instead of injecting a second flood.
+  ces::Bytes seed;
+  seed.insert(seed.end(), myFullKey.begin(), myFullKey.end());
+  uint64_t t = req.time;
+  for (int i = 0; i < 8; ++i)
+    seed.push_back(static_cast<uint8_t>((t >> (i * 8)) & 0xff));
+  seed.insert(seed.end(), msg.begin(), msg.end());
+  CryptoPP::SHA256().CalculateDigest(req.msgId.data(), seed.data(), seed.size());
+
+  return sendSigned(req, gossipGen_, gossipResultCode_,
+                    [&] { return gossipResultOriginId_ == myId; });
+}
+
 uint8_t CesClient::queryAssetSigned(const Hash& assetId, uint8_t items,
                                     std::vector<AssetEntry>& assets) {
   LOGTRACE << "queryAsset";
@@ -1182,6 +1215,13 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         runAssetResultBudgetUsed_ = r.budgetUsed;
         runAssetResultAllowanceUsed_ = r.allowanceUsed;
         runAssetResultOutput_ = std::move(r.output);
+      });
+      break;
+
+    case CES_GOSSIP_RESULT:
+      handleSigned(CesGossipResult{}, "gossip", gossipGen_, [&](auto& r) {
+        gossipResultCode_ = r.rcode;
+        gossipResultOriginId_ = r.originId;
       });
       break;
 

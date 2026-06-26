@@ -333,11 +333,11 @@ BOOST_AUTO_TEST_CASE(L2FeeKnobsAndStatsEndpoints) {
   };
   BOOST_CHECK(has(setKnob("fee_file_rent", "321").body, "\"ok\":true"));
   BOOST_CHECK(has(setKnob("fee_compute_slot_sec", "654").body, "\"ok\":true"));
-  BOOST_CHECK(has(setKnob("fee_net_byte_sent", "9").body, "\"ok\":true"));
+  BOOST_CHECK(has(setKnob("fee_net_kib_sent", "9").body, "\"ok\":true"));
   auto cfg = httpReq(port, "GET", "/api/config").body;
   BOOST_CHECK_EQUAL(jnum(cfg, "feeFileRent"), 321);
   BOOST_CHECK_EQUAL(jnum(cfg, "feeComputeSlotSec"), 654);
-  BOOST_CHECK_EQUAL(jnum(cfg, "feeNetByteSent"), 9);
+  BOOST_CHECK_EQUAL(jnum(cfg, "feeNetKiBSent"), 9);
 
   // The File/Compute monitoring endpoints respond with the right shape; the
   // features are off in this fixture (no rpc port, caps 0) → enabled:false.
@@ -481,7 +481,7 @@ BOOST_AUTO_TEST_CASE(ConfigExportWritesFile) {
   BOOST_CHECK(toml.find("fee_file_rent") != std::string::npos);       // file fees
   BOOST_CHECK(toml.find("fee_compute_slot_sec") != std::string::npos);// compute fees
   BOOST_CHECK(toml.find("fee_compute_net_byte") != std::string::npos);
-  BOOST_CHECK(toml.find("fee_net_byte_sent") != std::string::npos);   // net metering
+  BOOST_CHECK(toml.find("fee_net_kib_sent") != std::string::npos);    // net metering
   BOOST_CHECK(toml.find("rpc_max_pending") != std::string::npos);     // rpc backpressure
   BOOST_CHECK(toml.find("compute_client_pool_size") != std::string::npos);
   BOOST_CHECK(toml.find("ext_funding_per_day") != std::string::npos);

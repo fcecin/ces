@@ -178,6 +178,13 @@ public:
     return runAssetResultAllowanceUsed_;
   }
 
+  // Originate a gossip from this client. The home server floods the message
+  // across the peer mesh and charges this client's account the first-hop relay
+  // fee (a burn -- a client has no ledger to receive the conserved leg). dest
+  // all-zero = broadcast, otherwise a targeted route. Returns the home server's
+  // rcode (CES_OK = accepted and injected).
+  uint8_t gossip(const ces::Bytes& msg, uint64_t budget, const Hash& dest);
+
   /**
    * Query asset.
    * @return CES_OK, CES_ERROR_ASSET_NOT_FOUND, etc.
@@ -394,6 +401,10 @@ private:
   uint64_t runAssetResultBudgetUsed_ = 0;
   uint64_t runAssetResultAllowanceUsed_ = 0;
   ces::Bytes runAssetResultOutput_;
+
+  HashPrefix gossipResultOriginId_;
+  uint8_t gossipResultCode_ = 0;
+  std::atomic<uint64_t> gossipGen_ = 0;
   std::atomic<uint64_t> runAssetGen_ = 0;
 
   uint32_t assetQueryReqNonce_ = 0;

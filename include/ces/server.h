@@ -40,11 +40,11 @@ constexpr uint64_t BASE_FEE_ACCOUNT = 6'400'000;
 // Asset rent tracks the RAM size ratio: Account is 64 B, Asset is
 // 256 B, so feeAsset = 4x feeAccount.
 constexpr uint64_t BASE_FEE_ASSET = 25'600'000;
-constexpr uint64_t BASE_FEE_TRANSACTION = 320'000;
+constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 // Query fee covers dedup + state write. The network share is billed
-// separately (feeNetByte*) and the bind contract removed the per-op
+// separately (feeNetKiB*) and the bind contract removed the per-op
 // envelope verify, leaving this well below feeTx.
-constexpr uint64_t BASE_FEE_QUERY = 20'000;
+constexpr uint64_t BASE_FEE_QUERY = 2'000;
 constexpr uint64_t BASE_FEE_VM_MULT = 50;
 
 struct CesConfig {
@@ -103,6 +103,16 @@ struct CesConfig {
   int peerMinerIntervalSecs = 60;   // seconds between miner cycles (lower for testing)
   std::vector<PeerConfig> peers;
   int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
+
+  // Max reserve (raw) one operation may spend at one peer. It caps each gossip
+  // fan-out leg (each peer at min(our reserve there, this)); the unallocated
+  // remainder reverts to the originator. Bounds a single op's upstream-reserve
+  // reach. 0 = uncapped.
+  uint64_t maxPeerReserveDisturbance = 100'000;
+
+  // Peers each gossip hop forwards to: a random subset of this size drawn from
+  // the reachable peers we hold reserve with. 0 = forward to every peer.
+  uint32_t gossipFanoutDegree = 6;
 
   // Presence cache: max tracked client addresses for push (send()).
   size_t presenceCacheSize = 250000;
@@ -245,15 +255,18 @@ struct CesConfig {
   //                         of holding a RUDP channel.
   //   feeNetMemByteDay    - per (byte x day) of RUDP buffer state
   //                         (reorder + send + ack caches).
-  //   feeNetByteSent      - per byte sent server to client.
-  //   feeNetByteReceived  - per byte received client to server.
+  //   feeNetKiBSent       per KiB sent server to client.
+  //   feeNetKiBReceived   per KiB received client to server.
+  // Throughput is metered per KiB so the rate can sit below 1 raw/byte.
   //
-  // Defaults: 0 (observability only); non-zero values bill per channel
-  // via ChannelMeter.
+  // 0 is a sentinel, not free: the CesServer constructor derives a non-zero
+  // rate from the ledger anchors (floored to >= 1), so a live server always
+  // meters and evicts. Setting 0 re-derives; it does not disable metering. An
+  // explicit non-zero is honored. See the constructor for the anchors.
   uint64_t feeNetChannelSec   = 0;
   uint64_t feeNetMemByteDay   = 0;
-  uint64_t feeNetByteSent     = 0;
-  uint64_t feeNetByteReceived = 0;
+  uint64_t feeNetKiBSent      = 0;
+  uint64_t feeNetKiBReceived  = 0;
 
   // --- Compute feature (CesPlex builtin:compute) ---
   //
@@ -731,6 +744,33 @@ public:
     uint32_t pingFailures = 0;
     uint16_t rpcPort = 0;   // peer's CesPlex rpc port (0 = not yet probed)
   };
+  // Author and fan out a gossip from this server (no client, no ticket).
+  // Returns the amount actually fanned out; the caller may refund budget minus
+  // that (a program refunds it to its file_balance).
+  uint64_t originateGossip(const ces::Bytes& msg, uint64_t budget,
+                           const Hash& dest);
+  // Count of gossips received and processed (non-sink).
+  uint64_t gossipReceivedCount() const {
+    return gossipRecvCount_.load(std::memory_order_relaxed);
+  }
+  // Count of gossip sink events (dest was an entity hosted here).
+  uint64_t gossipSinkCount() const {
+    return gossipSinkCount_.load(std::memory_order_relaxed);
+  }
+
+  // Gossip sink registry: a `dest` matching a pubkey registered here is terminal
+  // (handleGossip flushes the budget into it, no fan-out). Refcounted. Both run
+  // on logicStrand_ (post from elsewhere) and the set is read there, so no lock.
+  void registerSinkTarget(const minx::Hash& pubkey);
+  void unregisterSinkTarget(const minx::Hash& pubkey);
+
+  // Even split of `budget` over `caps` with redistribution of capped-off excess;
+  // `pocket` takes the remainder. sum(alloc) + pocket == budget. Static so the
+  // allocator can be unit-tested directly.
+  static std::vector<uint64_t> splitCapped(uint64_t budget,
+                                              const std::vector<uint64_t>& caps,
+                                              uint64_t& pocket);
+
   std::vector<PeerInfo> _peerSnapshot();
   // Vostro balances: for each peer pubkey, the balance of THAT peer's account on
   // THIS server (what we owe them) — the other half of the nostro/vostro pair
@@ -1120,6 +1160,31 @@ private:
   void handleRunAsset(const CesRunAsset& req, const HashPrefix& originPrefix,
                       const SockAddr& addr, const MinxMessage& msg);
 
+  // CES_GOSSIP: sink-or-dedup, collect the sender's budget (leg 2), skim, fan
+  // out, ack the charge (leg 1), deliver to local programs.
+  void handleGossip(const CesGossip& req, const SockAddr& addr,
+                    const MinxMessage& msg);
+
+  // A planned fan-out: one re-signed gossip per leg carrying that leg's
+  // allocation as its budget. `fanned` = sum of allocations.
+  struct FanoutLeg { std::string address; minx::Hash key; uint64_t alloc; };
+  struct FanoutPlan { std::vector<FanoutLeg> legs; uint64_t fanned = 0; };
+  // Plan the fan-out of `budget` over a random gossipFanoutDegree subset of
+  // reachable peers (!= exclude), each capped by reserve and disturbance.
+  // Any-thread (peer table mutex). The unallocated remainder is not charged.
+  FanoutPlan computeGossipFanout(uint64_t budget, const Hash& excludeKey);
+  // Dispatch a planned fan-out via CesClientAsync, wiring the leg-1 credit
+  // callbacks. MUST run on logicStrand_ (touches settlementClients_).
+  void dispatchGossipFanout(const Hash& authorId, const Hash& msgId,
+                            const Hash& dest, const ces::Bytes& msg,
+                            const FanoutPlan& plan);
+  // Deliver a gossip to local compute programs (on_gossip). Hops onto
+  // rpcTaskIO_ (the compute supervisor thread). Called for received and
+  // self-originated gossip, so local programs see this node's own messages.
+  void deliverGossipLocal(const Hash& author, const Hash& sender,
+                          const Hash& msgId, const Hash& dest,
+                          const ces::Bytes& msg);
+
   // NONCELESS resolution, shared by the two time-boxed escape-hatch ops
   // (CES_OPEN_TRANSFER and CES_RUN_ASSET). Validates the dedup time window +
   // replay, then resolves the server-assigned nonce into `outNonce`. A non-
@@ -1367,6 +1432,24 @@ private:
   // for unsolicited push (send()). Updated on every dispatchSigned.
   BucketCache<HashPrefix, SockAddr> presence_;
 
+  // Gossip dedup record: who we charged for a msgId and how much (leg 2). A
+  // retried copy from the same sender re-acks the same amount (idempotent
+  // leg 1); a cycle copy from a different peer (never charged) acks 0.
+  struct GossipCharge {
+    HashPrefix sender{};
+    uint64_t paid = 0;
+  };
+  // Gossip dedup: seen message-ids (first 8 bytes) -> charge record. Bounded:
+  // two rotating buckets of this size each (~2x entries live across a flip),
+  // ~6 MB total at this capacity. Never grows.
+  static constexpr uint64_t GOSSIP_SEEN_CAPACITY = 65536;
+  BucketCache<HashPrefix, GossipCharge> gossipSeen_{GOSSIP_SEEN_CAPACITY};
+  std::atomic<uint64_t> gossipRecvCount_{0};
+  std::atomic<uint64_t> gossipSinkCount_{0};
+  // dest-prefix -> (full pubkey, refcount). logicStrand_-owned (see
+  // registerSinkTarget). Seeded at construction with this server's own pubkey.
+  std::unordered_map<HashPrefix, std::pair<minx::Hash, int>> localSinkKeys_;
+
   // Reverse of presence_: addr → HashPrefix. Populated alongside
   // presence_.put and used by CES_APP_COMPUTE_MSG dispatch to stamp
   // a real sender_pfx on inbound program-bound messages. Guarded
@@ -1566,7 +1649,7 @@ private:
                    uint64_t inboundCredit);
 
   // -- Auto-nonce dedup constants --
-  static constexpr uint64_t DEDUP_WINDOW_US = 3600ULL * 1000000;
+  static constexpr uint64_t DEDUP_WINDOW_US = CES_NONCELESS_DEDUP_WINDOW_US;
   static constexpr uint64_t DEDUP_FUTURE_DRIFT_US = 300ULL * 1000000;
 
   static constexpr size_t MAX_PERSISTED_PEERS = 100;

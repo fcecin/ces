@@ -1011,6 +1011,41 @@ BOOST_AUTO_TEST_CASE(MineExistingAccount) {
 // too long for a test — for reference, diff 14 is the first that covers
 // the fee ((1<<13)*1000 = 8,192,000), and diff 14 on a test VM is slow.
 
+// ---------------------------------------------------------------------------
+// Gossip — the signed main-port producer (needs a real PoW ticket, hence the
+// PoW engine). The lone server has no peers, so the flood reaches nobody, but
+// the home server still accepts/charges/acks: exit 0 is the producer working.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(GossipBroadcast) {
+  ensurePoWEngine();
+  auto r = run(cmd("gossip hello 1000000"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "Gossip Sent");
+  assertContains(r.out, "broadcast");
+}
+
+BOOST_AUTO_TEST_CASE(GossipTargeted) {
+  ensurePoWEngine();
+  auto r = run(cmd("gossip hi 500000 " + secondPubHex()));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "Gossip Sent");
+}
+
+BOOST_AUTO_TEST_CASE(GossipQuietJson) {
+  ensurePoWEngine();
+  auto r = run(cmd("-q gossip hi 1000"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "\"ok\":true");
+}
+
+BOOST_AUTO_TEST_CASE(BareGossipShowsHelp) {
+  auto r = run(cmd("gossip"));
+  BOOST_CHECK_EQUAL(r.exitCode, 1);
+  assertContains(r.out, "msg");
+  assertContains(r.out, "budget");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ============================================================================

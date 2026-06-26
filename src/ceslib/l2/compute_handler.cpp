@@ -149,7 +149,7 @@ constexpr uint8_t kIpcTagListenOn     = 0x09;  // child → server
 constexpr uint8_t kIpcTagListenOff    = 0x0a;  // child → server
 constexpr uint8_t kIpcTagLog          = 0x0b;  // child → server (ces.log)
 constexpr uint8_t kIpcTagHostLog      = 0x0c;  // child → server (host C++)
-constexpr uint8_t kIpcTagNetUsage     = 0x0c;  // child -> server (channel usage)
+constexpr uint8_t kIpcTagNetUsage     = 0x15;  // child -> server (channel usage)
 
 // Extension contract (must match cesluajitd TAG_EXT_*).
 constexpr uint8_t kIpcTagExtRegister    = 0x0d;  // child → server
@@ -158,6 +158,9 @@ constexpr uint8_t kIpcTagExtRep         = 0x0f;  // child → server (reply)
 constexpr uint8_t kIpcTagExtConfig      = 0x10;  // server → child (on_config)
 constexpr uint8_t kIpcTagExtDisableSelf = 0x11;  // child → server
 constexpr uint8_t kIpcTagExtManifest    = 0x12;  // child → server (ces.manifest)
+
+constexpr uint8_t kIpcTagGossipIn       = 0x13;  // server → child (flooded message)
+constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip.send)
 
 constexpr uint8_t kExtReqStatus  = 0x00;
 constexpr uint8_t kExtReqCommand = 0x01;
@@ -706,6 +709,9 @@ void killByPid(uint64_t pid) {
   teardownInstance(*inst);
   releaseComputePort(inst->clientPort);
   releaseComputePort(inst->rpcPort);
+  // Drop this instance's gossip sink registration (refcounted).
+  if (CesServer* sv = gServer.load())
+    sv->unregisterSinkTarget(inst->programPubkey);
   gInstances.erase(it);
   if (auto pit = gByPrefix.find(inst->progPrefix); pit != gByPrefix.end()) {
     pit->second.erase(pid);
@@ -1066,6 +1072,40 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     if (body.size() < kIpcHdr + sizeof(uint64_t)) return;
     uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
     luaHandlerHandleConnClose(inst->pid, connId);
+    return;
+  }
+  if (tag == kIpcTagGossipOut) {
+    // Payload: [u64 budget BE][32 dest][u32 BE len][len bytes]. ces.gossip.send
+    // from the program: originate a flood from this server (server-funded out
+    // of its own peer reserves). One-way.
+    constexpr size_t kBudgetOff = kIpcHdr;
+    constexpr size_t kDestOff   = kBudgetOff + sizeof(uint64_t);
+    constexpr size_t kLenOff    = kDestOff + sizeof(minx::Hash);
+    constexpr size_t kMsgOff    = kLenOff + sizeof(uint32_t);
+    if (body.size() < kMsgOff) return;
+    uint64_t budget = ces::Buffer::peek<uint64_t>(body.data() + kBudgetOff);
+    minx::Hash dest;
+    std::memcpy(dest.data(), body.data() + kDestOff, sizeof(minx::Hash));
+    uint32_t mlen = ces::Buffer::peek<uint32_t>(body.data() + kLenOff);
+    if (body.size() < kMsgOff + mlen) return;
+    CesServer* server = gServer.load();
+    if (server) {
+      // Charge the program's source file_balance the full budget up front so a
+      // non-/s/ program can't flood on the OPERATOR's PoW reserves without
+      // bound. The debit no-ops on /s/ (operator extensions stay free); on a
+      // metered program with too little balance it deletes the source (compute
+      // out-of-funds semantics) and we skip the originate. Bounds a program's
+      // total gossip to its funding -- the same discipline as every compute fee.
+      if (budget > 0 && !fileHandlerDebitBalance(inst->sourceName, budget))
+        return;
+      ces::Bytes m(body.data() + kMsgOff, body.data() + kMsgOff + mlen);
+      uint64_t fanned = server->originateGossip(m, budget, dest);
+      // Refund the reserve-backpressure surplus (what couldn't fan out) to the
+      // program's file_balance -- charge only what actually propagated. No-ops
+      // on /s/ (decorative there).
+      if (fanned < budget)
+        fileHandlerCreditBalance(inst->sourceName, budget - fanned);
+    }
     return;
   }
   if (tag == kIpcTagLog) {
@@ -2298,6 +2338,9 @@ void allocateAndSpawnInstance(
       gInstances[inst->pid] = inst;
       gByPrefix[inst->progPrefix].insert(inst->pid);
       gByName[inst->sourceName].insert(inst->pid);
+      // Make this program's account a gossip sink target.
+      if (CesServer* sv = gServer.load())
+        sv->registerSinkTarget(inst->programPubkey);
       // Registered in gInstances now — drop the launch-slot reservation
       // so it isn't double-counted against the cap.
       st->slot.reset();
@@ -3298,6 +3341,27 @@ void computeSendConnClosed(uint64_t pid, uint64_t connId,
   body.push_back(reason);
   enqueueOutbound(it->second, makeFrame(kIpcTagConnClosed, 0,
                                          body.data(), body.size()));
+}
+
+void computeHandlerDeliverGossip(const minx::Hash& author,
+                                 const minx::Hash& sender,
+                                 const minx::Hash& msgId,
+                                 const minx::Hash& dest,
+                                 const uint8_t* msg, std::size_t len) {
+  if (gInstances.empty()) return;
+  // Body: [32 author][32 sender][32 msgId][32 dest][u32 BE len][len bytes].
+  ces::Bytes body;
+  body.reserve(4 * sizeof(minx::Hash) + sizeof(uint32_t) + len);
+  body.insert(body.end(), author.begin(), author.end());
+  body.insert(body.end(), sender.begin(), sender.end());
+  body.insert(body.end(), msgId.begin(), msgId.end());
+  body.insert(body.end(), dest.begin(), dest.end());
+  ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(len));
+  if (len > 0) body.insert(body.end(), msg, msg + len);
+  // Fan to every local instance; the child calls its on_gossip if defined.
+  for (auto& [pid, inst] : gInstances)
+    enqueueOutbound(inst, makeFrame(kIpcTagGossipIn, 0,
+                                    body.data(), body.size()));
 }
 
 } // namespace ces

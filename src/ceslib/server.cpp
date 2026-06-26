@@ -19,6 +19,7 @@
 #include <fstream>
 #include <future>
 #include <limits>
+#include <algorithm>
 #include <random>
 #include <sstream>
 #include <thread>
@@ -80,6 +81,8 @@ constexpr int REPLY_TIMER_TICK_MS      = 20;   // steady-state tick
 // Daily maintenance timer: fires at 09:00 UTC every day.
 constexpr uint64_t SECS_PER_DAY              = 86400;
 constexpr uint64_t DAILY_MAINTENANCE_HOUR_UTC = 9;
+// Network throughput is metered per KiB (see feeNetKiB* sentinel note).
+constexpr uint64_t BYTES_PER_KIB            = 1024;
 
 // Peer miner policy: skip peers whose minimum difficulty exceeds our own
 // minDifficulty by more than MARGIN, or whose absolute difficulty exceeds MAX.
@@ -906,6 +909,13 @@ CesServer::CesServer(const CesConfig& config)
   for (auto& m : feeMult_)
     m.store(10000, std::memory_order_relaxed);
 
+  // Register our own pubkey as a sink target: a gossip with dest == us is
+  // terminal and its budget burns into our bottomless self-account.
+  {
+    Hash self = serverKeyPair_.getPublicKeyAsHash();
+    localSinkKeys_[Account::getMapKey(self)] = {self, 1};
+  }
+
   // Seed the runtime peer target from config. The miner reads this atomic
   // (not cfg_.peerTarget) so the dashboard can change it live.
   peerTarget_.store(cfg_.peerTarget, std::memory_order_relaxed);
@@ -939,7 +949,7 @@ CesServer::CesServer(const CesConfig& config)
   //   feeFileWrite — network + SSD write (per-byte), ~10 days of
   //                   rent per byte
   //   feeFileRead  — SSD read (per-byte). Most of what was previously
-  //                   bundled here moved to feeNetByte* (it was
+  //                   bundled here moved to feeNetKiB* (it was
   //                   network bandwidth, not SSD work). The remainder
   //                   covers the SSD's read-bandwidth-share — a small
   //                   floor since reads have no wear cost.
@@ -950,7 +960,7 @@ CesServer::CesServer(const CesConfig& config)
     if (cfg_.feeFileRent == 0) cfg_.feeFileRent = 1;
   }
   if (cfg_.feeFileWrite == 0) {
-    // The network share is billed separately via feeNetByteReceived
+    // The network share is billed separately via feeNetKiBReceived
     // against the body bytes. Wear stays heavy: WRITE pays ~9x
     // per-byte-day rent per KB, vs READ's ~0.125x, preserving NAND's
     // ~10:1 wear-vs-bandwidth asymmetry.
@@ -958,7 +968,7 @@ CesServer::CesServer(const CesConfig& config)
     if (cfg_.feeFileWrite == 0) cfg_.feeFileWrite = 1;
   }
   if (cfg_.feeFileRead == 0) {
-    // The network share is billed separately via feeNetByteSent. What
+    // The network share is billed separately via feeNetKiBSent. What
     // remains here is the SSD read-bandwidth share — a small floor (no
     // wear, no replacement cost, just bus time and power).
     cfg_.feeFileRead = cfg_.feeFileRent / 8;
@@ -969,18 +979,20 @@ CesServer::CesServer(const CesConfig& config)
   // pull that share out and bill it explicitly per-byte/per-second
   // here. ChannelMeter reads these into each channel's bound
   // contract at bind time and debits the payer per tick.
-  if (cfg_.feeNetByteSent == 0) {
-    // Symmetric per-byte rate (sending and receiving cost the
-    // same on the server side: NIC, kernel buffers, CPU per byte).
-    // Anchor to per-byte-day rent / 1024 ≈ "1 byte ≈ 1 KB-day rent":
-    // small but non-zero, scaling transient network bytes below long-lived
-    // disk bytes.
-    uint64_t v = static_cast<uint64_t>(cfg_.feeFileRent) / 1024;
+  //
+  // 0 is a sentinel meaning "derive a default", not "free": each feeNet* of 0
+  // is overwritten below with a value from the ledger anchors (floored to >= 1).
+  // A live server always meters and evicts; setting 0 re-derives, it does not
+  // disable metering. An explicit non-zero is honored.
+  if (cfg_.feeNetKiBSent == 0) {
+    // Per-KiB throughput rate, priced below disk retention since network is a
+    // regenerative flow. Anchor: feeFileRent/2 per KiB.
+    uint64_t v = static_cast<uint64_t>(cfg_.feeFileRent) / 2;
     if (v == 0) v = 1;
-    cfg_.feeNetByteSent = v;
+    cfg_.feeNetKiBSent = v;
   }
-  if (cfg_.feeNetByteReceived == 0) {
-    cfg_.feeNetByteReceived = cfg_.feeNetByteSent;
+  if (cfg_.feeNetKiBReceived == 0) {
+    cfg_.feeNetKiBReceived = cfg_.feeNetKiBSent;
   }
   if (cfg_.feeNetMemByteDay == 0) {
     // RAM equivalence: a byte sitting in a RUDP buffer for a day
@@ -1033,7 +1045,7 @@ CesServer::CesServer(const CesConfig& config)
            << VAR(cfg_.feeTx) << VAR(cfg_.feeQuery)
            << VAR(cfg_.feeFileRent) << VAR(cfg_.feeFileWrite)
            << VAR(cfg_.feeFileRead)
-           << VAR(cfg_.feeNetByteSent) << VAR(cfg_.feeNetByteReceived)
+           << VAR(cfg_.feeNetKiBSent) << VAR(cfg_.feeNetKiBReceived)
            << VAR(cfg_.feeNetMemByteDay) << VAR(cfg_.feeNetChannelSec)
            << VAR(cfg_.feeComputeSlotSec)
            << VAR(cfg_.feeComputeRssByteDay)
@@ -3044,6 +3056,22 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
       break;
     }
 
+    case CES_GOSSIP: {
+      CesGossip req;
+      req.fromBytes(msg.data);
+      // Self-certifying: verify the immediate sender's signature directly
+      // against originId (the op carries the full pubkey; the sender may be a
+      // peer server with no local account, so there is no ledger lookup here).
+      PublicKey pk(req.originId);
+      if (!req.verifySignature(msg.data, pk)) {
+        LOGDEBUG << "gossip: bad signature";
+        minx_->banAddress(addr.address());
+        return;
+      }
+      handleGossip(req, addr, msg);
+      break;
+    }
+
     default:
       LOGTRACE << "unknown opcode";
       minx_->banAddress(addr.address());
@@ -4492,12 +4520,15 @@ uint64_t CesServer::priceNetUsage(const CesPlexUsage& usage) const {
   // seconds/day); __uint128_t guards the conversion against overflow.
   const uint64_t feeChanSec = discountFee(FeeKind::Net, cfg_.feeNetChannelSec);
   const uint64_t feeMemDay  = discountFee(FeeKind::Net, cfg_.feeNetMemByteDay);
-  const uint64_t feeBSent   = discountFee(FeeKind::Net, cfg_.feeNetByteSent);
-  const uint64_t feeBRecv   = discountFee(FeeKind::Net, cfg_.feeNetByteReceived);
+  const uint64_t feeKiBSent = discountFee(FeeKind::Net, cfg_.feeNetKiBSent);
+  const uint64_t feeKiBRecv = discountFee(FeeKind::Net, cfg_.feeNetKiBReceived);
 
   __uint128_t debit = 0;
-  debit += static_cast<__uint128_t>(usage.bytesSent)      * feeBSent;
-  debit += static_cast<__uint128_t>(usage.bytesReceived)  * feeBRecv;
+  // Throughput rates are per KiB, so divide the byte counts by 1024.
+  debit += (static_cast<__uint128_t>(usage.bytesSent)     * feeKiBSent)
+           / BYTES_PER_KIB;
+  debit += (static_cast<__uint128_t>(usage.bytesReceived) * feeKiBRecv)
+           / BYTES_PER_KIB;
   debit += (static_cast<__uint128_t>(usage.memByteSeconds) * feeMemDay)
            / SECS_PER_DAY;
   debit += static_cast<__uint128_t>(usage.ageSeconds)     * feeChanSec;
@@ -4630,6 +4661,290 @@ void CesServer::recordDedup(uint64_t sigHash, uint64_t epochNow) {
   std::lock_guard lock(dedupMutex_);
   rotateDedupLocked(epochNow);
   dedupCurrent_.insert(sigHash);
+}
+
+// Even split of `budget` over `caps`, each alloc <= caps[i], the excess from
+// capped entries redistributed to those with headroom; `pocket` takes the
+// remainder. sum(alloc) + pocket == budget.
+std::vector<uint64_t> CesServer::splitCapped(
+    uint64_t budget, const std::vector<uint64_t>& caps, uint64_t& pocket) {
+  std::vector<uint64_t> alloc(caps.size(), 0);
+  uint64_t remaining = budget;
+  std::vector<size_t> active;
+  for (size_t i = 0; i < caps.size(); ++i)
+    if (caps[i] > 0) active.push_back(i);
+  while (remaining > 0 && !active.empty()) {
+    uint64_t share = remaining / active.size();
+    if (share == 0) break;  // indivisible crumb -> pocket the remainder
+    bool progress = false;
+    std::vector<size_t> still;
+    for (size_t idx : active) {
+      uint64_t headroom = caps[idx] - alloc[idx];
+      uint64_t give = std::min(share, headroom);
+      alloc[idx] += give;
+      remaining -= give;
+      if (give > 0) progress = true;
+      if (alloc[idx] < caps[idx]) still.push_back(idx);
+    }
+    active.swap(still);
+    if (!progress) break;
+  }
+  pocket = remaining;
+  return alloc;
+}
+
+// Plan the fan-out: cap each reachable peer (!= excludeKey) at our reserve there
+// (ourBalanceThere; -1 unknown -> uncapped) and at maxPeerReserveDisturbance,
+// take a random gossipFanoutDegree subset, split `budget` across them. Any-thread
+// (peer table mutex). plan.fanned = sum of allocations; the rest is not charged.
+CesServer::FanoutPlan CesServer::computeGossipFanout(uint64_t budget,
+                                                     const Hash& excludeKey) {
+  FanoutPlan plan;
+  if (budget == 0) return plan;
+  struct Cand { std::string address; minx::Hash key; uint64_t cap; };
+  std::vector<Cand> cands;
+  {
+    std::lock_guard lock(peerTableMutex_);
+    for (const auto& p : peerTable_) {
+      if (!p.reachable || p.declaredAddress.empty()) continue;
+      if (p.ckey == excludeKey) continue;
+      uint64_t cap = p.ourBalanceThere >= 0
+                       ? static_cast<uint64_t>(p.ourBalanceThere)
+                       : std::numeric_limits<uint64_t>::max();
+      if (cfg_.maxPeerReserveDisturbance > 0 &&
+          cap > cfg_.maxPeerReserveDisturbance)
+        cap = cfg_.maxPeerReserveDisturbance;
+      if (cap == 0) continue;   // no headroom
+      cands.push_back({p.declaredAddress, p.ckey, cap});
+    }
+  }
+  if (cands.empty()) return plan;
+  // Forward to a random gossipFanoutDegree subset (0 = every peer).
+  if (cfg_.gossipFanoutDegree > 0 &&
+      cands.size() > cfg_.gossipFanoutDegree) {
+    static thread_local std::mt19937_64 rng{std::random_device{}()};
+    std::shuffle(cands.begin(), cands.end(), rng);
+    cands.resize(cfg_.gossipFanoutDegree);
+  }
+  std::vector<uint64_t> caps;
+  caps.reserve(cands.size());
+  for (auto& c : cands) caps.push_back(c.cap);
+  uint64_t pocket = 0;
+  std::vector<uint64_t> allocs = splitCapped(budget, caps, pocket);
+  for (size_t i = 0; i < cands.size(); ++i) {
+    if (allocs[i] == 0) continue;
+    plan.legs.push_back({cands[i].address, cands[i].key, allocs[i]});
+    plan.fanned += allocs[i];
+  }
+  return plan;
+}
+
+// Dispatch a planned fan-out: one re-signed gossip per leg with that leg's
+// allocation as its budget. Leg 1: credit the peer's reserve here by what it
+// acked draining (leg 2), capped at what we authorized. paid==0 credits
+// nothing. Runs on logicStrand_ (touches settlementClients_).
+void CesServer::dispatchGossipFanout(const Hash& authorId, const Hash& msgId,
+                                     const Hash& dest, const ces::Bytes& msg,
+                                     const FanoutPlan& plan) {
+  for (const auto& leg : plan.legs) {
+    auto* c = getOrCreateSettlementClient(leg.address, leg.key);
+    if (!c) continue;
+    Hash peerKey = leg.key;
+    uint64_t authorized = leg.alloc;
+    c->gossip(authorId, msgId, dest, leg.alloc, msg,
+      [this, peerKey, authorized](uint8_t rc, uint64_t paid) {
+        if (rc != CES_OK || paid == 0) return;
+        uint64_t credit = paid < authorized ? paid : authorized;
+        postLogic([this, peerKey, credit]() {
+          HashPrefix pid = Account::getMapKey(peerKey);
+          ActiveAccount peer = accounts_.get(pid);
+          if (peer.exists() && peer.data().getKey(pid) == peerKey)
+            peer.credit(credit);
+          else
+            accounts_.createAccount(
+              pid, Account(peerKey, static_cast<int64_t>(credit), 0));
+          LOGTRACE << "gossip leg1 credit" << VAR(credit)
+                   << SVAR(minx::hashToString(peerKey));
+        });
+      });
+  }
+}
+
+void CesServer::registerSinkTarget(const minx::Hash& pubkey) {
+  postLogic([this, pubkey]() {
+    auto& e = localSinkKeys_[Account::getMapKey(pubkey)];
+    e.first = pubkey;
+    ++e.second;
+    LOGTRACE << "gossip sink target +"
+             << SVAR(minx::hashToString(pubkey)) << VAR(e.second);
+  });
+}
+
+void CesServer::unregisterSinkTarget(const minx::Hash& pubkey) {
+  postLogic([this, pubkey]() {
+    auto it = localSinkKeys_.find(Account::getMapKey(pubkey));
+    if (it == localSinkKeys_.end()) return;
+    if (--it->second.second <= 0) localSinkKeys_.erase(it);
+  });
+}
+
+void CesServer::handleGossip(const CesGossip& req, const SockAddr& addr,
+                             const MinxMessage& msg) {
+  // Runs on logicStrand_: race-free dedup and all ledger touches on one thread.
+  postLogic([this, req, addr, msg]() {
+    HashPrefix mid = Account::getMapKey(req.msgId);
+    HashPrefix senderPfx = Account::getMapKey(req.originId);
+
+    auto reply = [&](uint8_t rcode, uint64_t paid) {
+      CesGossipResult res;
+      res.originId = senderPfx;
+      res.rcode = rcode;
+      res.paid = paid;
+      sendSignedReply(addr, msg, std::move(res));
+    };
+
+    // SINK: if `dest` is an entity we host (a compute program or this server),
+    // the gossip is terminal. Drain the sender and credit `dest`'s account here,
+    // no fan-out. Reply paid == skim so the sender mirrors only the toll (leg 1);
+    // the delivered remainder has no leg 1. Deduped by msgId so a retransmit
+    // re-acks without re-draining.
+    if (req.dest != Hash{}) {
+      HashPrefix destPfx = Account::getMapKey(req.dest);
+      auto sit = localSinkKeys_.find(destPfx);
+      if (sit != localSinkKeys_.end() && sit->second.first == req.dest) {
+        auto seen = gossipSeen_.get(mid);
+        if (seen.has_value()) {
+          reply(CES_OK, seen->sender == senderPfx ? seen->paid : 0);
+          return;
+        }
+        uint64_t senderReserve = 0;
+        {
+          ActiveAccount s = accounts_.get(senderPfx);
+          if (s.exists() && s.data().getKey(senderPfx) == req.originId &&
+              s.balance() > 0)
+            senderReserve = static_cast<uint64_t>(s.balance());
+        }
+        uint64_t collectable = std::min<uint64_t>(req.budget, senderReserve);
+        uint64_t skim = 0;
+        if (collectable > 0) {
+          skim =
+            static_cast<uint64_t>(discountedFlatFee(-1, cfg_.feeTx, FeeKind::Tx));
+          if (skim > collectable) skim = collectable;
+          uint64_t delivered = collectable - skim;
+          {
+            ActiveAccount s = accounts_.get(senderPfx);
+            if (s.exists()) s.debit(collectable);   // leg 2
+          }
+          bool toSelf = (req.dest == serverKeyPair_.getPublicKeyAsHash());
+          if (!toSelf && delivered > 0) {
+            ActiveAccount d = accounts_.get(destPfx);
+            if (d.exists() && d.data().getKey(destPfx) == req.dest)
+              d.credit(delivered);
+            else
+              accounts_.createAccount(
+                destPfx, Account(req.dest, static_cast<int64_t>(delivered), 0));
+          }
+          // toSelf: nothing credited, the delivered amount burns
+          gossipSinkCount_.fetch_add(1, std::memory_order_relaxed);
+          LOGINFO << "gossip sink" << SVAR(minx::hashToString(req.dest))
+                  << VAR(collectable) << VAR(skim) << VAR(delivered)
+                  << VAR(toSelf);
+        }
+        gossipSeen_.put(mid, GossipCharge{senderPfx, skim});
+        deliverGossipLocal(req.authorId, req.originId, req.msgId, req.dest,
+                           req.msg);
+        reply(CES_OK, skim);  // leg 1: sender mirrors only our skim
+        return;
+      }
+    }
+
+    auto seen = gossipSeen_.get(mid);
+    if (seen.has_value()) {
+      // Duplicate. Re-ack the SAME amount only to the peer we actually charged
+      // (so a retry from it completes leg 1 exactly once); a cycle copy from
+      // any other peer was never charged -> ack 0. Never re-charge/re-forward.
+      reply(CES_OK, seen->sender == senderPfx ? seen->paid : 0);
+      LOGTRACE << "gossip dup" << SVAR(minx::hashToString(req.msgId));
+      return;
+    }
+
+    // First sight: collect what the sender authorized and holds (leg 2), skim,
+    // plan the fan-out, charge skim + what we push, ack the charge (leg 1),
+    // deliver, dispatch.
+    uint64_t senderReserve = 0;
+    {
+      ActiveAccount s = accounts_.get(senderPfx);
+      if (s.exists() && s.data().getKey(senderPfx) == req.originId &&
+          s.balance() > 0)
+        senderReserve = static_cast<uint64_t>(s.balance());
+    }
+    uint64_t collectable = std::min<uint64_t>(req.budget, senderReserve);
+    if (collectable == 0) {
+      gossipSeen_.put(mid, GossipCharge{senderPfx, 0});
+      reply(CES_ERROR_INSUFFICIENT_BALANCE, 0);
+      return;
+    }
+    uint64_t skim =
+      static_cast<uint64_t>(discountedFlatFee(-1, cfg_.feeTx, FeeKind::Tx));
+    if (skim > collectable) skim = collectable;
+    uint64_t forwardable = collectable - skim;
+    FanoutPlan plan = computeGossipFanout(forwardable, req.originId);
+    uint64_t charge = skim + plan.fanned;
+    {
+      ActiveAccount s = accounts_.get(senderPfx);
+      if (s.exists()) s.debit(charge);          // leg 2
+    }
+    gossipSeen_.put(mid, GossipCharge{senderPfx, charge});
+    gossipRecvCount_.fetch_add(1, std::memory_order_relaxed);
+    reply(CES_OK, charge);                       // leg 1
+    LOGINFO << "gossip recv" << SVAR(minx::hashToString(req.msgId))
+            << VAR(collectable) << VAR(skim) << VAR(plan.fanned) << VAR(charge);
+    deliverGossipLocal(req.authorId, req.originId, req.msgId, req.dest, req.msg);
+    dispatchGossipFanout(req.authorId, req.msgId, req.dest, req.msg, plan);
+  });
+}
+
+uint64_t CesServer::originateGossip(const ces::Bytes& msg, uint64_t budget,
+                                   const Hash& dest) {
+  // Author a gossip: msgId from author+time+msg, seed it seen so a loop-back
+  // dedups, then fan out.
+  Hash authorId = serverKeyPair_.getPublicKeyAsHash();
+  uint64_t t = getMicrosSinceEpoch();
+  ces::Bytes seed;
+  seed.insert(seed.end(), authorId.begin(), authorId.end());
+  for (int i = 0; i < 8; ++i)
+    seed.push_back(static_cast<uint8_t>((t >> (i * 8)) & 0xff));
+  seed.insert(seed.end(), msg.begin(), msg.end());
+  Hash msgId = sha256(seed.data(), seed.size());
+
+  gossipSeen_.put(Account::getMapKey(msgId), GossipCharge{});
+  // Plan synchronously so the caller gets `fanned` (to refund the remainder).
+  // Self-deliver, then dispatch on logicStrand_ (settlementClients_ is
+  // strand-only). The author pays nothing to itself; the fan-out spends this
+  // server's reserves at peers.
+  FanoutPlan plan = computeGossipFanout(budget, /*excludeKey=*/Hash{});
+  LOGINFO << "gossip originate" << SVAR(minx::hashToString(msgId))
+          << VAR(budget) << VAR(plan.fanned);
+  deliverGossipLocal(authorId, authorId, msgId, dest, msg);
+  postLogic([this, authorId, msgId, dest, msg, plan]() {
+    dispatchGossipFanout(authorId, msgId, dest, msg, plan);
+  });
+  return plan.fanned;
+}
+
+void CesServer::deliverGossipLocal(const Hash& author, const Hash& sender,
+                                   const Hash& msgId, const Hash& dest,
+                                   const ces::Bytes& msg) {
+  // The compute instance map lives on rpcTaskIO_; hop onto it. Copy the bytes
+  // into a shared_ptr the closure owns. No-op when the rpc port (and thus
+  // compute) is off.
+  auto io = _rpcTaskIOExecutor();
+  if (!io) return;
+  auto m = std::make_shared<ces::Bytes>(msg);
+  boost::asio::post(io, [author, sender, msgId, dest, m]() {
+    computeHandlerDeliverGossip(author, sender, msgId, dest,
+                                m->data(), m->size());
+  });
 }
 
 CesClientAsync* CesServer::getOrCreateSettlementClient(
@@ -5114,11 +5429,15 @@ bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
     else if (key == "fee_compute_rss_byte_day") { cfg_.feeComputeRssByteDay = static_cast<int64_t>(value); ok = true; }
     else if (key == "fee_compute_net_byte")     { cfg_.feeComputeNetByte    = static_cast<int64_t>(value); ok = true; }
     else if (key == "fee_bucket_byte_sec")      { cfg_.feeBucketByteSec     = static_cast<int64_t>(value); ok = true; }
-    // ChannelMeter (net metering) rates, live on the meter tick.
-    else if (key == "fee_net_byte_sent")     { cfg_.feeNetByteSent     = value; ok = true; }
-    else if (key == "fee_net_byte_received") { cfg_.feeNetByteReceived = value; ok = true; }
-    else if (key == "fee_net_channel_sec")   { cfg_.feeNetChannelSec   = value; ok = true; }
-    else if (key == "fee_net_mem_byte_day")  { cfg_.feeNetMemByteDay   = value; ok = true; }
+    // ChannelMeter (net metering) rates, live on the meter tick. Floored to >= 1
+    // to preserve the constructor invariant that feeNet* is never a literal 0 --
+    // a runtime 0 would silently DISABLE the meter (the ctor's 0-sentinel
+    // derivation only runs at startup, so it would not re-derive here). To get
+    // the derived default back, restart; to go cheap, set 1.
+    else if (key == "fee_net_kib_sent")      { cfg_.feeNetKiBSent      = value ? value : 1; ok = true; }
+    else if (key == "fee_net_kib_received")  { cfg_.feeNetKiBReceived  = value ? value : 1; ok = true; }
+    else if (key == "fee_net_channel_sec")   { cfg_.feeNetChannelSec   = value ? value : 1; ok = true; }
+    else if (key == "fee_net_mem_byte_day")  { cfg_.feeNetMemByteDay   = value ? value : 1; ok = true; }
     // Feature caps: the value is read live (file GC / compute LAUNCH admission),
     // but the handler binds/unbinds only at boot, so the 0 boundary is frozen in
     // both directions — a feature off at boot can't be enabled live, and an
@@ -5207,9 +5526,9 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "fee_compute_net_byte = "     << cfg_.feeComputeNetByte    << "\n";
     o << "fee_bucket_byte_sec = "      << cfg_.feeBucketByteSec     << "\n\n";
 
-    o << "# ChannelMeter net-metering rates (0 = observe only)\n";
-    o << "fee_net_byte_sent = "     << cfg_.feeNetByteSent     << "\n";
-    o << "fee_net_byte_received = " << cfg_.feeNetByteReceived << "\n";
+    o << "# ChannelMeter net-metering rates (0 = derive a non-zero default, NOT free)\n";
+    o << "fee_net_kib_sent = "      << cfg_.feeNetKiBSent      << "\n";
+    o << "fee_net_kib_received = "  << cfg_.feeNetKiBReceived  << "\n";
     o << "fee_net_channel_sec = "   << cfg_.feeNetChannelSec   << "\n";
     o << "fee_net_mem_byte_day = "  << cfg_.feeNetMemByteDay   << "\n\n";
 
@@ -5218,7 +5537,10 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "peer_miner_interval = " << cfg_.peerMinerIntervalSecs << "\n";
     o << "peer_pow_inbound_reciprocation_bps = "
       << cfg_.peerPowInboundReciprocationBps << "\n";
-    o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n\n";
+    o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n";
+    o << "max_peer_reserve_disturbance = "
+      << cfg_.maxPeerReserveDisturbance << "\n";
+    o << "gossip_fanout_degree = " << cfg_.gossipFanoutDegree << "\n\n";
 
     o << "# Interfaces\n";
     if (!cfg_.adminSocket.empty())

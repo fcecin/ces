@@ -199,6 +199,143 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
+// Gossip consumer: a program that defines a global on_gossip receives flooded
+// messages, including ones THIS node originates itself (self-delivery). On
+// receipt the handler (a coroutine — it calls the yielding ces.transfer)
+// transfers 7 to a beacon. Originating one gossip moves the beacon to 1 + 7.
+BOOST_FIXTURE_TEST_CASE(GossipDeliveredToProgram, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);  // create the beacon (1) so we expect 1 + 7
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/gconsumer.bin";
+  const std::string src =
+    "function on_gossip(msg, meta)\n"
+    "  ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "end\n"
+    "ces.conn.run()\n";   // enter the event loop so gossip gets drained
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 1'000'000'000);   // fund the program's transfer
+  launch(path);
+
+  // Let the child start and reach the run loop before originating.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // Originate one gossip from this node; self-delivery routes it to on_gossip.
+  ces::Bytes payload{'h', 'i'};
+  server->originateGossip(payload, 1'000'000, Hash{});
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 8; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// Outbound: a program calls ces.gossip.send; the node originates the flood and
+// (self-delivery) routes it straight back to the same program's on_gossip,
+// which filters on the payload and transfers to the beacon. Proves the program
+// send path → server originate → local delivery loop end-to-end.
+BOOST_FIXTURE_TEST_CASE(GossipSendFromProgram, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);  // beacon starts at 1, expect 1 + 7
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/gsender.bin";
+  const std::string src =
+    "function on_gossip(msg, meta)\n"
+    "  if msg == 'ping' then ces.transfer('"
+      + luaBytes(beaconPk.data(), 32) + "', 7) end\n"
+    "end\n"
+    "ces.gossip.send('ping', 1000000)\n"   // originate; loops back to us
+    "ces.conn.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 1'000'000'000);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 8; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// Metadata integrity: on_gossip transfers ONLY when meta.author equals this
+// server's key (a server-originated gossip), the payload matches, and msgid/dest
+// are 32-byte strings. A pass means the {author,sender,msgid,dest} table arrived
+// intact, not just that the handler fired.
+BOOST_FIXTURE_TEST_CASE(GossipMetadataDelivered, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const auto serverKey = server->_serverKeyPair().getPublicKeyAsHash();
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/gmeta.bin";
+  const std::string src =
+    "function on_gossip(msg, meta)\n"
+    "  if msg == 'tag' and meta.author == '"
+      + luaBytes(serverKey.data(), 32) + "'\n"
+    "     and #meta.msgid == 32 and #meta.dest == 32\n"
+    "     and #meta.sender == 32 then\n"
+    "    ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "  end\n"
+    "end\n"
+    "ces.conn.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 1'000'000'000);
+  launch(path);
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  ces::Bytes payload{'t', 'a', 'g'};
+  server->originateGossip(payload, 1'000'000, Hash{});
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 8; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// A launched program's pubkey becomes a gossip sink target, so a gossip with
+// dest == ces.program_pubkey() is flushed into the program's account. The
+// fixture's connected client originates it (ticketless). Exercises the
+// launch to sink-registry to credit path with a real child.
+BOOST_FIXTURE_TEST_CASE(GossipSinkCreditsProgramAccount, LuaRpcFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/gsink.bin";
+  const std::string src = "ces.conn.run()\n";  // stay alive; key stays registered
+  const auto progPk = deploy(path, src);
+  launch(path);
+  // Let the child reach the run loop and the launch-time sink registration
+  // (posted to the logic strand) land before we address a gossip to it.
+  std::this_thread::sleep_for(std::chrono::seconds(1));
+
+  // The program account already holds the file's deposit; the sink TOPS IT UP
+  // (a gossip-payment funds the very account the supervisor bills and the
+  // program spends from). Measure the delta.
+  const int64_t before = balanceOf(progPk);
+  BOOST_REQUIRE_GT(before, 0);
+
+  const uint64_t budget = 1'000'000;
+  ces::Bytes payload{'p', 'a', 'y'};
+  BOOST_REQUIRE_EQUAL(client->gossip(payload, budget, progPk), CES_OK);
+
+  int64_t bal = before;
+  for (int i = 0; i < 200 && bal <= before; i++) {
+    bal = balanceOf(progPk);
+    if (bal <= before) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_GT(bal, before);                  // the multicast payment landed
+  BOOST_CHECK_LE(bal - before, static_cast<int64_t>(budget));  // <= budget (skim)
+  BOOST_CHECK_GE(server->gossipSinkCount(), 1u);
+}
+
 // Same path, but the client dials from inside a ces.spawn coroutine — so
 // ces.conn.connect runs under the event loop and must transparently YIELD
 // (park, endpoint drives the bind, resume on completion) rather than block.

@@ -129,6 +129,15 @@ peer_pow_inbound_reciprocation_bps = )" << DEFAULT_PEER_POW_INBOUND_RECIPROCATIO
 # Async settlement max retries per operation (1 = no retries, for testing)
 settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
 
+# Max reserve (raw) one operation may spend at one peer. Caps each gossip
+# fan-out leg; the unallocated remainder reverts to the originator.
+# 0 = uncapped (only the reserve on hand bounds a leg).
+max_peer_reserve_disturbance = 100000
+
+# Peers each gossip hop forwards to: a random subset of this size from the
+# reachable peers we hold reserve with. 0 = forward to every peer.
+gossip_fanout_degree = 6
+
 # Admin console (Unix domain socket). Empty or omitted = disabled.
 # admin_socket = "./admin.sock"
 
@@ -256,10 +265,12 @@ channel_idle_secs = 60
 # fee_compute_slot_sec     = -1
 # fee_bucket_byte_sec      = -1   # ces.bucket_new committed-capacity rent
 #
-# ChannelMeter (CesPlex net metering) rates — what the host charges per bound
-# channel's raw usage. 0 = observe only (the default; no charge).
-# fee_net_byte_sent      = 0
-# fee_net_byte_received  = 0
+# ChannelMeter (CesPlex net metering) rates. Throughput is metered per KiB so
+# the rate can sit below 1 raw/byte. 0 is a sentinel, not "free": the server
+# derives a non-zero default from the ledger anchors at startup, so metering
+# stays on. An explicit non-zero overrides (small = cheap, large = dear).
+# fee_net_kib_sent       = 0
+# fee_net_kib_received   = 0
 # fee_net_channel_sec    = 0
 # fee_net_mem_byte_day   = 0
 #
@@ -349,6 +360,8 @@ int main(int argc, char* argv[]) {
   uint64_t optPeerPowInboundReciprocationBps = 0;
   int optPeerMinerInterval = 60;
   int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
+  uint64_t optMaxPeerReserveDisturbance = 100'000;
+  uint32_t optGossipFanoutDegree = 6;
   std::string optAdminSocket;
   uint16_t optWebPort = 0;
   std::string optWebBind = "127.0.0.1";
@@ -383,8 +396,11 @@ int main(int argc, char* argv[]) {
   int64_t optFeeComputeNetByte    = -1;
   int64_t optFeeComputeSlotSec    = -1;
   int64_t optFeeBucketByteSec     = -1;
-  uint64_t optFeeNetByteSent      = 0;   // net meter (ChannelMeter); 0 = observe
-  uint64_t optFeeNetByteReceived  = 0;
+  // net meter (ChannelMeter). 0 is a sentinel: the CesServer ctor derives a
+  // non-zero rate from the ledger anchors (floored to >= 1), so metering stays
+  // on. Pass an explicit non-zero to override.
+  uint64_t optFeeNetKiBSent       = 0;
+  uint64_t optFeeNetKiBReceived   = 0;
   uint64_t optFeeNetChannelSec    = 0;
   uint64_t optFeeNetMemByteDay    = 0;
   std::string optComputeWorkDir;
@@ -487,6 +503,14 @@ int main(int argc, char* argv[]) {
     app.add_option("--settlementretries", optSettlementMaxRetries,
       "Async settlement max retries (1 = no retries)")
       ->default_val(std::to_string(CesClientAsync::DEFAULT_MAX_RETRIES));
+    app.add_option("--maxpeerreservedisturbance", optMaxPeerReserveDisturbance,
+      "Max reserve (raw) one op may spend at one peer; caps each gossip "
+      "fan-out leg, remainder refunds the originator (0 = uncapped)")
+      ->default_val("100000");
+    app.add_option("--gossipfanoutdegree", optGossipFanoutDegree,
+      "Peers each gossip hop forwards to, a random subset of funded peers "
+      "(0 = forward to every peer)")
+      ->default_val("6");
     app.add_option("--adminsocket", optAdminSocket,
       "Admin console Unix socket path (empty = disabled)")->default_val("");
     app.add_option("--webport", optWebPort,
@@ -597,10 +621,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--feebucketbytesec", optFeeBucketByteSec,
       "Bucket cache fee per byte per second of declared capacity "
       "(credits, -1 = derive from feeComputeRssByteDay)");
-    app.add_option("--feenetbytesent", optFeeNetByteSent,
-      "Net meter: credits per byte sent server->client (0 = observe only)");
-    app.add_option("--feenetbytereceived", optFeeNetByteReceived,
-      "Net meter: credits per byte received client->server (0 = observe only)");
+    app.add_option("--feenetkibsent", optFeeNetKiBSent,
+      "Net meter: credits per KiB sent server->client (0 = derive default)");
+    app.add_option("--feenetkibreceived", optFeeNetKiBReceived,
+      "Net meter: credits per KiB received client->server (0 = derive default)");
     app.add_option("--feenetchannelsec", optFeeNetChannelSec,
       "Net meter: credits per channel-second open (0 = observe only)");
     app.add_option("--feenetmembyteday", optFeeNetMemByteDay,
@@ -708,6 +732,10 @@ int main(int argc, char* argv[]) {
       applyIfDefault("peer_miner_interval", optPeerMinerInterval,
                      "--peerminerinterval");
       applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
+      applyIfDefault("max_peer_reserve_disturbance", optMaxPeerReserveDisturbance,
+                     "--maxpeerreservedisturbance");
+      applyIfDefault("gossip_fanout_degree", optGossipFanoutDegree,
+                     "--gossipfanoutdegree");
       applyIfDefault("admin_socket", optAdminSocket, "--adminsocket");
       applyIfDefault("web_port", optWebPort, "--webport");
       applyIfDefault("web_bind", optWebBind, "--webbind");
@@ -782,10 +810,10 @@ int main(int argc, char* argv[]) {
                      "--feecomputeslotsec");
       applyIfDefault("fee_bucket_byte_sec",      optFeeBucketByteSec,
                      "--feebucketbytesec");
-      applyIfDefault("fee_net_byte_sent",        optFeeNetByteSent,
-                     "--feenetbytesent");
-      applyIfDefault("fee_net_byte_received",    optFeeNetByteReceived,
-                     "--feenetbytereceived");
+      applyIfDefault("fee_net_kib_sent",         optFeeNetKiBSent,
+                     "--feenetkibsent");
+      applyIfDefault("fee_net_kib_received",     optFeeNetKiBReceived,
+                     "--feenetkibreceived");
       applyIfDefault("fee_net_channel_sec",      optFeeNetChannelSec,
                      "--feenetchannelsec");
       applyIfDefault("fee_net_mem_byte_day",     optFeeNetMemByteDay,
@@ -931,6 +959,8 @@ int main(int argc, char* argv[]) {
   config.peerPowInboundReciprocationBps = optPeerPowInboundReciprocationBps;
   config.peerMinerIntervalSecs = optPeerMinerInterval;
   config.settlementMaxRetries = optSettlementMaxRetries;
+  config.maxPeerReserveDisturbance = optMaxPeerReserveDisturbance;
+  config.gossipFanoutDegree = optGossipFanoutDegree;
   config.adminSocket = optAdminSocket;
   config.webPort = optWebPort;
   config.webBind = optWebBind;
@@ -972,8 +1002,8 @@ int main(int argc, char* argv[]) {
     config.feeComputeSlotSec    = optFeeComputeSlotSec;
   if (optFeeBucketByteSec     >= 0)
     config.feeBucketByteSec     = optFeeBucketByteSec;
-  config.feeNetByteSent       = optFeeNetByteSent;
-  config.feeNetByteReceived   = optFeeNetByteReceived;
+  config.feeNetKiBSent        = optFeeNetKiBSent;
+  config.feeNetKiBReceived    = optFeeNetKiBReceived;
   config.feeNetChannelSec     = optFeeNetChannelSec;
   config.feeNetMemByteDay     = optFeeNetMemByteDay;
   config.cesComputeWorkDir      = optComputeWorkDir;

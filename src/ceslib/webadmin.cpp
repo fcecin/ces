@@ -518,8 +518,8 @@ std::string buildConfig(CesServer& s) {
   kv(o, "computePortBase", c.computePortBase, false);
   kv(o, "computePortCount", c.computePortCount, false);
   kv(o, "computeClientPoolSize", static_cast<uint64_t>(c.computeClientPoolSize), false);
-  kv(o, "feeNetByteSent", c.feeNetByteSent, false);
-  kv(o, "feeNetByteReceived", c.feeNetByteReceived, false);
+  kv(o, "feeNetKiBSent", c.feeNetKiBSent, false);
+  kv(o, "feeNetKiBReceived", c.feeNetKiBReceived, false);
   kv(o, "feeNetChannelSec", c.feeNetChannelSec, false);
   kv(o, "feeNetMemByteDay", c.feeNetMemByteDay, false);
   kv(o, "feeFileRent", static_cast<uint64_t>(c.feeFileRent), false);
@@ -2116,7 +2116,7 @@ async function helloLoad(){const r=await post('/api/hello_load',{});
 /* config */
 // Editable fee groups: [snake_key (config_set), camel_knob_key (/api/config), label].
 const FEES_BASE=[['fee_account','feeAccount','Account rent / day'],['fee_asset','feeAsset','Asset rent / day'],['fee_tx','feeTx','Per signed op'],['fee_query','feeQuery','Per signed query'],['fee_vm_mult','feeVmMult','VM gas multiplier']];
-const FEES_NET=[['fee_net_byte_sent','feeNetByteSent','Per byte sent (S→C)'],['fee_net_byte_received','feeNetByteReceived','Per byte received (C→S)'],['fee_net_channel_sec','feeNetChannelSec','Per channel-second open'],['fee_net_mem_byte_day','feeNetMemByteDay','Per RUDP mem byte-day']];
+const FEES_NET=[['fee_net_kib_sent','feeNetKiBSent','Per KiB sent (S→C)'],['fee_net_kib_received','feeNetKiBReceived','Per KiB received (C→S)'],['fee_net_channel_sec','feeNetChannelSec','Per channel-second open'],['fee_net_mem_byte_day','feeNetMemByteDay','Per RUDP mem byte-day']];
 const FEES_FILE=[['fee_file_rent','feeFileRent','Rent / byte-day'],['fee_file_write','feeFileWrite','Write / KB'],['fee_file_read','feeFileRead','Read / KB']];
 const FEES_COMPUTE=[['fee_compute_slot_sec','feeComputeSlotSec','Slot / sec'],['fee_compute_cpu_sec','feeComputeCpuSec','CPU / core-sec'],['fee_compute_rss_byte_day','feeComputeRssByteDay','RSS / byte-day'],['fee_compute_net_byte','feeComputeNetByte','Net / byte'],['fee_bucket_byte_sec','feeBucketByteSec','Bucket / byte-sec']];
 // Render a fee-editor group; input id = fee_<camel>, config key shown in mono.

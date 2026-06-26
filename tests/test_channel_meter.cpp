@@ -474,8 +474,8 @@ BOOST_FIXTURE_TEST_CASE(EvictsAfterChannelDies, NetBillFixture) {
 BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   // Use a fresh key (NOT testKey, which the fixture funds heavily).
   ces::KeyPair brokeKey;
-  // Fund only enough for a single feeQuery — far less than what the
-  // tick's bytes/age/mem debit will cost.
+  // Fund 100 raw, far below the tick debit. Throughput is metered per KiB, so a
+  // multi-KiB round-trip makes the byte debit clearly exceed the funding.
   server->_brr(brokeKey.getPublicKeyAsHash(), 100);
 
   NbTestPeer peer;
@@ -483,9 +483,10 @@ BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   auto stream = peer.selectAndOpen(rpcPort, "/ces/test/echo/1", brokeKey);
   BOOST_REQUIRE(stream != nullptr);
 
-  // Confirm tracked + drive a small round-trip so deltas accumulate.
-  auto reply = peer.echo(stream, std::string(64, 'x'));
-  BOOST_REQUIRE_EQUAL(reply, std::string(64, 'x'));
+  // Confirm tracked + drive a multi-KiB round-trip so the byte deltas accrue
+  // well past the 100-credit balance.
+  auto reply = peer.echo(stream, std::string(4096, 'x'));
+  BOOST_REQUIRE_EQUAL(reply, std::string(4096, 'x'));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
 

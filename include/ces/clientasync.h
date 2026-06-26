@@ -27,6 +27,10 @@ namespace ces {
 class CesClientAsync {
 public:
   using Callback = std::function<void(uint8_t rc)>;
+  // Gossip result carries the amount the peer drained for the hop (leg 2); the
+  // local server credits the peer's reserve on itself by it (leg 1). rc != OK
+  // (e.g. terminal timeout) arrives with paid = 0 -> no credit -> a burn.
+  using GossipCallback = std::function<void(uint8_t rc, uint64_t paid)>;
 
   CesClientAsync(boost::asio::io_context& io,
                  const boost::asio::ip::udp::endpoint& serverEndpoint,
@@ -38,6 +42,12 @@ public:
   ~CesClientAsync();
 
   void openTransfer(const Hash& destKey, uint64_t amount, Callback cb);
+
+  // Queue a CES_GOSSIP op to this peer. Re-signs as the local server (originId);
+  // authorId/msgId are carried unchanged for provenance and dedup, budget is
+  // per-hop. Reuses the same ticketed-channel machinery as openTransfer.
+  void gossip(const Hash& authorId, const Hash& msgId, const Hash& dest,
+              uint64_t budget, const ces::Bytes& msg, GossipCallback cb);
 
   // Queue fill percentage [0..100]. The server uses this to backpressure:
   // callers bounce with CES_ERROR_QUEUE_FULL around 95%.
@@ -54,13 +64,27 @@ public:
   static constexpr int DEFAULT_MAX_RETRIES = 7;
 
 private:
+  enum class OpKind { OpenTransfer, Gossip };
+
   // Queued operation (not yet assigned to a channel)
   struct QueuedOp {
+    OpKind kind = OpKind::OpenTransfer;
     Hash destKey;
     uint64_t amount;
-    Callback cb;
+    Callback cb;        // OpenTransfer result (rc)
+    GossipCallback gcb; // Gossip result (rc, paid)
     minx::Bytes signedPayload; // cached, stable across retries
+    std::chrono::steady_clock::time_point deadline{};  // gossip give-up time
   };
+
+  // Fire whichever callback the op carries, with a uniform (rc, paid) shape.
+  // Gossip uses paid; OpenTransfer ignores it. Used by the result path and by
+  // every failure path (timeout / close) with paid = 0 so a failed gossip hop
+  // burns rather than mints.
+  static void fireOpCallback(QueuedOp& op, uint8_t rc, uint64_t paid) {
+    if (op.kind == OpKind::Gossip) { if (op.gcb) op.gcb(rc, paid); }
+    else { if (op.cb) op.cb(rc); }
+  }
 
   // Per-channel state
   enum class ChState { Idle, Handshaking, Ready, Busy };
@@ -123,6 +147,19 @@ private:
   static constexpr int RETRY_MS = 3000;
   static constexpr int HANDSHAKE_RETRY_MS = 2000;
   static constexpr size_t MAX_QUEUE = 50000;
+  // Gossip is best-effort and timely: it retries fast and gives up after a short
+  // window (paid = 0, a burn), instead of inheriting settlement's retry.
+  static constexpr int GOSSIP_RETRY_MS = 1000;
+  static constexpr int GOSSIP_DEADLINE_MS = 5000;
+  // Gossip rides a peer's settlement client only while its queue has no backlog
+  // (nothing waiting for a channel). In-flight settlement ops do not bar it.
+  // Settlement gives up after the receiver's nonceless dedup window: past it a
+  // retry is stale-rejected anyway, and this also bounds a half-up peer that
+  // answers handshakes but never replies to the op. Bound to the same window
+  // (CES_NONCELESS_DEDUP_WINDOW_US) so the two cannot drift. Give-up is
+  // conserved (vostro stands).
+  static constexpr int SETTLEMENT_DEADLINE_MS =
+    static_cast<int>(CES_NONCELESS_DEDUP_WINDOW_US / 1000);
 };
 
 } // namespace ces

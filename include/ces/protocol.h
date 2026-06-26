@@ -224,6 +224,90 @@ struct CesCrossTransferResult {
   CES_INJECT_SIGNED_METHODS(CES_CROSS_TRANSFER_RESULT)
 };
 
+// --- CES_GOSSIP (flood/route a message across the server mesh) ---
+// Re-signed each hop: originId is the immediate sender (the client at hop 0,
+// the relaying server after), serverId binds this copy to its next-hop
+// recipient. authorId and msgId are the original broadcaster and a dedup id,
+// carried unchanged across hops; budget decrements per hop. dest all-zero =
+// broadcast to everyone, otherwise a targeted route.
+struct CesGossip {
+  Hash originId;
+  HashPrefix serverId{};
+  uint32_t reqNonce;
+  Hash authorId;
+  Hash msgId;
+  Hash dest;
+  uint64_t budget;
+  uint64_t time = 0; // UTC epoch microseconds (staleness)
+  ces::Bytes msg;    // up to 1024 bytes
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(serverId) + sizeof(reqNonce) +
+           sizeof(authorId) + sizeof(msgId) + sizeof(dest) + sizeof(budget) +
+           sizeof(time) + 2 + msg.size();
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(serverId);
+    buf.put(reqNonce);
+    buf.put(authorId);
+    buf.put(msgId);
+    buf.put(dest);
+    buf.put(budget);
+    buf.put(time);
+    buf.put(static_cast<uint16_t>(msg.size()));
+    buf.putBytes(msg);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<Hash>();
+    serverId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    authorId = buf.get<Hash>();
+    msgId = buf.get<Hash>();
+    dest = buf.get<Hash>();
+    budget = buf.get<uint64_t>();
+    time = buf.get<uint64_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 1024) len = 1024;
+    msg = buf.getBytes<ces::Bytes>(len);
+  }
+
+  Signature sig{};
+  CES_INJECT_SIGNED_METHODS(CES_GOSSIP)
+};
+
+struct CesGossipResult {
+  HashPrefix originId{};
+  uint8_t rcode = 0;
+  // Amount the receiver actually drained from the sender's reserve for this hop
+  // (leg 2). The sender credits this same amount to the receiver's reserve on
+  // itself (leg 1) when the ack lands -- so the per-hop value move is conserved,
+  // and a lost/timed-out ack leaves paid=0 on the sender side: a burn, never a
+  // mint. Zero on a free hop, an unpaid drop, or a deduped cycle copy.
+  uint64_t paid = 0;
+  Signature sig{};
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(rcode) + sizeof(paid);
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(rcode);
+    buf.put(paid);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<HashPrefix>();
+    rcode = buf.get<uint8_t>();
+    paid = buf.get<uint64_t>();
+  }
+
+  CES_INJECT_SIGNED_METHODS(CES_GOSSIP_RESULT)
+};
+
 // --- CES_RUN_ASSET ---
 struct CesRunAsset {
   Hash originId;
