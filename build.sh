@@ -15,6 +15,9 @@ print_help() {
     echo "  minsizerel      Builds the smallest possible release."
     echo ""
     echo "Options:"
+    echo "  --native        Build for the build host's exact CPU (-march=native)."
+    echo "                  Faster but NOT portable -- local dev/bench only."
+    echo "                  Default is -march=x86-64-v3 (portable, shippable)."
     echo "  --asan          Enables AddressSanitizer."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
@@ -72,12 +75,17 @@ build_one_config() {
         EXTRA_ARGS="-DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
     fi
 
+    # Portable -march by default; --native pins to the build host.
+    local MARCH="x86-64-v3"
+    [ "$ENABLE_NATIVE" = true ] && MARCH="native"
+
     # Always reconfigure: the git hash baked into the version stamp is
     # captured at configure time (CMakeLists.txt, git rev-parse HEAD), so
     # skipping configure on an existing build dir leaves the stamp stale.
-    echo "Configuring ${BUILD_TYPE_CAMEL} build..."
+    echo "Configuring ${BUILD_TYPE_CAMEL} build (-march=${MARCH})..."
     cmake -S . -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}" \
+        -DCES_MARCH="${MARCH}" \
         $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
@@ -92,6 +100,7 @@ RUN_TESTS=false
 TEST_FILTER=""
 DO_CLEAN=false
 ENABLE_ASAN=false
+ENABLE_NATIVE=false
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter
@@ -124,6 +133,9 @@ while [ $i -lt ${#ARGS[@]} ]; do
             ;;
         --clean)
             DO_CLEAN=true
+            ;;
+        --native)
+            ENABLE_NATIVE=true
             ;;
         --asan)
             ENABLE_ASAN=true

@@ -10,7 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # -----------------------------------------------------------------------------
 
 # Apply hardware optimizations globally to all C and C++ targets
-add_compile_options(-march=native)
+set(CES_MARCH "x86-64-v3" CACHE STRING "Target -march; 'native' = local-only")
+add_compile_options(-march=${CES_MARCH})
 
 # Force -O3 for pure Release builds (Overrides secp256k1's -O2 fallback)
 add_compile_options("$<$<CONFIG:Release>:-O3>")

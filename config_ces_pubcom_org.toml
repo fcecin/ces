@@ -86,6 +86,12 @@ compute_max_instances = 4
 compute_port_base = 53900
 compute_port_count = 100
 
+# Operator dashboard: loopback-only, NO AUTH by design -- reach it over an SSH
+# tunnel (ssh -N -L 8080:localhost:8080 ...). Must stay at top-level scope; a
+# web_port under a [table] is silently ignored.
+web_port = 8080
+web_bind = "127.0.0.1"
+
 # L2 handlers wired on: file + lua + compute + the peer mesh. Nothing
 # auto-mounts; the peer mesh must be listed here too.
 [cesplex_mounts]
