@@ -3759,8 +3759,12 @@ int lua_ces_peer_listen(lua_State* L) {
   if (lua_isnoneornil(L, 2)) lua_pushnil(L); else lua_pushvalue(L, 2);
   lua_settable(L, -3);   // tbl[service] = fn (or nil)
   lua_pop(L, 1);
-  if (!write_frame(TAG_PEER_LISTEN, 0,
-                   reinterpret_cast<const uint8_t*>(s), slen)) {
+  // Body: [u16 service_len][service]. The server reads a length-prefixed
+  // service (matching TAG_PEER_MSG_OUT's framing).
+  std::vector<uint8_t> body;
+  put_u16(body, static_cast<uint16_t>(slen));
+  body.insert(body.end(), s, s + slen);
+  if (!write_frame(TAG_PEER_LISTEN, 0, body.data(), body.size())) {
     lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
   }
   lua_pushboolean(L, 1);
