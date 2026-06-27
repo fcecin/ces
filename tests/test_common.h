@@ -119,6 +119,10 @@ inline CesConfig makeTestConfig(const fs::path& dir, const minx::Hash& key,
   // values; the discount system is exercised in MetricsTests where it
   // matters.
   cfg.feeDiscountEnabled = false;
+  // The compiled default peer target is now 5 credits (servers mine reserves on
+  // peers by default). Pin tests to 0 so no test starts the RandomX peer miner;
+  // tests that exercise mining set peerTarget explicitly.
+  cfg.peerTarget = 0;
   return cfg;
 }
 

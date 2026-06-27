@@ -2379,10 +2379,12 @@ int lua_ces_peers(lua_State* L) {
     if (p + 32 + 2 > end) break;
     const uint8_t* ckey = p; p += 32;
     uint16_t alen = get_u16(p); p += 2;
-    if (p + size_t(alen) + 1 + 2 > end) break;
+    if (p + size_t(alen) + 1 + 2 + 16 > end) break;  // addr,flags,rpc,powIn,powOut
     const char* addr = reinterpret_cast<const char*>(p); p += alen;
     uint8_t flags = *p; p += 1;
     uint16_t rpcPort = get_u16(p); p += 2;
+    uint64_t powIn = get_u64(p); p += 8;
+    uint64_t powOut = get_u64(p); p += 8;
     lua_newtable(L);
     lua_pushlstring(L, reinterpret_cast<const char*>(ckey), 32);
     lua_setfield(L, -2, "pubkey");
@@ -2394,6 +2396,10 @@ int lua_ces_peers(lua_State* L) {
     lua_pushboolean(L, (flags & 0x08) ? 1 : 0); lua_setfield(L, -2, "inbound");
     lua_pushnumber(L, static_cast<lua_Number>(rpcPort));
     lua_setfield(L, -2, "rpc_port");
+    lua_pushnumber(L, static_cast<lua_Number>(powIn));
+    lua_setfield(L, -2, "inbound_pow");
+    lua_pushnumber(L, static_cast<lua_Number>(powOut));
+    lua_setfield(L, -2, "outbound_pow");
     lua_rawseti(L, -2, i + 1);
   }
   return 1;

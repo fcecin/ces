@@ -519,7 +519,8 @@ BOOST_AUTO_TEST_CASE(ConfigHasFeeMultipliers) {
 }
 
 BOOST_AUTO_TEST_CASE(DefaultStateNoMiner) {
-  // Fresh fixture: peerTarget defaults to 0 and the miner isn't started.
+  // Fresh fixture: makeTestConfig pins peerTarget to 0, so the miner isn't
+  // started (the compiled prod default is 5 credits; tests opt out).
   auto s = httpReq(port, "GET", "/api/status");
   BOOST_CHECK_EQUAL(jnum(s.body, "peerTarget"), 0);
   BOOST_CHECK(has(s.body, "\"minerRunning\":false"));

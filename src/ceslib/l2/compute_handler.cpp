@@ -1645,6 +1645,10 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       if (p.inbound)   flags |= 0x08;
       body.push_back(flags);
       ces::Buffer::put<uint16_t>(body, p.rpcPort);
+      // Lifetime PoW exchanged with the peer (raw units): the econ signal an
+      // autopeering extension uses to tell a committed peering from a dead one.
+      ces::Buffer::put<uint64_t>(body, p.totalInboundPoW);
+      ces::Buffer::put<uint64_t>(body, p.totalOutboundPoW);
     }
     sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
     return;

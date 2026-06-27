@@ -63,7 +63,7 @@ constexpr uint64_t DEFAULT_POW_DELAY       = 0;
 constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
 constexpr uint64_t DEFAULT_FLUSH_VALUE     = 0;          // 0 = flush every change
 constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB = 100;
-constexpr uint64_t DEFAULT_PEER_TARGET     = 0;
+constexpr uint64_t DEFAULT_PEER_TARGET     = 500000000;  // 5 full credits; 0 = no peering
 constexpr uint64_t DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS = 0;
 constexpr int      DEFAULT_PEER_MINER_INTERVAL_SECS  = 60;
 constexpr uint64_t DEFAULT_MAX_PEER_RESERVE_DISTURBANCE = 100'000;
