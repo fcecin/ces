@@ -1,32 +1,38 @@
-// file_handler.h - builtin:file handler lifecycle API (v2)
+// file_handler.h - builtin:file: per-server disk file storage handler.
 //
-// The file handler is a compiled-in CesPlex handler registered as
-// "file" in the global builtin registry.
+// Mounts /ces/file/1 on the plex (rpc) port. Disk-backed file storage with
+// four-zone naming, per-byte/day rent, and a kv-store file type.
 //
-// Lifecycle: CesServer::start() calls fileHandlerBind(this) after
-// CesPlex is constructed, and fileHandlerBind(nullptr) on shutdown
-// before CesPlex is torn down. Not thread-safe; intended to run on
-// the main thread during server start/stop.
+// One FileHandler OBJECT per CesServer (owned by the server, holds a back
+// pointer to it). No process-global state: N servers coexist in one process.
 //
-// CesServer also drives one startup hook:
-//   - fileHandlerStartupReconcile() runs once at start(), walking
-//     the storage dir to rebuild .store.toml so crash-state drift
-//     converges back to ground truth.
+// Lifecycle: the server constructs a FileHandler(this) and mounts it into its
+// CesPlex when /ces/file/1 is wired in [cesplex_mounts], then calls
+// startupReconcile(); on shutdown it calls stop() and drops the object (before
+// CesPlex / rpcRudp_ go away). cesFileStoreMaxBytes is only the metered-zone
+// cap (/s/ is unmetered and served whenever mounted), not the on/off switch.
 //
-// Rent is collected lazily — on every non-DEPOSIT op touching a
-// file, and on JIT GC during CREATE when the store is at capacity.
-// No periodic "rent pass" runs; dead files stay on disk until the
-// next CREATE (or op touching them) reclaims them.
+// Rent is collected lazily - on every non-DEPOSIT op touching a file, and on
+// JIT GC during CREATE when the store is at capacity. No periodic "rent pass"
+// runs; dead files stay on disk until the next CREATE (or op touching them)
+// reclaims them.
 
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include <boost/asio/any_io_executor.hpp>
+
+#include <ces/buffer.h>            // ces::Bytes
+#include <ces/cesplex/mux.h>      // CesPlexHandler, BoundChannelContext
+#include <minx/rudp/rudp_stream.h>
 
 namespace ces {
 
@@ -40,123 +46,6 @@ inline bool isServerZone(const std::string& name) {
   return name.size() >= 3 && name[0] == '/' &&
          name[1] == 's' && name[2] == '/';
 }
-
-// Bind/unbind the builtin:file handler to a CesServer. See header
-// comment for semantics.
-void fileHandlerBind(CesServer* server);
-
-// One-time startup walk of the file store directory. Recomputes
-// total_files and total_bytes from sidecars and rewrites .store.toml.
-// Safe to call with no files present. No-op if not bound.
-void fileHandlerStartupReconcile();
-
-// Daily per-extension local-budget sweep: top every /s/ program account up to the
-// server's extLocalBudget (deficit only). Called from dailyTaskTick. No-op if the
-// file feature is off, the budget is 0, or the handler is not bound.
-void fileHandlerSweepExtensionBudget(CesServer* server);
-
-// /s/ file read/write/remove for L2 cross-handler use (the extension manager), so
-// callers do no raw file I/O. A /s/ file is content-on-disk plus a reconcile-stamped
-// sidecar; the write is atomic (temp+rename) and re-stamps it. name = canonical
-// "/s/<...>". Read returns "" and write/remove false if not /s/ or not bound.
-std::string fileHandlerReadServerFile(const std::string& name);
-bool fileHandlerWriteServerFile(const std::string& name, const std::string& content);
-bool fileHandlerRemoveServerFile(const std::string& name);
-
-// Daily per-key rent sweep for kv-stores. Each kv key is a self-renting cell:
-// its value carries a [balance][last_charged] header the file service owns.
-// This walks every metered kv-store, charges each cell feeFileRent x
-// (key+value bytes) x elapsed (capped at its balance), evicts cells whose
-// balance hits 0, and burns the collected rent from the store's program
-// account. Transparent to any program using the store. The CES server calls
-// this from daily maintenance, alongside the account/asset sweeps. MUST run
-// OFF logicStrand_: it takes gKvMutex then hops to logicStrand for the burn,
-// the same lock order kv ops use. `server` may be null to use the bound one.
-void fileHandlerSweepKvRent(CesServer* server);
-
-// Read store-level stats from .store.toml (under the store mutex) for
-// monitoring. Returns false if the handler is unbound (feature off);
-// otherwise fills the totals (0/0 when the store is empty). Any-thread
-// safe — used by the web dashboard's File tab.
-bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes);
-
-// ---------------------------------------------------------------------------
-// Cross-handler primitives
-// ---------------------------------------------------------------------------
-//
-// These are intended for other CesPlex builtins that need to cooperate
-// with the file store (currently: builtin:compute, which charges the
-// source file's file_balance for hosting a running program). They are
-// in-process, unsigned, and do NOT perform any feeQuery / nonce / dedup
-// work — those are the caller's own concern. All three run on whatever
-// thread invokes them; the file handler takes no internal locks beyond
-// the small gStoreMetaMutex for the store-level TOML.
-
-// Roll rent forward on the file and return its current owner pubkey
-// and file_balance. Returns false if the file doesn't exist, the
-// sidecar is unreadable, the handler is unbound, or rent drove the
-// file into deletion (the deletion callback has already fired in that
-// case).
-bool fileHandlerReadOwnerAndBalance(
-    const std::string& name,
-    std::array<uint8_t, 32>& outOwnerPubkey,
-    uint64_t& outFileBalance);
-
-// Read the file's program-account pubkey (the ed25519 public key stored
-// in the sidecar at CREATE time, identifying the ledger Account that
-// running instances of this program share). Returns false if the file
-// doesn't exist or the sidecar is unreadable.
-bool fileHandlerReadProgramPubkey(
-    const std::string& name,
-    std::array<uint8_t, 32>& outProgramPubkey);
-
-// Read the file's program-account ed25519 private key (sidecar). Returns
-// false if the file doesn't exist or the sidecar is unreadable.
-bool fileHandlerReadProgramPrivkey(
-    const std::string& name,
-    std::array<uint8_t, 32>& outProgramPrivkey);
-
-// Debit `amount` credits from the file's file_balance. Rolls rent
-// forward before the debit. If the post-roll balance cannot cover
-// `amount`, the file is DELETED (like rent exhaustion) and the
-// function returns false — the deletion callback has fired by then.
-// On success, persists the new balance and returns true.
-bool fileHandlerDebitBalance(const std::string& name, uint64_t amount);
-
-// Credit `amount` credits into the file's file_balance. Rolls rent
-// forward before the credit (so incoming credits don't pay off
-// already-owed rent silently). Returns false if the file doesn't
-// exist, the sidecar is unreadable, the handler is unbound, or
-// rent drove the file into deletion during the roll-forward.
-bool fileHandlerCreditBalance(const std::string& name, uint64_t amount);
-
-// Returns the sha256(file_content || file_path) for the file at
-// `name`, computing it lazily on first call (or after invalidation
-// by a content-mutating verb). The result is cached in the sidecar
-// — subsequent calls do no hashing until the file is WRITE/APPEND/
-// RESIZE-ed, at which point the cached value is cleared and the
-// next call recomputes. Used by builtin:compute when minting
-// authentic assets, where the 32-byte hash becomes the asset
-// content's protected prefix.
-//
-// Returns false if the file doesn't exist, the sidecar is
-// unreadable, the handler is unbound, rent drove the file into
-// deletion during the roll-forward, or content streaming failed.
-bool fileHandlerGetProgramHash(
-    const std::string& name,
-    std::array<uint8_t, 32>& outHash);
-
-// Register a callback invoked right after a file is deleted by any
-// internal path (rent exhaustion via chargeRentOrDelete, the DELETE
-// verb, the gcReclaim sweep, or the debit-exhaustion path in
-// fileHandlerDebitBalance). Callback receives the file name and runs
-// on the thread that drove the deletion — typically rpcTaskIO_, but
-// not guaranteed. Must be quick and non-blocking. Multiple callbacks
-// may be registered; they fire in registration order. There is no
-// deregister — callbacks live for the process lifetime, which matches
-// the handler-singleton lifecycle.
-void fileHandlerRegisterDeletionCallback(
-    std::function<void(const std::string&)> cb);
 
 // ---------------------------------------------------------------------------
 // In-process verb execution for L2 cross-handler use
@@ -172,26 +61,19 @@ void fileHandlerRegisterDeletionCallback(
 // on WRITE/APPEND, feeFileRead + price_per_kb on non-owner READ,
 // upfront rent on CREATE/APPEND/RESIZE-grow, initial_deposit on
 // CREATE, etc.). The PAYER for every credit that would normally hit
-// the wire signer's account is `sourceName` — the file_balance of
+// the wire signer's account is `sourceName` - the file_balance of
 // the program's source file ("the program's wallet"). Refunds that
 // would normally go to the wire signer's account (WITHDRAW amount,
-// DELETE refund) also land in sourceName's file_balance. This keeps
-// the program's credit exposure bounded by what the operator put
-// into the source file's file_balance at LAUNCH time and prevents
-// a running program from writing to the store without being charged.
+// DELETE refund) also land in sourceName's file_balance.
 //
-// Zone-ownership gate (/h/, /f/, /p/, /s/) still applies: a program
-// running under owner X can only CREATE in /h/<hex(X)>/ paths, /f/<n>
-// paths whose asset X owns, /p/, or nothing in /s/. Subsequent ops
-// on existing files check the sidecar's owner_pubkey against the
-// passed-in owner.
+// Zone-ownership gate (/h/, /f/, /p/, /s/) still applies.
 //
 // Returns via callback on `cbExecutor`. Thread-safe: internal calls
 // hop to logicStrand_ as needed (/f/ zone check).
 
 struct FileExecReq {
   std::array<uint8_t, 32> ownerPubkey{};
-  std::string sourceName;         // program's source file — pays all fees
+  std::string sourceName;         // program's source file - pays all fees
   uint8_t verb = 0;               // 0x01..0x0a (matches wire verb codes)
   std::string name;
   uint64_t offset = 0;            // WRITE, READ
@@ -226,9 +108,98 @@ struct FileExecResp {
                                 // the next undelivered key (resume point)
 };
 
-void fileHandlerExec(
-    const FileExecReq& req,
-    std::function<void(FileExecResp)> cb,
-    boost::asio::any_io_executor cbExecutor);
+// Per-server kv-store cache (mutex + open-store map). Defined in the .cpp,
+// where the logkv store type is visible; the handler holds it by pointer so
+// this header stays free of logkv.
+struct FileKvCache;
+
+class FileHandler : public CesPlexHandler {
+public:
+  explicit FileHandler(CesServer* server);
+  ~FileHandler();
+
+  FileHandler(const FileHandler&) = delete;
+  FileHandler& operator=(const FileHandler&) = delete;
+
+  // CesPlexHandler: a freshly-bound /ces/file/1 channel. Runs the signed
+  // per-op verb loop (cesPlexServe).
+  void serve(std::shared_ptr<minx::RudpStream> stream,
+             BoundChannelContext bound) override;
+
+  // Release kv handles and stop accepting verbs. Call on shutdown before
+  // CesPlex / rpcRudp_ go away.
+  void stop();
+
+  // One-time startup walk of the file store directory: publish the bundled
+  // /s/ site, reconcile /s/ sidecars, regenerate the /s/ index, and recompute
+  // total_files/total_bytes into .store.toml. Safe with no files present.
+  void startupReconcile();
+
+  // Daily per-extension local-budget sweep: top every /s/ program account up
+  // to the server's extLocalBudget (deficit only). Called from dailyTaskTick.
+  // No-op if the file feature is off or the budget is 0.
+  void sweepExtensionBudget();
+
+  // Daily per-key rent sweep for kv-stores: charge each cell its rent, evict
+  // cells whose balance hits 0, and burn the collected rent from the store's
+  // program account. MUST run OFF logicStrand_ (takes the kv mutex then hops
+  // to logicStrand for the burn).
+  void sweepKvRent();
+
+  // /s/ file read/write/remove for L2 cross-handler use (the extension
+  // manager). Read returns "" and write/remove false if not /s/.
+  std::string readServerFile(const std::string& name);
+  bool writeServerFile(const std::string& name, const std::string& content);
+  bool removeServerFile(const std::string& name);
+
+  // Read store-level stats from .store.toml (under the store mutex) for
+  // monitoring. Fills the totals (0/0 when empty). Any-thread safe.
+  bool storeStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes);
+
+  // -------------------------------------------------------------------------
+  // Cross-handler primitives (builtin:compute). In-process, unsigned; no
+  // feeQuery / nonce / dedup. See the per-method comments in file_handler.cpp.
+  // -------------------------------------------------------------------------
+
+  // Roll rent forward and return the file's owner pubkey + program-account
+  // balance. False if missing/unreadable or rent drove it into deletion.
+  bool readOwnerAndBalance(const std::string& name,
+                           std::array<uint8_t, 32>& outOwnerPubkey,
+                           uint64_t& outFileBalance);
+  // Read the file's program-account ed25519 public key from its sidecar.
+  bool readProgramPubkey(const std::string& name,
+                         std::array<uint8_t, 32>& outProgramPubkey);
+  // Read the file's program-account ed25519 private key from its sidecar.
+  bool readProgramPrivkey(const std::string& name,
+                          std::array<uint8_t, 32>& outProgramPrivkey);
+  // Debit `amount` from the file's program account (rolls rent first). The
+  // file is DELETED if the post-roll balance cannot cover it; returns false.
+  bool debitBalance(const std::string& name, uint64_t amount);
+  // Credit `amount` into the file's program account (rolls rent first).
+  bool creditBalance(const std::string& name, uint64_t amount);
+  // sha256(file_content || file_path), cached in the sidecar until the file
+  // is content-mutated. Used by builtin:compute for authentic asset minting.
+  bool getProgramHash(const std::string& name,
+                      std::array<uint8_t, 32>& outHash);
+  // Register a callback invoked right after a file is deleted by any internal
+  // path. Fires in registration order on the deleting thread. No deregister.
+  void registerDeletionCallback(std::function<void(const std::string&)> cb);
+  // In-process verb execution. See FileExecReq / FileExecResp above.
+  void exec(const FileExecReq& req,
+            std::function<void(FileExecResp)> cb,
+            boost::asio::any_io_executor cbExecutor);
+
+  // Per-server state. Public so this translation unit's free helpers
+  // (file_handler.cpp) reach it via server->fileHandler(); not a stable API
+  // for other code.
+  CesServer* server_ = nullptr;
+  std::mutex storeMetaMutex_;
+  std::mutex deletionCallbacksMutex_;
+  std::vector<std::function<void(const std::string&)>> deletionCallbacks_;
+  std::unique_ptr<FileKvCache> kv_;
+
+private:
+  std::atomic<bool> stopped_{false};
+};
 
 } // namespace ces

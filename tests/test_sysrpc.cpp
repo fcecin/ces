@@ -56,6 +56,7 @@
 #include <ces/ramfilestore.h>
 #include <ces/keys.h>
 #include <ces/cesplex/wire.h>
+#include <ces/cesplex/session.h>
 #include <ces/server.h>
 #include <ces/util/vmprogram.h>
 
@@ -1087,149 +1088,13 @@ BOOST_AUTO_TEST_CASE(DisabledWhenNoRpcPort) {
 BOOST_AUTO_TEST_SUITE_END()
 
 // ---------------------------------------------------------------------------
-// Inbound RPC is intentionally disabled; CES is rpc-client-only. A CesServer
-// with rpcPort != 0 must still reject inbound RUDP handshakes at the
-// Accept predicate — no session state, no logging. This test spins up a
-// minimal RUDP client probe and asserts its push() never reaches
-// ESTABLISHED on the server side.
+// Inbound RPC is intentionally off: CES core ships only the outbound SYS_RPC
+// engine and mounts no /ces/rpc/1 handler. The plex port does accept inbound
+// channels (the server-to-server peer mesh rides them), so the guarantee is
+// at the bind gate: a /ces/rpc/1 bind NACKs (unknown protocol).
 // ---------------------------------------------------------------------------
 
 namespace {
-
-// Minimal RUDP client stack — Minx + Rudp + io_context + thread, with
-// just enough wiring to drive a push() toward a CesServer's rpcPort.
-// No inbound sessions, no streams; we only care whether the handshake
-// completes (it must not).
-class InboundProbeClient {
-public:
-  InboundProbeClient() = default;
-  ~InboundProbeClient() { stop(); }
-
-  uint16_t start() {
-    minx_ = std::make_unique<minx::Minx>(
-      &listener_, minx::MinxConfig{
-        .instanceName = "probe",
-        .randomXVMsToKeep = 0,
-        .trustLoopback = true});
-    rudpListener_.setMinx(minx_.get());
-    rudp_ = std::make_unique<minx::Rudp>(&rudpListener_);
-    minx::MinxStdExtensions stdExt;
-    stdExt.registerExtension(
-      minx::Rudp::KEY_V0,
-      [this](const minx::SockAddr& peer, uint64_t key,
-             const minx::Bytes& payload) {
-        if (rudp_) rudp_->onPacket(peer, key, payload, mockNowMicros());
-      });
-    minx_->setExtensionHandler(std::move(stdExt).build());
-
-    port_ = minx_->openSocket(
-      boost::asio::ip::address_v6::loopback(), 0, netIO_, taskIO_);
-    if (port_ == 0) return 0;
-
-    netThread_ = std::thread([this]() { netIO_.run(); });
-    taskThread_ = std::thread([this]() { taskIO_.run(); });
-
-    tickTimer_ = std::make_shared<boost::asio::steady_timer>(taskIO_);
-    boost::asio::post(taskIO_, [this]() { scheduleTick(); });
-
-    return port_;
-  }
-
-  void stop() {
-    if (!minx_) return;
-    if (tickTimer_) {
-      boost::system::error_code ec;
-      tickTimer_->cancel(ec);
-    }
-    minx_->closeSocket(false);
-    netIO_.stop();
-    taskIO_.stop();
-    if (netThread_.joinable()) netThread_.join();
-    if (taskThread_.joinable()) taskThread_.join();
-    tickTimer_.reset();
-    rudp_.reset();
-    minx_.reset();
-    rudpListener_.setMinx(nullptr);
-    port_ = 0;
-  }
-
-  // Register a stub channel handler on (peer, channelId) and post a
-  // reliable message. Returns true iff both registerChannel and push
-  // succeeded. The probe doesn't care what the handler does — it
-  // just needs the channel state to exist so RUDP fires HS_OPEN
-  // toward the server. The new RUDP API requires registerChannel
-  // before push().
-  bool pushSync(const minx::SockAddr& peer, uint32_t channelId,
-                const minx::Bytes& msg) {
-    struct StubHandler : public minx::Rudp::ChannelHandler {};
-    std::promise<bool> p;
-    auto f = p.get_future();
-    boost::asio::post(taskIO_, [this, &peer, channelId, &msg, &p]() {
-      // Seed the clock before registerChannel — see CesFileClient
-      // for the rationale (avoid immediate idle-GC).
-      rudp_->tick(mockNowMicros());
-      auto handler = std::make_shared<StubHandler>();
-      if (!rudp_->registerChannel(peer, channelId, handler)) {
-        p.set_value(false);
-        return;
-      }
-      p.set_value(rudp_->push(peer, channelId, msg, /*reliable=*/true));
-    });
-    return f.get();
-  }
-
-  // Same serialized-access pattern for isEstablished. Rudp lookups
-  // touch the internal peer/channel map; do them on taskIO_ so we
-  // don't race with tick() or inbound packet handling.
-  bool isEstablishedSync(const minx::SockAddr& peer, uint32_t channelId) {
-    std::promise<bool> p;
-    auto f = p.get_future();
-    boost::asio::post(taskIO_, [this, &peer, channelId, &p]() {
-      p.set_value(rudp_->isEstablished(peer, channelId));
-    });
-    return f.get();
-  }
-
-private:
-  void scheduleTick() {
-    if (!tickTimer_ || !rudp_) return;
-    tickTimer_->expires_after(std::chrono::milliseconds(20));
-    auto timer = tickTimer_;
-    timer->async_wait(
-      [this, timer](const boost::system::error_code& ec) {
-        if (ec || !rudp_) return;
-        rudp_->tick(mockNowMicros());
-        scheduleTick();
-      });
-  }
-
-  minx::MinxListener listener_;
-  // Outbound-only Rudp::Listener: forwards onSend, rejects inbound.
-  class ProbeRudpListener : public minx::Rudp::Listener {
-   public:
-    void setMinx(minx::Minx* m) { minx_ = m; }
-    void onSend(const minx::SockAddr& peer,
-                const minx::Bytes& bytes) override {
-      if (!minx_) return;
-      try {
-        minx_->sendExtension(peer, bytes);
-      } catch (const std::exception&) {
-        // Socket already closed during teardown.
-      }
-    }
-   private:
-    minx::Minx* minx_ = nullptr;
-  };
-  ProbeRudpListener rudpListener_;
-  std::unique_ptr<minx::Minx> minx_;
-  std::unique_ptr<minx::Rudp> rudp_;
-  boost::asio::io_context netIO_;
-  boost::asio::io_context taskIO_;
-  std::thread netThread_;
-  std::thread taskThread_;
-  std::shared_ptr<boost::asio::steady_timer> tickTimer_;
-  uint16_t port_ = 0;
-};
 
 // Fresh fixture specifically for the inbound test. We deliberately do
 // NOT reuse SysRpcFixture — that fixture also starts a MockRpcServer
@@ -1274,43 +1139,21 @@ struct InboundProbeFixture {
 BOOST_FIXTURE_TEST_SUITE(SysRpcInboundDisabledTests, InboundProbeFixture)
 
 BOOST_AUTO_TEST_CASE(InboundHandshakeRejected) {
-  // The server's RPC socket is bound — this is a running RPC listener
-  // that accepts OUTBOUND calls. We send an inbound OPEN at it via a
-  // bare RUDP probe. The server's ChannelAccept predicate returns
-  // false, so the handshake silently dies: the probe keeps retrying
-  // until its handshakeMaxRetries are exhausted and isEstablished
-  // stays false the entire time.
+  // CES core ships only the OUTBOUND SYS_RPC engine: it does not mount an
+  // inbound /ces/rpc/1 handler. The plex port accepts inbound channels
+  // (the server-to-server peer mesh rides them), so rejection is at the
+  // BIND level, not the channel level: a bind for /ces/rpc/1 NACKs
+  // (unknown protocol). That is what "inbound RPC is off" means now.
   const uint16_t rpcPort = server->_rpcBoundPort();
   BOOST_REQUIRE_MESSAGE(rpcPort > 0,
                         "server did not bind its RPC port");
 
-  InboundProbeClient probe;
-  BOOST_REQUIRE(probe.start() > 0);
-
-  minx::SockAddr serverAddr(
-    boost::asio::ip::address_v6::loopback(), rpcPort);
-  const uint32_t channelId = 0xDEADBEEF;
-  minx::Bytes payload;
-  payload.push_back('x');
-
-  // push() may succeed (it only fails on MAX_MESSAGE_SIZE / per-peer
-  // cap / send-buffer-full — none of those apply here). What we care
-  // about is that the channel never reaches ESTABLISHED.
-  BOOST_REQUIRE(probe.pushSync(serverAddr, channelId, payload));
-
-  // Give both sides time to exchange handshake packets. RUDP's default
-  // handshakeRetryInterval is 200 ms × 3 retries = 600 ms. We wait
-  // longer than that to be sure retries have been exhausted.
-  for (int i = 0; i < 20; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    if (probe.isEstablishedSync(serverAddr, channelId)) break;
-  }
-
-  BOOST_CHECK_MESSAGE(
-    !probe.isEstablishedSync(serverAddr, channelId),
-    "Inbound RUDP channel was accepted — inbound RPC must be off");
-
-  probe.stop();
+  ces::CesPlexClient c;
+  c.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  ces::KeyPair k;
+  uint8_t rc = c.connect("localhost", rpcPort, "/ces/rpc/1", k);
+  CES_CHECK_RC_EQ(rc, CES_ERROR_PROTO_REJECTED);
+  c.disconnect();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -16,9 +16,8 @@ go unreachable are retried, given up after a few failures, and dropped.
 No mesh, no persistent connections: it is a periodic crawler built out
 of the same client primitives any program has.
 
-The full design lives in the cesdk source tree
-(`apps/discovery/`, `local/PEERING_AGENT_DESIGN.md`); this file is the
-built single-file bundle the operator deploys.
+The full design lives in the cesdk source tree (`apps/discovery/`); this file
+is the built single-file bundle the operator deploys.
 
 ---
 

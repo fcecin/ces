@@ -42,15 +42,15 @@ public:
   // `port`     — UDP port to bind (0 = OS-assigned; read back via boundPort()).
   // `host`     — signs bind replies + sinks measured usage; its signing key
   //              also becomes the Minx server key. Must outlive the endpoint.
-  // `mounts`   — protocol-name → "builtin:<name>", resolved in the global
-  //              CesPlex builtin registry at construction.
+  // `mounts`   — protocol-name → handler object, mounted into the CesPlex at
+  //              construction. Each handler must outlive the endpoint.
   // `minxCfg` / `rudpCfg` — fully specify the MINX + RUDP posture (the caller
   //              owns those decisions: anti-spam, pacing, buffer sizes). The
   //              server key is set internally from `host`.
   // `meterTick` — ChannelMeter cadence.
   CesPlexEndpoint(uint16_t port,
                   CesPlexHost* host,
-                  std::map<std::string, std::string> mounts,
+                  std::map<std::string, CesPlexHandler*> mounts,
                   minx::MinxConfig minxCfg,
                   minx::RudpConfig rudpCfg,
                   std::chrono::seconds meterTick = std::chrono::seconds(60));

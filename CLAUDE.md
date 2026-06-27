@@ -2,7 +2,7 @@
 
 C++20 public token/credit ledger for resource accounting. Clients earn credits via RandomX PoW mining and spend them on transfers, queries, and assets. Each server is a sovereign ledger; servers peer via bilateral vostro/reserve settlement. No blockchain.
 
-CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind handshake, routes each bound RUDP channel to a named handler, and meters the channel's raw byte/time usage for the host to price. CesPlex knows no credits. The handlers riding it are L2. Shipped in CES core: `builtin:file` (disk file storage), `builtin:compute` (instance lifecycle plus Lua hosting), `builtin:lua` (channel attach into a running program). The protocol name `/ces/rpc/1` is reserved and CES ships the SYS_RPC outbound engine, but `builtin:rpc` is not registered by CES core; inbound RPC is L3 (downstream binaries link ceslib and register their own).
+CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind handshake, routes each bound RUDP channel to a named handler, and meters the channel's raw byte/time usage for the host to price. CesPlex knows no credits. The handlers riding it are L2. Shipped in CES core: `builtin:file` (disk file storage), `builtin:compute` (instance lifecycle plus Lua hosting), `builtin:lua` (channel attach into a running program). The protocol name `/ces/rpc/1` is reserved and CES ships the SYS_RPC outbound engine, but CES core mounts no inbound `/ces/rpc/1` handler; inbound RPC is L3 (downstream binaries link ceslib and host their own).
 
 ## Coding practices
 
@@ -42,7 +42,7 @@ include/ces/        CES core (L1): types, account/asset, keys, protocol,
                     autoexec, cesco, cesproxy, feemult, buffer, persisted
 include/ces/cesplex/  CesPlex, the L1 connection multiplexer:
                       mux     bus core: bind handshake, channel routing,
-                              handler registry, CesPlexHost seam
+                              object mount(), CesPlexHost seam
                       wire    bind contract + per-op envelope wire format
                       session per-op serve loop + CesPlexClient (the L2
                               verb SDK file/compute ride; lua bypasses it)
@@ -151,7 +151,7 @@ Runs on `rpc_port`. Each inbound RUDP channel does a signed bind contract: the c
 
 Each per-op envelope is verb + preamble + a 65-byte sig over `sha256(verb || preamble || sessionToken)`, with no per-op pubkey or timestamp (implicit on the bound channel). Body-bearing verbs append bytes hashed against a digest committed in the preamble. Dedup key is the first 8 sig bytes (per-channel-incarnation, so no cross-channel collisions).
 
-Handlers register via `registerCesPlexBuiltin("<name>", &inst)`; CesServer maps `proto_name` to `"builtin:<name>"`, freezing the bind table at construction. Errors close the channel (clients reopen). Most handlers loop on the channel; the exception is `builtin:lua` ATTACH, a one-shot verb that converts the channel into a raw byte stream into the target compute instance.
+CesServer mounts each `[cesplex_mounts]` entry as a per-server handler object: `resolveBuiltin` (server.cpp) maps `builtin:<name>` to a concrete class, constructs it once, and calls `CesPlex::mount(proto, obj)`. There is no global registry; an unknown `builtin:<name>` is logged and skipped. Errors close the channel (clients reopen). Most handlers loop on the channel; the exception is `builtin:lua` ATTACH, a one-shot verb that converts the channel into a raw byte stream into the target compute instance.
 
 CES sets `rpcRudpMaxChannelsPerPeer = 2` so a long-lived `cesh dial` can coexist with side ops.
 
@@ -159,10 +159,11 @@ Handlers shipped (registered in CES core):
 - `/ces/file/1` to `builtin:file`: disk-backed file storage. `l2/file_{handler,client}.{h,cpp}`
 - `/ces/compute/1` to `builtin:compute`: instance lifecycle (LAUNCH/KILL/LIST/STAT/INSTANCES). `l2/compute_{handler,client}.{h,cpp}`
 - `/ces/lua/1` to `builtin:lua`: one-shot ATTACH; converts the channel into a raw byte tunnel into a running compute instance. `l2/compute_lua_handler.{h,cpp}`. No client lib (use `cesh dial`).
+- `/ces/peer/1` to `builtin:peer`: the server-to-server mesh. `l2/peer_handler.{h,cpp}`. Mounted only when wired in `[cesplex_mounts]` (like every builtin; nothing auto-mounts). A persistent, unmetered, bidirectional channel between two servers that are mutual peer-table entries. Peer-gated at bind (`cesplexBindAllowed`); never metered (`cesplexChannelMetered`). Self-maintains on a reconcile pass riding the rpcTaskIO tick: dial a peer we should link to but do not, drop a link whose peer left the table, keepalive the rest (a sub-60s keepalive holds the link past RUDP's idle GC and surfaces a dead peer via send failure). Lower-pubkey side dials, higher accepts (one channel per pair). The dialer rides the server's own `rpcRudp_`; the reconcile decision (`computePeerLinkActions`) is pure and separately tested.
 
 Compute handler pair: `compute_handler` runs the management verbs and the per-instance supervisor (CPU/RSS sampling, slot/rent billing); `compute_lua_handler` runs the channel-attach protocol that pipes user bytes into a chosen instance. They are two CesPlexHandler subclasses; each .cpp includes both .h files because compute exposes APIs the lua handler calls (`computeOpenConnection`, `computeSendConnDataIn`) and lua exposes APIs compute calls (`luaHandlerHandleConnDataOut`, `luaHandlerOnInstanceDying`).
 
-`/ces/rpc/1` protocol name is reserved; CES core ships only the outbound engine. SYS_RPC's outbound side (`RpcSession` plus `queueRpc`/`executeRpc`/`completeRpc`) lives in `src/ceslib/server.cpp`. There is no `builtin:rpc` handler in CES core; the inbound side is L3 (downstream binaries link ceslib and register their own). `MockRpcServer` in `tests/test_sysrpc.cpp` is the test fixture for this shape, not a production handler.
+`/ces/rpc/1` protocol name is reserved; CES core ships only the outbound engine. SYS_RPC's outbound side (`RpcSession` plus `queueRpc`/`executeRpc`/`completeRpc`) lives in `src/ceslib/server.cpp`. There is no `builtin:rpc` handler in CES core; the inbound side is L3 (downstream binaries link ceslib and host their own). `MockRpcServer` in `tests/test_sysrpc.cpp` is the test fixture for this shape, not a production handler.
 
 ## ChannelMeter (`cesplex/meter.h`)
 
@@ -394,7 +395,8 @@ Network simulator:
 - Cross-transfers are fire-and-forget: CES_OK to the user before async delivery to the peer.
 - Payment account `nonce` is days-until-expiry, not a replay counter.
 - `isConnected() == true` bypasses the spam filter and tickets; only for authenticated peers.
-- `rpc_port = 0` disables SYS_RPC and CesPlex entirely (VM gets `CES_ERROR_DISABLED`; no L2 binds; no ChannelMeter).
+- `rpc_port = 0` disables SYS_RPC and CesPlex entirely (VM gets `CES_ERROR_DISABLED`; no L2 binds; no ChannelMeter; no peer mesh). With the plex port up, CesPlex is always constructed (even with zero handlers mounted), so inbound channels are accepted at the channel level and rejected at the per-protocol bind gate, not at channel accept.
+- `builtin:peer` (`/ces/peer/1`): mounted only when wired in `[cesplex_mounts]` (no auto-mount); admits only peer-table members and is never metered (server-to-server, both ends bottomless). One channel per pair (lower pubkey dials), held open by keepalives, reconciled against the peer table on the rpcTaskIO tick. No new thread.
 - `cesFileStoreMaxBytes = 0` disables the file handler entirely; compute requires file.
 - `computeMaxInstances = 0` disables compute entirely.
 - CesPlex per-op verifies use the sessionToken, not a per-op timestamp. Bound pubkey is implicit. Dedup hash is the first 8 sig bytes.

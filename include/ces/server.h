@@ -47,6 +47,45 @@ constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 constexpr uint64_t BASE_FEE_QUERY = 2'000;
 constexpr uint64_t BASE_FEE_VM_MULT = 50;
 
+// ---------------------------------------------------------------------------
+// Default config values. Single source of truth: the CesConfig member
+// initializers below, main.cpp's CLI option defaults, and the `ces --config`
+// dumped template all read these constants, so the three cannot drift apart.
+// 0/-1 sentinels ("off" / "derive at startup") are left as literals at their
+// field; only real default values live here.
+// ---------------------------------------------------------------------------
+constexpr uint64_t DEFAULT_MIN_ACC         = 131072;
+constexpr uint64_t DEFAULT_MAX_ACC         = 16777216;
+constexpr uint64_t DEFAULT_MIN_ASSET       = 131072;
+constexpr uint64_t DEFAULT_MAX_ASSET       = 16777216;
+constexpr uint8_t  DEFAULT_MIN_DIFF        = 10;
+constexpr uint64_t DEFAULT_POW_DELAY       = 0;
+constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
+constexpr uint64_t DEFAULT_FLUSH_VALUE     = 0;          // 0 = flush every change
+constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB = 100;
+constexpr uint64_t DEFAULT_PEER_TARGET     = 0;
+constexpr uint64_t DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS = 0;
+constexpr int      DEFAULT_PEER_MINER_INTERVAL_SECS  = 60;
+constexpr uint64_t DEFAULT_MAX_PEER_RESERVE_DISTURBANCE = 100'000;
+constexpr uint32_t DEFAULT_GOSSIP_FANOUT_DEGREE      = 6;
+constexpr size_t   DEFAULT_PRESENCE_CACHE_SIZE       = 250'000;
+constexpr const char* DEFAULT_WEB_BIND               = "127.0.0.1";
+constexpr uint32_t DEFAULT_RPC_MAX_PENDING           = 1000;
+constexpr size_t   DEFAULT_RPC_MAX_REQUEST_BYTES     = 64 * 1024;
+constexpr size_t   DEFAULT_RPC_MAX_RESPONSE_BYTES    = 64 * 1024;
+constexpr uint32_t DEFAULT_RPC_RESPONSE_TIMEOUT_MS   = 30000;
+constexpr uint32_t DEFAULT_RPC_RUDP_BYTES_PER_SECOND = 0xFFFFFFFFu;
+constexpr uint32_t DEFAULT_RPC_RUDP_BURST_BYTES      = 0xFFFFFFFFu;
+constexpr size_t   DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER = 2;
+constexpr int64_t  DEFAULT_RPC_RUDP_MAX_REORDER_BYTES = -1;   // -1 = library default
+constexpr int64_t  DEFAULT_RPC_RUDP_MAX_REORDER_MSGS  = -1;   // -1 = library default
+constexpr uint32_t DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS = 60;
+constexpr uint64_t DEFAULT_EXT_FUNDING_PER_DAY       = 500'000'000;     // 5 credits
+constexpr uint64_t DEFAULT_EXT_LOCAL_BUDGET          = 100'000'000'000; // 1000 credits
+constexpr uint64_t DEFAULT_COMPUTE_PROCESS_MEM_MAX   = 268435456;       // 256 MB
+constexpr uint32_t DEFAULT_COMPUTE_CLIENT_POOL_SIZE  = 4;
+constexpr const char* DEFAULT_COMPUTE_USER           = "cesluad";
+
 struct CesConfig {
 
   boost::filesystem::path dataDir;
@@ -54,18 +93,20 @@ struct CesConfig {
   KeyAlgo serverKeyAlgo = KeyAlgo::ED25519;
   std::string version;
 
-  uint64_t minAcc = 0;
-  uint64_t maxAcc = 0;
-  uint8_t minDiff = 0;
-  uint64_t spendSlotSize = 0;
+  uint64_t minAcc = DEFAULT_MIN_ACC;
+  uint64_t maxAcc = DEFAULT_MAX_ACC;
+  uint8_t minDiff = DEFAULT_MIN_DIFF;
+  uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE;
   uint64_t minProveWorkTimestamp = 0;
 
-  uint64_t minAsset = 0;
-  uint64_t maxAsset = 0;
+  uint64_t minAsset = DEFAULT_MIN_ASSET;
+  uint64_t maxAsset = DEFAULT_MAX_ASSET;
 
+  // Runtime default is hardware_concurrency/2 - 2 (computed in main.cpp); this
+  // is the floor used by direct construction (tests override it).
   int taskThreads = 1;
-  uint64_t flushValue = 10000;
-  uint64_t maxLogBytes = 100ULL * 1024 * 1024 * 1024; // 100 GB
+  uint64_t flushValue = DEFAULT_FLUSH_VALUE;
+  uint64_t maxLogBytes = DEFAULT_MAX_LOG_SIZE_GB * 1024ULL * 1024 * 1024;
   size_t accountStoreBufferSize = 1 << 19;
   size_t assetStoreBufferSize = 1 << 19;
 
@@ -96,11 +137,11 @@ struct CesConfig {
     std::string pubKeyHex; // 64-char hex
     std::string address;   // host:port
   };
-  uint64_t peerTarget = 0;       // credit target on each peer (0 = no peering)
+  uint64_t peerTarget = DEFAULT_PEER_TARGET;  // credit target on each peer (0 = no peering)
   // Inbound PoW reciprocation, basis points: outbound PoW we mine per inbound
   // PoW received. 0 = off. 10000 = 1:1. Outbound peers ignore it (use peerTarget).
-  uint64_t peerPowInboundReciprocationBps = 0;
-  int peerMinerIntervalSecs = 60;   // seconds between miner cycles (lower for testing)
+  uint64_t peerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
+  int peerMinerIntervalSecs = DEFAULT_PEER_MINER_INTERVAL_SECS;
   std::vector<PeerConfig> peers;
   int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
 
@@ -108,14 +149,14 @@ struct CesConfig {
   // fan-out leg (each peer at min(our reserve there, this)); the unallocated
   // remainder reverts to the originator. Bounds a single op's upstream-reserve
   // reach. 0 = uncapped.
-  uint64_t maxPeerReserveDisturbance = 100'000;
+  uint64_t maxPeerReserveDisturbance = DEFAULT_MAX_PEER_RESERVE_DISTURBANCE;
 
   // Peers each gossip hop forwards to: a random subset of this size drawn from
   // the reachable peers we hold reserve with. 0 = forward to every peer.
-  uint32_t gossipFanoutDegree = 6;
+  uint32_t gossipFanoutDegree = DEFAULT_GOSSIP_FANOUT_DEGREE;
 
   // Presence cache: max tracked client addresses for push (send()).
-  size_t presenceCacheSize = 250000;
+  size_t presenceCacheSize = DEFAULT_PRESENCE_CACHE_SIZE;
 
   // Autoexec key pattern: assets whose key matches this pattern
   // are parsed as signed CesRunAsset packets and executed on server boot.
@@ -136,7 +177,7 @@ struct CesConfig {
   // design (127.0.0.1); an operator who fronts it with their own auth
   // proxy can repoint it, and gets a warning if it isn't a loopback IP.
   uint16_t webPort = 0;
-  std::string webBind = "127.0.0.1";
+  std::string webBind = DEFAULT_WEB_BIND;
 
   // Dedicated MINX/RUDP port for the SYS_RPC syscall. This is a SECOND
   // Minx instance bound to a separate UDP port, held
@@ -165,38 +206,38 @@ struct CesConfig {
   // CES_ERROR_QUEUE_FULL past this. rpcMaxRequestBytes /
   // rpcMaxResponseBytes cap the envelope body size in either direction.
   // rpcResponseTimeoutMs arms an asio timer per session.
-  uint32_t rpcMaxPending       = 1000;
-  size_t   rpcMaxRequestBytes  = 64 * 1024;
-  size_t   rpcMaxResponseBytes = 64 * 1024;
-  uint32_t rpcResponseTimeoutMs = 30000;
+  uint32_t rpcMaxPending       = DEFAULT_RPC_MAX_PENDING;
+  size_t   rpcMaxRequestBytes  = DEFAULT_RPC_MAX_REQUEST_BYTES;
+  size_t   rpcMaxResponseBytes = DEFAULT_RPC_MAX_RESPONSE_BYTES;
+  uint32_t rpcResponseTimeoutMs = DEFAULT_RPC_RESPONSE_TIMEOUT_MS;
 
   // Per-channel RUDP pacing advertised in the handshake. The effective
   // bucket is min(local, peer) per parameter. Defaults mean "unlimited"
   // (matches current behavior); operators who run adversarial SYS_RPC
   // workloads can clamp. 0xFFFFFFFFu == minx::RudpConfig::PER_CHANNEL_UNLIMITED.
-  uint32_t rpcRudpBytesPerSecond = 0xFFFFFFFFu;
-  uint32_t rpcRudpBurstBytes     = 0xFFFFFFFFu;
+  uint32_t rpcRudpBytesPerSecond = DEFAULT_RPC_RUDP_BYTES_PER_SECOND;
+  uint32_t rpcRudpBurstBytes     = DEFAULT_RPC_RUDP_BURST_BYTES;
 
   // RUDP transport caps on the rpc_port. CES ships an opinion on
   // channels (default 2 — lets cesh hold a long-lived stream while
   // doing other ops in parallel) and stays passthrough on the two
   // reorder buffers (-1 = keep the minx::RudpConfig library default,
   // currently 1 MB / 1024 messages).
-  size_t  rpcRudpMaxChannelsPerPeer         = 2;
-  int64_t rpcRudpMaxReorderBytesPerChannel  = -1;
-  int64_t rpcRudpMaxReorderMsgsPerChannel   = -1;
+  size_t  rpcRudpMaxChannelsPerPeer         = DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER;
+  int64_t rpcRudpMaxReorderBytesPerChannel  = DEFAULT_RPC_RUDP_MAX_REORDER_BYTES;
+  int64_t rpcRudpMaxReorderMsgsPerChannel   = DEFAULT_RPC_RUDP_MAX_REORDER_MSGS;
 
   // rpc_port RUDP channel idle GC, in seconds: a channel with no traffic for
   // this long is dropped. 60 suits request/reply, but is too short for a
   // long-lived interactive channel (a `cesh dial` terminal where a human
   // pauses between commands) — raise it on terminal-serving boxes.
-  uint32_t rpcRudpChannelIdleSecs           = 60;
+  uint32_t rpcRudpChannelIdleSecs           = DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS;
 
   // --- File storage feature (CesPlex builtin:file, v2) ---
   // Master switch + hard capacity cap. The feature is entirely
-  // disabled when 0 — fileHandlerBind is skipped, startup reconcile
-  // is skipped, any inbound /ces/file/* channel's handler sees no
-  // bound CesServer and drops. A positive value is a hard ceiling
+  // disabled when 0 — the FileHandler is not created, startup reconcile
+  // is skipped, and /ces/file/1 is never mounted (inbound binds NACK).
+  // A positive value is a hard ceiling
   // on store-wide total_bytes: CREATE is rejected with
   // CES_ERROR_STORE_FULL when the new file's size would push past
   // the cap. WRITE cannot extend files (size fixed at CREATE), so
@@ -214,10 +255,10 @@ struct CesConfig {
   // extensions and remotes) the server grants /s/ programs that call
   // ces.request_funds to spend at remotes. The discovery extension needs it.
   // 0 = off. Enforced here, never in Lua.
-  uint64_t extFundingPerDay = 500'000'000;   // 5 credits
+  uint64_t extFundingPerDay = DEFAULT_EXT_FUNDING_PER_DAY;
   // Local extension budget: raw credit units each /s/ program account is topped up
   // to (per extension) on boot and at daily maintenance. 0 = off (no auto top-up).
-  uint64_t extLocalBudget = 100'000'000'000;   // 1000 credits
+  uint64_t extLocalBudget = DEFAULT_EXT_LOCAL_BUDGET;
   // Three fee knobs mapping to the three physical costs of file
   // storage:
   //   feeFileRent  = retention (byte sitting on disk over time)
@@ -302,13 +343,13 @@ struct CesConfig {
   // No per-process CPU cap — CPU is a flow, billed (feeComputeCpuSec) and
   // shared by the scheduler; the process cap above is the CPU bound. No
   // pids cap — the sandbox exposes no fork/exec, so a child is one process.
-  uint64_t computeProcessMemMax   = 268435456; // 256 MB
+  uint64_t computeProcessMemMax   = DEFAULT_COMPUTE_PROCESS_MEM_MAX;
   // Worker threads each Lua child uses for OUTBOUND verb-client calls
   // (ces.file_client / ces.compute_client): how many such round-trips can be in
   // flight concurrently before further ones queue. Bounds the child's blocking
   // pool; the main-port client pool (ces.ping / ces.remote_*) is fixed at 1
   // (one leased outbound port). Passed to the child on spawn; clamped [1, 64].
-  uint32_t computeClientPoolSize  = 4;
+  uint32_t computeClientPoolSize  = DEFAULT_COMPUTE_CLIENT_POOL_SIZE;
   // Fee knobs for compute — credits per unit time / per byte.
   // Every non-zero on a tick is accumulated against the source file's
   // file_balance. 0 = "derive default" at bind time. The four knobs:
@@ -354,7 +395,7 @@ struct CesConfig {
   // capacity (max_entries × max_entry_bytes per bucket, summed across
   // all of an instance's buckets). Charged on the same supervisor
   // tick that bills slot/cpu/rss, against the source file's
-  // file_balance. /s/ files are exempt (fileHandlerDebitBalance is a
+  // file_balance. /s/ files are exempt (the file handler's debitBalance is a
   // no-op there). 0 = derive at bind from feeComputeRssByteDay /
   // 86400 — same per-byte basis as RSS, but on a per-second cadence
   // because the buckets are an explicit standing capacity rather
@@ -375,7 +416,7 @@ struct CesConfig {
   std::string cesComputeWorkDir;
   // Unix user that cesluad child processes drop to. Must exist on the
   // host. Bind fails if the user can't be resolved.
-  std::string cesComputeUser = "cesluad";
+  std::string cesComputeUser = DEFAULT_COMPUTE_USER;
   // Path to the compute child binary. The CES CLI (src/ces/main.cpp)
   // auto-discovers `cesluajitd` next to /proc/self/exe when this is
   // empty, with bare-name PATH fallback — operators with the typical
@@ -450,6 +491,18 @@ struct CesConfig {
 class CesRpcListener : public minx::MinxListener {};
 
 class CesServer;
+
+// Defined in ces/l2/peer_handler.h; returned by _peerLinkTargets() for
+// the /ces/peer/1 mesh reconcile.
+struct PeerLinkTarget;
+
+// builtin:peer / builtin:lua handlers, per-server objects owned by CesServer
+// (defined in ces/l2/*.h, included only in server.cpp). Forward-declared so
+// server.h does not pull the L2 handler headers into every consumer.
+class PeerHandler;
+class LuaHandler;
+class FileHandler;
+class ComputeHandler;
 
 // Rudp::Listener for the rpc port. Owns the back-pointer to CesServer
 // for onSend (forward to rpcMinx_) and onAccept (delegate to CesPlex
@@ -632,6 +685,46 @@ public:
   // these to skip the miner and set up a reachable outbound peer directly.
   void _markPeerReachable(const minx::Hash& ckey, const std::string& address);
   bool _isPeerReachable(const minx::Hash& ckey);
+
+  // True iff `ckey` is currently in the peer table (membership, not
+  // reachability). The /ces/peer/1 bind gate uses it.
+  bool _isPeerByKey(const minx::Hash& ckey);
+
+  // Reachable peers flattened into mesh targets for the /ces/peer/1
+  // reconcile. dialable = resolved IP known and plex port advertised.
+  // Unreachable peers are omitted (the reconcile drops their links).
+  std::vector<PeerLinkTarget> _peerLinkTargets();
+
+  // rpcRudp accessor for the peer-mesh dialer (server-to-server). Null
+  // when the plex port is down. Used by builtin:peer to open outbound
+  // channels on the server's own rpc Rudp.
+  minx::Rudp* _rpcRudp() { return rpcRudp_.get(); }
+
+  // This server's builtin handler instances, or null when the protocol is not
+  // wired in [cesplex_mounts] (e.g. file is null unless /ces/file/1 is mounted;
+  // file_store_max_bytes is only the metered cap, not the on/off switch).
+  // Cross-handler callers reach them through these accessors.
+  PeerHandler* peerHandler() { return peerHandler_.get(); }
+  LuaHandler* luaHandler() { return luaHandler_.get(); }
+  FileHandler* fileHandler() { return fileHandler_.get(); }
+  ComputeHandler* computeHandler() { return computeHandler_.get(); }
+
+  // Test hook: add a peer with a pre-resolved plex endpoint (simulates a
+  // completed probe) without starting the peer miner. Drives the
+  // /ces/peer/1 reconcile deterministically in tests.
+  void _testAddPeerWithRpc(const minx::Hash& ckey,
+                           const std::string& declaredAddr,
+                           const boost::asio::ip::address& ip,
+                           uint16_t rpcPort);
+
+  // TEST-ONLY (`_`-prefixed). Mounts an arbitrary CesPlex handler object on
+  // the live bus, for tests that exercise a non-core handler (e.g. echo).
+  // This is NOT a production extension point: prod handlers are mounted only
+  // by resolveBuiltin() in start() (the hardcoded builtin:<name> -> class
+  // switch). Do not call this outside tests. Posts onto rpcTaskIO_ and blocks
+  // (race-free vs live accepts); the handler must outlive the server. No-op
+  // if the plex port is down.
+  void _mountCesPlexHandler(const std::string& proto, CesPlexHandler* handler);
 
   // Test hook: post runAutoexec() onto logicStrand_ and block until done.
   // Production callers go through the one-shot boot post in start().
@@ -972,7 +1065,7 @@ public:
   void _l2Transact(const std::function<void(LedgerTxn&)>& fn);
 
   // Program-initiated transfer. Origin is the program's owner pubkey
-  // (the program acts as its owner — same model as fileHandlerExec).
+  // (the program acts as its owner — same model as FileHandler::exec).
   // Mode = Open (auto-creates destination), CES_NONCELESS, standard
   // tx + rent fees out of origin's balance. Wraps transfer() onto
   // logicStrand_, hops back to cbExecutor with the result code and
@@ -1023,7 +1116,7 @@ public:
                          uint32_t lastXferTime)> cb,
       boost::asio::any_io_executor cbExecutor);
 
-  // ---- Extension funding rate gate (see local/extension_funding.md). A token
+  // ---- Extension funding rate gate. A token
   // bucket refilling at cfg_.extFundingPerDay raw units/day, capped at one day's
   // worth. The grant is the only thing bounding what /s/ programs spend at remotes
   // (the server account is bottomless), so it lives here, never in Lua.
@@ -1070,6 +1163,12 @@ public:
   void cesplexReportUsage(const HashPrefix& payer,
                           const minx::SockAddr& peer, uint32_t channelId,
                           const CesPlexUsage& usage) override;
+
+  // Metering opt-out: the /ces/peer/1 mesh is never metered (both ends are
+  // sovereign servers paying from their bottomless accounts). Every other
+  // protocol is metered. Defined in server.cpp. (The peer-only access gate
+  // lives in PeerHandler::serve, not here.)
+  bool cesplexChannelMetered(const std::string& proto) override;
 
   // Price a CesPlexUsage tick at the live discounted feeNet* rates -> credits
   // (0 = free). Shared by cesplexReportUsage and the compute handler's
@@ -1273,15 +1372,24 @@ private:
 
   // CesPlex — the L2 protocol multiplexer. Lives on rpcTaskIO_,
   // owns inbound-channel dispatch for the secondary port. Handed the
-  // mount map from cfg_.cesplexMounts at ctor. Null when
-  // cfg_.rpcPort == 0 or cesplexMounts is empty (no point
-  // constructing if nothing will ever be selectable). All callbacks
-  // on rpcRudp_ that CesPlex installs run on rpcTaskIO_.
+  // mount map from cfg_.cesplexMounts at ctor. Null only when
+  // cfg_.rpcPort == 0 (no second Minx); otherwise constructed whenever the
+  // plex port is up, even with an empty mount map (inbound binds then NACK).
+  // All callbacks on rpcRudp_ that CesPlex installs run on rpcTaskIO_.
   //
   // Forward-declared: defined in ces/cesplex/mux.h — only included where
   // needed (server.cpp) to avoid pulling the rudp headers into every
   // consumer of server.h.
   std::unique_ptr<CesPlex> cesplex_;
+
+  // builtin:peer / lua / file / compute handler instances, owned per-server.
+  // Each is created only when its protocol is wired in [cesplex_mounts] (so any
+  // may be null), mounted into cesplex_, destroyed on stop(). Per-server
+  // objects (migrated off process-globals).
+  std::unique_ptr<PeerHandler> peerHandler_;
+  std::unique_ptr<LuaHandler> luaHandler_;
+  std::unique_ptr<FileHandler> fileHandler_;
+  std::unique_ptr<ComputeHandler> computeHandler_;
 
   // SYS_RPC dispatcher state. queueRpc runs on the logic strand
   // (validates the file, materializes request bytes, signs the

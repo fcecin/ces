@@ -1625,3 +1625,49 @@ BOOST_AUTO_TEST_CASE(FileStatQuietIsJsonOnly) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// Regression for `ces --config`: the dumped template must be valid, loadable
+// TOML with every top-level key BEFORE the first [table] header (a [table]
+// above a bare key silently re-parents it -- the file-scalars-under-[rpc_rudp]
+// bug), the file + peer builtins wired by default, and it must round-trip
+// (ces loads its own dump and starts).
+BOOST_AUTO_TEST_SUITE(CesConfigE2E)
+
+BOOST_AUTO_TEST_CASE(ConfigDumpRoundTrips) {
+  const std::string ces = findCesBinary();
+
+  RunResult dump = runShell("\"" + ces + "\" --config");
+  BOOST_REQUIRE_EQUAL(dump.exitCode, 0);
+  assertContains(dump.out, "[cesplex_mounts]");
+  assertContains(dump.out, "builtin:peer", "peer wired by default");
+  assertContains(dump.out, "builtin:file", "file wired by default");
+
+  // Table-ordering: a representative top-level scalar must precede the first
+  // [table] header, else TOML re-parents it under that table.
+  auto firstTable = dump.out.find("\n[");
+  auto fileKey    = dump.out.find("\nfile_store_max_bytes");
+  BOOST_REQUIRE(fileKey != std::string::npos);
+  BOOST_REQUIRE(firstTable != std::string::npos);
+  BOOST_CHECK_MESSAGE(fileKey < firstTable,
+    "file_store_max_bytes must be a top-level key (before any [table] header)");
+
+  // Round-trip: ces loads its own dump and starts. Light boot (no rpc / no PoW,
+  // ephemeral main port, throwaway data dir). The dump carries a fresh usable
+  // server_key, so no -k is needed.
+  static int n = 0;
+  fs::path dir = fs::temp_directory_path() /
+                 ("ces_cfg_rt_" + std::to_string(++n));
+  fs::create_directories(dir);
+  fs::path cfg = dir / "server.toml";
+  { std::ofstream f(cfg.string()); f << dump.out; }
+  RunResult boot = runShell(
+    "\"" + ces + "\" --config \"" + cfg.string() + "\" --port 0 --rpcport 0 "
+    "--nopowengine --datadir \"" + dir.string() + "\"", /*timeoutSecs=*/5);
+  assertContains(boot.out, "ces starting server",
+                 "ces must load its own --config dump");
+  assertNotContains(boot.out, "Config parse error");
+  boost::system::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

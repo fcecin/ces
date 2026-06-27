@@ -34,6 +34,22 @@ bool validName(const std::string& n) {
   return true;
 }
 
+// builtin:file is a per-server object now; the /s/ file ops route through it.
+// Thin guarded wrappers keep the old "" / false-on-disabled contract.
+std::string fhReadServerFile(CesServer* s, const std::string& name) {
+  FileHandler* fh = s ? s->fileHandler() : nullptr;
+  return fh ? fh->readServerFile(name) : std::string();
+}
+bool fhWriteServerFile(CesServer* s, const std::string& name,
+                       const std::string& content) {
+  FileHandler* fh = s ? s->fileHandler() : nullptr;
+  return fh && fh->writeServerFile(name, content);
+}
+bool fhRemoveServerFile(CesServer* s, const std::string& name) {
+  FileHandler* fh = s ? s->fileHandler() : nullptr;
+  return fh && fh->removeServerFile(name);
+}
+
 std::string catalogDir(CesServer* s) { return s->_config().cesExtensionsDir; }
 fs::path storeSDir(CesServer* s) {
   return fs::path(s->_config().cesFileStoreDir) / "s";
@@ -47,15 +63,17 @@ fs::path sLua(CesServer* s, const std::string& n) {
 std::string srcName(const std::string& n) { return "/s/" + n + ".lua"; }
 
 // Pid of the running instance of /s/<name>.lua, or 0.
-uint64_t runningPid(const std::string& name) {
+uint64_t runningPid(CesServer* server, const std::string& name) {
+  ComputeHandler* h = server ? server->computeHandler() : nullptr;
+  if (!h) return 0;
   std::string src = srcName(name);
-  for (auto& st : computeHandlerSnapshot())
+  for (auto& st : h->snapshot())
     if (st.source == src) return st.pid;
   return 0;
 }
 
-// /s/ file I/O is in the file handler: fileHandlerReadServerFile /
-// fileHandlerWriteServerFile / fileHandlerRemoveServerFile.
+// /s/ file I/O is in the file handler (FileHandler::read/write/removeServerFile),
+// reached via the guarded fhReadServerFile / fhWriteServerFile / fhRemoveServerFile.
 
 struct ProbedManifest { std::string name, version, description; };
 
@@ -134,7 +152,8 @@ std::vector<ExtensionItem> extensionList(CesServer* server) {
     byName[n].name = n;
     byName[n].installed = true;
   }
-  for (auto& st : computeHandlerSnapshot()) {
+  ComputeHandler* ch = server->computeHandler();
+  for (auto& st : ch ? ch->snapshot() : std::vector<ComputeInstanceStat>{}) {
     std::string n = nameFromSource(st.source);
     if (n.empty()) continue;
     auto& it = byName[n];
@@ -142,7 +161,7 @@ std::vector<ExtensionItem> extensionList(CesServer* server) {
     it.enabled = true;
     it.pid = st.pid;
     ComputeExtInfo info;
-    if (computeHandlerExtInfo(st.pid, info)) {
+    if (ch->extInfo(st.pid, info)) {
       // Identity from the live CES_MANIFEST report (present even with no contract).
       if (!info.name.empty()) it.displayName = info.name;
       it.version = info.version;
@@ -182,14 +201,13 @@ bool extensionInstall(CesServer* server, const std::string& name) {
   if (!in) return false;
   std::ostringstream ss;
   ss << in.rdbuf();
-  return fileHandlerWriteServerFile("/s/" + name + ".lua", ss.str());
+  return fhWriteServerFile(server, "/s/" + name + ".lua", ss.str());
 }
 
 bool extensionUninstall(CesServer* server, const std::string& name) {
-  (void)server;
   if (!validName(name)) return false;
-  computeHandlerKillBySource(srcName(name));
-  fileHandlerRemoveServerFile("/s/" + name + ".lua");
+  if (ComputeHandler* h = server->computeHandler()) h->killBySource(srcName(name));
+  fhRemoveServerFile(server, "/s/" + name + ".lua");
   return true;
 }
 
@@ -197,23 +215,24 @@ bool extensionEnable(CesServer* server, const std::string& name) {
   if (!validName(name)) return false;
   std::error_code ec;
   if (!fs::exists(sLua(server, name), ec)) return false;
-  return computeHandlerLaunchInternal(srcName(name)) == CES_OK;
+  ComputeHandler* h = server->computeHandler();
+  return h && h->launchInternal(srcName(name)) == CES_OK;
 }
 
 bool extensionDisable(CesServer* server, const std::string& name) {
-  (void)server;
   if (!validName(name)) return false;
-  computeHandlerKillBySource(srcName(name));
+  if (ComputeHandler* h = server->computeHandler()) h->killBySource(srcName(name));
   return true;
 }
 
 bool extensionStatus(CesServer* server, const std::string& name,
                      std::vector<std::pair<std::string, std::string>>& kv) {
-  (void)server;
-  uint64_t pid = runningPid(name);
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return false;
+  uint64_t pid = runningPid(server, name);
   if (!pid) return false;
   ces::Bytes out;
-  if (!computeHandlerExtRequest(pid, kComputeExtReqStatus, ces::Bytes{}, out, 2000))
+  if (!h->extRequest(pid, kComputeExtReqStatus, ces::Bytes{}, out, 2000))
     return false;
   if (out.size() < 2) return true;
   size_t o = 0;
@@ -236,8 +255,9 @@ bool extensionStatus(CesServer* server, const std::string& name,
 bool extensionCommand(CesServer* server, const std::string& name,
                       const std::string& id, const std::string& arg,
                       std::string& out) {
-  (void)server;
-  uint64_t pid = runningPid(name);
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return false;
+  uint64_t pid = runningPid(server, name);
   if (!pid) return false;
   ces::Bytes in;
   in.push_back(static_cast<uint8_t>((id.size() >> 8) & 0xFF));
@@ -245,16 +265,15 @@ bool extensionCommand(CesServer* server, const std::string& name,
   in.insert(in.end(), id.begin(), id.end());
   in.insert(in.end(), arg.begin(), arg.end());
   ces::Bytes outb;
-  if (!computeHandlerExtRequest(pid, kComputeExtReqCommand, in, outb, 5000))
+  if (!h->extRequest(pid, kComputeExtReqCommand, in, outb, 5000))
     return false;
   out.assign(reinterpret_cast<const char*>(outb.data()), outb.size());
   return true;
 }
 
 std::string extensionConfigGet(CesServer* server, const std::string& name) {
-  (void)server;
   if (!validName(name)) return "";
-  return fileHandlerReadServerFile("/s/" + name + ".conf");
+  return fhReadServerFile(server, "/s/" + name + ".conf");
 }
 
 // Make the on-disk /s/<name>.conf take effect on the running instance. Config is
@@ -263,33 +282,36 @@ std::string extensionConfigGet(CesServer* server, const std::string& name) {
 // actually takes effect -- writing the file and changing nothing (a silent
 // no-op) is worse than having no editor. No-op if the extension is not running.
 void applyExtConfig(CesServer* server, const std::string& name) {
-  (void)server;
-  uint64_t pid = runningPid(name);
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return;
+  uint64_t pid = runningPid(server, name);
   if (!pid) return;
   ComputeExtInfo info;
-  if (computeHandlerExtInfo(pid, info) && (info.caps & kComputeExtCapOnConfig)) {
-    computeHandlerExtConfig(pid, fileHandlerReadServerFile("/s/" + name + ".conf"));  // hot-reload
+  if (h->extInfo(pid, info) && (info.caps & kComputeExtCapOnConfig)) {
+    h->extConfig(pid, fhReadServerFile(server, "/s/" + name + ".conf"));  // hot-reload
   } else {
-    computeHandlerKillBySource(srcName(name));                     // relaunch:
-    computeHandlerLaunchInternal(srcName(name));                   // re-read at launch
+    h->killBySource(srcName(name));                     // relaunch:
+    h->launchInternal(srcName(name));                   // re-read at launch
   }
 }
 
 bool extensionConfigSet(CesServer* server, const std::string& name,
                         const std::string& text) {
   if (!validName(name)) return false;
-  if (!fileHandlerWriteServerFile("/s/" + name + ".conf", text)) return false;
+  if (!fhWriteServerFile(server, "/s/" + name + ".conf", text)) return false;
   applyExtConfig(server, name);
   return true;
 }
 
 bool extensionConfigReset(CesServer* server, const std::string& name) {
   if (!validName(name)) return false;
-  uint64_t pid = runningPid(name);
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return false;
+  uint64_t pid = runningPid(server, name);
   if (!pid) return false;
   ComputeExtInfo info;
-  if (!computeHandlerExtInfo(pid, info)) return false;
-  if (!fileHandlerWriteServerFile("/s/" + name + ".conf", info.configDefaults)) return false;
+  if (!h->extInfo(pid, info)) return false;
+  if (!fhWriteServerFile(server, "/s/" + name + ".conf", info.configDefaults)) return false;
   applyExtConfig(server, name);
   return true;
 }

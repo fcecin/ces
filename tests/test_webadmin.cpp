@@ -101,6 +101,10 @@ struct WebAdminFix {
 
   WebAdminFix() {
     blog::init();
+    // Log-capture tests (LogTailCapturesActivity) need INFO visible. blog
+    // level is process-global, so a prior suite that left it at fatal would
+    // otherwise suppress the line. Set what this suite needs at setup.
+    blog::set_level(blog::info);
     tempDir = makeUniqueTempDir("ces_web_test");
     minx::Hash sp;
     sp.fill(0xEE);
@@ -210,6 +214,8 @@ BOOST_AUTO_TEST_CASE(PeerAddListRemove) {
   auto list = httpReq(port, "GET", "/api/peers");
   BOOST_CHECK(has(list.body, addr));
   BOOST_CHECK(has(list.body, "\"outbound\":true"));
+  // The /ces/peer/1 mesh link-state column is exposed per peer.
+  BOOST_CHECK(has(list.body, "\"rpcLink\":"));
 
   auto rm = httpReq(port, "POST", "/api/peer_remove", form({{"key", pk}}));
   BOOST_CHECK(has(rm.body, "\"ok\":true"));
@@ -339,8 +345,8 @@ BOOST_AUTO_TEST_CASE(L2FeeKnobsAndStatsEndpoints) {
   BOOST_CHECK_EQUAL(jnum(cfg, "feeComputeSlotSec"), 654);
   BOOST_CHECK_EQUAL(jnum(cfg, "feeNetKiBSent"), 9);
 
-  // The File/Compute monitoring endpoints respond with the right shape; the
-  // features are off in this fixture (no rpc port, caps 0) → enabled:false.
+  // The File/Compute monitoring endpoints respond with the right shape; this
+  // fixture has no rpc port, so no handlers are mounted → enabled:false.
   auto fs = httpReq(port, "GET", "/api/filestore");
   BOOST_CHECK_EQUAL(fs.status, 200);
   BOOST_CHECK(has(fs.body, "\"enabled\":false"));
@@ -350,6 +356,11 @@ BOOST_AUTO_TEST_CASE(L2FeeKnobsAndStatsEndpoints) {
   BOOST_CHECK_EQUAL(cp.status, 200);
   BOOST_CHECK(has(cp.body, "\"enabled\":false"));
   BOOST_CHECK(has(cp.body, "\"instances\":[]"));
+
+  // Extensions need file + compute mounted; neither is here -> disabled.
+  auto ex = httpReq(port, "GET", "/api/extensions");
+  BOOST_CHECK_EQUAL(ex.status, 200);
+  BOOST_CHECK(has(ex.body, "\"enabled\":false"));
 
   // File STAT lookup responds; the file feature is off in this fixture.
   auto fst = httpReq(port, "GET", "/api/filestat?path=/s/x.lua");
@@ -391,6 +402,58 @@ BOOST_AUTO_TEST_CASE(FileStatActivePathWhenEnabled) {
   srv->stop();
   boost::system::error_code ec;
   fs::remove_all(d, ec);
+}
+
+// Regression: the File/Compute/Extensions "enabled" flags derive from whether
+// the handler is MOUNTED (wired in [cesplex_mounts]), not from the old numeric
+// knobs. In particular file is enabled at cesFileStoreMaxBytes = 0 (that knob
+// is only the metered cap; /s/ is still served), and compute/extensions are on
+// only when wired.
+BOOST_AUTO_TEST_CASE(FeatureDetectionFollowsMounts) {
+  auto stand = [](uint8_t seed, const std::map<std::string, std::string>& mounts,
+                  uint64_t fileCap, uint32_t computeMax,
+                  bool& fileOn, bool& computeOn, bool& extOn) {
+    fs::path d = makeUniqueTempDir("ces_web_feat");
+    minx::Hash sp; sp.fill(seed);
+    CesConfig cfg = makeTestConfig(d, sp, std::numeric_limits<uint64_t>::max());
+    cfg.rpcPort = 0;
+    cfg.rpcAutoPort = true;
+    cfg.cesplexMounts = mounts;
+    cfg.cesFileStoreMaxBytes = fileCap;
+    cfg.computeMaxInstances = computeMax;
+    cfg.feeFileRent = 1;
+    auto srv = std::make_unique<CesServer>(cfg);
+    srv->start(0);
+    BOOST_REQUIRE(srv->_rpcBoundPort() != 0);
+    boost::asio::io_context io;
+    ces::WebAdmin w(io, *srv);
+    BOOST_REQUIRE(w.listen("127.0.0.1", 0));
+    uint16_t p = w.boundPort();
+    std::thread t([&] { io.run(); });
+    fileOn    = has(httpReq(p, "GET", "/api/filestore").body,  "\"enabled\":true");
+    computeOn = has(httpReq(p, "GET", "/api/compute").body,    "\"enabled\":true");
+    extOn     = has(httpReq(p, "GET", "/api/extensions").body, "\"enabled\":true");
+    w.stop(); io.stop(); if (t.joinable()) t.join(); srv->stop();
+    boost::system::error_code ec; fs::remove_all(d, ec);
+  };
+
+  bool fileOn = false, computeOn = false, extOn = false;
+
+  // file + compute wired, file cap 0 -> all three on (file on despite cap 0).
+  stand(0xC1, {{"/ces/file/1", "builtin:file"},
+               {"/ces/compute/1", "builtin:compute"}},
+        /*fileCap=*/0, /*computeMax=*/1, fileOn, computeOn, extOn);
+  BOOST_CHECK(fileOn);
+  BOOST_CHECK(computeOn);
+  BOOST_CHECK(extOn);
+
+  // file wired, compute NOT wired -> file on, compute + extensions off.
+  stand(0xC2, {{"/ces/file/1", "builtin:file"}},
+        /*fileCap=*/64ull * 1024 * 1024, /*computeMax=*/0,
+        fileOn, computeOn, extOn);
+  BOOST_CHECK(fileOn);
+  BOOST_CHECK(!computeOn);
+  BOOST_CHECK(!extOn);
 }
 
 BOOST_AUTO_TEST_CASE(NetbillInactiveWithoutRpc) {

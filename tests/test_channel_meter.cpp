@@ -10,6 +10,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_echo_handler.h"
 
 #include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
@@ -38,6 +39,10 @@
 #include <vector>
 
 namespace {
+
+// Mounted as an object by the fixture (no global handler registry). Outlives
+// every fixture instance, so the server's raw pointer stays valid.
+ces::EchoHandler gNbEchoHandler;
 
 uint64_t nbNowMicros() {
   return static_cast<uint64_t>(
@@ -303,7 +308,6 @@ struct NetBillFixture {
     // that client sockets bind into).
     cfg.rpcPort = 0;
     cfg.rpcAutoPort = true;
-    cfg.cesplexMounts = { {"/ces/test/echo/1", "builtin:echo"} };
     cfg.cesFileStoreMaxBytes = 1ull * 1024 * 1024 * 1024;
     cfg.feeFileRent = 1;
 
@@ -312,6 +316,8 @@ struct NetBillFixture {
     rpcPort = server->_rpcBoundPort();
     BOOST_REQUIRE_MESSAGE(rpcPort != 0,
       "CesServer failed to bind secondary port");
+    // Mount the echo handler as an object (no global registry).
+    server->_mountCesPlexHandler("/ces/test/echo/1", &gNbEchoHandler);
     BOOST_REQUIRE_MESSAGE(server->_channelMeter() != nullptr,
       "ChannelMeter not constructed");
 

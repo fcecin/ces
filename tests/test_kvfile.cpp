@@ -109,8 +109,8 @@ struct KvFixture {
     wait_net();
   }
 
-  // Stop and rebuild the server on the SAME store dir. fileHandlerBind(nullptr)
-  // on stop closes the kv-store cache, so a reopened store must reload from the
+  // Stop and rebuild the server on the SAME store dir. FileHandler::stop()
+  // closes the kv-store cache, so a reopened store must reload from the
   // on-disk logkv event log — the real persistence guarantee.
   void restartServer() {
     server->stop();
@@ -129,7 +129,7 @@ struct KvFixture {
     boost::asio::io_context io;
     auto work = boost::asio::make_work_guard(io);
     std::optional<FileExecResp> out;
-    fileHandlerExec(req,
+    server->fileHandler()->exec(req,
       [&](FileExecResp r) { out = std::move(r); work.reset(); },
       io.get_executor());
     io.run();
@@ -243,7 +243,7 @@ BOOST_AUTO_TEST_CASE(SweepEvictsUnfundedKeepsFunded) {
   CES_REQUIRE_OK(put(name, "rich", "y", 1'000'000'000'000ull)); // huge balance
 
   std::this_thread::sleep_for(std::chrono::milliseconds(15));   // accrue rent
-  fileHandlerSweepKvRent(server.get());
+  server->fileHandler()->sweepKvRent();
 
   { auto r = req(KV_GET, name); r.key = b_("poor");
     BOOST_CHECK(!exec(r).found); }                              // evicted
@@ -269,7 +269,7 @@ BOOST_AUTO_TEST_CASE(DepositKeepsCellAlive) {
     BOOST_CHECK_GT(resp.fileBalance, 1'000'000'000'000ull); }   // 100 + deposit
 
   std::this_thread::sleep_for(std::chrono::milliseconds(15));
-  fileHandlerSweepKvRent(server.get());
+  server->fileHandler()->sweepKvRent();
 
   auto r = req(KV_GET, name); r.key = b_("k");
   auto resp = exec(r);

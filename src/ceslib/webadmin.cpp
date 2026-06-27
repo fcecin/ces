@@ -13,6 +13,7 @@
 #include <ces/keys.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/peer_handler.h>
 #include <ces/protocol.h>
 #include <ces/server.h>
 #include <ces/util/hex.h>
@@ -407,8 +408,8 @@ std::string buildStatus(CesServer& s) {
     << ",\"net\":" << s.getNetBp() << "}";
   o << ",\"features\":{"
     << "\"rpc\":" << (s._rpcBoundPort() != 0 ? "true" : "false")
-    << ",\"file\":" << (c.cesFileStoreMaxBytes > 0 ? "true" : "false")
-    << ",\"compute\":" << (c.computeMaxInstances > 0 ? "true" : "false")
+    << ",\"file\":" << (s.fileHandler() != nullptr ? "true" : "false")
+    << ",\"compute\":" << (s.computeHandler() != nullptr ? "true" : "false")
     << ",\"peering\":" << (s._peerTarget() > 0 ? "true" : "false")
     << ",\"powReady\":" << (s.isPoWEngineReady() ? "true" : "false") << "}";
   o << ",\"peerCount\":" << s._peerSnapshot().size();
@@ -458,7 +459,14 @@ std::string buildPeers(CesServer& s) {
       << ",\"totalOutboundPoW\":" << p.totalOutboundPoW
       << ",\"lastInboundTime\":" << p.lastInboundTime
       << ",\"lastCheckTime\":" << p.lastCheckTime
-      << ",\"pingFailures\":" << p.pingFailures << "}";
+      << ",\"pingFailures\":" << p.pingFailures;
+    // /ces/peer/1 mesh link state: "up" if a channel is live now; "down"
+    // if the peer is dialable (advertises a plex port) but unlinked;
+    // "none" if it advertises no plex port (the mesh can't reach it).
+    const bool linked = s.peerHandler() && s.peerHandler()->isLinked(p.ckey);
+    const char* rpcLink =
+      linked ? "up" : (p.rpcPort == 0 ? "none" : "down");
+    o << ",\"rpcLink\":" << jstr(rpcLink) << "}";
   }
   o << "]}";
   return o.str();
@@ -555,7 +563,10 @@ std::string buildFileStore(CesServer& s) {
   const CesConfig& c = s._config();
   std::ostringstream o;
   uint64_t files = 0, bytes = 0;
-  bool enabled = fileHandlerStoreStats(files, bytes);
+  // Enabled = the file handler is mounted (wired in [cesplex_mounts]); the cap
+  // is a separate knob, not the on/off switch. Stats are best-effort on top.
+  bool enabled = s.fileHandler() != nullptr;
+  if (enabled) s.fileHandler()->storeStats(files, bytes);
   o << "{\"enabled\":" << (enabled ? "true" : "false")
     << ",\"maxBytes\":" << c.cesFileStoreMaxBytes
     << ",\"totalFiles\":" << files
@@ -569,13 +580,14 @@ std::string buildFileStore(CesServer& s) {
 std::string buildCompute(CesServer& s) {
   const CesConfig& c = s._config();
   std::ostringstream o;
-  o << "{\"enabled\":" << (c.computeMaxInstances > 0 ? "true" : "false")
+  o << "{\"enabled\":" << (s.computeHandler() != nullptr ? "true" : "false")
     << ",\"maxInstances\":" << c.computeMaxInstances
     << ",\"portBase\":" << c.computePortBase
     << ",\"portCount\":" << c.computePortCount
     << ",\"processMemMax\":" << c.computeProcessMemMax
     << ",\"instances\":[";
-  auto insts = computeHandlerSnapshot();
+  auto insts = s.computeHandler() ? s.computeHandler()->snapshot()
+                                  : std::vector<ces::ComputeInstanceStat>{};
   bool first = true;
   for (auto& i : insts) {
     if (!first) o << ",";
@@ -604,7 +616,11 @@ std::string buildFunding(CesServer& s) {
 
 std::string buildExtensions(CesServer& s) {
   std::ostringstream o;
-  o << "{\"catalog\":" << (s._config().cesExtensionsDir.empty() ? "false" : "true")
+  // Extensions need both the file handler (deploy/read /s/) and the compute
+  // handler (run them); enabled only when both are mounted.
+  bool enabled = s.fileHandler() != nullptr && s.computeHandler() != nullptr;
+  o << "{\"enabled\":" << (enabled ? "true" : "false")
+    << ",\"catalog\":" << (s._config().cesExtensionsDir.empty() ? "false" : "true")
     << ",\"items\":[";
   bool first = true;
   for (auto& it : extensionList(&s)) {
@@ -1344,7 +1360,7 @@ nav.tabs{display:flex;gap:2px;padding:0 16px;background:#0c111c;border-bottom:1p
 .tab:hover{color:var(--tx)}
 .tab.active{color:var(--accent);border-bottom-color:var(--accent)}
 
-main{padding:22px;max-width:1180px;margin:0 auto}
+main{padding:22px;max-width:1280px;margin:0 auto}
 .panel{display:none}
 .panel.active{display:block;animation:fade .25s}
 @keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
@@ -1887,7 +1903,7 @@ async function loadPeers(){
   };
   $('#peerSummary').innerHTML=`<span class="feat on">${cOut} outbound</span><span class="feat ${cIn?'on':''}">${cIn} inbound</span><span class="feat ${cRch?'on':''}">${cRch} reachable</span>`;
   const dir=p=>{let b='';if(p.outbound)b+='<span class="badge out">OUT</span> ';if(p.inbound)b+='<span class="badge in">IN</span>';return b||'<span class="muted">—</span>';};
-  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th></th></tr>`+
+  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th>rpc link</th><th></th></tr>`+
     (d.peers.length?d.peers.map(p=>`<tr>
       <td style="white-space:nowrap">${dir(p)}</td>
       <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${esc(p.key)}','${esc(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
@@ -1899,8 +1915,9 @@ async function loadPeers(){
       <td class="num">${fmtCredits(p.totalInboundPoW)}</td>
       <td class="muted">${ago(p.lastCheckTime)}</td>
       <td class="num">${p.pingFailures||0}</td>
+      <td style="white-space:nowrap">${p.rpcLink==='up'?'<span style="color:var(--accent)">up</span>':(p.rpcLink==='down'?'<span class="muted">down</span>':'<span class="muted">&mdash;</span>')}</td>
       <td><button class="danger sm" onclick="rmPeer('${esc(p.key)}')">remove</button></td></tr>`).join('')
-     :`<tr><td colspan="11" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
+     :`<tr><td colspan="12" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
 }
 async function setTarget(){
   const credits=parseFloat($('#peerTarget').value||'0');
@@ -2161,10 +2178,10 @@ async function loadFile(){let fs,cfg;try{fs=await api('/api/filestore');cfg=awai
   if(fs.enabled){const pct=fs.maxBytes>0?Math.min(100,fs.totalBytes/fs.maxBytes*100):0;
     $('#fileStats').innerHTML=[['Files',fmtNum(fs.totalFiles)],['Bytes used',fmtBytes(fs.totalBytes)],['Capacity',fs.maxBytes>0?fmtBytes(fs.maxBytes):'∞'],['Used',fs.maxBytes>0?pct.toFixed(1)+'%':'—']].map(c=>`<div class="card wide"><h3>${c[0]}</h3><div class="stat">${c[1]}</div></div>`).join('');
     $('#fileOff').textContent='';
-  }else{$('#fileStats').innerHTML='';$('#fileOff').innerHTML='<b>File store disabled.</b> Set <span class="mono">cesFileStoreMaxBytes</span> &gt; 0 and restart.';}
+  }else{$('#fileStats').innerHTML='';$('#fileOff').innerHTML='<b>File handler not mounted.</b> Wire <span class="mono">"/ces/file/1" = "builtin:file"</span> in <span class="mono">[cesplex_mounts]</span> and restart.';}
   if(!fileReady){$('#fileFees').innerHTML=feeRows(FEES_FILE);fillFees(cfg.knobs,FEES_FILE);
     if(fs.enabled){$('#fileCapEdit').innerHTML=capEditorHtml('cesFileStoreMaxBytes','capFileMax','applyFileCap');$('#capFileMax').value=fs.maxBytes;}
-    else $('#fileCapEdit').innerHTML='<p class="hint"><span class="mono">cesFileStoreMaxBytes = 0</span> — file store off. The 0 boundary (enable/disable) binds the handler at boot, so crossing it needs a restart.</p>';
+    else $('#fileCapEdit').innerHTML='<p class="hint">file handler not mounted — wire <span class="mono">/ces/file/1 = builtin:file</span> in <span class="mono">[cesplex_mounts]</span> and restart.</p>';
     fileReady=true;}
   $('#fileCap').innerHTML=[['store dir',esc(fs.dir||'—')]].map(r=>`<tr><td class="mono">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('');}
 async function loadCompute(){let cp,cfg;try{cp=await api('/api/compute');cfg=await api('/api/config');}catch(e){return;}
@@ -2172,10 +2189,10 @@ async function loadCompute(){let cp,cfg;try{cp=await api('/api/compute');cfg=awa
     $('#computeStats').innerHTML=[['Running',fmtNum(cp.instances.length)],['Max',fmtNum(cp.maxInstances)],['Port range',cp.portCount>0?(cp.portBase+'–'+(cp.portBase+cp.portCount-1)):'none','wide']].map(c=>`<div class="card${c[2]?' '+c[2]:''}"><h3>${c[0]}</h3><div class="stat">${c[1]}</div></div>`).join('');
     $('#computeTbl').innerHTML='<tr><th>pid</th><th>source</th><th class="num">CPU</th><th class="num">RSS</th><th class="num">uptime</th><th class="num" title="outbound CES-client port / inbound /ces/luarpc/1 host port (0 = none)">ports (CES/rpc)</th></tr>'+(cp.instances.length?cp.instances.map(i=>`<tr><td class="mono">${i.pid}</td><td class="mono">${esc(i.source)}</td><td class="num">${(i.cpuBp/100).toFixed(0)}%</td><td class="num">${fmtBytes(i.rssBytes)}</td><td class="num">${fmtDur(i.uptimeSecs)}</td><td class="num">${i.clientPort||'-'} / ${i.rpcPort||'-'}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no running instances</td></tr>');
     $('#computeOff').textContent='';
-  }else{$('#computeStats').innerHTML='';$('#computeTbl').innerHTML='';$('#computeOff').innerHTML='<b>Compute disabled.</b> Set <span class="mono">computeMaxInstances</span> &gt; 0 (needs the file store) and restart.';}
+  }else{$('#computeStats').innerHTML='';$('#computeTbl').innerHTML='';$('#computeOff').innerHTML='<b>Compute handler not mounted.</b> Wire <span class="mono">"/ces/compute/1" = "builtin:compute"</span> (plus file) in <span class="mono">[cesplex_mounts]</span>, set <span class="mono">computeMaxInstances</span> &gt; 0, and restart.';}
   if(!computeReady){$('#computeFees').innerHTML=feeRows(FEES_COMPUTE);fillFees(cfg.knobs,FEES_COMPUTE);
     if(cp.enabled){$('#computeCapEdit').innerHTML=capEditorHtml('computeMaxInstances','capCompMax','applyComputeCap');$('#capCompMax').value=cp.maxInstances;}
-    else $('#computeCapEdit').innerHTML='<p class="hint"><span class="mono">computeMaxInstances = 0</span> — compute off. The 0 boundary (enable/disable) binds the handler at boot, so crossing it needs a restart.</p>';
+    else $('#computeCapEdit').innerHTML='<p class="hint">compute handler not mounted — wire <span class="mono">/ces/compute/1 = builtin:compute</span> in <span class="mono">[cesplex_mounts]</span> and restart.</p>';
     computeReady=true;}
   $('#computeCap').innerHTML=[['computePortBase',cfg.knobs.computePortBase],['computePortCount',cfg.knobs.computePortCount],['computeClientPoolSize',cfg.knobs.computeClientPoolSize],['processMemMax',fmtBytes(cp.processMemMax)]].map(r=>`<tr><td class="mono">${r[0]}</td><td class="num">${typeof r[1]==='number'?fmtNum(r[1]):r[1]}</td></tr>`).join('');}
 async function applyMinDiff(){const b=$('#cfgMinDiffBtn');b.disabled=true;b.textContent='Applying…';$('#cfgMinDiffState').textContent='';
@@ -2280,6 +2297,7 @@ async function localBudgetApply(){
 async function loadExtensions(){
   loadFunding();
   let d;try{d=await api('/api/extensions');}catch(e){return;}
+  if(!d.enabled){$('#extList').innerHTML='';extSig='';$('#extOff').innerHTML='<b>Extensions not available.</b> They need file and compute both mounted — wire <span class="mono">/ces/file/1</span>, <span class="mono">/ces/lua/1</span> and <span class="mono">/ces/compute/1</span> in <span class="mono">[cesplex_mounts]</span> (and set <span class="mono">computeMaxInstances</span> &gt; 0), then restart.';return;}
   $('#extOff').innerHTML=d.catalog?'':'<b>No catalog.</b> Set <span class="mono">extensions_dir</span> to a folder of single-file .lua extensions to install from. Installed /s/ extensions still appear.';
   // Rebuild the rows only on a real structural change (state/caps/pid), and NOT
   // while a config editor is open (a rebuild would clobber the textarea). Status

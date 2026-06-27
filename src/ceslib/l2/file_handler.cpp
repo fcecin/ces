@@ -5,7 +5,7 @@
 //   - Name validation + filesystem-path mapping (5-component cap,
 //     leading slash, no dotfiles, etc.)
 //   - TOML sidecar load/save with write-rename atomicity
-//   - Global .store.toml with process-wide mutex
+//   - Per-server .store.toml guarded by the handler's store-meta mutex
 //   - 8 verbs: CREATE, WRITE, READ, STAT (free unsigned), DEPOSIT,
 //     WITHDRAW, SET_PRICE, DELETE
 //   - Preamble-first wire framing; sig commits to preamble before
@@ -87,27 +87,19 @@ namespace ces {
 namespace {
 
 // ---------------------------------------------------------------------------
-// Global server binding - see file header.
+// Deletion notify - fire the owning handler's registered callbacks right
+// after a file is deleted internally. The callback list + its mutex, the
+// store-meta mutex, and the kv cache are all per-server FileHandler members,
+// reached from these free helpers via server->fileHandler().
 // ---------------------------------------------------------------------------
 
-std::atomic<CesServer*> gServer{nullptr};
-
-// Process-wide mutex for .store.toml read-modify-write. Held only
-// during the small TOML update, never across content I/O.
-std::mutex gStoreMetaMutex;
-
-// Registered deletion callbacks - invoked right after a file is
-// deleted internally. See fileHandlerRegisterDeletionCallback in the
-// public header for the contract. Append-only; callbacks live for the
-// process lifetime.
-std::mutex gDeletionCallbacksMutex;
-std::vector<std::function<void(const std::string&)>> gDeletionCallbacks;
-
-void notifyDeletion(const std::string& name) {
+void notifyDeletion(CesServer* server, const std::string& name) {
+  FileHandler* fh = server ? server->fileHandler() : nullptr;
+  if (!fh) return;
   std::vector<std::function<void(const std::string&)>> cbs;
   {
-    std::lock_guard lk(gDeletionCallbacksMutex);
-    cbs = gDeletionCallbacks; // copy under lock; fire outside
+    std::lock_guard lk(fh->deletionCallbacksMutex_);
+    cbs = fh->deletionCallbacks_; // copy under lock; fire outside
   }
   for (auto& cb : cbs) {
     try { cb(name); } catch (...) {}
@@ -318,7 +310,7 @@ std::filesystem::path storeMetaPath(const std::string& dir) {
 // directory. The file driver owns the directory (creation, billing, eviction)
 // the same way it owns flat files; logkv only uses the directory. Stores are
 // opened lazily and cached, keyed by file name; access is serialized by
-// gKvMutex (logkv::Store has no internal locking). Keys and values are byte
+// the kv cache mutex (logkv::Store has no internal locking). Keys and values are byte
 // strings (logkv::Bytes); logkv treats an empty value as "absent", so a kv
 // PUT of an empty value is an erase and callers must not rely on storing one.
 // ---------------------------------------------------------------------------
@@ -343,49 +335,54 @@ struct KvKeyLess {
 template <class K, class V> using KvMap = std::map<K, V, KvKeyLess>;
 using KvStore = logkv::Store<KvMap, logkv::Bytes, logkv::Bytes>;
 
-std::mutex gKvMutex;
-std::unordered_map<std::string, std::unique_ptr<KvStore>> gKvStores;
+}  // namespace (anon)
+
+// Per-server kv-store cache: the open-store map plus the mutex serializing
+// access to it and to logkv (which has no internal locking). Held by the
+// FileHandler; the free helpers below reach it via server->fileHandler()->kv_.
+// TODO: those free helpers take CesServer* and round-trip server->fileHandler()
+// to get back to effectively `this`. Passing the FileHandler* (or making them
+// methods) would drop the round-trip; only valid because they run inside a
+// mounted handler.
+struct FileKvCache {
+  std::mutex mutex;
+  std::unordered_map<std::string, std::unique_ptr<KvStore>> stores;
+};
+
+namespace {
 
 // Open (or return the cached) logkv store for kv-file `name`. The content
 // directory must already exist (the driver creates it at CREATE). Returns
 // nullptr if the directory is missing or logkv fails to load. Caller holds
-// gKvMutex.
-KvStore* kvStoreOpenLocked(const std::string& dir, const std::string& name) {
+// the kv cache mutex.
+KvStore* kvStoreOpenLocked(CesServer* server, const std::string& dir,
+                           const std::string& name) {
+  auto& stores = server->fileHandler()->kv_->stores;
   auto cPath = resolveContentPath(dir, name);
-  // Cache key is the ABSOLUTE content path, not the bare CES name: two stores
-  // sharing a logical name across different store dirs (a stop/start with dir
-  // reuse, or two servers in one test process) must not alias.
+  // Cache key is the ABSOLUTE content path, not the bare CES name: a logical
+  // name reused across store dirs (a stop/start with dir reuse) must not alias.
   std::string key = cPath.string();
   std::error_code ec;
-  auto it = gKvStores.find(key);
-  if (it != gKvStores.end()) {
+  auto it = stores.find(key);
+  if (it != stores.end()) {
     // A cached store whose directory was deleted (rent GC / DELETE) is stale:
     // drop it (closes logkv's file handles) and fail. The op's sidecar read
     // reports FILE_NOT_FOUND. This lazy check lets delete paths just
-    // remove_all the dir without taking gKvMutex (avoids a lock-order
-    // inversion with gcReclaim, which deletes under gStoreMetaMutex).
+    // remove_all the dir without taking the kv mutex (avoids a lock-order
+    // inversion with gcReclaim, which deletes under the store-meta mutex).
     if (std::filesystem::is_directory(cPath, ec)) return it->second.get();
-    gKvStores.erase(it);
+    stores.erase(it);
     return nullptr;
   }
   if (!std::filesystem::is_directory(cPath, ec)) return nullptr;
   try {
     auto st = std::make_unique<KvStore>(cPath.string());   // loads existing data
     KvStore* raw = st.get();
-    gKvStores.emplace(key, std::move(st));
+    stores.emplace(key, std::move(st));
     return raw;
   } catch (...) {
     return nullptr;
   }
-}
-
-// Flush and drop every cached kv store. Called on handler unbind (shutdown) so
-// logkv file handles are released and a rebind on the same process reloads from
-// disk. Each mutation already flushed, so the flush here is belt-and-braces.
-void kvStoresCloseAll() {
-  std::lock_guard<std::mutex> lk(gKvMutex);
-  for (auto& [k, st] : gKvStores) { try { st->flush(true); } catch (...) {} }
-  gKvStores.clear();
 }
 
 // ces::Bytes (vector<uint8_t>) <-> logkv::Bytes (vector<char>).
@@ -685,7 +682,7 @@ bool writeStoreMeta(const std::filesystem::path& path, const StoreMeta& m) {
 }
 
 // Updates the store meta by (delta_files, delta_bytes). Caller must
-// hold gStoreMetaMutex. Creates .store.toml if missing.
+// hold the store-meta mutex. Creates .store.toml if missing.
 void adjustStoreMeta(const std::string& dir, int64_t df, int64_t db) {
   auto p = storeMetaPath(dir);
   StoreMeta m;
@@ -865,17 +862,18 @@ bool reconcileOneServerZoneFile(CesServer* server, const std::string& dir,
 // are seeded elsewhere; they are never auto-minted a program account. MUST run
 // off logicStrand_ (the lazy mint may top up the program account via a sync
 // hop). Non-/s/ names: a plain readSidecar, no auto-create.
-bool loadSidecar(const std::string& dir, const std::string& name, Sidecar& sc) {
+bool loadSidecar(CesServer* server, const std::string& dir,
+                 const std::string& name, Sidecar& sc) {
   auto sPath = resolveSidecarPath(dir, name);
   if (readSidecar(sPath, sc)) return true;
   if (!isServerZone(name)) return false;
   if (name == kServerIndexName || isBuiltinSitePath(name)) return false;
-  CesServer* server = gServer.load();
   if (!server) return false;
   return reconcileOneServerZoneFile(server, dir, name, sc);
 }
 
-bool chargeRentOrDelete(const std::filesystem::path& cPath,
+bool chargeRentOrDelete(CesServer* server,
+                        const std::filesystem::path& cPath,
                         const std::filesystem::path& sPath,
                         Sidecar& sc,
                         int64_t feeRent,
@@ -889,7 +887,6 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
     sc.size, feeRent, sc.last_rent_us, now);
   if (owed == 0) return true;
 
-  CesServer* server = gServer.load();
   if (!server) return false;
   minx::Hash pubkey{};
   std::memcpy(pubkey.data(), sc.program_pubkey.data(), 32);
@@ -914,10 +911,10 @@ bool chargeRentOrDelete(const std::filesystem::path& cPath,
       }
     }
     {
-      std::lock_guard lk(gStoreMetaMutex);
+      std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
       adjustStoreMeta(dir, -1, -static_cast<int64_t>(sc.size));
     }
-    notifyDeletion(sc.name);
+    notifyDeletion(server, sc.name);
     return false;
   }
   sc.last_rent_us = now;
@@ -972,15 +969,16 @@ void dispatchResize (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 
 // JIT rent GC - forward decl so dispatchers that grow total_bytes
 // (CREATE, APPEND, RESIZE-grow) can call it below. Caller must hold
-// gStoreMetaMutex.
-uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
+// the store-meta mutex.
+uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
                    uint64_t bytesNeeded);
 
 // Cap-and-GC helper. Returns CES_OK if `addBytes` fits under `cap`
 // (possibly after a debounced GC), CES_ERROR_STORE_FULL otherwise.
-// Caller must hold gStoreMetaMutex. Does not bump total_bytes -
+// Caller must hold the store-meta mutex. Does not bump total_bytes -
 // caller commits after the op's disk work succeeds.
-uint8_t checkCapAndMaybeGc(const std::string& dir,
+uint8_t checkCapAndMaybeGc(CesServer* server,
+                           const std::string& dir,
                            uint64_t cap,
                            int64_t feeRent,
                            uint64_t addBytes);
@@ -991,45 +989,6 @@ void dispatchKvDeposit(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchWithdraw(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchSetPrice(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchDelete (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
-
-class FileHandler : public CesPlexHandler {
-public:
-  void serve(std::shared_ptr<minx::RudpStream> stream,
-             BoundChannelContext bound) override {
-    CesServer* server = gServer.load();
-    if (!server) {
-      LOGWARNING << "invoked with no bound CesServer";
-      return;
-    }
-    CesPlexProtocol proto;
-    // accepts() also gates "still bound?" - false on unbind stops the loop.
-    proto.accepts = [](uint8_t verb) {
-      return gServer.load() != nullptr &&
-             (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize) ||
-              verb == kVerbKvDeposit);
-    };
-    proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-      switch (ctx->verb) {
-        case kVerbCreate:    dispatchCreate   (ctx, std::move(pre)); break;
-        case kVerbWrite:     dispatchWrite    (ctx, std::move(pre)); break;
-        case kVerbRead:      dispatchRead     (ctx, std::move(pre)); break;
-        case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
-        case kVerbDeposit:   dispatchDeposit  (ctx, std::move(pre)); break;
-        case kVerbWithdraw:  dispatchWithdraw (ctx, std::move(pre)); break;
-        case kVerbSetPrice:  dispatchSetPrice (ctx, std::move(pre)); break;
-        case kVerbDelete:    dispatchDelete   (ctx, std::move(pre)); break;
-        case kVerbAppend:    dispatchAppend   (ctx, std::move(pre)); break;
-        case kVerbResize:    dispatchResize   (ctx, std::move(pre)); break;
-        case kVerbKvDeposit: dispatchKvDeposit(ctx, std::move(pre)); break;
-        default:             ctx->error(CES_ERROR_BAD_INPUT); break;
-      }
-    };
-    cesPlexServe(std::move(stream), std::move(bound), server,
-                 std::move(proto));
-  }
-};
-
-FileHandler gFileHandler;
 
 // ---------------------------------------------------------------------------
 // Dispatch: CREATE
@@ -1208,10 +1167,9 @@ void regenerateServerIndex(CesServer* server, const std::string& dir) {
 // Hook fired at the success of a /s/ file-set change (CREATE / DELETE). Guarded
 // to the /s/ zone and self-bypassing (the index write above never goes through
 // the verbs, so this can't recurse). Runs on the file/rpc strand.
-void noteServerZoneMutation(const std::string& name) {
+void noteServerZoneMutation(CesServer* server, const std::string& name) {
   if (!isServerZone(name)) return;
   if (name == kServerIndexName) return;          // recursion guard (belt + braces)
-  CesServer* server = gServer.load();
   if (!server) return;
   regenerateServerIndex(server, server->_config().cesFileStoreDir);
 }
@@ -1254,8 +1212,8 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   if (rc != CES_OK) return { rc, 0, 0 };
   const bool serverZone = isServerZone(name);
   if (!serverZone) {
-    std::lock_guard lk(gStoreMetaMutex);
-    uint8_t capRc = checkCapAndMaybeGc(cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
+    std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
+    uint8_t capRc = checkCapAndMaybeGc(server, cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
                                        cfg.feeFileRent, size);
     if (capRc != CES_OK) return { capRc, 0, 0 };
   }
@@ -1296,8 +1254,8 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     // kv content is a directory: the driver creates it, logkv uses it.
     std::filesystem::create_directory(cPath, ec);
     if (ec) return { CES_ERROR_INTERNAL, 0, 0 };
-    std::lock_guard<std::mutex> lk(gKvMutex);
-    if (!kvStoreOpenLocked(cfg.cesFileStoreDir, name)) {
+    std::lock_guard<std::mutex> lk(server->fileHandler()->kv_->mutex);
+    if (!kvStoreOpenLocked(server, cfg.cesFileStoreDir, name)) {
       std::filesystem::remove_all(cPath, ec);
       return { CES_ERROR_INTERNAL, 0, 0 };
     }
@@ -1325,10 +1283,10 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     return { CES_ERROR_INTERNAL, 0, 0 };
   }
   if (!serverZone) {
-    std::lock_guard lk(gStoreMetaMutex);
+    std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, +1, static_cast<int64_t>(size));
   }
-  noteServerZoneMutation(name);
+  noteServerZoneMutation(server, name);
   return { CES_OK, programAccountInitial, costDebited };
 }
 
@@ -1418,7 +1376,7 @@ WriteOutcome writeCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0 };
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
     return { CES_ERROR_NOT_OWNER, 0 };
@@ -1533,8 +1491,8 @@ ReadOutcome readCore(CesServer* server, const std::string& name,
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return { CES_ERROR_FILE_NOT_FOUND, {} };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!loadSidecar(server, cfg.cesFileStoreDir, name, sc)) return { CES_ERROR_FILE_NOT_FOUND, {} };
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, {} };
   writeSidecar(sPath, sc);
   if (offset > sc.size || offset + uint64_t(length) > sc.size)
@@ -1690,7 +1648,7 @@ WithdrawOutcome withdrawCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0 };
   writeSidecar(sPath, sc);
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
@@ -1766,7 +1724,7 @@ SetPriceOutcome setPriceCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0 };
   writeSidecar(sPath, sc);
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
@@ -1838,9 +1796,9 @@ StatOutcome statCore(CesServer* server, const std::string& name,
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!loadSidecar(cfg.cesFileStoreDir, name, sc))
+  if (!loadSidecar(server, cfg.cesFileStoreDir, name, sc))
     return { CES_ERROR_FILE_NOT_FOUND, {}, 0, 0, 0, 0, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, {}, 0, 0, 0, 0, 0 };
   writeSidecar(sPath, sc);
 
@@ -1910,7 +1868,7 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0 };
   writeSidecar(sPath, sc);
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
@@ -1938,7 +1896,7 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
     else                        std::filesystem::remove(cPath, ec);
     std::filesystem::remove(sPath, ec);
     if (!isServerZone(name)) {
-      std::lock_guard lk(gStoreMetaMutex);
+      std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
       adjustStoreMeta(cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size));
     }
     std::filesystem::path p = cPath.parent_path();
@@ -1948,8 +1906,8 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
       if (!std::filesystem::remove(p, rmec)) break;
       p = p.parent_path();
     }
-    notifyDeletion(name);
-    noteServerZoneMutation(name);
+    notifyDeletion(server, name);
+    noteServerZoneMutation(server, name);
   }
   return { CES_OK, refund };
 }
@@ -2013,7 +1971,7 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0, 0 };
   writeSidecar(sPath, sc);
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
@@ -2022,8 +1980,8 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
 
   const bool serverZone = isServerZone(name);
   if (!serverZone) {
-    std::lock_guard lk(gStoreMetaMutex);
-    uint8_t capRc = checkCapAndMaybeGc(cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
+    std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
+    uint8_t capRc = checkCapAndMaybeGc(server, cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
                                        cfg.feeFileRent, length);
     if (capRc != CES_OK) return { capRc, 0, 0 };
   }
@@ -2069,7 +2027,7 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
   sc2.program_hash.fill(0);
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
   if (!serverZone) {
-    std::lock_guard lk(gStoreMetaMutex);
+    std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, 0, static_cast<int64_t>(length));
   }
   return { CES_OK, newBal, sc2.size };
@@ -2145,7 +2103,7 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0, 0 };
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, 0, 0 };
   writeSidecar(sPath, sc);
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
@@ -2155,8 +2113,8 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
   const bool serverZone = isServerZone(name);
   uint64_t upfront = 0;
   if (bytesDelta > 0 && !serverZone) {
-    { std::lock_guard lk(gStoreMetaMutex);
-      uint8_t capRc = checkCapAndMaybeGc(cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
+    { std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
+      uint8_t capRc = checkCapAndMaybeGc(server, cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
                                          cfg.feeFileRent, static_cast<uint64_t>(bytesDelta));
       if (capRc != CES_OK) return { capRc, 0, 0 }; }
     upfront = computeOwedRent(static_cast<uint64_t>(bytesDelta), cfg.feeFileRent, 0, kGcDebounceUs);
@@ -2194,7 +2152,7 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
   sc2.program_hash.fill(0);
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
   if (bytesDelta != 0 && !serverZone) {
-    std::lock_guard lk(gStoreMetaMutex);
+    std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, 0, bytesDelta);
   }
   return { CES_OK, sc2.size, bal };
@@ -2230,9 +2188,9 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 // every op; a PUT that grows the logical size (sum key+value bytes) pays the
 // per-KB write cost and the 15-min upfront rent on the delta from the file's
 // own program account, plus feeQuery from the source. Logical size lives in
-// the sidecar (size). The logkv store is accessed under gKvMutex; the ledger
-// transaction is taken while holding it (no path takes gStoreMetaMutex then
-// gKvMutex, so the brief gStoreMetaMutex acquisitions here cannot deadlock).
+// the sidecar (size). The logkv store is accessed under the kv cache mutex; the
+// ledger transaction is taken while holding it (no path takes the store-meta
+// mutex then the kv mutex, so the brief store-meta acquisitions here cannot deadlock).
 // ---------------------------------------------------------------------------
 
 struct KvPutOutcome     { uint8_t status; uint64_t balance; uint64_t size; };
@@ -2271,8 +2229,8 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
   logkv::Bytes k = toLogkvBytes(key);
   uint64_t now = getMicrosSinceEpoch();
 
-  std::lock_guard<std::mutex> kvLk(gKvMutex);
-  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+  KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
   if (!st) return { CES_ERROR_INTERNAL, 0, 0 };
 
   uint64_t cellBalance = 0, lastCharged = now, oldStored = 0;
@@ -2287,8 +2245,8 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
   uint64_t grow = storedDelta > 0 ? static_cast<uint64_t>(storedDelta) : 0;
 
   if (grow > 0 && !serverZone) {
-    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
-    uint8_t capRc = checkCapAndMaybeGc(cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
+    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
+    uint8_t capRc = checkCapAndMaybeGc(server, cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
                                        cfg.feeFileRent, grow);
     if (capRc != CES_OK) return { capRc, 0, 0 };
   }
@@ -2319,7 +2277,7 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
   sc2.modified_us = now;
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
   if (storedDelta != 0 && !serverZone) {
-    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, 0, storedDelta);
   }
   return { CES_OK, cellBalance, sc2.size };
@@ -2344,8 +2302,8 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
   logkv::Bytes k = toLogkvBytes(key);
 
-  std::lock_guard<std::mutex> kvLk(gKvMutex);
-  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+  KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
   if (!st) return { CES_ERROR_INTERNAL, 0 };
   auto it = st->find(k);
   if (it == st->end()) return { CES_ERROR_FILE_NOT_FOUND, 0 };
@@ -2383,8 +2341,8 @@ KvGetOutcome kvGetCore(CesServer* server, const std::string& name,
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, {}, false };
   if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, {}, false };
 
-  std::lock_guard<std::mutex> kvLk(gKvMutex);
-  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+  KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
   if (!st) return { CES_ERROR_INTERNAL, {}, false };
   auto it = st->find(toLogkvBytes(key));
   if (it == st->end()) return { CES_OK, {}, false };
@@ -2413,8 +2371,8 @@ KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
 
   uint64_t oldStored = 0, forfeit = 0;
   {
-    std::lock_guard<std::mutex> kvLk(gKvMutex);
-    KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+    std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+    KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
     if (!st) return { CES_ERROR_INTERNAL, 0 };
     logkv::Bytes k = toLogkvBytes(key);
     auto it = st->find(k);
@@ -2425,7 +2383,7 @@ KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
     }
   }
   // Burn the cell's forfeited balance from the store pot to keep the pot equal
-  // to the sum of live cell balances. gKvMutex is released; no lock is held
+  // to the sum of live cell balances. The kv mutex is released; no lock is held
   // across the logicStrand hop.
   if (forfeit > 0 && !serverZone) debitProgramAccount(server, sc, forfeit);
 
@@ -2435,7 +2393,7 @@ KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
   sc2.modified_us = getMicrosSinceEpoch();
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0 };
   if (oldStored > 0 && !serverZone) {
-    std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, 0, -static_cast<int64_t>(oldStored));
   }
   return { CES_OK, sc2.size };
@@ -2452,8 +2410,8 @@ KvIterOutcome kvIterCore(CesServer* server, const std::string& name,
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, {} };
   if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, {} };
 
-  std::lock_guard<std::mutex> kvLk(gKvMutex);
-  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+  KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
   if (!st) return { CES_ERROR_INTERNAL, {} };
   std::vector<ces::Bytes> keys;
   for (auto& kv : st->getObjects()) keys.push_back(fromLogkvBytes(kv.first));
@@ -2482,8 +2440,8 @@ KvRangeOutcome kvRangeCore(CesServer* server, const std::string& name,
   const bool hasHi = !hi.empty();
   logkv::Bytes hiB = toLogkvBytes(hi);
 
-  std::lock_guard<std::mutex> kvLk(gKvMutex);
-  KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+  std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+  KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
   if (!st) return { CES_ERROR_INTERNAL, {}, {}, {} };
   auto& m = st->getObjects();
 
@@ -2582,7 +2540,7 @@ void walkFileStore(const std::filesystem::path& root,
   }
 }
 
-uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
+uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
                    uint64_t bytesNeeded) {
   uint64_t reclaimed = 0;
   int64_t files_delta = 0;
@@ -2597,7 +2555,6 @@ uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
       if (isServerZone(s.name)) return;
       uint64_t owed = computeOwedRent(
         s.size, feeRent, s.last_rent_us, now);
-      CesServer* server = gServer.load();
       uint64_t bal = server ? readProgramAccountBalance(server, s) : 0;
       if (owed > bal) {
         // Dead. Delete content + sidecar. Best-effort rmdir of
@@ -2616,7 +2573,7 @@ uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
         reclaimed += s.size;
         files_delta -= 1;
         bytes_delta -= static_cast<int64_t>(s.size);
-        notifyDeletion(s.name);
+        notifyDeletion(server, s.name);
       }
       // Live files: leave alone. Their rent advances on next touch.
     });
@@ -2625,7 +2582,8 @@ uint64_t gcReclaim(const std::string& dir, int64_t feeRent,
   return reclaimed;
 }
 
-uint8_t checkCapAndMaybeGc(const std::string& dir,
+uint8_t checkCapAndMaybeGc(CesServer* server,
+                           const std::string& dir,
                            uint64_t cap,
                            int64_t feeRent,
                            uint64_t addBytes) {
@@ -2638,7 +2596,7 @@ uint8_t checkCapAndMaybeGc(const std::string& dir,
     return CES_ERROR_STORE_FULL;
   }
   uint64_t need = (m.total_bytes + addBytes) - cap;
-  uint64_t reclaimed = gcReclaim(dir, feeRent, need);
+  uint64_t reclaimed = gcReclaim(server, dir, feeRent, need);
   readStoreMeta(metaP, m);
   m.last_gc_us = now;
   writeStoreMeta(metaP, m);
@@ -2669,7 +2627,7 @@ uint8_t resolveSourceForBilling(CesServer* server, const std::string& sourceName
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, sourceName);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return CES_ERROR_FILE_NOT_FOUND;
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return CES_ERROR_FILE_NOT_FOUND;
   writeSidecar(sPath, sc);
   std::memcpy(outProg.data(), sc.program_pubkey.data(), 32);
@@ -2694,9 +2652,9 @@ void deleteExhaustedSource(CesServer* server, const std::string& sourceName) {
     if (!std::filesystem::remove(p, rmec)) break;
     p = p.parent_path();
   }
-  { std::lock_guard lk(gStoreMetaMutex);
+  { std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
     adjustStoreMeta(cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size)); }
-  notifyDeletion(sourceName);
+  notifyDeletion(server, sourceName);
 }
 
 // The flag is set iff the SOURCE itself could not pay (so the adapter knows to
@@ -2739,7 +2697,7 @@ void execWithSource(CesServer* server, const FileExecReq& req,
   FileExecResp r = run(sourceBilling(srcProg, metered, &sourceInsufficient),
                        srcProg, metered);
   // Delete the source only when the SOURCE itself ran out (not a target-side
-  // INSUFFICIENT) - mirrors the old fileHandlerDebitBalance exhaustion-delete.
+  // INSUFFICIENT) - mirrors the old FileHandler::debitBalance exhaustion-delete.
   if (sourceInsufficient && metered)
     deleteExhaustedSource(server, req.sourceName);
   boost::asio::post(cbEx, [cb, r]() { cb(r); });
@@ -3010,19 +2968,56 @@ void execKvCreate(CesServer* server, FileExecReq req,
 // Public API
 // ---------------------------------------------------------------------------
 
-void fileHandlerBind(CesServer* server) {
-  gServer.store(server);
-  if (!server) kvStoresCloseAll();   // unbind (shutdown): release kv handles
+FileHandler::FileHandler(CesServer* server)
+    : server_(server), kv_(std::make_unique<FileKvCache>()) {}
+
+FileHandler::~FileHandler() { stop(); }
+
+void FileHandler::stop() {
+  stopped_.store(true);
+  // Release kv handles so logkv flushes and a rebind reloads from disk. Each
+  // mutation already flushed, so the flush here is belt-and-braces.
+  std::lock_guard<std::mutex> lk(kv_->mutex);
+  for (auto& [k, st] : kv_->stores) { try { st->flush(true); } catch (...) {} }
+  kv_->stores.clear();
 }
 
-void fileHandlerSweepKvRent(CesServer* server) {
-  if (!server) server = gServer.load();
-  if (!server) return;
+void FileHandler::serve(std::shared_ptr<minx::RudpStream> stream,
+                        BoundChannelContext bound) {
+  CesServer* server = server_;
+  CesPlexProtocol proto;
+  // accepts() also gates "still serving?" - false after stop() ends the loop.
+  proto.accepts = [this](uint8_t verb) {
+    return !stopped_.load() &&
+           (verb == kVerbStat || (verb >= kVerbCreate && verb <= kVerbResize) ||
+            verb == kVerbKvDeposit);
+  };
+  proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+    switch (ctx->verb) {
+      case kVerbCreate:    dispatchCreate   (ctx, std::move(pre)); break;
+      case kVerbWrite:     dispatchWrite    (ctx, std::move(pre)); break;
+      case kVerbRead:      dispatchRead     (ctx, std::move(pre)); break;
+      case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
+      case kVerbDeposit:   dispatchDeposit  (ctx, std::move(pre)); break;
+      case kVerbWithdraw:  dispatchWithdraw (ctx, std::move(pre)); break;
+      case kVerbSetPrice:  dispatchSetPrice (ctx, std::move(pre)); break;
+      case kVerbDelete:    dispatchDelete   (ctx, std::move(pre)); break;
+      case kVerbAppend:    dispatchAppend   (ctx, std::move(pre)); break;
+      case kVerbResize:    dispatchResize   (ctx, std::move(pre)); break;
+      case kVerbKvDeposit: dispatchKvDeposit(ctx, std::move(pre)); break;
+      default:             ctx->error(CES_ERROR_BAD_INPUT); break;
+    }
+  };
+  cesPlexServe(std::move(stream), std::move(bound), server, std::move(proto));
+}
+
+void FileHandler::sweepKvRent() {
+  CesServer* server = server_;
   const auto& cfg = server->_config();
   const int64_t feeRent = cfg.feeFileRent;
   const uint64_t now = getMicrosSinceEpoch();
 
-  // Collect metered kv-store names first (the walk does not hold gKvMutex).
+  // Collect metered kv-store names first (the walk does not hold the kv mutex).
   std::vector<std::string> stores;
   walkFileStore(cfg.cesFileStoreDir,
     [&](const std::filesystem::path&, const std::filesystem::path&, Sidecar& s) {
@@ -3042,8 +3037,8 @@ void fileHandlerSweepKvRent(CesServer* server) {
       uint64_t totalCharge = 0;
       int64_t sizeDelta = 0;
       {
-        std::lock_guard<std::mutex> kvLk(gKvMutex);
-        KvStore* st = kvStoreOpenLocked(cfg.cesFileStoreDir, name);
+        std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+        KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
         if (!st) continue;
         std::vector<logkv::Bytes> toErase;
         std::vector<std::pair<logkv::Bytes, logkv::Bytes>> toUpdate;
@@ -3067,7 +3062,7 @@ void fileHandlerSweepKvRent(CesServer* server) {
         for (auto& k : toErase) st->erase(k);
         if (!toUpdate.empty() || !toErase.empty()) st->flush(true);
       }
-      // Burn the rent from the store pot. gKvMutex is released, so the
+      // Burn the rent from the store pot. The kv mutex is released, so the
       // logicStrand hop holds no kv lock.
       if (totalCharge > 0) debitProgramAccount(server, sc, totalCharge);
       if (sizeDelta != 0) {
@@ -3077,7 +3072,7 @@ void fileHandlerSweepKvRent(CesServer* server) {
           sc2.size = sc2.size > dec ? sc2.size - dec : 0;
           sc2.modified_us = now;
           writeSidecar(sPath, sc2);
-          std::lock_guard<std::mutex> mlk(gStoreMetaMutex);
+          std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
           adjustStoreMeta(cfg.cesFileStoreDir, 0, sizeDelta);
         }
       }
@@ -3089,14 +3084,14 @@ void fileHandlerSweepKvRent(CesServer* server) {
   }
 }
 
-bool fileHandlerReadProgramPubkey(
+bool FileHandler::readProgramPubkey(
     const std::string& name,
     std::array<uint8_t, 32>& outProgramPubkey) {
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) return false;
   const auto& cfg = server->_config();
   Sidecar sc{};
-  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
+  if (!loadSidecar(server, cfg.cesFileStoreDir, name, sc)) return false;
   outProgramPubkey = sc.program_pubkey;
   return true;
 }
@@ -3104,30 +3099,30 @@ bool fileHandlerReadProgramPubkey(
 // Read the file's program-account ed25519 private key from its sidecar.
 // All-zero on success means the account has no signing key (no remote
 // signing). False if the sidecar is unreadable.
-bool fileHandlerReadProgramPrivkey(
+bool FileHandler::readProgramPrivkey(
     const std::string& name,
     std::array<uint8_t, 32>& outProgramPrivkey) {
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) return false;
   const auto& cfg = server->_config();
   Sidecar sc{};
-  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
+  if (!loadSidecar(server, cfg.cesFileStoreDir, name, sc)) return false;
   outProgramPrivkey = sc.program_privkey;
   return true;
 }
 
-bool fileHandlerReadOwnerAndBalance(
+bool FileHandler::readOwnerAndBalance(
     const std::string& name,
     std::array<uint8_t, 32>& outOwnerPubkey,
     uint64_t& outFileBalance) {
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) return false;
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
-  if (!loadSidecar(cfg.cesFileStoreDir, name, sc)) return false;
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
+  if (!loadSidecar(server, cfg.cesFileStoreDir, name, sc)) return false;
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     // chargeRentOrDelete already fired notifyDeletion + removed disk.
     return false;
@@ -3138,8 +3133,8 @@ bool fileHandlerReadOwnerAndBalance(
   return true;
 }
 
-bool fileHandlerCreditBalance(const std::string& name, uint64_t amount) {
-  CesServer* server = gServer.load();
+bool FileHandler::creditBalance(const std::string& name, uint64_t amount) {
+  CesServer* server = server_;
   if (!server) return false;
   if (amount == 0) return true;
   // /s/ files are unmetered - operator donates via the reconcile-time
@@ -3151,7 +3146,7 @@ bool fileHandlerCreditBalance(const std::string& name, uint64_t amount) {
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return false;
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     return false; // chargeRentOrDelete already notified
   }
@@ -3161,17 +3156,17 @@ bool fileHandlerCreditBalance(const std::string& name, uint64_t amount) {
   return true;
 }
 
-bool fileHandlerGetProgramHash(
+bool FileHandler::getProgramHash(
     const std::string& name,
     std::array<uint8_t, 32>& outHash) {
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) return false;
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return false;
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     return false;
   }
@@ -3217,8 +3212,8 @@ bool fileHandlerGetProgramHash(
   return true;
 }
 
-bool fileHandlerDebitBalance(const std::string& name, uint64_t amount) {
-  CesServer* server = gServer.load();
+bool FileHandler::debitBalance(const std::string& name, uint64_t amount) {
+  CesServer* server = server_;
   if (!server) return false;
   // /s/ files are unmetered - operator donates everything via the
   // reconcile-time top-up. Treat any debit as a successful no-op so
@@ -3230,7 +3225,7 @@ bool fileHandlerDebitBalance(const std::string& name, uint64_t amount) {
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return false;
-  if (!chargeRentOrDelete(cPath, sPath, sc, cfg.feeFileRent,
+  if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent,
                           cfg.cesFileStoreDir)) {
     return false; // chargeRentOrDelete already notified
   }
@@ -3253,11 +3248,11 @@ bool fileHandlerDebitBalance(const std::string& name, uint64_t amount) {
       }
     }
     {
-      std::lock_guard lk(gStoreMetaMutex);
+      std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
       adjustStoreMeta(cfg.cesFileStoreDir, -1,
                       -static_cast<int64_t>(sc.size));
     }
-    notifyDeletion(sc.name);
+    notifyDeletion(server, sc.name);
     return false;
   }
   sc.modified_us = getMicrosSinceEpoch();
@@ -3265,18 +3260,18 @@ bool fileHandlerDebitBalance(const std::string& name, uint64_t amount) {
   return true;
 }
 
-void fileHandlerRegisterDeletionCallback(
+void FileHandler::registerDeletionCallback(
     std::function<void(const std::string&)> cb) {
   if (!cb) return;
-  std::lock_guard lk(gDeletionCallbacksMutex);
-  gDeletionCallbacks.push_back(std::move(cb));
+  std::lock_guard lk(deletionCallbacksMutex_);
+  deletionCallbacks_.push_back(std::move(cb));
 }
 
-void fileHandlerExec(
+void FileHandler::exec(
     const FileExecReq& req,
     std::function<void(FileExecResp)> cb,
     boost::asio::any_io_executor cbEx) {
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) {
     FileExecResp r; r.status = CES_ERROR_DISABLED;
     boost::asio::post(cbEx, [cb, r]() { cb(r); });
@@ -3370,10 +3365,12 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
 // server's extLocalBudget (deficit only). Runs off logicStrand_ (the top-up
 // sync-hops to it), called from dailyTaskTick. No-op if the file feature or the
 // budget is off.
-void fileHandlerSweepExtensionBudget(CesServer* server) {
-  if (!server) return;
+void FileHandler::sweepExtensionBudget() {
+  CesServer* server = server_;
   const auto& cfg = server->_config();
-  if (cfg.cesFileStoreMaxBytes == 0) return;
+  // No cap gate: /s/ is unmetered and present whenever file is mounted (this
+  // is a FileHandler method, so the handler exists), even at cap 0. The only
+  // gate is the budget itself.
   if (server->extLocalBudget() == 0) return;
   namespace fs = std::filesystem;
   const std::string& dir = cfg.cesFileStoreDir;
@@ -3392,7 +3389,7 @@ void fileHandlerSweepExtensionBudget(CesServer* server) {
     std::string name = "/" + rel.generic_string();
     if (name == kServerIndexName || isBuiltinSitePath(name)) continue;
     Sidecar sc{};
-    if (!loadSidecar(dir, name, sc)) continue;
+    if (!loadSidecar(server, dir, name, sc)) continue;
     if (topUpProgramAccountToCap(server, sc)) ++topped;
   }
   LOGINFO << "extension budget swept" << VAR(topped);
@@ -3439,8 +3436,8 @@ void seedBuiltinSite(CesServer* server, const std::string& dir) {
   LOGDEBUG << "/s/welcome site published";
 }
 
-void fileHandlerStartupReconcile() {
-  CesServer* server = gServer.load();
+void FileHandler::startupReconcile() {
+  CesServer* server = server_;
   if (!server) return;
   const std::string& dir = server->_config().cesFileStoreDir;
   std::error_code ec;
@@ -3460,7 +3457,7 @@ void fileHandlerStartupReconcile() {
     m.total_files += 1;
     m.total_bytes += s.size;
   });
-  std::lock_guard lk(gStoreMetaMutex);
+  std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
   writeStoreMeta(storeMetaPath(dir), m);
   LOGINFO << "store reconciled"
           << VAR(m.total_files) << VAR(m.total_bytes);
@@ -3471,8 +3468,8 @@ void fileHandlerStartupReconcile() {
 // atomic and re-stamps the sidecar; it runs off logicStrand_ (its reconcile
 // sync-hops to it), like the boot scan.
 
-std::string fileHandlerReadServerFile(const std::string& name) {
-  CesServer* server = gServer.load();
+std::string FileHandler::readServerFile(const std::string& name) {
+  CesServer* server = server_;
   if (!server || !isServerZone(name)) return "";
   std::ifstream f(resolveContentPath(server->_config().cesFileStoreDir, name),
                   std::ios::binary);
@@ -3482,8 +3479,8 @@ std::string fileHandlerReadServerFile(const std::string& name) {
   return ss.str();
 }
 
-bool fileHandlerWriteServerFile(const std::string& name, const std::string& content) {
-  CesServer* server = gServer.load();
+bool FileHandler::writeServerFile(const std::string& name, const std::string& content) {
+  CesServer* server = server_;
   if (!server || !isServerZone(name)) return false;
   const std::string& dir = server->_config().cesFileStoreDir;
   auto cPath = resolveContentPath(dir, name);
@@ -3505,8 +3502,8 @@ bool fileHandlerWriteServerFile(const std::string& name, const std::string& cont
   return true;
 }
 
-bool fileHandlerRemoveServerFile(const std::string& name) {
-  CesServer* server = gServer.load();
+bool FileHandler::removeServerFile(const std::string& name) {
+  CesServer* server = server_;
   if (!server || !isServerZone(name)) return false;
   const std::string& dir = server->_config().cesFileStoreDir;
   std::error_code ec;
@@ -3515,12 +3512,12 @@ bool fileHandlerRemoveServerFile(const std::string& name) {
   return true;
 }
 
-bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes) {
-  CesServer* server = gServer.load();
+bool FileHandler::storeStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes) {
+  CesServer* server = server_;
   if (!server) return false;
   const std::string& dir = server->_config().cesFileStoreDir;
   StoreMeta m{};
-  std::lock_guard lk(gStoreMetaMutex);
+  std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
   readStoreMeta(storeMetaPath(dir), m);  // tolerant of a missing file
   outTotalFiles = m.total_files;
   outTotalBytes = m.total_bytes;
@@ -3529,12 +3526,3 @@ bool fileHandlerStoreStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes) {
 
 
 } // namespace ces
-
-// ---------------------------------------------------------------------------
-// Static registration: map protocol name "file" -> gFileHandler.
-// ---------------------------------------------------------------------------
-
-REGISTER_CESPLEX_BUILTIN("file", ::ces::gFileHandler, FileHandler)
-
-// TU anchor - cesplex/mux.cpp references this via its anchor array.
-extern "C" { int file_handler_anchor = 1; }

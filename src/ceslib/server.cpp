@@ -3,6 +3,7 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/l2/compute_lua_handler.h>
+#include <ces/l2/peer_handler.h>
 #include <ces/cesvm.h>
 #include <ces/util/ctrlc.h>
 #include <ces/util/helpers.h>
@@ -21,7 +22,9 @@
 #include <limits>
 #include <algorithm>
 #include <random>
+#include <set>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <minx/blog.h>
 #include <minx/rudp/rudp.h>
@@ -1243,56 +1246,81 @@ uint16_t CesServer::start(uint16_t serverPort) {
     channelMeter_ = std::make_unique<ChannelMeter>(
       *rpcRudp_, rpcTaskIO_, this);
 
-    // CesPlex — the L2 protocol multiplexer. Constructed iff the
-    // operator configured any mounts; otherwise we stay in "outbound
-    // only" mode and inbound HS_OPENs are rejected (rpcRudpListener_
-    // returns nullptr from onAccept when cesplex_ is null).
-    // Construction happens before the socket is opened so the listener
-    // sees a coherent CesPlex pointer before any packet can arrive.
-    if (!cfg_.cesplexMounts.empty()) {
-      cesplex_ = std::make_unique<CesPlex>(
-        cfg_.cesplexMounts, *rpcRudp_, rpcTaskIO_, this, channelMeter_.get());
-      if (!cesplex_->hasAnyBinding()) {
-        // All mounts resolved to unknown targets — construction
-        // succeeded but there's nothing to accept. Tear it down so
-        // we stay in the "inbound-rejected" mode instead of pretending
-        // CesPlex is active.
-        LOGDEBUG << "rpc: CesPlex has no resolved bindings; disabling";
-        cesplex_.reset();
-      } else {
-        if (cfg_.cesFileStoreMaxBytes > 0) {
-          // File-storage feature is on. Bind the builtin:file
-          // handler and do the startup reconciliation walk.
-          fileHandlerBind(this);
-          fileHandlerStartupReconcile();
-        } else {
-          // CesPlex has other bindings but file-storage is off.
-          LOGINFO << "file-store: disabled (cesFileStoreMaxBytes = 0)";
+    // CesPlex — the L2 protocol multiplexer. Built whenever the plex port is
+    // up. Builtins are builtins: their C++ is linked and every server speaks
+    // the whole suite. CesPlex resolves the operator's cfg mounts (file /
+    // compute / lua, plus any non-core handler) via the builtin registry;
+    // builtin:peer is a per-server object mounted directly. Whether a mounted
+    // handler does real work is the handler's own decision (its capability /
+    // params); a disabled or unauthorized bind is refused IN THE HANDLER.
+    // Construction happens before the socket is opened so the listener sees a
+    // coherent CesPlex pointer before any packet can arrive.
+    {
+      // CesPlex is impl-agnostic: each [cesplex_mounts] entry wires a protocol
+      // name to a builtin handler impl. The map is the ONLY thing that decides
+      // what is served -- nothing auto-mounts (auto would hardcode the impl
+      // choice). A protocol absent from the map is simply not served.
+      //
+      // resolveBuiltin is the hardcoded list of core builtin implementors: it
+      // maps a "builtin:<name>" string to exactly one concrete class, the
+      // single place that knows name->class. Each role is constructed once as a
+      // per-server object (lazily, so several protos may share one handler) and
+      // returned as the base handler to mount. An alternative impl (e.g.
+      // "builtin:peeralt" -> a second peer class) is a new case here -- but the
+      // role members hold concrete types today, so a real alternative needs the
+      // role's abstract base first. There is no global registry: a target this
+      // switch does not know is logged and skipped (the server serves only what
+      // it can construct).
+      auto resolveBuiltin = [this](const std::string& target) -> CesPlexHandler* {
+        if (target == "builtin:peer") {
+          if (!peerHandler_) peerHandler_ = std::make_unique<PeerHandler>(this);
+          return peerHandler_.get();
         }
-        // Compute feature: binds after file, fails loudly with a
-        // specific reason if its prereqs aren't satisfied.
-        if (cfg_.computeMaxInstances > 0) {
-          uint8_t rc = computeHandlerBind(this);
-          if (rc != CES_OK) {
-            LOGWARNING << "compute: handler bind refused"
-                       << VAR(int(rc));
-          }
-        } else {
-          LOGINFO << "compute: disabled (computeMaxInstances = 0)";
+        if (target == "builtin:lua") {
+          if (!luaHandler_) luaHandler_ = std::make_unique<LuaHandler>(this);
+          return luaHandler_.get();
         }
-        // /ces/lua/1 user-↔-program connection routing. Always bind
-        // when CesPlex is up — the handler itself is cheap (no timer,
-        // no resources) and bind-time visibility is the same as the
-        // file/compute handlers above.
-        luaHandlerBind(this);
+        if (target == "builtin:file") {
+          if (!fileHandler_) fileHandler_ = std::make_unique<FileHandler>(this);
+          return fileHandler_.get();
+        }
+        if (target == "builtin:compute") {
+          if (!computeHandler_)
+            computeHandler_ = std::make_unique<ComputeHandler>(this);
+          return computeHandler_.get();
+        }
+        return nullptr;  // unknown builtin -> skipped below
+      };
 
-        // Deploy + launch /s/ extensions. Posted onto rpcTaskIO_
-        // (the supervisor strand); runs after the rpc threads spin
-        // up. fileHandlerEnsureServerFile is idempotent; missing
-        // file/compute prereqs surface as logged warnings.
-        boost::asio::post(rpcTaskIO_,
-          [this]() { launchExtensions(); });
+      cesplex_ = std::make_unique<CesPlex>(
+        *rpcRudp_, rpcTaskIO_, this, channelMeter_.get());
+      for (const auto& [proto, target] : cfg_.cesplexMounts) {
+        if (CesPlexHandler* h = resolveBuiltin(target)) {
+          cesplex_->mount(proto, h);
+        } else {
+          LOGWARNING << "cesplex: mount skipped, unknown builtin"
+                     << SVAR(proto) << SVAR(target);
+        }
       }
+
+      // Per-role startup hooks, in dependency order. file_store_max_bytes is
+      // only the metered-zone cap (/s/ is unmetered and served whenever file is
+      // mounted), not an on/off switch. peer start() kicks off the reconcile
+      // pass; file before compute (compute needs the file store); compute
+      // start() self-gates on its prerequisites (instance cap > 0, file handler
+      // present, work dir) and logs if unmet -- a badly-wired compute mount is
+      // inert, not a crash. lua has no startup hook.
+      if (peerHandler_) peerHandler_->start();
+      if (fileHandler_) fileHandler_->startupReconcile();
+      if (computeHandler_) {
+        uint8_t rc = computeHandler_->start();
+        if (rc != CES_OK) {
+          LOGWARNING << "compute: handler start refused" << VAR(int(rc));
+        }
+      }
+
+      // Deploy + launch /s/ extensions on the supervisor strand.
+      boost::asio::post(rpcTaskIO_, [this]() { launchExtensions(); });
     }
 
     // Register the Rudp family with a MinxStdExtensions builder.
@@ -1319,10 +1347,15 @@ uint16_t CesServer::start(uint16_t serverPort) {
       // Tear down in reverse construction order: CesPlex holds
       // references into rpcRudp_ and must go first; channelMeter_
       // also references rpcRudp_.
-      luaHandlerBind(nullptr);
-      computeHandlerBind(nullptr);
-      fileHandlerBind(nullptr);
+      if (peerHandler_) peerHandler_->stop();
+      if (luaHandler_) luaHandler_->stop();
+      if (computeHandler_) computeHandler_->stop();
+      if (fileHandler_) fileHandler_->stop();   // after compute (depends on file)
       cesplex_.reset();
+      peerHandler_.reset();
+      luaHandler_.reset();
+      computeHandler_.reset();
+      fileHandler_.reset();
       channelMeter_.reset();
       rpcMinx_.reset();
       rpcRudp_.reset();
@@ -1482,11 +1515,18 @@ void CesServer::stop(bool flushEvents) {
     // CesPlex, and no RudpStream outlives its Rudp. Compute unbind
     // must run BEFORE its rpcTaskIO_ executor goes away — it cancels
     // the supervisor timer and SIGKILLs live instances.
-    luaHandlerBind(nullptr);
-    computeFundingDrain();        // let in-flight ces.request_funds transfers finish
-    computeHandlerBind(nullptr);
-    fileHandlerBind(nullptr);
+    if (peerHandler_) peerHandler_->stop();
+    if (luaHandler_) luaHandler_->stop();
+    if (computeHandler_) {
+      computeHandler_->fundingDrain();  // let in-flight request_funds transfers finish
+      computeHandler_->stop();
+    }
+    if (fileHandler_) fileHandler_->stop();   // after compute (depends on file)
     cesplex_.reset();
+    peerHandler_.reset();
+    luaHandler_.reset();
+    computeHandler_.reset();
+    fileHandler_.reset();
     channelMeter_.reset();
     rpcRudp_.reset();
     rpcMinx_.reset();
@@ -3638,10 +3678,11 @@ void CesServer::incomingApplication(const SockAddr& addr, const uint8_t code,
       if (!fwd || *fwd != addr)
         senderPfx = {};
     }
-    boost::asio::post(io, [buf, senderPfx]() {
-      computeHandlerOnApplicationMsg(
-        reinterpret_cast<const uint8_t*>(buf->data()), buf->size(),
-        senderPfx);
+    boost::asio::post(io, [this, buf, senderPfx]() {
+      if (computeHandler_)
+        computeHandler_->onApplicationMsg(
+          reinterpret_cast<const uint8_t*>(buf->data()), buf->size(),
+          senderPfx);
     });
     return;
   }
@@ -4008,8 +4049,8 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
   // logicStrand: the sweep takes gKvMutex then hops to logicStrand to burn the
   // rent (the lock order kv ops use), so running it inside the postLogic block
   // above would invert that order and deadlock.
-  fileHandlerSweepKvRent(this);
-  fileHandlerSweepExtensionBudget(this);
+  if (fileHandler_) fileHandler_->sweepKvRent();
+  if (fileHandler_) fileHandler_->sweepExtensionBudget();
 
   dailyTaskStartTimer();
 }
@@ -4049,19 +4090,20 @@ void CesServer::_brr(const minx::Hash& accountKey, int64_t amount) {
 }
 
 // Boot-time autolaunch of /s/ extensions. For each name in
-// cfg_.extensions, calls computeHandlerLaunchInternal on
+// cfg_.extensions, calls computeHandler_->launchInternal on
 // /s/<name>.lua. The file itself is operator-deployed: drop it into
 // <storeDir>/s/, the file handler's startup reconcile auto-generates
 // the sidecar before this runs. Source missing → WRN, skip; the
 // server keeps running.
 //
 // Runs on rpcTaskIO_ (caller posts it there). Posted after
-// fileHandlerStartupReconcile so reconcile has already filled in any
+// fileHandler startupReconcile so reconcile has already filled in any
 // missing /s/ sidecars.
 void CesServer::launchExtensions() {
+  if (!computeHandler_) return;
   for (const auto& name : cfg_.extensions) {
     std::string path = "/s/" + name + ".lua";
-    uint8_t rc = computeHandlerLaunchInternal(path);
+    uint8_t rc = computeHandler_->launchInternal(path);
     if (rc != CES_OK) {
       LOGWARNING << "extension: launch failed"
                  << SVAR(name) << SVAR(path) << VAR(int(rc));
@@ -4941,9 +4983,10 @@ void CesServer::deliverGossipLocal(const Hash& author, const Hash& sender,
   auto io = _rpcTaskIOExecutor();
   if (!io) return;
   auto m = std::make_shared<ces::Bytes>(msg);
-  boost::asio::post(io, [author, sender, msgId, dest, m]() {
-    computeHandlerDeliverGossip(author, sender, msgId, dest,
-                                m->data(), m->size());
+  boost::asio::post(io, [this, author, sender, msgId, dest, m]() {
+    if (computeHandler_)
+      computeHandler_->deliverGossip(author, sender, msgId, dest,
+                                     m->data(), m->size());
   });
 }
 
@@ -5097,6 +5140,80 @@ bool CesServer::_isPeerReachable(const minx::Hash& ckey) {
   return false;
 }
 
+bool CesServer::_isPeerByKey(const minx::Hash& ckey) {
+  std::lock_guard lock(peerTableMutex_);
+  for (const auto& p : peerTable_) {
+    if (p.ckey == ckey) return true;
+  }
+  return false;
+}
+
+std::vector<PeerLinkTarget> CesServer::_peerLinkTargets() {
+  std::vector<PeerLinkTarget> out;
+  std::lock_guard lock(peerTableMutex_);
+  out.reserve(peerTable_.size());
+  for (const auto& p : peerTable_) {
+    // Only reachable peers are mesh targets. An unreachable peer (the peer
+    // miner flips this on probe failure) drops out of the set, so the
+    // reconcile tears its link down; it reappears when reachable again.
+    // This is the liveness signal that replaces a channel keepalive.
+    if (!p.reachable) continue;
+    PeerLinkTarget t;
+    t.ckey = p.ckey;
+    t.dialable = (p.rpcPort != 0) && !p.resolvedIP.is_unspecified();
+    if (t.dialable) t.endpoint = minx::SockAddr(p.resolvedIP, p.rpcPort);
+    out.push_back(t);
+  }
+  return out;
+}
+
+bool CesServer::cesplexChannelMetered(const std::string& proto) {
+  // POSSIBLE TODO: this keys off the proto NAME, not the handler identity. If
+  // builtin:peer is ever wired at a non-standard proto name, its channel would
+  // be metered. Keying off "is this the peerHandler_ instance" would be robust.
+  return proto != ces::CES_PEER_PROTO;
+}
+
+void CesServer::_testAddPeerWithRpc(const minx::Hash& ckey,
+                                    const std::string& declaredAddr,
+                                    const boost::asio::ip::address& ip,
+                                    uint16_t rpcPort) {
+  std::lock_guard lock(peerTableMutex_);
+  for (auto& p : peerTable_) {
+    if (p.ckey == ckey) {
+      p.declaredAddress = declaredAddr;
+      p.resolvedIP = ip;
+      p.resolvedEndpoint = minx::SockAddr(ip, rpcPort);
+      p.resolvedEndpointValid = true;
+      p.rpcPort = rpcPort;
+      p.reachable = true;
+      p.outbound = true;
+      return;
+    }
+  }
+  PeerEntry pe;
+  pe.ckey = ckey;
+  pe.declaredAddress = declaredAddr;
+  pe.resolvedIP = ip;
+  pe.resolvedEndpoint = minx::SockAddr(ip, rpcPort);
+  pe.resolvedEndpointValid = true;
+  pe.rpcPort = rpcPort;
+  pe.reachable = true;
+  pe.outbound = true;
+  peerTable_.push_back(pe);
+}
+
+void CesServer::_mountCesPlexHandler(const std::string& proto,
+                                     CesPlexHandler* handler) {
+  if (!cesplex_) return;
+  std::promise<void> done;
+  boost::asio::post(rpcTaskIO_, [&]() {
+    cesplex_->mount(proto, handler);
+    done.set_value();
+  });
+  done.get_future().wait();
+}
+
 // =============================================================================
 // Dashboard / admin surface
 // =============================================================================
@@ -5189,8 +5306,12 @@ CesServer::FileStat CesServer::_fileStat(const std::string& path) {
   // whole call on rpcTaskIO so it stays serialized with the handler's other
   // verbs instead of racing them from this web thread, then block on the future.
   boost::asio::post(_rpcTaskIOExecutor(), [this, &req, &pr]() {
-    fileHandlerExec(req, [&pr](FileExecResp r) { pr.set_value(std::move(r)); },
-                    _rpcTaskIOExecutor());
+    if (!fileHandler_) {
+      FileExecResp r; r.status = CES_ERROR_DISABLED; pr.set_value(std::move(r));
+      return;
+    }
+    fileHandler_->exec(req, [&pr](FileExecResp r) { pr.set_value(std::move(r)); },
+                       _rpcTaskIOExecutor());
   });
   FileExecResp r = pr.get_future().get();
   if (r.status == CES_OK) {

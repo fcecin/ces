@@ -184,25 +184,39 @@ case "$ACTION" in
         if [ "$RUN_TESTS" = true ]; then
             BIN="build/${TARGET}/tests/cestests"
             if [ -f "$BIN" ] && [ -x "$BIN" ]; then
-                BOOST_ARGS="-l test_suite"
+                # -l test_suite: per-suite progress during the run.
+                # --report_level=short: a count summary (cases/assertions) at the end.
+                BOOST_ARGS="-l test_suite --report_level=short"
                 LABEL="All Tests"
                 if [ -n "$TEST_FILTER" ]; then
                     BOOST_ARGS="$BOOST_ARGS --run_test=$TEST_FILTER"
                     LABEL="Tests ($TEST_FILTER)"
                 fi
                 echo "--- Running $LABEL ---"
+                # Per-run log file so concurrent build.sh --test invocations
+                # don't clobber each other's output/tally.
+                logf=$(mktemp "${TMPDIR:-/tmp}/cestests.XXXXXX.log")
                 set +e
-                "$BIN" $BOOST_ARGS 2>&1 | tee /tmp/cestests_last.log
+                "$BIN" $BOOST_ARGS 2>&1 | tee "$logf"
                 rc=${PIPESTATUS[0]}
                 set -e
-                # Surface the Boost.Test tally explicitly — never drive by the
-                # exit code alone (a wrapping command can mask it).
-                tally=$(grep -aoE '\*\*\* [0-9]+ failures? (are|is) detected|No errors detected' /tmp/cestests_last.log | tail -1)
-                if [ $rc -ne 0 ]; then
-                    echo "❌ $LABEL FAILED (exit code $rc) — ${tally:-see output above}"
+                # Build a one-line tally from the Boost short report. Never drive
+                # by the exit code alone (a wrapping command can mask it).
+                cases=$(grep -aoE '[0-9]+ test cases? out of [0-9]+ (passed|failed)' "$logf" | tail -1)
+                skipped=$(grep -aoE '[0-9]+ test cases? out of [0-9]+ skipped' "$logf" | tail -1)
+                asserts=$(grep -aoE '[0-9]+ assertions? out of [0-9]+ (passed|failed)' "$logf" | tail -1)
+                summary="$cases"
+                [ -n "$skipped" ] && summary="$summary, $skipped"
+                [ -n "$asserts" ] && summary="$summary; $asserts"
+                failed=$(grep -aoE '\*\*\* [0-9]+ failures? (are|is) detected|has failed with' "$logf" | tail -1)
+                if [ $rc -ne 0 ] || [ -n "$failed" ]; then
+                    # Keep the log for inspection on failure; print its path.
+                    echo "❌ $LABEL FAILED (exit code $rc) — ${summary:-see output above}"
+                    echo "   log: $logf"
                     exit 1
                 else
-                    echo "✅ $LABEL passed — ${tally:-No errors detected}"
+                    rm -f "$logf"
+                    echo "✅ $LABEL passed — ${summary:-no tally}"
                 fi
             else
                 echo "⚠️  cestests not found: $BIN"

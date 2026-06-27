@@ -1,13 +1,9 @@
 // mux.cpp — CesPlex implementation
 //
 // See include/ces/cesplex/mux.h for the design. This file
-// implements:
-//
-//   - The process-wide builtin registry (Meyer-style static).
-//   - registerCesPlexBuiltin / findCesPlexBuiltin entrypoints.
-//   - The CesPlex class: per-session bind-handshake state machine,
-//     wiring into Rudp's channel-opened + receive callbacks, and
-//     the hand-off to registered handlers on OK.
+// implements the CesPlex class: per-session bind-handshake state
+// machine, wiring into Rudp's channel-opened + receive callbacks, and
+// the hand-off to mounted handlers on OK.
 
 #include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
@@ -22,83 +18,12 @@
 #include <array>
 #include <chrono>
 #include <cstring>
-#include <mutex>
 #include <span>
 #include <vector>
 
 LOG_MODULE("plex");
 
-// ---------------------------------------------------------------------------
-// Translation-unit anchors for builtin handlers
-// ---------------------------------------------------------------------------
-//
-// Each handler .cpp file that participates in the static-registration
-// pattern must export an anchor symbol and be referenced here. Without
-// the reference, the linker strips the handler's TU from ceslib (it
-// sees no external symbols used, and static-init alone doesn't count).
-// The address-of in the array below counts as a use.
-//
-// When adding a new handler, add `extern "C" int <anchor_name>;` and
-// `&<anchor_name>,` to the array. Keep this list in sync with the
-// handler files in this directory.
-
-extern "C" int file_handler_anchor;
-extern "C" int compute_handler_anchor;
-extern "C" int compute_lua_handler_anchor;
-
-namespace {
-  [[maybe_unused]] int* const _cesplex_tu_anchors[] = {
-    &file_handler_anchor,
-    &compute_handler_anchor,
-    &compute_lua_handler_anchor,
-  };
-}
-
 namespace ces {
-
-// ---------------------------------------------------------------------------
-// Builtin registry — Meyer-style function-local static, safe against
-// translation-unit init order. Mutex guards against the (unlikely) case
-// of a background thread registering during startup; in practice all
-// registration happens from main-thread static-init before any CesPlex
-// exists.
-// ---------------------------------------------------------------------------
-
-namespace {
-
-struct Registry {
-  std::mutex mu;
-  std::map<std::string, CesPlexHandler*> map;
-};
-
-Registry& registry() {
-  static Registry r;
-  return r;
-}
-
-} // namespace
-
-void registerCesPlexBuiltin(const std::string& name,
-                            CesPlexHandler* handler) {
-  if (!handler) return;
-  auto& r = registry();
-  std::lock_guard<std::mutex> lk(r.mu);
-  auto [it, inserted] = r.map.emplace(name, handler);
-  if (!inserted) {
-    // Duplicate registration. Keep the first; complain. This can
-    // happen if two translation units try to register the same name,
-    // which is almost certainly a bug — the later registration loses.
-    LOGWARNING << "CesPlex: duplicate builtin registration ignored"
-               << SVAR(name);
-  }
-}
-
-CesPlexHandler* findCesPlexBuiltin(const std::string& name) {
-  auto& r = registry();
-  std::lock_guard<std::mutex> lk(r.mu);
-  auto it = r.map.find(name);
-  return it == r.map.end() ? nullptr : it->second;
-}
 
 // ---------------------------------------------------------------------------
 // Session — per-channel state for the select handshake
@@ -275,7 +200,9 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
 
     // Begin metering this channel. Each tick measures its resource deltas
     // and reports them to the host, which prices them however it likes.
-    if (parent.channelMeter_) {
+    // The host may opt a protocol out (server-to-server peer mesh).
+    if (parent.channelMeter_ &&
+        (!parent.host_ || parent.host_->cesplexChannelMetered(name))) {
       parent.channelMeter_->track(
         peer, channelId, "plex:" + name, bound.payerPfx);
     }
@@ -367,37 +294,13 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
 // CesPlex
 // ---------------------------------------------------------------------------
 
-CesPlex::CesPlex(const std::map<std::string, std::string>& mounts,
-                 minx::Rudp& rudp,
+CesPlex::CesPlex(minx::Rudp& rudp,
                  boost::asio::io_context& io,
                  CesPlexHost* host,
                  ChannelMeter* meter)
   : rudp_(rudp), io_(io), host_(host), channelMeter_(meter) {
-  // Resolve each mount's target string against the builtin registry.
-  // Unresolvable targets are logged and skipped.
-  for (const auto& [proto, target] : mounts) {
-    constexpr const char* kBuiltinPrefix = "builtin:";
-    if (target.rfind(kBuiltinPrefix, 0) == 0) {
-      std::string name = target.substr(std::strlen(kBuiltinPrefix));
-      CesPlexHandler* h = findCesPlexBuiltin(name);
-      if (!h) {
-        LOGWARNING << "CesPlex: mount skipped — unknown builtin"
-                   << SVAR(proto) << SVAR(target);
-        continue;
-      }
-      bindings_.emplace(proto, h);
-      LOGINFO << "CesPlex: mount"
-              << SVAR(proto) << SVAR(target);
-    } else {
-      LOGWARNING << "CesPlex: mount skipped — unrecognized target"
-                 << " (expected 'builtin:...')"
-                 << SVAR(proto) << SVAR(target);
-    }
-  }
-
-  LOGINFO << "CesPlex: constructed"
-          << VAR(bindings_.size())
-          << VAR(mounts.size());
+  // No bindings at construction: the host mounts handler objects via mount().
+  LOGINFO << "CesPlex: constructed";
 }
 
 CesPlex::~CesPlex() {
@@ -406,6 +309,15 @@ CesPlex::~CesPlex() {
   // on rpcRudp_ that point at us are cleared by CesServer before
   // destruction; this is just defensive cleanup.
   sessions_.clear();
+}
+
+void CesPlex::mount(const std::string& proto, CesPlexHandler* handler) {
+  if (handler) {
+    bindings_[proto] = handler;
+    LOGINFO << "CesPlex: mount instance" << SVAR(proto);
+  } else {
+    bindings_.erase(proto);
+  }
 }
 
 std::shared_ptr<minx::Rudp::ChannelHandler> CesPlex::acceptInbound(

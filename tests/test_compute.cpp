@@ -779,16 +779,16 @@ BOOST_AUTO_TEST_CASE(TwoPortsAllocatedAndReused) {
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));
   CES_REQUIRE_OK(cc.launch(ps.src, b, s));
   // Both of a's ports allocated, distinct, lowest-first; b takes the next pair.
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), ps.portBase + 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    ps.portBase + 1);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)), ps.portBase + 2);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),    ps.portBase + 3);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(a)), ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(a)),    ps.portBase + 1);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(b)), ps.portBase + 2);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(b)),    ps.portBase + 3);
 
   // Kill a → frees the first pair; the next launch reuses the lowest free pair.
   CES_REQUIRE_OK(cc.kill(a));
   CES_REQUIRE_OK(cc.launch(ps.src, d, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(d)), ps.portBase + 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(d)),    ps.portBase + 1);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(d)), ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(d)),    ps.portBase + 1);
 
   cc.disconnect();
 }
@@ -804,8 +804,8 @@ BOOST_AUTO_TEST_CASE(OnePortAllocated) {
 
   uint64_t a = 0, s = 0;
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), ps.portBase + 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(a)), ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(a)),    0);
 
   cc.disconnect();
 }
@@ -821,8 +821,8 @@ BOOST_AUTO_TEST_CASE(ZeroPortsAllocated) {
 
   uint64_t a = 0, s = 0;
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));   // launch still succeeds
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)), 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),    0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(a)), 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(a)),    0);
 
   cc.disconnect();
 }
@@ -841,12 +841,12 @@ BOOST_AUTO_TEST_CASE(PortsDrainAcrossInstancesAllLaunch) {
   CES_REQUIRE_OK(cc.launch(ps.src, a, s));    // base+0, base+1
   CES_REQUIRE_OK(cc.launch(ps.src, b, s));    // base+2, then 0
   CES_REQUIRE_OK(cc.launch(ps.src, cId, s));  // 0, 0
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(a)),   ps.portBase + 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(a)),      ps.portBase + 1);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(b)),   ps.portBase + 2);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(b)),      0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceClientPort(cId)), 0);
-  BOOST_CHECK_EQUAL(int(_computeTestInstanceRpcPort(cId)),    0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(a)),   ps.portBase + 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(a)),      ps.portBase + 1);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(b)),   ps.portBase + 2);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(b)),      0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceClientPort(cId)), 0);
+  BOOST_CHECK_EQUAL(int(ps.server->computeHandler()->testInstanceRpcPort(cId)),    0);
 
   cc.disconnect();
 }

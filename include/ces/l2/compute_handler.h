@@ -1,30 +1,40 @@
-// compute_handler.h - builtin:compute handler lifecycle API.
+// compute_handler.h - builtin:compute: per-server program-hosting handler.
 //
-// The compute handler is a compiled-in CesPlex handler registered as
-// "compute" in the global builtin registry.
+// Mounts /ces/compute/1 on the plex (rpc) port. Each LAUNCH spawns
+// `cesComputeChildBinary` (default `cesluajitd`, a sandboxed LuaJIT VM per
+// process) as a separate OS process, holds a Unix domain socket to it, and
+// charges slot/cpu/rss/bucket fees to the source file's `file_balance` while
+// the instance runs. When the balance can't cover a tick the instance is
+// SIGKILLed; likewise when the source file is deleted (file handler delete /
+// rent-exhaust / GC).
 //
-// The handler spawns `cesComputeChildBinary` (default `cesluajitd`, a
-// sandboxed LuaJIT VM per process) as a separate OS process, holds a Unix
-// domain socket to it, and charges `feeComputeSlotSec` per wall-clock second
-// to the source file's `file_balance` while the instance runs. When the
-// balance can't cover a tick the instance is SIGKILLed; likewise when the
-// source file is deleted (file handler delete / rent-exhaust / GC).
+// One ComputeHandler OBJECT per CesServer (owned by the server, holds a back
+// pointer to it). No process-global state: N servers coexist in one process.
 //
-// Lifecycle: CesServer::start() calls computeHandlerBind(this) after
-// CesPlex is constructed and the file handler has been bound (the
-// compute handler refuses to bind otherwise). computeHandlerBind(nullptr)
-// on shutdown SIGKILLs all running instances and tears down timers.
-//
-// One translation unit, one handler instance. Same pattern as
-// builtin:file.
+// Lifecycle: the server constructs a ComputeHandler(this) and mounts it into
+// its CesPlex when /ces/compute/1 is wired in [cesplex_mounts], then calls
+// start() (which self-gates on its prereqs: computeMaxInstances > 0, builtin:
+// file mounted, work dir); on shutdown it calls fundingDrain() then stop() and
+// drops the object (before CesPlex /
+// rpcRudp_ go away).
 
 #pragma once
 
 #include <ces/types.h>
 #include <ces/buffer.h>
+#include <ces/cesplex/mux.h>      // CesPlexHandler, BoundChannelContext
+
+#include <minx/rudp/rudp_stream.h>
+
+#include <boost/asio/steady_timer.hpp>
 
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
+#include <map>
+#include <memory>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,64 +43,12 @@ namespace ces {
 
 class CesServer;
 
-// Bind / unbind the builtin:compute handler to a CesServer. Returns
-// CES_OK if bind succeeded, or a CES_ERROR_COMPUTE_* code if any
-// prerequisite was missing. On failure the handler stays unbound and
-// inbound /ces/compute/* selects reach a handler with no bound server
-// and drop (matching the file handler's off-switch behavior).
-//
-// Prereqs (all must hold):
-//   1. cfg.computeMaxInstances > 0                       (off switch)
-//   2. builtin:file is registered in the CesPlex registry  (we call
-//      into fileHandler* primitives for source-file auth + fund ops)
-//   3. cfg.cesComputeWorkDir resolves and is writable       (scratch
-//      + IPC socket paths live there)
-//   4. cfg.cesComputeChildBinary resolves on the host        (relative
-//      names go through execvp; absolute paths are used directly)
-//
-// Pass `server = nullptr` to unbind. Unbind SIGKILLs every running
-// instance synchronously, cancels the supervisor tick timer, and
-// removes the handler's work-dir scratch files.
-uint8_t computeHandlerBind(CesServer* server);
-
-// Boot-time launch path for /s/ extensions. Bypasses the
-// wire-auth/dedup/upfront-fee sequence used by dispatchLaunch — the
-// caller is the server itself. The source file at `name` must
-// already exist on disk (deploy via fileHandlerEnsureServerFile),
-// be in /s/, and be owned by the server's pubkey.
-//
-// Must be called from rpcTaskIO_'s strand (post via
-// CesServer::_rpcTaskIOExecutor). Validation (instance cap, source
-// existence, server ownership) is synchronous and returns CES_OK, or a
-// CES_ERROR_COMPUTE_*/CES_ERROR_FILE_*/CES_ERROR_BAD_NAME code. The
-// child's connect-back is then awaited asynchronously, so CES_OK means
-// "validated + spawn started," not "child connected"; a connect-back
-// failure is logged, not returned.
-//
-// Owner pubkey is read fresh from the source's sidecar — the caller
-// doesn't pass it. This keeps the contract symmetric with the wire
-// path: source-of-truth for ownership is always the sidecar.
-uint8_t computeHandlerLaunchInternal(const std::string& name);
-
-// Deliver an inbound CES_APP_COMPUTE_MSG-shaped packet to the
-// compute handler. Called from CesServer::incomingApplication after
-// the hop onto rpcTaskIO_. `senderPfx` is the 8-byte prefix of the
-// sending client's pubkey (resolved via the presence cache reverse
-// index) — programs use it as the reply-to target for
-// ces.client_send. All-zero means the sender wasn't in presence; the
-// program will see the zero prefix and typically ignore the message.
-void computeHandlerOnApplicationMsg(
-    const uint8_t* data, std::size_t len,
-    const std::array<uint8_t, 8>& senderPfx);
-
-// ---------------------------------------------------------------------------
-// /ces/lua/1 cross-handler primitives
-// ---------------------------------------------------------------------------
-//
-// Used by the lua handler (compute_lua_handler.cpp) to route between
-// inbound RUDP channels and the running cesluajitd children. All run
-// on rpcTaskIO_'s strand — same as the supervisor itself — so they're
-// safe to call from there but not elsewhere.
+// Per-instance supervisor state, defined in compute_handler.cpp (the only TU
+// that touches it). Held here only through shared_ptr, so the header stays
+// free of its definition.
+struct Instance;
+// In-flight EXT_REQ correlation state, also defined in the .cpp.
+struct ExtPending;
 
 // Per-instance monitoring snapshot, surfaced to the web dashboard's
 // Compute tab. CPU is in basis points of one core (10000 = a full core);
@@ -104,11 +62,6 @@ struct ComputeInstanceStat {
   uint16_t clientPort = 0;     // outbound CES-client port (0 = none)
   uint16_t rpcPort = 0;        // inbound /ces/luarpc/1 host port (0 = none)
 };
-
-// Snapshot every running instance for monitoring. Safe to call from any
-// thread; runs on the CesPlex strand internally (blocking post+wait), so
-// it sees a consistent registry. Empty if the handler is unbound.
-std::vector<ComputeInstanceStat> computeHandlerSnapshot();
 
 // ---- Extension contract (ces.extension_admin{}). Read/drive a running /s/
 // extension through the management surface the ExtensionManager exposes to the
@@ -131,100 +84,127 @@ struct ComputeExtInfo {
   std::string configDefaults;
 };
 
-// What a running instance reported: identity (ces.manifest) + the contract
-// (ces.extension_admin). false if pid unknown. Synchronous (CesPlex strand).
-bool computeHandlerExtInfo(uint64_t pid, ComputeExtInfo& out);
+class ComputeHandler : public CesPlexHandler {
+public:
+  explicit ComputeHandler(CesServer* server);
+  ~ComputeHandler();
 
-// Round-trip a status/command request to a running extension; `out` is the
-// reply payload after the status byte. false on timeout / unknown / non-ext /
-// child error. For STATUS, out = [u16 count]([lp k][lp v])*; for COMMAND,
-// `in` = [u16 idLen][id][arg] and out = the command's string result.
-bool computeHandlerExtRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
-                              ces::Bytes& out, int timeoutMs);
+  ComputeHandler(const ComputeHandler&) = delete;
+  ComputeHandler& operator=(const ComputeHandler&) = delete;
 
-// Push a config blob (text) to a running extension's on_config. Best-effort.
-void computeHandlerExtConfig(uint64_t pid, const std::string& cfg);
+  // CesPlexHandler: a freshly-bound /ces/compute/1 channel. Runs the signed
+  // per-op verb loop (cesPlexServe).
+  void serve(std::shared_ptr<minx::RudpStream> stream,
+             BoundChannelContext bound) override;
 
-// Kill every running instance of `sourceName` (e.g. "/s/discovery.lua"). Async
-// (hops onto the CesPlex strand). The ExtensionManager's Disable.
-void computeHandlerKillBySource(const std::string& sourceName);
+  // Bring the handler up: validate prereqs (computeMaxInstances > 0,
+  // builtin:file up, work-dir + child binary resolvable), create the
+  // work-dir, register the file-deletion interlock, and start the
+  // supervisor tick. Returns CES_OK or a CES_ERROR_COMPUTE_* code.
+  uint8_t start();
 
-// Bounded wait for in-flight ces.request_funds remote transfers to finish, so the
-// CesServer isn't destroyed under them. Call before compute teardown.
-void computeFundingDrain();
+  // SIGKILL every running instance, cancel the supervisor tick, and stop
+  // accepting verbs. Call on shutdown before CesPlex / rpcRudp_ go away.
+  void stop();
 
-// True iff `pid` is currently registered in the supervisor.
-// Used by the lua handler to disambiguate "no such instance" from
-// "instance exists but accept gate closed".
-bool computeInstanceExists(uint64_t pid);
+  // Bounded wait for in-flight ces.request_funds remote transfers to finish,
+  // so the CesServer isn't destroyed under them. Call before stop().
+  void fundingDrain();
 
-// True iff the given instance has its accept gate open (the program
-// has called ces.conn.set_listener(handler)). Returns false for any
-// missing / dead instance.
-bool computeInstanceAcceptsConnections(uint64_t pid);
+  // Boot-time launch path for /s/ extensions. Bypasses the
+  // wire-auth/dedup/upfront-fee sequence used by the LAUNCH verb -- the caller
+  // is the server itself. The source file at `name` must already exist on disk
+  // (deploy via fileHandler), be in /s/, and be owned by the server's pubkey.
+  // Must be called from rpcTaskIO_'s strand. CES_OK means "validated + spawn
+  // started," not "child connected."
+  uint8_t launchInternal(const std::string& name);
 
-// Allocate a fresh server-side conn_id for the given instance and
-// send TAG_CONN_OPENED to its child (with the user's pubkey).
-// Returns the new conn_id, or 0 if the instance is gone before the
-// allocation lands.
-uint64_t computeOpenConnection(uint64_t pid,
-                                const std::array<uint8_t, 32>& userPubkey);
+  // Deliver an inbound CES_APP_COMPUTE_MSG-shaped packet. Called from
+  // CesServer::incomingApplication after the hop onto rpcTaskIO_. `senderPfx`
+  // is the 8-byte prefix of the sending client's pubkey (reply-to target for
+  // ces.client_send); all-zero means the sender wasn't in presence.
+  void onApplicationMsg(const uint8_t* data, std::size_t len,
+                        const std::array<uint8_t, 8>& senderPfx);
 
-// Send TAG_CONN_DATA_IN (bytes flowing user → program) to the
-// instance's child. No-op if the instance is gone.
-void computeSendConnDataIn(uint64_t pid, uint64_t connId,
-                            const uint8_t* data, std::size_t len);
+  // Snapshot every running instance for monitoring. Safe to call from any
+  // thread; runs on the CesPlex strand internally (blocking post+wait).
+  std::vector<ComputeInstanceStat> snapshot();
 
-// Send TAG_CONN_CLOSED (channel ended for any reason) to the
-// instance's child. No-op if the instance is gone. The lua handler
-// is responsible for cleaning up its own (pid, connId) routing
-// entry separately.
-void computeSendConnClosed(uint64_t pid, uint64_t connId,
-                            uint8_t reason);
+  // What a running instance reported: identity (ces.manifest) + the contract
+  // (ces.extension_admin). false if pid unknown. Synchronous (CesPlex strand).
+  bool extInfo(uint64_t pid, ComputeExtInfo& out);
 
-// Deliver a flooded gossip message to EVERY local compute instance (each child
-// calls its program's on_gossip handler if defined). Called for gossip received
-// from the mesh and for gossip this node originates itself, so local programs
-// see the node's own messages too. Must run on the compute supervisor thread
-// (rpcTaskIO_) — it touches the instance map. No-op if compute is disabled.
-void computeHandlerDeliverGossip(const minx::Hash& author,
-                                 const minx::Hash& sender,
-                                 const minx::Hash& msgId,
-                                 const minx::Hash& dest,
-                                 const uint8_t* msg, std::size_t len);
+  // Round-trip a status/command request to a running extension; `out` is the
+  // reply payload after the status byte. false on timeout / unknown / non-ext /
+  // child error.
+  bool extRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
+                  ces::Bytes& out, int timeoutMs);
 
-// Test hook: reads CPU ticks (utime + stime from /proc/<pid>/stat)
-// and resident-set-size bytes (resident × PAGESIZE from
-// /proc/<pid>/statm) for the given pid. Returns false if /proc is
-// unavailable or the pid is gone. Public only for unit tests — the
-// per-instance sampler runs on the supervisor tick internally.
+  // Push a config blob (text) to a running extension's on_config. Best-effort.
+  void extConfig(uint64_t pid, const std::string& cfg);
+
+  // Kill every running instance of `sourceName` (e.g. "/s/discovery.lua").
+  // Async (hops onto the CesPlex strand). The ExtensionManager's Disable.
+  void killBySource(const std::string& sourceName);
+
+  // Deliver a flooded gossip message to EVERY local compute instance (each
+  // child calls its program's on_gossip handler if defined). Must run on the
+  // compute supervisor thread (rpcTaskIO_).
+  void deliverGossip(const minx::Hash& author, const minx::Hash& sender,
+                     const minx::Hash& msgId, const minx::Hash& dest,
+                     const uint8_t* msg, std::size_t len);
+
+  // ---- /ces/lua/1 + /ces/peer/1 cross-handler primitives. Used by the lua /
+  // peer handlers; all run on rpcTaskIO_'s strand. ----
+
+  // True iff `pid` is currently registered in the supervisor.
+  bool instanceExists(uint64_t pid);
+  // True iff the instance has its accept gate open (ces.conn.set_listener).
+  bool instanceAcceptsConnections(uint64_t pid);
+  // Allocate a fresh server-side conn_id and send TAG_CONN_OPENED to the child
+  // (with the user's pubkey). Returns the new conn_id, or 0 if the instance
+  // is gone before the allocation lands.
+  uint64_t openConnection(uint64_t pid,
+                          const std::array<uint8_t, 32>& userPubkey);
+  // Send TAG_CONN_DATA_IN (bytes user -> program). No-op if instance is gone.
+  void sendConnDataIn(uint64_t pid, uint64_t connId,
+                      const uint8_t* data, std::size_t len);
+  // Send TAG_CONN_CLOSED (channel ended). No-op if instance is gone. The lua
+  // handler cleans up its own (pid, connId) routing entry separately.
+  void sendConnClosed(uint64_t pid, uint64_t connId, uint8_t reason);
+  // Route an inbound /ces/peer/1 mesh message to the local instance that
+  // registered `service` via ces.peer.listen. No-op if none did.
+  void routePeerMsg(const std::string& service, const minx::Hash& fromKey,
+                    const uint8_t* data, std::size_t len);
+
+  // ---- Test hooks (see comments at the definitions). ----
+  void testForceTick();
+  std::size_t testFloodDeliver(uint64_t pid, std::size_t count);
+  uint16_t testInstanceClientPort(uint64_t pid);
+  uint16_t testInstanceRpcPort(uint64_t pid);
+
+  // Per-server supervisor state. Public so this translation unit's free
+  // helpers reach it via server->computeHandler(); not a stable API.
+  CesServer* server_ = nullptr;
+  std::map<uint64_t, std::shared_ptr<Instance>> instances_;
+  std::map<std::array<uint8_t, 8>, std::set<uint64_t>> byPrefix_;
+  std::map<std::string, std::set<uint64_t>> byName_;
+  std::map<std::string, uint64_t> serviceTags_;
+  uint64_t nextPid_ = 1;
+  std::map<uint16_t, std::shared_ptr<ExtPending>> extPending_;
+  uint16_t extCorr_ = 1;
+  uint64_t pendingLaunches_ = 0;
+  std::set<uint16_t> usedComputePorts_;
+  std::shared_ptr<boost::asio::steady_timer> tickTimer_;
+  std::atomic<bool> tickRunning_{false};
+  std::atomic<int> fundingInFlight_{0};
+  std::atomic<bool> stopped_{false};
+};
+
+// Test hook: reads CPU ticks (utime + stime from /proc/<pid>/stat) and
+// resident-set-size bytes for the given pid. Stateless; not tied to a handler.
 bool _computeTestReadProcSample(int pid,
                                 uint64_t& outTicks,
                                 uint64_t& outRssBytes);
-
-// Test hook: fires one supervisor tick synchronously (sample + bill
-// for every instance). Lets tests assert tick-driven behavior — CPU
-// basis-points updating, slot-fee debit landing on the sidecar,
-// SIGKILL on fund exhaustion — without waiting on the timer. Safe
-// to call from any thread; runs on the CesPlex strand internally
-// with a blocking post+wait. No-op if the handler is unbound.
-void _computeTestForceTick();
-
-// Test hook: floods an instance with `count` best-effort DELIVER frames
-// back-to-back on the CesPlex strand and returns the resulting outbound
-// queue (`outbox`) depth at saturation. With the flood guard in place this
-// caps at kMaxDeliverBacklog; without it, it grows to `count`. Runs in a
-// single non-yielding strand task so nothing drains mid-flood — the result
-// is deterministic, with no socket-buffer or timing dependence. 0 if the
-// handler is unbound or the instance is gone.
-size_t _computeTestFloodDeliver(uint64_t pid, size_t count);
-
-// Test hook: returns the UDP port the server statically assigned the
-// given instance's outbound client (Instance::clientPort), or 0 if the
-// instance is gone (or no static range was configured). Runs on the
-// CesPlex strand with a blocking post+wait.
-uint16_t _computeTestInstanceClientPort(uint64_t pid);
-// Same, for the instance's inbound CesPlex host port (Instance::rpcPort).
-uint16_t _computeTestInstanceRpcPort(uint64_t pid);
 
 } // namespace ces

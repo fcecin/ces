@@ -20,7 +20,7 @@
 #include <ces/l2/compute_client.h>
 #include <ces/l2/compute_handler.h>   // _computeTestInstanceRpcPort
 #include <ces/l2/file_client.h>
-#include <ces/l2/file_handler.h>      // fileHandlerReadProgramPubkey
+#include <ces/l2/file_handler.h>      // FileHandler::readProgramPubkey
 
 #include <boost/test/unit_test.hpp>
 
@@ -116,7 +116,7 @@ struct LuaRpcFixture {
     CES_REQUIRE_OK(fc.write(path, 0, content, fb));
     fc.disconnect();
     std::array<uint8_t, 32> pk{};
-    BOOST_REQUIRE(fileHandlerReadProgramPubkey(path, pk));
+    BOOST_REQUIRE(server->fileHandler()->readProgramPubkey(path, pk));
     return pk;
   }
 
@@ -167,7 +167,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   //    grace period for the child to actually bind its endpoint.
   uint16_t serverRpc = 0;
   for (int i = 0; i < 100 && serverRpc == 0; i++) {
-    serverRpc = _computeTestInstanceRpcPort(serverId);
+    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
     if (serverRpc == 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
@@ -356,7 +356,7 @@ BOOST_FIXTURE_TEST_CASE(ConnectFromCoroutineYields, LuaRpcFixture) {
 
   uint16_t serverRpc = 0;
   for (int i = 0; i < 100 && serverRpc == 0; i++) {
-    serverRpc = _computeTestInstanceRpcPort(serverId);
+    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
     if (serverRpc == 0)
       std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }

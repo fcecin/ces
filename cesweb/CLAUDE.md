@@ -25,7 +25,7 @@ per-read cost, not as a feature.
    server in the page.
 
 3. **Metadata / wallet (later).** Account/asset/server-info as a block explorer;
-   a web wallet for signed ops. Design notes: `../local/web.md`.
+   a web wallet for signed ops.
 
 The split is the whole economic model: **files are on the gateway's dime; `/dev`
 is on yours.** cesweb never holds your key for either.

@@ -28,9 +28,9 @@
 // handler that wants to do anything long-running should hop off to
 // another executor; the framework keeps its own bookkeeping on the strand.
 //
-// Extensibility: adding a new builtin handler is two files: the
-// handler class + its REGISTER_CESPLEX_BUILTIN line at namespace
-// scope. No dynamic loading, no plugin API beyond the wire protocol.
+// Extensibility: a CesPlex serves only handler objects its host mounts
+// via mount(). The host owns the name->class choice (CesServer does it in
+// resolveBuiltin). No global registry, no dynamic loading, no plugin API.
 
 #pragma once
 
@@ -97,6 +97,14 @@ struct CesPlexHost {
                                   const minx::SockAddr& peer,
                                   uint32_t channelId,
                                   const CesPlexUsage& usage) = 0;
+
+  // Whether a bound channel for this protocol participates in metering.
+  // Default true; a server-to-server protocol (the peer mesh) opts out,
+  // since both ends pay from their own bottomless accounts. (Access control
+  // is the handler's job, decided in serve(), not a bind-time gate here.)
+  virtual bool cesplexChannelMetered(const std::string& /*proto*/) {
+    return true;
+  }
 };
 
 // Graceful-close timeout for server-initiated channel teardown across
@@ -161,30 +169,6 @@ public:
 };
 
 // -----------------------------------------------------------------------
-// Builtin registration
-// -----------------------------------------------------------------------
-//
-// At program load time, builtin handlers self-register their short
-// name → pointer-to-handler mapping into a process-wide registry.
-// CesPlex looks up "builtin:<name>" targets in this registry at
-// construction time. The typical pattern is the
-// REGISTER_CESPLEX_BUILTIN macro at the bottom of this header.
-//
-// `handler` is a raw pointer because the convention is that handlers
-// are process-lifetime singletons (a global static in their .cpp).
-// The registry never owns; it just maps names to addresses. A handler
-// destroyed before the registry is read is undefined behavior, but in
-// practice that never happens — handlers outlive the process.
-
-void registerCesPlexBuiltin(const std::string& name,
-                            CesPlexHandler* handler);
-
-// Lookup — returns nullptr if no handler is registered under `name`.
-// Intended for CesPlex's ctor and for tests that want to introspect
-// the registry. Not meant for hot-path use.
-CesPlexHandler* findCesPlexBuiltin(const std::string& name);
-
-// -----------------------------------------------------------------------
 // CesPlex — the multiplexer
 // -----------------------------------------------------------------------
 //
@@ -194,9 +178,9 @@ CesPlexHandler* findCesPlexBuiltin(const std::string& name);
 
 class CesPlex {
 public:
-  // `mounts` maps protocol-name → target-string. Each target string
-  // is "builtin:<name>" — looked up in the global builtin registry
-  // at ctor time; unresolved bindings are logged and skipped.
+  // Constructed with no bindings; the host mounts handler objects after
+  // construction via mount(). There is no global registry: a CesPlex serves
+  // only what its host explicitly mounts.
   //
   // `rudp` is the Rudp instance on the secondary port. CesPlex
   // installs channel-opened + receive callbacks on it that route
@@ -210,8 +194,7 @@ public:
   // `host` supplies the bind-reply ingredients: cesplexSigningKey() to
   // sign the reply. May be null only for tests that don't exercise the
   // bind handshake.
-  CesPlex(const std::map<std::string, std::string>& mounts,
-          minx::Rudp& rudp,
+  CesPlex(minx::Rudp& rudp,
           boost::asio::io_context& io,
           CesPlexHost* host,
           ChannelMeter* meter = nullptr);
@@ -241,6 +224,13 @@ public:
   // caller may want to skip constructing us entirely.
   bool hasAnyBinding() const { return !bindings_.empty(); }
 
+  // Bind a per-host handler object to a protocol name. This is the ONLY way
+  // handlers get bound: the host owns the handler's lifetime and the
+  // name->object choice. A null handler unbinds the protocol. Call before the
+  // socket opens (host construction), or post onto the bus strand if the
+  // endpoint is already live.
+  void mount(const std::string& proto, CesPlexHandler* handler);
+
   // Introspection — test-only. Number of live sessions awaiting bind.
   size_t _pendingSessionCount() const { return sessions_.size(); }
 
@@ -255,7 +245,7 @@ private:
   CesPlexHost* host_;           // signs bind replies + supplies bind rates
   ChannelMeter* channelMeter_;  // optional, may be null
 
-  // Protocol-name → registered handler, resolved at ctor.
+  // Protocol-name → mounted handler object (host-owned). Filled by mount().
   std::map<std::string, CesPlexHandler*> bindings_;
 
   // In-flight inbound select handshakes. Keyed by (peer, channelId).
@@ -263,25 +253,5 @@ private:
   // closes.
   std::map<SessionKey, std::shared_ptr<Session>> sessions_;
 };
-
-// -----------------------------------------------------------------------
-// Convenience macro — register a builtin handler at static-init time
-// -----------------------------------------------------------------------
-//
-// Expands to a namespace-scope struct whose ctor registers the handler
-// in the global registry. Place at the bottom of the handler's .cpp
-// file. The `uniq` argument is a source-unique identifier (e.g. the
-// handler class name) used to keep the generated struct name unique
-// even if the same .cpp registers multiple handlers.
-
-#define REGISTER_CESPLEX_BUILTIN(name_str, handler_instance, uniq)   \
-  namespace {                                                        \
-    struct _CesPlexReg_##uniq {                                      \
-      _CesPlexReg_##uniq() {                                         \
-        ::ces::registerCesPlexBuiltin((name_str), &(handler_instance)); \
-      }                                                              \
-    };                                                               \
-    static _CesPlexReg_##uniq _cesplex_reg_##uniq;                   \
-  }
 
 } // namespace ces

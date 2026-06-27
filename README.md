@@ -62,13 +62,16 @@ Requires: C++20 compiler, CMake 3.28+, Boost 1.83+ (system, log, log_setup, stac
 ## Running a server
 
 ```bash
-./run ces --genkeypair
-# Copy the private key into your config file
-
-./run ces --config production.toml
+./run ces --config > server.toml   # dump a ready-to-run config
+./run ces --config server.toml     # run with it
 ```
 
-See `production.toml` for recommended settings, or `ces --config` (no argument) to dump the default config with all options.
+`ces --config` (no argument) prints the canonical template: it is generated
+from the binary, so it always lists every option this build understands at its
+real default value, and it mints a fresh `server_key` on each dump — so the
+file is unique and runnable as-is, no separate key step needed. Edit it to
+taste; CLI flags override file values. (You can still mint a standalone key
+with `ces --genkeypair` if you want one outside a config.)
 
 ## Using the shell client
 

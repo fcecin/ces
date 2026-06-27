@@ -16,13 +16,13 @@
 // After OK, bytes are handed to the registered handler; after NACK,
 // the channel is closed.
 //
-// Test handlers register themselves via REGISTER_CESPLEX_BUILTIN
-// exactly like production handlers. Registration is process-wide and
-// persists across test cases — which is fine because any given
-// CesServer only sees handlers it explicitly mounts.
+// The echo handler is a plain object the fixture mounts on the server's
+// CesPlex via _mountCesPlexHandler (object mount path) — there is no global
+// registry. Any given CesServer serves only handlers it explicitly mounts.
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_echo_handler.h"
 
 #include <ces/cesplex/mux.h>
 #include <ces/l2/file_handler.h>
@@ -56,67 +56,12 @@
 
 namespace {
 
-// ---------------------------------------------------------------------------
-// EchoHandler — test-only builtin. Registered as "echo".
-// ---------------------------------------------------------------------------
-//
-// After the select handshake completes, reads an 8-byte length prefix
-// (u64 BE), then that many payload bytes, then writes the same length
-// + payload back. Clean enough to assert "round-trip" on.
-
-class EchoHandler : public ces::CesPlexHandler {
-public:
-  void serve(std::shared_ptr<minx::RudpStream> stream,
-             ces::BoundChannelContext /*bound*/) override {
-    auto st = std::make_shared<State>();
-    st->stream = std::move(stream);
-    readLen(st);
-  }
-
-private:
-  struct State {
-    std::shared_ptr<minx::RudpStream> stream;
-    std::array<uint8_t, 8> lenBuf{};
-    ces::Bytes payload;
-  };
-
-  static void readLen(std::shared_ptr<State> st) {
-    boost::asio::async_read(
-      *st->stream, boost::asio::buffer(st->lenBuf),
-      [st](const boost::system::error_code& ec, std::size_t) {
-        if (ec) return;
-        uint64_t n = ces::Buffer::peek<uint64_t>(st->lenBuf.data());
-        if (n == 0 || n > 4096) return; // test bounds
-        st->payload.resize(n);
-        boost::asio::async_read(
-          *st->stream, boost::asio::buffer(st->payload),
-          [st](const boost::system::error_code& ec2, std::size_t) {
-            if (ec2) return;
-            writeBack(st);
-          });
-      });
-  }
-
-  static void writeBack(std::shared_ptr<State> st) {
-    // Reuse lenBuf; it still holds the length from the read path.
-    boost::asio::async_write(
-      *st->stream, boost::asio::buffer(st->lenBuf),
-      [st](const boost::system::error_code& ec, std::size_t) {
-        if (ec) return;
-        boost::asio::async_write(
-          *st->stream, boost::asio::buffer(st->payload),
-          [st](const boost::system::error_code&, std::size_t) {
-            // Done. st drops; RudpStream closes when peer closes.
-          });
-      });
-  }
-};
-
-EchoHandler gEchoHandler;
+// EchoHandler (test-only length-prefixed byte echo) lives in
+// test_echo_handler.h so this suite and the channel-meter suite each mount
+// their own instance. gEchoHandler is mounted by the fixture as an object.
+ces::EchoHandler gEchoHandler;
 
 } // namespace
-
-REGISTER_CESPLEX_BUILTIN("echo", gEchoHandler, EchoHandler)
 
 // ---------------------------------------------------------------------------
 // PlexTestPeer — in-process Minx + Rudp "client" that initiates a
@@ -396,7 +341,8 @@ struct CesPlexFixture {
   uint16_t rpcPort = 0;
 
   explicit CesPlexFixture(
-      const std::map<std::string, std::string>& mounts) {
+      const std::map<std::string, std::string>& mounts,
+      const std::map<std::string, ces::CesPlexHandler*>& objMounts = {}) {
     blog::init();
     blog::set_level(blog::info);
     blog::set_level("plex", blog::debug);
@@ -428,6 +374,10 @@ struct CesPlexFixture {
     rpcPort = server->_rpcBoundPort();
     BOOST_REQUIRE_MESSAGE(rpcPort != 0,
       "CesServer failed to bind secondary port for CesPlex test");
+    // Mount non-core test handlers (e.g. echo) directly as objects; there is
+    // no global registry, so the host mounts what it serves.
+    for (const auto& [proto, h] : objMounts)
+      server->_mountCesPlexHandler(proto, h);
   }
 
   ~CesPlexFixture() {
@@ -446,11 +396,10 @@ struct CesPlexFixture {
 BOOST_AUTO_TEST_SUITE(CesPlexSuite)
 
 BOOST_AUTO_TEST_CASE(NackUnknownProtocol) {
-  // Empty mounts → every select NACKs. But if mounts is empty the
-  // server doesn't construct CesPlex and rejects inbound HS_OPEN at
-  // Accept — we wouldn't get far enough to see NACK. So we mount
-  // something unrelated (file mock) to keep CesPlex alive, then
-  // select an unrelated name.
+  // With no bindings, CesPlex rejects inbound HS_OPEN at Accept — we
+  // wouldn't get far enough to see a NACK. So we mount something unrelated
+  // (file) to give CesPlex a binding, then select an unrelated name to
+  // exercise the per-protocol NACK path.
   CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
 
   PlexTestPeer peer;
@@ -465,7 +414,7 @@ BOOST_AUTO_TEST_CASE(NackUnknownProtocol) {
 }
 
 BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
-  CesPlexFixture fx({ {"/ces/test/echo/1", "builtin:echo"} });
+  CesPlexFixture fx({}, { {"/ces/test/echo/1", &gEchoHandler} });
 
   PlexTestPeer peer;
   BOOST_REQUIRE(peer.start() != 0);

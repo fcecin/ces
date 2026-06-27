@@ -234,6 +234,12 @@ constexpr uint8_t  TAG_EXT_MANIFEST     = 0x12;  // child → server (ces.manife
 constexpr uint8_t  TAG_GOSSIP_IN        = 0x13;  // server → child (a flooded message)
 constexpr uint8_t  TAG_GOSSIP_OUT       = 0x14;  // child → server (ces.gossip.send)
 
+// Peer-mesh messaging (must match compute_handler kIpcTagPeer*). Targeted,
+// free, service-tagged messages over /ces/peer/1 between same-named extensions.
+constexpr uint8_t  TAG_PEER_MSG_IN      = 0x16;  // server → child (mesh message)
+constexpr uint8_t  TAG_PEER_MSG_OUT     = 0x17;  // child → server (ces.peer.send)
+constexpr uint8_t  TAG_PEER_LISTEN      = 0x18;  // child → server (ces.peer.listen)
+
 constexpr uint8_t  EXT_REQ_STATUS  = 0x00;
 constexpr uint8_t  EXT_REQ_COMMAND = 0x01;
 
@@ -298,6 +304,7 @@ std::deque<Frame> g_inbox;       // pending DELIVER frames
 std::deque<Frame> g_reply_q;     // pending API_REPLY frames
 std::deque<Frame> g_conn_q;      // pending CONN_* frames (drained by run())
 std::deque<Frame> g_gossip_q;    // pending GOSSIP_IN frames (drained by run())
+std::deque<Frame> g_peer_q;      // pending PEER_MSG_IN frames (drained by run())
 
 // Cooperative I/O scheduler state (single-threaded: only the IPC thread that
 // runs run()/the main chunk touches these). A coroutine that calls a host
@@ -476,6 +483,7 @@ void route_to_queue(Frame f) {
   else if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
            f.tag == TAG_CONN_CLOSED) g_conn_q.push_back(std::move(f));
   else if (f.tag == TAG_GOSSIP_IN) g_gossip_q.push_back(std::move(f));
+  else if (f.tag == TAG_PEER_MSG_IN) g_peer_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
 }
 
@@ -1051,8 +1059,8 @@ void luarpc_ensure_endpoint() {
 
     g_luarpc_endpoint = std::make_unique<ces::CesPlexEndpoint>(
         g_rpc_port, g_luarpc_host.get(),
-        std::map<std::string, std::string>{
-            {"/ces/luarpc/1", "builtin:luarpc"}},
+        std::map<std::string, ces::CesPlexHandler*>{
+            {"/ces/luarpc/1", &g_luaRpcHandler}},
         std::move(minxCfg), std::move(rudpCfg));
     g_luarpc_io = &g_luarpc_endpoint->io();
     g_luarpc_rudp = g_luarpc_endpoint->rudp();
@@ -1065,7 +1073,6 @@ void luarpc_ensure_endpoint() {
   }
 }
 }  // namespace
-REGISTER_CESPLEX_BUILTIN("luarpc", g_luaRpcHandler, LuaRpcHandler)
 uint16_t g_next_corr_id = 1;
 
 int lua_ces_now(lua_State* L) {
@@ -3151,6 +3158,9 @@ int lua_ces_store(lua_State* L) {
 // inbound routing. Those two native spaces are independent and overlap, so they
 // are NEVER the program-facing identity — see g_conn_uid_next.
 constexpr const char* kRegListenerTable = "ces.conn.listener";
+// Registry table service(string) -> handler fn, set by ces.peer.listen and
+// read by drain_peer to dispatch an inbound /ces/peer/1 message.
+constexpr const char* kRegPeerListeners = "ces.peer.listeners";
 constexpr const char* kRegConnsTable    = "ces.conn.relay.live";  // [native] = conn
 
 // Program-facing conn.id: ONE monotonic id owned entirely by this host, handed
@@ -3703,6 +3713,60 @@ int lua_ces_gossip_send(lua_State* L) {
   return 0;
 }
 
+// ces.peer.send(peer_pubkey, service, bytes) - fire a targeted message to a
+// peer's same-service extension over the /ces/peer/1 mesh. Free (unmetered,
+// server-to-server), fire-and-forget. No-op if there is no live link to peer.
+int lua_ces_peer_send(lua_State* L) {
+  size_t klen = 0;
+  const char* k = luaL_checklstring(L, 1, &klen);
+  if (klen != 32)
+    return luaL_error(L, "ces.peer.send: peer must be a 32-byte key");
+  size_t slen = 0;
+  const char* s = luaL_checklstring(L, 2, &slen);
+  if (slen == 0 || slen > 0xFFFF)
+    return luaL_error(L, "ces.peer.send: service must be 1..65535 bytes");
+  size_t plen = 0;
+  const char* p = luaL_checklstring(L, 3, &plen);
+  // Body: [32 peer][u16 service_len][service][payload].
+  std::vector<uint8_t> body;
+  body.insert(body.end(), k, k + 32);
+  put_u16(body, static_cast<uint16_t>(slen));
+  body.insert(body.end(), s, s + slen);
+  body.insert(body.end(), p, p + plen);
+  write_frame(TAG_PEER_MSG_OUT, 0, body.data(), body.size());
+  return 0;
+}
+
+// ces.peer.listen(service, fn) - register fn(from_pubkey, bytes) as the handler
+// for inbound mesh messages tagged `service`. fn nil unregisters. Tells the
+// server this instance owns `service` so it routes inbound messages here.
+int lua_ces_peer_listen(lua_State* L) {
+  size_t slen = 0;
+  const char* s = luaL_checklstring(L, 1, &slen);
+  if (slen == 0 || slen > 0xFFFF)
+    return luaL_error(L, "ces.peer.listen: service must be 1..65535 bytes");
+  if (!lua_isnoneornil(L, 2) && !lua_isfunction(L, 2))
+    return luaL_error(L, "ces.peer.listen: handler must be a function or nil");
+  // Ensure the service -> fn registry table exists.
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegPeerListeners);
+  if (!lua_istable(L, -1)) {
+    lua_pop(L, 1);
+    lua_newtable(L);
+    lua_pushvalue(L, -1);
+    lua_setfield(L, LUA_REGISTRYINDEX, kRegPeerListeners);
+  }
+  lua_pushlstring(L, s, slen);
+  if (lua_isnoneornil(L, 2)) lua_pushnil(L); else lua_pushvalue(L, 2);
+  lua_settable(L, -3);   // tbl[service] = fn (or nil)
+  lua_pop(L, 1);
+  if (!write_frame(TAG_PEER_LISTEN, 0,
+                   reinterpret_cast<const uint8_t*>(s), slen)) {
+    lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
 
 // ces.sleep(ms) - looks blocking, isn't: suspends THIS behavior for ms while
 // the run loop services the rest. Only valid inside spawn() (a coroutine), not
@@ -4158,6 +4222,40 @@ static void drain_gossip(lua_State* mainL) {
   }
 }
 
+// Inbound /ces/peer/1 mesh message: [32 from][u16 service_len][service]
+// [u32 len][payload]. Dispatch the per-service handler registered via
+// ces.peer.listen(service, fn) as fn(from_pubkey, payload) in a coroutine.
+static void drain_peer(lua_State* mainL) {
+  while (!g_peer_q.empty()) {
+    Frame f = std::move(g_peer_q.front());
+    g_peer_q.pop_front();
+    if (f.body.size() < WIRE_KEY_LEN + sizeof(uint16_t)) continue;
+    const uint8_t* b = f.body.data();
+    uint16_t slen = get_u16(b + WIRE_KEY_LEN);
+    size_t svcOff = WIRE_KEY_LEN + sizeof(uint16_t);
+    size_t lenOff = svcOff + slen;
+    if (f.body.size() < lenOff + sizeof(uint32_t)) continue;
+    uint32_t plen = get_u32(b + lenOff);
+    size_t payOff = lenOff + sizeof(uint32_t);
+    if (f.body.size() < payOff + plen) continue;
+    std::string service(reinterpret_cast<const char*>(b + svcOff), slen);
+
+    lua_getfield(mainL, LUA_REGISTRYINDEX, kRegPeerListeners);  // [tbl?]
+    if (!lua_istable(mainL, -1)) { lua_pop(mainL, 1); continue; }
+    lua_getfield(mainL, -1, service.c_str());                   // [tbl, fn?]
+    if (!lua_isfunction(mainL, -1)) { lua_pop(mainL, 2); continue; }
+    lua_remove(mainL, -2);                                       // [fn]
+
+    lua_State* co = lua_newthread(mainL);            // [fn, co]
+    int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);    // pop co; [fn]
+    g_coro_refs[co] = ref;
+    lua_xmove(mainL, co, 1);                          // fn -> co; co: [fn]
+    lua_pushlstring(co, reinterpret_cast<const char*>(b), WIRE_KEY_LEN); // from
+    lua_pushlstring(co, reinterpret_cast<const char*>(b + payOff), plen); // payload
+    g_ready.push_back({co, 2});
+  }
+}
+
 // Resume every ready coroutine (spawn starts, sleep wakeups). Spawns made while
 // draining are picked up in the same pass, so a burst of spawns all start before
 // the loop blocks again.
@@ -4267,6 +4365,7 @@ int lua_ces_run(lua_State* L) {
     drain_conn_advance(L);
     drain_luarpc_advance(L);
     drain_gossip(L);
+    drain_peer(L);
     drain_ready(L);
 
     // Block until the next event on either source, or the next timer deadline.
@@ -5426,6 +5525,16 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_gossip_send>);
   lua_setfield(L, -2, "send");
   lua_setfield(L, -2, "gossip");
+
+  // ces.peer.send(peer_pubkey, service, bytes) fires a targeted, free message
+  // over the /ces/peer/1 mesh to a peer server's same-service extension;
+  // ces.peer.listen(service, fn) registers fn(from_pubkey, bytes) for inbound.
+  lua_newtable(L);
+  lua_pushcfunction(L, guarded<lua_ces_peer_send>);
+  lua_setfield(L, -2, "send");
+  lua_pushcfunction(L, guarded<lua_ces_peer_listen>);
+  lua_setfield(L, -2, "listen");
+  lua_setfield(L, -2, "peer");
 
   // Direct-transport live-conn registry (the relay's is created lazily in
   // set_listener).

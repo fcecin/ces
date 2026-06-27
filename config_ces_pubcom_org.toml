@@ -1,0 +1,109 @@
+# config_ces_pubcom_org.toml -- the live config for the public CES node
+# (ces.pubcom.org). It carries no private key: server_key is left unset and
+# provided at launch with -k, so no key ever sits in this committed file.
+#
+# Seeded from `ces --config` (every current option at its default); comments
+# mark only the values this node overrides, with why.
+
+log_level = "info"
+data_dir = "./data"
+port = 53830
+
+# server_key is intentionally unset so no key is committed. Provide the real key
+# at launch with -k. Without it, ces uses the well-known sample key and logs a
+# loud boot warning (it will not silently run a real key).
+# server_key = "<provide with -k>"
+
+# Public address advertised to peers for discovery.
+server_name = "ces.pubcom.org:53830"
+
+# Production scarcity: ~minutes per solution on modern hardware (default 10 is dev-fast).
+min_difficulty = 15
+
+# Let the RandomX dataset finish initializing before solutions count.
+pow_delay = 120
+
+spend_slot_size = 3600
+no_pow_engine = false
+cache_only_pow = false
+
+# Pinned to a fixed value (not auto-derived from the host core count).
+threads = 4
+
+# Capacity for a large-RAM node: 2^26 accounts (~4.9 GB) / 2^23 assets
+# (~2.4 GB), reserving 2^20 of each at boot.
+min_accounts = 1048576
+max_accounts = 67108864
+min_assets = 1048576
+max_assets = 8388608
+
+# Batch writes under production load instead of flushing every change.
+flush_value = 10000
+
+# Keep the WAL small so it compacts often (also keeps restart-replay fast).
+max_log_size_gb = 2
+
+fee_account = -1
+# Fee schedule for the public node, above the built-in defaults.
+fee_asset = 38400000
+fee_tx = 320000
+fee_query = 80000
+fee_vm_mult = -1
+
+peer_target = 0
+
+# Reciprocate inbound peer PoW 1:1 (mine back as much as a peer mines on us).
+peer_pow_inbound_reciprocation_bps = 10000
+
+settlement_max_retries = 7
+max_peer_reserve_disturbance = 100000
+gossip_fanout_degree = 6
+
+# Enable the CesPlex / L2 stack (file/lua/compute/peer) + SYS_RPC on this UDP port.
+rpc_port = 9999
+
+rpc_max_pending = 1000
+rpc_max_request_bytes = 65536
+rpc_max_response_bytes = 65536
+rpc_response_timeout_ms = 30000
+rpc_rudp_bytes_per_second = 4294967295
+rpc_rudp_burst_bytes = 4294967295
+
+# 256 MiB metered user storage (/h/ /f/ /p/); /s/ is unmetered and always served.
+file_store_max_bytes = 268435456
+file_store_dir = ""
+extensions_dir = ""
+ext_funding_per_day = 500000000
+ext_local_budget = 100000000000
+fee_file_rent = -1
+fee_file_write = -1
+fee_file_read = -1
+
+# Compute on: 4 concurrent Lua instances (resource cap ~1 GB RAM, ~2 cores
+# worst-case). The child binary is auto-discovered next to ces.
+compute_max_instances = 4
+# A fixed UDP range for instance ports, so a firewall can open exactly these.
+compute_port_base = 53900
+compute_port_count = 100
+
+# L2 handlers wired on: file + lua + compute + the peer mesh. Nothing
+# auto-mounts; the peer mesh must be listed here too.
+[cesplex_mounts]
+"/ces/file/1"    = "builtin:file"
+"/ces/lua/1"     = "builtin:lua"
+"/ces/compute/1" = "builtin:compute"
+"/ces/peer/1"    = "builtin:peer"
+
+[rpc_rudp]
+# 4 channels/peer so cesh can hold a long-lived dial while issuing side ops.
+max_channels_per_peer = 4
+max_reorder_bytes_per_channel = -1
+max_reorder_msgs_per_channel = -1
+# Long idle window for interactive dial terminals (humans pause between commands).
+channel_idle_secs = 180
+
+# Autolaunched /s/ extensions (their .lua sources live in the file store's /s/ zone).
+[extension]
+dice = 1
+discovery = 1
+peerfunder = 1

@@ -6,7 +6,7 @@
 // LuaJIT VM; cescompmockd is the no-Lua test stub), connected via a named
 // Unix domain socket. The supervisor ticks periodically, samples the child's
 // /proc CPU + RSS, debits slot/cpu/rss/bucket fees from the source file's
-// file_balance via fileHandlerDebitBalance, and SIGKILLs the instance when a
+// file_balance via the file handler's debitBalance, and SIGKILLs the instance when a
 // debit would delete the source file. A 15-minute upfront slot+rss fee is
 // debited at LAUNCH to prevent create-and-abandon on the scheduler.
 //
@@ -45,7 +45,9 @@
 #include <ces/cesplex/mux.h>
 #include <ces/cesplex/session.h>
 #include <ces/l2/compute_handler.h>
+#include <ces/l2/compute_lua_handler.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/peer_handler.h>
 #include <ces/buffer.h>
 #include <ces/client.h>
 #include <ces/ramfilestore.h>
@@ -162,6 +164,12 @@ constexpr uint8_t kIpcTagExtManifest    = 0x12;  // child → server (ces.manife
 constexpr uint8_t kIpcTagGossipIn       = 0x13;  // server → child (flooded message)
 constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip.send)
 
+// Peer-mesh messaging (must match cesluajitd TAG_PEER_*). Targeted, free,
+// service-tagged messages over /ces/peer/1 between same-named extensions.
+constexpr uint8_t kIpcTagPeerMsgIn      = 0x16;  // server → child (mesh message)
+constexpr uint8_t kIpcTagPeerMsgOut     = 0x17;  // child → server (ces.peer.send)
+constexpr uint8_t kIpcTagPeerListen     = 0x18;  // child → server (ces.peer.listen)
+
 constexpr uint8_t kExtReqStatus  = 0x00;
 constexpr uint8_t kExtReqCommand = 0x01;
 constexpr size_t  kLuaProgramLogMax   = 4096;  // cap a program log line
@@ -225,7 +233,7 @@ constexpr uint16_t kApiMethodPeerTargetSet = 0x0233;
 constexpr uint16_t kApiMethodPeerTargetGet = 0x0234;
 // ces.request_funds(addr, amount): petition the server to fund THIS program's key
 // at remote `addr` — a regular server-signed transfer at the remote (NOT
-// settlement), gated by the global funding rate. See local/extension_funding.md.
+// settlement), gated by the global funding rate.
 constexpr uint16_t kApiMethodRequestFunds  = 0x0235;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
@@ -237,7 +245,7 @@ constexpr size_t AUTHENTIC_ASSET_PAYLOAD_SIZE =
   std::tuple_size_v<AssetData> - AUTHENTIC_ASSET_HASH_SIZE;
 
 // File-verb codes mirror file_handler.cpp. Exposed to
-// fileHandlerExec via FileExecReq.verb.
+// FileHandler::exec via FileExecReq.verb.
 constexpr uint8_t kFileVerbCreate   = 0x01;
 constexpr uint8_t kFileVerbWrite    = 0x02;
 constexpr uint8_t kFileVerbRead     = 0x03;
@@ -276,31 +284,54 @@ constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
 constexpr size_t kMaxDeliverBacklog = 1024;
 
 } // namespace
-// Forward decls into the lua handler — defined in compute_lua_handler.cpp.
-// The compute supervisor calls these when CONN_DATA_OUT / CONN_CLOSE
-// frames arrive from the child, and when an instance is dying (so the
-// lua handler can tear down all its routed connections before the
-// Instance is dropped).
-void luaHandlerHandleConnDataOut(uint64_t pid, uint64_t connId,
-                                  const uint8_t* data, size_t len);
-void luaHandlerHandleConnClose(uint64_t pid, uint64_t connId);
-void luaHandlerOnInstanceDying(uint64_t pid);
 namespace {
 
 // All BE serialization goes through ces::Buffer (see ces/buffer.h).
 
 // ---------------------------------------------------------------------------
-// Global handler state — accessed only from rpcTaskIO_ (the CesPlex /
-// handler strand). APPLICATION messages posted from taskIO_ hop onto
-// rpcTaskIO_ before touching any of this.
+// File-handler cross-calls. builtin:file is a per-server object; compute
+// reaches its primitives through the bound server. Each wrapper matches the
+// old contract (false / no-op when the file feature is unavailable).
 // ---------------------------------------------------------------------------
 
-std::atomic<CesServer*> gServer{nullptr};
+inline FileHandler* fileHOf(CesServer* sv) {
+  return sv ? sv->fileHandler() : nullptr;
+}
+inline bool fhDebitBalance(CesServer* sv, const std::string& name, uint64_t amount) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->debitBalance(name, amount);
+}
+inline bool fhCreditBalance(CesServer* sv, const std::string& name, uint64_t amount) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->creditBalance(name, amount);
+}
+inline bool fhReadOwnerAndBalance(CesServer* sv, const std::string& name,
+                                  std::array<uint8_t, 32>& o, uint64_t& b) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->readOwnerAndBalance(name, o, b);
+}
+inline bool fhReadProgramPubkey(CesServer* sv, const std::string& name,
+                                std::array<uint8_t, 32>& o) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->readProgramPubkey(name, o);
+}
+inline bool fhReadProgramPrivkey(CesServer* sv, const std::string& name,
+                                 std::array<uint8_t, 32>& o) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->readProgramPrivkey(name, o);
+}
+inline bool fhGetProgramHash(CesServer* sv, const std::string& name,
+                             std::array<uint8_t, 32>& o) {
+  FileHandler* fh = fileHOf(sv);  return fh && fh->getProgramHash(name, o);
+}
 
+} // namespace
+
+// UnixSocket/UnixAcceptor + Instance + ExtPending live in the named ces
+// namespace so the handler header can forward-declare Instance/ExtPending
+// (its members hold them only through shared_ptr).
 using UnixSocket = boost::asio::local::stream_protocol::socket;
 using UnixAcceptor = boost::asio::local::stream_protocol::acceptor;
 
 struct Instance : std::enable_shared_from_this<Instance> {
+  // Owning handler (per-server). Set at creation; the supervisor state the
+  // free helpers touch hangs off here.
+  ComputeHandler* owner = nullptr;
   // CES process id -- the computing-layer "pid" (1, 2, 3, ...). Server-assigned,
   // monotonic, never reused. This is what Lua, the protocol, and the UI speak.
   uint64_t pid = 0;
@@ -395,18 +426,6 @@ struct Instance : std::enable_shared_from_this<Instance> {
   uint32_t nextBucketId = 1;
 };
 
-// Instance registry. Keyed by pid (the only identity). The
-// path → ids and prefix → ids indexes are multi-valued: a source path
-// may have N concurrent instances (one cesh compute launch ⇒ one new
-// id), and prog_pfx is content-addressed from the path so all sibling
-// instances on this server share it. APPLICATION routing broadcasts
-// to every matching instance; file-deletion kills every matching
-// instance.
-std::map<uint64_t, std::shared_ptr<Instance>> gInstances;
-std::map<std::array<uint8_t, 8>, std::set<uint64_t>> gByPrefix;
-std::map<std::string, std::set<uint64_t>> gByName;
-uint64_t gNextPid = 1;
-
 // In-flight EXT_REQ correlation. The reply (EXT_REP) lands on rpcTaskIO_ in
 // handleChildFrame; the caller (e.g. the webadmin worker thread) blocks on the
 // shared state until it is filled or times out. corr_id is host-allocated for
@@ -420,58 +439,50 @@ struct ExtPending {
   bool ok = false;
   ces::Bytes reply;            // EXT_REP payload after the status byte
 };
-std::map<uint16_t, std::shared_ptr<ExtPending>> gExtPending;   // rpcTaskIO_-only
-uint16_t gExtCorr = 1;
 
-// In-flight LAUNCH reservations: launches admitted past the cap check
-// whose instance isn't in gInstances yet (the child is still connecting
-// back — async, up to kAcceptTimeoutMs). Counted against the cap so
-// concurrent launches can't overshoot computeMaxInstances. Strand-only
-// (rpcTaskIO_); no atomic needed.
-uint64_t gPendingLaunches = 0;
+namespace {
 
-// RAII reservation token: ++gPendingLaunches on construct, -- on
-// destruct. Held (via shared_ptr) across the async LAUNCH chain and
-// released once the instance lands in gInstances or the launch fails.
+// RAII reservation token: ++pendingLaunches_ on construct, -- on destruct.
+// Held (via shared_ptr) across the async LAUNCH chain and released once the
+// instance lands in instances_ or the launch fails.
 struct LaunchSlot {
-  LaunchSlot() { ++gPendingLaunches; }
-  ~LaunchSlot() { if (gPendingLaunches > 0) --gPendingLaunches; }
+  ComputeHandler* H;
+  explicit LaunchSlot(ComputeHandler* h) : H(h) { ++H->pendingLaunches_; }
+  ~LaunchSlot() { if (H->pendingLaunches_ > 0) --H->pendingLaunches_; }
   LaunchSlot(const LaunchSlot&) = delete;
   LaunchSlot& operator=(const LaunchSlot&) = delete;
 };
 
 // Launch slots spoken for = registered instances + in-flight launches.
-// The LAUNCH cap is checked against this, never gInstances alone.
-inline std::size_t launchSlotsInUse() {
-  return gInstances.size() + static_cast<std::size_t>(gPendingLaunches);
+// The LAUNCH cap is checked against this, never instances_ alone.
+inline std::size_t launchSlotsInUse(ComputeHandler& H) {
+  return H.instances_.size() + static_cast<std::size_t>(H.pendingLaunches_);
 }
 
 // L2 compute program port allocator. Each running instance gets one UDP
 // port for its child's outbound CES client, claimed from the configured
 // range [computePortBase, computePortBase + computePortCount - 1]. The
 // server owns the whole lifecycle — no child picks its own port — so a
-// firewalled L2 host can open exactly this range. Strand-only
-// (rpcTaskIO_), like gInstances; no lock.
-std::set<uint16_t> gUsedComputePorts;
-
+// firewalled L2 host can open exactly this range. Strand-only (rpcTaskIO_).
+//
 // Claim the lowest free port in the configured range. Returns false if
 // the range is configured (base != 0) but fully spoken for. With base
 // == 0 there is no range: returns true with out = 0, which the child
 // reads as "no network" — its outbound remote_* verbs fail cleanly
 // rather than binding an unreachable ephemeral port.
-bool allocateComputePort(const CesConfig& cfg, uint16_t& out) {
+bool allocateComputePort(ComputeHandler& H, const CesConfig& cfg, uint16_t& out) {
   if (cfg.computePortBase == 0) { out = 0; return true; }
   uint32_t base = cfg.computePortBase;
   uint32_t end = base + cfg.computePortCount;   // exclusive
   for (uint32_t p = base; p < end && p <= 0xFFFF; ++p) {
     uint16_t port = static_cast<uint16_t>(p);
-    if (gUsedComputePorts.insert(port).second) { out = port; return true; }
+    if (H.usedComputePorts_.insert(port).second) { out = port; return true; }
   }
   return false;
 }
 
-void releaseComputePort(uint16_t port) {
-  if (port != 0) gUsedComputePorts.erase(port);
+void releaseComputePort(ComputeHandler& H, uint16_t port) {
+  if (port != 0) H.usedComputePorts_.erase(port);
 }
 
 // RAII reservation for a claimed compute port — mirrors LaunchSlot.
@@ -480,24 +491,15 @@ void releaseComputePort(uint16_t port) {
 // lease and frees the port; on success the port is committed to the
 // Instance, and killByPid frees it when the instance dies.
 struct PortLease {
+  ComputeHandler* H;
   uint16_t port = 0;
   bool committed = false;
-  explicit PortLease(uint16_t p) : port(p) {}
-  ~PortLease() { if (!committed) releaseComputePort(port); }
+  PortLease(ComputeHandler* h, uint16_t p) : H(h), port(p) {}
+  ~PortLease() { if (!committed) releaseComputePort(*H, port); }
   void commit() { committed = true; }
   PortLease(const PortLease&) = delete;
   PortLease& operator=(const PortLease&) = delete;
 };
-
-// Supervisor tick timer. Lives on rpcTaskIO_'s strand.
-std::shared_ptr<boost::asio::steady_timer> gTickTimer;
-std::atomic<bool> gTickRunning{false};
-
-// True iff we've registered our deletion callback with the file
-// handler. Registration is one-shot per process — fileHandler has no
-// unregister. Repeat binds reuse the same callback, which reads
-// gServer atomically.
-std::atomic<bool> gDeletionCallbackInstalled{false};
 
 // ---------------------------------------------------------------------------
 // Unix socket / process helpers
@@ -679,7 +681,7 @@ void sampleInstanceProc(Instance& inst, uint64_t nowUs) {
 }
 
 // Tear down per-instance resources (sockets, socket file). Does not
-// manipulate gInstances / gByPrefix / gByName — caller handles the
+// manipulate instances_ / byPrefix_ / byName_ — caller handles the
 // registry.
 void teardownInstance(Instance& inst) {
   if (inst.peer) {
@@ -696,30 +698,36 @@ void teardownInstance(Instance& inst) {
 // Kill an instance by pid, remove from registries, clean up resources.
 // No fee refund on kill: the upfront slot-fee paid for a commitment the
 // host already honored by running.
-void killByPid(uint64_t pid) {
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) return;
+void killByPid(ComputeHandler& H, uint64_t pid) {
+  auto it = H.instances_.find(pid);
+  if (it == H.instances_.end()) return;
   auto inst = it->second;
   // Tear down any /ces/lua/1 connections routed to this instance
   // before we drop the registry entry, so the lua handler can
   // still find it (and so the bytes-and-onClosed cascade fires
   // while the supervisor is still in a coherent state).
-  luaHandlerOnInstanceDying(pid);
+  if (CesServer* sv = H.server_; sv && sv->luaHandler())
+    sv->luaHandler()->onInstanceDying(pid);
   killAndReap(inst->ospid);
   teardownInstance(*inst);
-  releaseComputePort(inst->clientPort);
-  releaseComputePort(inst->rpcPort);
+  releaseComputePort(H, inst->clientPort);
+  releaseComputePort(H, inst->rpcPort);
   // Drop this instance's gossip sink registration (refcounted).
-  if (CesServer* sv = gServer.load())
+  if (CesServer* sv = H.server_)
     sv->unregisterSinkTarget(inst->programPubkey);
-  gInstances.erase(it);
-  if (auto pit = gByPrefix.find(inst->progPrefix); pit != gByPrefix.end()) {
+  H.instances_.erase(it);
+  if (auto pit = H.byPrefix_.find(inst->progPrefix); pit != H.byPrefix_.end()) {
     pit->second.erase(pid);
-    if (pit->second.empty()) gByPrefix.erase(pit);
+    if (pit->second.empty()) H.byPrefix_.erase(pit);
   }
-  if (auto nit = gByName.find(inst->sourceName); nit != gByName.end()) {
+  if (auto nit = H.byName_.find(inst->sourceName); nit != H.byName_.end()) {
     nit->second.erase(pid);
-    if (nit->second.empty()) gByName.erase(nit);
+    if (nit->second.empty()) H.byName_.erase(nit);
+  }
+  // Drop any peer-mesh service tags this instance registered.
+  for (auto sit = H.serviceTags_.begin(); sit != H.serviceTags_.end();) {
+    if (sit->second == pid) sit = H.serviceTags_.erase(sit);
+    else ++sit;
   }
   LOGDEBUG << "instance terminated"
            << VAR(pid) << SVAR(inst->sourceName);
@@ -787,7 +795,7 @@ void kickOutboundIfIdle(std::shared_ptr<Instance> inst) {
       if (ec) {
         LOGDEBUG << "ipc write failed"
                  << VAR(inst->pid) << SVAR(ec.message());
-        killByPid(inst->pid);
+        killByPid(*inst->owner, inst->pid);
         return;
       }
       kickOutboundIfIdle(inst);
@@ -840,13 +848,16 @@ void sendApiReplyWithBody(std::shared_ptr<Instance> inst,
 // set of detached threads run the actual server-signed remote open-transfer
 // off-strand (CesClient is blocking) and reply to the child async. On failure the
 // reservation is refunded, so the granted amount the child sees is the CONFIRMED one.
-std::atomic<int> gFundingInFlight{0};
+// The in-flight count is the per-server handler's fundingInFlight_ member.
 constexpr int    kFundingMaxInFlight = 4;
 
 void fundingWorker(std::shared_ptr<Instance> inst, uint16_t corr,
                    minx::Hash dest, uint64_t amount, std::string destServer,
                    CesServer* server, ces::KeyPair serverKey) {
-  struct Guard { ~Guard() { gFundingInFlight.fetch_sub(1); } } guard;
+  struct Guard {
+    ComputeHandler* H;
+    ~Guard() { H->fundingInFlight_.fetch_sub(1); }
+  } guard{inst->owner};
   bool ok = false;
   try {
     auto ep = ces::Resolver::resolveUdp(destServer);
@@ -956,14 +967,14 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
     [inst](const boost::system::error_code& ec, std::size_t) {
       if (ec) {
         // Child closed its end. Reap and clean up.
-        killByPid(inst->pid);
+        killByPid(*inst->owner, inst->pid);
         return;
       }
       uint32_t len = ces::Buffer::peek<uint32_t>(inst->rxLenBuf.data());
       if (len < 3 || len > kIpcMaxFrameLen) {
         LOGDEBUG << "ipc bad frame len"
                  << VAR(inst->pid) << VAR(len);
-        killByPid(inst->pid);
+        killByPid(*inst->owner, inst->pid);
         return;
       }
       inst->rxBodyBuf.assign(len, 0);
@@ -971,11 +982,11 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
         *inst->peer, boost::asio::buffer(inst->rxBodyBuf),
         [inst](const boost::system::error_code& ec2, std::size_t) {
           if (ec2) {
-            killByPid(inst->pid);
+            killByPid(*inst->owner, inst->pid);
             return;
           }
           handleChildFrame(inst);
-          if (gInstances.count(inst->pid))
+          if (inst->owner->instances_.count(inst->pid))
             startIpcReader(inst);
         });
     });
@@ -1024,8 +1035,7 @@ void emitHostLog(uint64_t pid, const std::string& source,
 // Read /s/<name>.conf for a /s/<name>.lua source ("" if absent). The startup
 // config push: an extension's persisted config is delivered to its on_config the
 // moment it registers, so its live state matches the file from the first tick.
-std::string readExtensionConfig(const std::string& sourceName) {
-  CesServer* server = gServer.load();
+std::string readExtensionConfig(CesServer* server, const std::string& sourceName) {
   if (!server || sourceName.empty() || sourceName[0] != '/') return "";
   auto dot = sourceName.rfind(".lua");
   if (dot == std::string::npos) return "";
@@ -1064,14 +1074,16 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kConnIdOff);
     uint32_t dlen  = ces::Buffer::peek<uint32_t>(body.data() + kLenOff);
     if (body.size() < kDataOff + dlen) return;
-    luaHandlerHandleConnDataOut(inst->pid, connId,
-                                 body.data() + kDataOff, dlen);
+    if (CesServer* sv = inst->owner->server_; sv && sv->luaHandler())
+      sv->luaHandler()->handleConnDataOut(inst->pid, connId,
+                                          body.data() + kDataOff, dlen);
     return;
   }
   if (tag == kIpcTagConnClose) {
     if (body.size() < kIpcHdr + sizeof(uint64_t)) return;
     uint64_t connId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
-    luaHandlerHandleConnClose(inst->pid, connId);
+    if (CesServer* sv = inst->owner->server_; sv && sv->luaHandler())
+      sv->luaHandler()->handleConnClose(inst->pid, connId);
     return;
   }
   if (tag == kIpcTagGossipOut) {
@@ -1088,7 +1100,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     std::memcpy(dest.data(), body.data() + kDestOff, sizeof(minx::Hash));
     uint32_t mlen = ces::Buffer::peek<uint32_t>(body.data() + kLenOff);
     if (body.size() < kMsgOff + mlen) return;
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (server) {
       // Charge the program's source file_balance the full budget up front so a
       // non-/s/ program can't flood on the OPERATOR's PoW reserves without
@@ -1096,7 +1108,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
       // metered program with too little balance it deletes the source (compute
       // out-of-funds semantics) and we skip the originate. Bounds a program's
       // total gossip to its funding -- the same discipline as every compute fee.
-      if (budget > 0 && !fileHandlerDebitBalance(inst->sourceName, budget))
+      if (budget > 0 && !fhDebitBalance(inst->owner->server_, inst->sourceName, budget))
         return;
       ces::Bytes m(body.data() + kMsgOff, body.data() + kMsgOff + mlen);
       uint64_t fanned = server->originateGossip(m, budget, dest);
@@ -1104,8 +1116,42 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
       // program's file_balance -- charge only what actually propagated. No-ops
       // on /s/ (decorative there).
       if (fanned < budget)
-        fileHandlerCreditBalance(inst->sourceName, budget - fanned);
+        fhCreditBalance(inst->owner->server_, inst->sourceName, budget - fanned);
     }
+    return;
+  }
+  if (tag == kIpcTagPeerListen) {
+    // Payload: [u16 service_len][service]. Register this instance as the
+    // handler for inbound /ces/peer/1 messages tagged `service`.
+    constexpr size_t kSlenOff = kIpcHdr;
+    constexpr size_t kSvcOff  = kSlenOff + sizeof(uint16_t);
+    if (body.size() < kSvcOff) return;
+    uint16_t slen = ces::Buffer::peek<uint16_t>(body.data() + kSlenOff);
+    if (body.size() < kSvcOff + slen) return;
+    std::string service(reinterpret_cast<const char*>(body.data() + kSvcOff),
+                        slen);
+    if (service.empty()) return;
+    inst->owner->serviceTags_[service] = inst->pid;
+    LOGDEBUG << "peer service registered" << VAR(inst->pid) << SVAR(service);
+    return;
+  }
+  if (tag == kIpcTagPeerMsgOut) {
+    // Payload: [32 dest_pubkey][u16 service_len][service][payload].
+    // ces.peer.send: relay over /ces/peer/1 to the dest peer's same service.
+    constexpr size_t kDestOff = kIpcHdr;
+    constexpr size_t kSlenOff = kDestOff + sizeof(minx::Hash);
+    constexpr size_t kSvcOff  = kSlenOff + sizeof(uint16_t);
+    if (body.size() < kSvcOff) return;
+    minx::Hash dest;
+    std::memcpy(dest.data(), body.data() + kDestOff, sizeof(minx::Hash));
+    uint16_t slen = ces::Buffer::peek<uint16_t>(body.data() + kSlenOff);
+    size_t payOff = kSvcOff + slen;
+    if (body.size() < payOff) return;
+    std::string service(reinterpret_cast<const char*>(body.data() + kSvcOff),
+                        slen);
+    size_t plen = body.size() - payOff;
+    if (CesServer* sv = inst->owner->server_; sv && sv->peerHandler())
+      sv->peerHandler()->sendMessage(dest, service, body.data() + payOff, plen);
     return;
   }
   if (tag == kIpcTagLog) {
@@ -1155,14 +1201,14 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     usage.bytesReceived  = ces::Buffer::peek<uint64_t>(body.data() + o); o += 8;
     usage.memByteSeconds = ces::Buffer::peek<uint64_t>(body.data() + o); o += 8;
     usage.ageSeconds     = ces::Buffer::peek<uint64_t>(body.data() + o);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) return;
     const uint64_t amount = server->priceNetUsage(usage);
     if (amount == 0) return;
     ces::HashPrefix self{};
     std::memcpy(self.data(), inst->programPubkey.data(), self.size());
     if (payer == self)
-      fileHandlerDebitBalance(inst->sourceName, amount);  // outbound: instance pays
+      fhDebitBalance(inst->owner->server_, inst->sourceName, amount);  // outbound: instance pays
     else
       server->debitNetworkBill(payer, amount);            // inbound: caller pays
     return;
@@ -1211,7 +1257,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     // Deliver the persisted config now so the extension's live state matches its
     // /s/<name>.conf from the first tick (not only after a Save/Reset).
     if (inst->extCaps & kComputeExtCapOnConfig) {
-      std::string cfg = readExtensionConfig(inst->sourceName);
+      std::string cfg = readExtensionConfig(inst->owner->server_, inst->sourceName);
       if (!cfg.empty())
         enqueueOutbound(inst, makeFrame(kIpcTagExtConfig, 0,
           reinterpret_cast<const uint8_t*>(cfg.data()), cfg.size()));
@@ -1222,10 +1268,10 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   }
   if (tag == kIpcTagExtRep) {
     // Reply to a host EXT_REQ: [u8 status][payload]. Match corr -> pending.
-    auto pit = gExtPending.find(corr);
-    if (pit == gExtPending.end()) return;
+    auto pit = inst->owner->extPending_.find(corr);
+    if (pit == inst->owner->extPending_.end()) return;
     auto pend = pit->second;
-    gExtPending.erase(pit);
+    inst->owner->extPending_.erase(pit);
     std::lock_guard<std::mutex> lk(pend->m);
     if (!pend->dead) {
       const uint8_t* p = body.data() + kIpcHdr;
@@ -1238,7 +1284,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     return;
   }
   if (tag == kIpcTagExtDisableSelf) {
-    killByPid(inst->pid);
+    killByPid(*inst->owner, inst->pid);
     return;
   }
   if (tag != kIpcTagApiCall) {
@@ -1246,7 +1292,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     // routing tags above. Anything else is a protocol error.
     LOGDEBUG << "unexpected child tag"
              << VAR(inst->pid) << VAR(int(tag));
-    killByPid(inst->pid);
+    killByPid(*inst->owner, inst->pid);
     return;
   }
   if (body.size() < 5) {
@@ -1289,7 +1335,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     pkt.insert(pkt.end(),
                reinterpret_cast<const char*>(payload),
                reinterpret_cast<const char*>(payload) + plen);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     bool ok = server && server->send(target, CES_APP_COMPUTE_MSG, pkt);
     sendApiReply(inst, corr_id,
                  ok ? kApiStatusOk : kApiStatusNotConnected);
@@ -1312,7 +1358,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     minx::Hash dest{};
     std::memcpy(dest.data(), mbody, 32);
     uint64_t amount = ces::Buffer::peek<uint64_t>(mbody + 32);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1351,7 +1397,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     std::string destServer(
       reinterpret_cast<const char*>(mbody + ces::KEY_SIZE + sizeof(uint64_t) + 1),
       srvLen);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1386,7 +1432,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     }
     std::string destServer(
       reinterpret_cast<const char*>(mbody + sizeof(uint64_t) + 1), srvLen);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
     auto reply = [&](uint64_t g) {
       ces::Bytes tail;
@@ -1397,17 +1443,17 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     LOGDEBUG << "ext funding: petition " << amount << " at " << destServer
              << " -> reserved " << granted;
     if (granted == 0) { reply(0); return; }               // budget exhausted / off
-    if (gFundingInFlight.load() >= kFundingMaxInFlight) {  // busy -> back off
+    if (inst->owner->fundingInFlight_.load() >= kFundingMaxInFlight) {  // busy -> back off
       server->extFundingRefund(granted); reply(0); return;
     }
     minx::Hash dest{};
     std::memcpy(dest.data(), inst->programPubkey.data(), 32);
-    gFundingInFlight.fetch_add(1);
+    inst->owner->fundingInFlight_.fetch_add(1);
     try {
       std::thread(fundingWorker, inst, corr_id, dest, granted, destServer,
                   server, server->_serverKeyPair()).detach();
     } catch (...) {
-      gFundingInFlight.fetch_sub(1);
+      inst->owner->fundingInFlight_.fetch_sub(1);
       server->extFundingRefund(granted); reply(0);
     }
     return;
@@ -1544,7 +1590,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     }
     minx::Hash key{};
     std::memcpy(key.data(), mbody, 32);
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1579,7 +1625,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   //   Same data as the public CES_QUERY_PEER_INFO opcode; _peerSnapshot()
   //   locks the peer-table mutex internally, so it is safe off logicStrand_.
   if (method == kApiMethodPeers) {
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1617,7 +1663,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     if (mlen <= 32 || mlen > 32 + 256) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
     minx::Hash ckey{};
     std::memcpy(ckey.data(), mbody, 32);
@@ -1634,7 +1680,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       sendApiReply(inst, corr_id, kApiStatusDenied); return;
     }
     if (mlen < 32) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
     minx::Hash ckey{};
     std::memcpy(ckey.data(), mbody, 32);
@@ -1654,7 +1700,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     if (mlen < sizeof(uint64_t)) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
     server->_setPeerTarget(ces::Buffer::peek<uint64_t>(mbody));
     sendApiReply(inst, corr_id, kApiStatusOk);
@@ -1667,7 +1713,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     if (!isServerZone(inst->sourceName)) {
       sendApiReply(inst, corr_id, kApiStatusDenied); return;
     }
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
     ces::Bytes body;
     ces::Buffer::put<uint64_t>(body, server->_peerTarget());
@@ -1696,7 +1742,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
 
-    CesServer* server = gServer.load();
+    CesServer* server = inst->owner->server_;
     if (!server) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
@@ -1706,7 +1752,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     // rpcTaskIO_ — it's a single sha256 of a small file (Lua
     // source). After the first hit it's cached in the sidecar.
     std::array<uint8_t, AUTHENTIC_ASSET_HASH_SIZE> progHash{};
-    if (!fileHandlerGetProgramHash(inst->sourceName, progHash)) {
+    if (!fhGetProgramHash(inst->owner->server_, inst->sourceName, progHash)) {
       sendApiReply(inst, corr_id, CES_ERROR_INTERNAL); return;
     }
 
@@ -1756,7 +1802,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     return true;
   };
 
-  CesServer* server = gServer.load();
+  CesServer* server = inst->owner->server_;
   if (!server) {
     sendApiReply(inst, corr_id, kApiStatusInternal); return;
   }
@@ -1985,7 +2031,9 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   // method-specific reply tail (only on OK) and sends API_REPLY.
   uint16_t saved_method = method;
   auto inst_cap = inst;
-  fileHandlerExec(req,
+  FileHandler* fh = server->fileHandler();
+  if (!fh) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+  fh->exec(req,
     [inst_cap, corr_id, saved_method](FileExecResp resp) {
       if (resp.status != CES_OK) {
         sendApiReply(inst_cap, corr_id, resp.status);
@@ -2088,7 +2136,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
 // Read the Lua source from disk for a source-file path (e.g.
 // /h/<hex>/echo.lua). Returns empty vector on any failure. The
 // handler is the caller; it already validated that the file exists
-// via fileHandlerReadOwnerAndBalance.
+// via the file handler's readOwnerAndBalance.
 ces::Bytes readSourceBytes(const CesConfig& cfg,
                                      const std::string& name) {
   auto p = std::filesystem::path(cfg.cesFileStoreDir) /
@@ -2176,7 +2224,7 @@ struct LaunchAccept {
 
 // Strand-only (rpcTaskIO_). Allocate a fresh instance, spawn the child
 // binary, and asynchronously await its connect-back on the per-instance
-// Unix socket. On success: register in gInstances, send the bootstrap
+// Unix socket. On success: register in instances_, send the bootstrap
 // frame, arm the IPC reader, invoke `done(id)`. On any failure:
 // `done(0)` after tearing down whatever was allocated.
 //
@@ -2208,11 +2256,13 @@ void allocateAndSpawnInstance(
   // Read the source's program-account keypair from its sidecar.
   std::array<uint8_t, 32> programPubkey{};
   std::array<uint8_t, 32> programPrivkey{};
-  fileHandlerReadProgramPubkey(name, programPubkey);
-  fileHandlerReadProgramPrivkey(name, programPrivkey);
+  fhReadProgramPubkey(server, name, programPubkey);
+  fhReadProgramPrivkey(server, name, programPrivkey);
 
-  uint64_t pid = gNextPid++;
+  ComputeHandler* H = server->computeHandler();
+  uint64_t pid = H->nextPid_++;
   auto inst = std::make_shared<Instance>();
+  inst->owner = H;
   inst->pid = pid;
   inst->sourceName = name;
   inst->ownerPk = ownerPk;
@@ -2314,9 +2364,10 @@ void allocateAndSpawnInstance(
         st->done(0);
         return;
       }
-      // Handler unbound mid-launch (server shutting down): don't register
-      // a zombie into gInstances after teardown ran.
-      if (gServer.load() == nullptr) {
+      // Handler stopped mid-launch (server shutting down): don't register
+      // a zombie into instances_ after teardown ran.
+      ComputeHandler& H = *inst->owner;
+      if (H.stopped_.load()) {
         killAndReap(inst->ospid);
         teardownInstance(*inst);
         st->done(0);
@@ -2335,13 +2386,13 @@ void allocateAndSpawnInstance(
       inst->rpcPort = st->rpcPortLease->port;
       st->rpcPortLease->commit();
 
-      gInstances[inst->pid] = inst;
-      gByPrefix[inst->progPrefix].insert(inst->pid);
-      gByName[inst->sourceName].insert(inst->pid);
+      H.instances_[inst->pid] = inst;
+      H.byPrefix_[inst->progPrefix].insert(inst->pid);
+      H.byName_[inst->sourceName].insert(inst->pid);
       // Make this program's account a gossip sink target.
-      if (CesServer* sv = gServer.load())
+      if (CesServer* sv = H.server_)
         sv->registerSinkTarget(inst->programPubkey);
-      // Registered in gInstances now — drop the launch-slot reservation
+      // Registered in instances_ now — drop the launch-slot reservation
       // so it isn't double-counted against the cap.
       st->slot.reset();
 
@@ -2399,14 +2450,14 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // Check instance cap against registered + in-flight launches. LAUNCH
   // always mints a fresh id; multiple instances of the same source path
   // are allowed up to the cap.
-  if (launchSlotsInUse() >= cfg.computeMaxInstances) {
+  if (launchSlotsInUse(*reqServer(ctx)->computeHandler()) >= cfg.computeMaxInstances) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_MAX_INSTANCES); return;
   }
 
   // Source-file owner + balance check via the file handler.
   std::array<uint8_t, 32> ownerPk{};
   uint64_t fileBalance = 0;
-  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
+  if (!fhReadOwnerAndBalance(reqServer(ctx), name, ownerPk, fileBalance)) {
     sendErrorAndLoop(ctx, CES_ERROR_FILE_NOT_FOUND); return;
   }
   if (std::memcmp(ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
@@ -2438,21 +2489,21 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // config. Only the child's OUTBOUND remote_* verbs go dark, and they
   // error permanently on port 0.
   uint16_t clientPort = 0;
-  allocateComputePort(cfg, clientPort);
-  auto portLease = std::make_shared<PortLease>(clientPort);
+  allocateComputePort(*reqServer(ctx)->computeHandler(), cfg, clientPort);
+  auto portLease = std::make_shared<PortLease>(reqServer(ctx)->computeHandler(), clientPort);
 
   // Second best-effort lease: the child's inbound CesPlex host port
   // (/ces/luarpc/1). Independent of clientPort — exhaustion here leaves
   // rpcPort 0 (the instance hosts nothing) without failing the launch.
   uint16_t rpcPort = 0;
-  allocateComputePort(cfg, rpcPort);
-  auto rpcPortLease = std::make_shared<PortLease>(rpcPort);
+  allocateComputePort(*reqServer(ctx)->computeHandler(), cfg, rpcPort);
+  auto rpcPortLease = std::make_shared<PortLease>(reqServer(ctx)->computeHandler(), rpcPort);
 
   // Reserve a launch slot now and hold it across the async validate +
   // spawn chain (released when the instance registers or the launch
   // fails). Race-free: nothing else runs on this strand between the cap
   // check above and here, so the reservation reflects that decision.
-  auto launchSlot = std::make_shared<LaunchSlot>();
+  auto launchSlot = std::make_shared<LaunchSlot>(reqServer(ctx)->computeHandler());
 
   auto after = [ctx, name, upfront, ownerPk, launchSlot, portLease, rpcPortLease](
                    uint8_t rc, bool /*duplicate*/) mutable {
@@ -2463,7 +2514,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Debit the 15-min upfront from the source file's file_balance.
     // This is a commitment the host honors by starting + monitoring
     // the instance; no refund on KILL.
-    if (!fileHandlerDebitBalance(name, upfront)) {
+    if (!fhDebitBalance(reqServer(ctx), name, upfront)) {
       sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_FUND_TOO_LOW); return;
     }
 
@@ -2506,8 +2557,8 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
   uint64_t pid = ces::Buffer::peek<uint64_t>(pre.data());
 
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) {
+  auto it = reqServer(ctx)->computeHandler()->instances_.find(pid);
+  if (it == reqServer(ctx)->computeHandler()->instances_.end()) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
   }
   if (std::memcmp(it->second->ownerPk.data(), ctx->bound.boundPubkey.getHash().data(), 32) != 0) {
@@ -2522,7 +2573,7 @@ void dispatchKill(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     // Duplicate (resent envelope): the kill already committed; don't re-run it
     // (idempotent anyway), just reply OK so the wire shape matches.
     if (duplicate) { sendResponseAndLoop(ctx, CES_OK, {}); return; }
-    killByPid(pid);
+    killByPid(*reqServer(ctx)->computeHandler(), pid);
     sendResponseAndLoop(ctx, CES_OK, {});
   };
 
@@ -2549,7 +2600,7 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
     uint32_t countOff = resp.size();
     ces::Buffer::put<uint32_t>(resp, 0); // placeholder
     uint32_t count = 0;
-    for (auto& [pid, inst] : gInstances) {
+    for (auto& [pid, inst] : reqServer(ctx)->computeHandler()->instances_) {
       if (std::memcmp(inst->ownerPk.data(),
                       ctx->bound.boundPubkey.getHash().data(), 32) != 0) continue;
       ces::Buffer::put<uint64_t>(resp, inst->pid);
@@ -2564,7 +2615,7 @@ void dispatchList(std::shared_ptr<ReqCtx> ctx, ces::Bytes /* pre */) {
       // was deleted out from under us, report 0.
       std::array<uint8_t, 32> opk{};
       uint64_t bal = 0;
-      fileHandlerReadOwnerAndBalance(inst->sourceName, opk, bal);
+      fhReadOwnerAndBalance(reqServer(ctx), inst->sourceName, opk, bal);
       ces::Buffer::put<uint64_t>(resp, bal);
       // CPU basis points + RSS bytes from last supervisor sample.
       ces::Buffer::put<uint32_t>(resp, inst->cpuBasisPoints);
@@ -2601,8 +2652,8 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   if (pre.size() < 8) { sendErrorAndLoop(ctx, CES_ERROR_BAD_INPUT); return; }
   uint64_t pid = ces::Buffer::peek<uint64_t>(pre.data());
 
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) {
+  auto it = reqServer(ctx)->computeHandler()->instances_.find(pid);
+  if (it == reqServer(ctx)->computeHandler()->instances_.end()) {
     sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
   }
   std::string name = it->second->sourceName;
@@ -2612,7 +2663,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
   // to inspection — report the live instance with balance 0.
   std::array<uint8_t, 32> ownerPk{};
   uint64_t fileBalance = 0;
-  fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance);
+  fhReadOwnerAndBalance(reqServer(ctx), name, ownerPk, fileBalance);
 
   const auto& cfg = reqServer(ctx)->_config();
   const ces::PublicKey& signer = ctx->bound.boundPubkey;
@@ -2621,8 +2672,8 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
                                                     bool /*duplicate*/) {
     if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
     // Read-only: a duplicate just re-reads current state — correct, no skip.
-    auto it = gInstances.find(pid);
-    if (it == gInstances.end()) {
+    auto it = reqServer(ctx)->computeHandler()->instances_.find(pid);
+    if (it == reqServer(ctx)->computeHandler()->instances_.end()) {
       sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
     }
     auto& inst = *it->second;
@@ -2663,7 +2714,7 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 //                         u64 rss_bytes, u16 client_port, u16 rpc_port]*
 //
 // No owner check, no file-existence check, no path validation beyond
-// the length cap. The path is just a key into gByName; absent → empty
+// the length cap. The path is just a key into byName_; absent -> empty
 // list. Same per-op fee as STAT/LIST so signers can't free-flood the
 // lookup, but anyone with a credited account can ask. Each entry carries
 // the instance's leased ports so a single call discovers a service AND
@@ -2689,14 +2740,14 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
     uint32_t countOff = resp.size();
     ces::Buffer::put<uint32_t>(resp, 0); // placeholder, patched below
     uint32_t count = 0;
-    auto it = gByName.find(name);
-    if (it != gByName.end()) {
+    auto it = reqServer(ctx)->computeHandler()->byName_.find(name);
+    if (it != reqServer(ctx)->computeHandler()->byName_.end()) {
       // std::set ⇒ ascending iteration; clients shouldn't depend on
       // the order. Two clients querying the same path back-to-back
       // see the same list as long as no LAUNCH/KILL hit in between.
       for (uint64_t pid : it->second) {
-        auto iit = gInstances.find(pid);
-        if (iit == gInstances.end()) continue;  // index/registry skew
+        auto iit = reqServer(ctx)->computeHandler()->instances_.find(pid);
+        if (iit == reqServer(ctx)->computeHandler()->instances_.end()) continue;  // index/registry skew
         auto& inst = *iit->second;
         ces::Buffer::put<uint64_t>(resp, inst.pid);
         ces::Buffer::put<uint64_t>(resp, inst.startedAtUs);
@@ -2726,8 +2777,8 @@ void dispatchInstances(std::shared_ptr<ReqCtx> ctx,
 // Supervisor tick — per-second slot-fee debit + SIGKILL on exhaustion.
 // ---------------------------------------------------------------------------
 
-void supervisorTick() {
-  CesServer* server = gServer.load();
+void supervisorTick(ComputeHandler& H) {
+  CesServer* server = H.server_;
   if (!server) return;
   const auto& cfg = server->_config();
   uint64_t now = getMicrosSinceEpoch();
@@ -2748,7 +2799,7 @@ void supervisorTick() {
                             ? cfg.feeBucketByteSec : 0));
 
   std::vector<uint64_t> toKill;
-  for (auto& [pid, inst] : gInstances) {
+  for (auto& [pid, inst] : H.instances_) {
     // One tick: procfs sample (CPU delta + RSS) + compound debit.
     // Runs at cfg.computeTickIntervalMs cadence (default 60 s).
     sampleInstanceProc(*inst, now);
@@ -2800,7 +2851,7 @@ void supervisorTick() {
     uint64_t debit = (total > static_cast<__uint128_t>(UINT64_MAX))
       ? UINT64_MAX : static_cast<uint64_t>(total);
     if (debit == 0) continue;
-    if (!fileHandlerDebitBalance(inst->sourceName, debit)) {
+    if (!fhDebitBalance(server, inst->sourceName, debit)) {
       toKill.push_back(pid);
     } else {
       inst->lastTickUs = now;
@@ -2816,20 +2867,21 @@ void supervisorTick() {
       toKill.push_back(pid);
     }
   }
-  for (uint64_t pid : toKill) killByPid(pid);
+  for (uint64_t pid : toKill) killByPid(H, pid);
 }
 
-void scheduleNextTick() {
-  if (!gTickTimer) return;
-  if (!gTickRunning.load()) return;
-  CesServer* server = gServer.load();
+void scheduleNextTick(ComputeHandler& H) {
+  if (!H.tickTimer_) return;
+  if (!H.tickRunning_.load()) return;
+  CesServer* server = H.server_;
   uint32_t ms = (server && server->_config().computeTickIntervalMs > 0)
     ? server->_config().computeTickIntervalMs : 60000u;
-  gTickTimer->expires_after(std::chrono::milliseconds(ms));
-  gTickTimer->async_wait([](const boost::system::error_code& ec) {
+  H.tickTimer_->expires_after(std::chrono::milliseconds(ms));
+  ComputeHandler* Hp = &H;
+  H.tickTimer_->async_wait([Hp](const boost::system::error_code& ec) {
     if (ec) return;
-    supervisorTick();
-    scheduleNextTick();
+    supervisorTick(*Hp);
+    scheduleNextTick(*Hp);
   });
 }
 
@@ -2838,60 +2890,56 @@ void scheduleNextTick() {
 // callback. If the deleted file has a running instance, kill it.
 // ---------------------------------------------------------------------------
 
-void onFileDeleted(const std::string& name) {
+void onFileDeleted(ComputeHandler& H, const std::string& name) {
   // Runs on whatever thread drove the deletion — typically rpcTaskIO_,
   // but we don't assume. Hop onto rpcTaskIO_ so we can touch the
   // instance registry without taking a lock.
-  CesServer* server = gServer.load();
+  CesServer* server = H.server_;
   if (!server) return;
   auto io = server->_rpcTaskIOExecutor();
   if (!io) return;
-  boost::asio::post(io, [name]() {
-    auto it = gByName.find(name);
-    if (it == gByName.end()) return;
-    // Snapshot ids — killByPid mutates gByName.
+  ComputeHandler* Hp = &H;
+  boost::asio::post(io, [Hp, name]() {
+    auto it = Hp->byName_.find(name);
+    if (it == Hp->byName_.end()) return;
+    // Snapshot ids — killByPid mutates byName_.
     std::vector<uint64_t> ids(it->second.begin(), it->second.end());
-    for (uint64_t pid : ids) killByPid(pid);
+    for (uint64_t pid : ids) killByPid(*Hp, pid);
   });
 }
 
-// ---------------------------------------------------------------------------
-// ComputeHandler class + registration
-// ---------------------------------------------------------------------------
-
-class ComputeHandler : public CesPlexHandler {
-public:
-  void serve(std::shared_ptr<minx::RudpStream> stream,
-             BoundChannelContext bound) override {
-    CesServer* server = gServer.load();
-    if (!server) {
-      LOGWARNING << "invoked with no bound CesServer";
-      return;
-    }
-    CesPlexProtocol proto;
-    // accepts() also gates "still bound?" — false on unbind stops the loop.
-    proto.accepts = [](uint8_t verb) {
-      return gServer.load() != nullptr &&
-             verb >= kVerbLaunch && verb <= kVerbInstances;
-    };
-    proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
-      switch (ctx->verb) {
-        case kVerbLaunch:    dispatchLaunch   (ctx, std::move(pre)); break;
-        case kVerbKill:      dispatchKill     (ctx, std::move(pre)); break;
-        case kVerbList:      dispatchList     (ctx, std::move(pre)); break;
-        case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
-        case kVerbInstances: dispatchInstances(ctx, std::move(pre)); break;
-        default:             ctx->error(CES_ERROR_BAD_INPUT); break;
-      }
-    };
-    cesPlexServe(std::move(stream), std::move(bound), server,
-                 std::move(proto));
-  }
-};
-
-ComputeHandler gComputeHandler;
-
 } // namespace
+
+// ---------------------------------------------------------------------------
+// ComputeHandler methods
+// ---------------------------------------------------------------------------
+
+ComputeHandler::ComputeHandler(CesServer* server) : server_(server) {}
+ComputeHandler::~ComputeHandler() = default;
+
+void ComputeHandler::serve(std::shared_ptr<minx::RudpStream> stream,
+                           BoundChannelContext bound) {
+  if (stopped_.load()) return;
+  CesPlexProtocol proto;
+  ComputeHandler* self = this;
+  // accepts() also gates "still serving?" — false on stop() ends the loop.
+  proto.accepts = [self](uint8_t verb) {
+    return !self->stopped_.load() &&
+           verb >= kVerbLaunch && verb <= kVerbInstances;
+  };
+  proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+    switch (ctx->verb) {
+      case kVerbLaunch:    dispatchLaunch   (ctx, std::move(pre)); break;
+      case kVerbKill:      dispatchKill     (ctx, std::move(pre)); break;
+      case kVerbList:      dispatchList     (ctx, std::move(pre)); break;
+      case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
+      case kVerbInstances: dispatchInstances(ctx, std::move(pre)); break;
+      default:             ctx->error(CES_ERROR_BAD_INPUT); break;
+    }
+  };
+  cesPlexServe(std::move(stream), std::move(bound), server_,
+               std::move(proto));
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -2899,16 +2947,16 @@ ComputeHandler gComputeHandler;
 
 // Read a running instance's extension metadata (manifest + caps + commands +
 // config defaults). Synchronous hop onto rpcTaskIO_. false if pid is unknown.
-bool computeHandlerExtInfo(uint64_t pid, ComputeExtInfo& out) {
-  CesServer* server = gServer.load();
+bool ComputeHandler::extInfo(uint64_t pid, ComputeExtInfo& out) {
+  CesServer* server = server_;
   if (!server) return false;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return false;
   std::mutex m; std::condition_variable cv; bool done = false, found = false;
   ComputeExtInfo info;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(pid);
-    if (it != gInstances.end()) {
+    auto it = instances_.find(pid);
+    if (it != instances_.end()) {
       auto& inst = it->second;
       info.name           = inst->extName;
       info.version        = inst->extVersion;
@@ -2930,23 +2978,23 @@ bool computeHandlerExtInfo(uint64_t pid, ComputeExtInfo& out) {
 // Send an EXT_REQ (status/command) to a running extension and block for the
 // EXT_REP, up to timeoutMs. `out` is the reply payload (after the status byte).
 // false on timeout, unknown pid, non-extension, or a child-side error.
-bool computeHandlerExtRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
-                              ces::Bytes& out, int timeoutMs) {
-  CesServer* server = gServer.load();
+bool ComputeHandler::extRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
+                                ces::Bytes& out, int timeoutMs) {
+  CesServer* server = server_;
   if (!server) return false;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return false;
   auto pend = std::make_shared<ExtPending>();
-  boost::asio::post(ex, [pend, pid, kind, in]() {
-    auto it = gInstances.find(pid);
-    if (it == gInstances.end() || !it->second->isExtension) {
+  boost::asio::post(ex, [this, pend, pid, kind, in]() {
+    auto it = instances_.find(pid);
+    if (it == instances_.end() || !it->second->isExtension) {
       std::lock_guard<std::mutex> lk(pend->m);
       pend->done = true; pend->ok = false; pend->cv.notify_all();
       return;
     }
-    uint16_t corr = gExtCorr++; if (corr == 0) corr = gExtCorr++;
+    uint16_t corr = extCorr_++; if (corr == 0) corr = extCorr_++;
     pend->corr = corr;
-    gExtPending[corr] = pend;
+    extPending_[corr] = pend;
     ces::Bytes b; b.reserve(1 + in.size());
     b.push_back(kind);
     b.insert(b.end(), in.begin(), in.end());
@@ -2959,75 +3007,58 @@ bool computeHandlerExtRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in,
   if (ok) out = pend->reply;
   lk.unlock();
   if (!got) {
-    boost::asio::post(ex, [pend]() {
+    boost::asio::post(ex, [this, pend]() {
       pend->dead = true;
-      if (pend->corr) gExtPending.erase(pend->corr);
+      if (pend->corr) extPending_.erase(pend->corr);
     });
   }
   return ok;
 }
 
 // Push a config blob to a running extension (one-way on_config). Best-effort.
-void computeHandlerExtConfig(uint64_t pid, const std::string& cfg) {
-  CesServer* server = gServer.load();
+void ComputeHandler::extConfig(uint64_t pid, const std::string& cfg) {
+  CesServer* server = server_;
   if (!server) return;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return;
-  boost::asio::post(ex, [pid, cfg]() {
-    auto it = gInstances.find(pid);
-    if (it == gInstances.end() || !it->second->isExtension) return;
+  boost::asio::post(ex, [this, pid, cfg]() {
+    auto it = instances_.find(pid);
+    if (it == instances_.end() || !it->second->isExtension) return;
     enqueueOutbound(it->second, makeFrame(kIpcTagExtConfig, 0,
       reinterpret_cast<const uint8_t*>(cfg.data()), cfg.size()));
   });
 }
 
-void computeFundingDrain() {
-  // Bounded wait for in-flight ces.request_funds remote transfers (gFundingInFlight
-  // lives in this TU's anonymous namespace) so the CesServer isn't torn down under
-  // one. Each is bounded by CesClient's own network timeout anyway.
-  for (int i = 0; i < 100 && gFundingInFlight.load() > 0; ++i)
+void ComputeHandler::fundingDrain() {
+  // Bounded wait for in-flight ces.request_funds remote transfers so the
+  // CesServer isn't torn down under one. Each is bounded by CesClient's own
+  // network timeout anyway.
+  for (int i = 0; i < 100 && fundingInFlight_.load() > 0; ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 }
 
-void computeHandlerKillBySource(const std::string& sourceName) {
-  CesServer* server = gServer.load();
+void ComputeHandler::killBySource(const std::string& sourceName) {
+  CesServer* server = server_;
   if (!server) return;
   auto io = server->_rpcTaskIOExecutor();
   if (!io) return;
-  boost::asio::post(io, [sourceName]() {
-    auto it = gByName.find(sourceName);
-    if (it == gByName.end()) return;
+  boost::asio::post(io, [this, sourceName]() {
+    auto it = byName_.find(sourceName);
+    if (it == byName_.end()) return;
     std::vector<uint64_t> ids(it->second.begin(), it->second.end());
-    for (uint64_t pid : ids) killByPid(pid);
+    for (uint64_t pid : ids) killByPid(*this, pid);
   });
 }
 
-uint8_t computeHandlerBind(CesServer* server) {
-  if (server == nullptr) {
-    // Teardown. SIGKILL every instance and cancel the tick.
-    gTickRunning.store(false);
-    if (gTickTimer) {
-      boost::system::error_code ec;
-      gTickTimer->cancel(ec);
-    }
-    // Kill all instances. Iterate over a snapshot since
-    // killByPid erases.
-    std::vector<uint64_t> ids;
-    ids.reserve(gInstances.size());
-    for (auto& [pid, _] : gInstances) ids.push_back(pid);
-    for (uint64_t pid : ids) killByPid(pid);
-    gTickTimer.reset();
-    gServer.store(nullptr);
-    return CES_OK;
-  }
-
+uint8_t ComputeHandler::start() {
+  CesServer* server = server_;
   const auto& cfg = server->_config();
 
   if (cfg.computeMaxInstances == 0)
     return CES_ERROR_COMPUTE_DISABLED;
 
-  // File handler must be registered.
-  if (findCesPlexBuiltin("file") == nullptr) {
+  // The file handler must be up (per-server object, gated by the file-store cap).
+  if (server->fileHandler() == nullptr) {
     LOGERROR << "requires builtin:file; refusing to bind";
     return CES_ERROR_COMPUTE_NO_FILE_HANDLER;
   }
@@ -3042,24 +3073,21 @@ uint8_t computeHandlerBind(CesServer* server) {
     return CES_ERROR_INTERNAL;
   }
 
-  gServer.store(server);
-
-  // One-shot deletion callback registration.
-  if (!gDeletionCallbackInstalled.exchange(true)) {
-    fileHandlerRegisterDeletionCallback(
-      [](const std::string& name) { onFileDeleted(name); });
+  // Register the file-deletion interlock into THIS server's file handler.
+  if (FileHandler* fh = server->fileHandler()) {
+    fh->registerDeletionCallback(
+      [this](const std::string& name) { onFileDeleted(*this, name); });
   }
 
   // Start supervisor timer on rpcTaskIO_.
   auto io = server->_rpcTaskIOExecutor();
   if (!io) {
     LOGERROR << "rpcTaskIO not available";
-    gServer.store(nullptr);
     return CES_ERROR_INTERNAL;
   }
-  gTickTimer = std::make_shared<boost::asio::steady_timer>(io);
-  gTickRunning.store(true);
-  scheduleNextTick();
+  tickTimer_ = std::make_shared<boost::asio::steady_timer>(io);
+  tickRunning_.store(true);
+  scheduleNextTick(*this);
 
   LOGINFO << "bound"
           << VAR(cfg.computeMaxInstances)
@@ -3068,28 +3096,43 @@ uint8_t computeHandlerBind(CesServer* server) {
   return CES_OK;
 }
 
-uint8_t computeHandlerLaunchInternal(const std::string& name) {
-  CesServer* server = gServer.load();
+void ComputeHandler::stop() {
+  // SIGKILL every instance and cancel the tick.
+  stopped_.store(true);
+  tickRunning_.store(false);
+  if (tickTimer_) {
+    boost::system::error_code ec;
+    tickTimer_->cancel(ec);
+  }
+  // Kill all instances. Iterate over a snapshot since killByPid erases.
+  std::vector<uint64_t> ids;
+  ids.reserve(instances_.size());
+  for (auto& [pid, _] : instances_) ids.push_back(pid);
+  for (uint64_t pid : ids) killByPid(*this, pid);
+  tickTimer_.reset();
+}
+
+uint8_t ComputeHandler::launchInternal(const std::string& name) {
+  CesServer* server = server_;
   if (!server) return CES_ERROR_COMPUTE_DISABLED;
   const auto& cfg = server->_config();
   if (cfg.computeMaxInstances == 0) return CES_ERROR_COMPUTE_DISABLED;
-  if (launchSlotsInUse() >= cfg.computeMaxInstances) {
+  if (launchSlotsInUse(*this) >= cfg.computeMaxInstances) {
     return CES_ERROR_COMPUTE_MAX_INSTANCES;
   }
   uint16_t clientPort = 0;
-  allocateComputePort(cfg, clientPort);   // best-effort; 0 = local-only
-  auto portLease = std::make_shared<PortLease>(clientPort);
+  allocateComputePort(*this, cfg, clientPort);   // best-effort; 0 = local-only
+  auto portLease = std::make_shared<PortLease>(this, clientPort);
   uint16_t rpcPort = 0;
-  allocateComputePort(cfg, rpcPort);   // best-effort 2nd port (/ces/luarpc/1 host)
-  auto rpcPortLease = std::make_shared<PortLease>(rpcPort);
+  allocateComputePort(*this, cfg, rpcPort);   // best-effort 2nd port (/ces/luarpc/1 host)
+  auto rpcPortLease = std::make_shared<PortLease>(this, rpcPort);
 
   // Source file must exist; ownership must be the server. /s/-zone
-  // requirement is enforced at deploy time by
-  // fileHandlerEnsureServerFile, so we don't double-check the path
-  // shape here.
+  // requirement is enforced at deploy time by the file handler's
+  // writeServerFile, so we don't double-check the path shape here.
   std::array<uint8_t, 32> ownerPk{};
   uint64_t fileBalance = 0;
-  if (!fileHandlerReadOwnerAndBalance(name, ownerPk, fileBalance)) {
+  if (!fhReadOwnerAndBalance(server, name, ownerPk, fileBalance)) {
     return CES_ERROR_FILE_NOT_FOUND;
   }
   std::array<uint8_t, 32> serverPk{};
@@ -3110,7 +3153,7 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   // "validated + spawn started," not "child connected."
   uint64_t now = getMicrosSinceEpoch();
   allocateAndSpawnInstance(server, name, ownerPk, 0, now,
-    std::make_shared<LaunchSlot>(), std::move(portLease), std::move(rpcPortLease),
+    std::make_shared<LaunchSlot>(this), std::move(portLease), std::move(rpcPortLease),
     [name](uint64_t pid) {
       if (pid == 0) {
         LOGWARNING << "internal launch spawn failed"
@@ -3120,10 +3163,10 @@ uint8_t computeHandlerLaunchInternal(const std::string& name) {
   return CES_OK;
 }
 
-void computeHandlerOnApplicationMsg(
+void ComputeHandler::onApplicationMsg(
     const uint8_t* data, std::size_t len,
     const std::array<uint8_t, 8>& senderPfx) {
-  if (gServer.load() == nullptr) return;
+  if (!server_) return;
   // Wire shape (op byte already stripped by CesServer::incomingApplication):
   //   [1B flags][8B prog_pfx][2B len BE][N payload]
   if (len < sizeof(uint8_t) + sizeof(uint64_t) + sizeof(uint16_t)) return;
@@ -3134,14 +3177,14 @@ void computeHandlerOnApplicationMsg(
   if (payloadLen > kAppPayloadMax) return;
   if (len < static_cast<size_t>(11 + payloadLen)) return;
 
-  auto it = gByPrefix.find(pfx);
-  if (it == gByPrefix.end()) return; // no local instance for this prefix; drop
+  auto it = byPrefix_.find(pfx);
+  if (it == byPrefix_.end()) return; // no local instance for this prefix; drop
   // Broadcast to every local instance sharing this content-addressed
   // prefix. Sibling instances see sibling traffic — same as if they
   // were on different servers in the swarm.
   for (uint64_t pid : it->second) {
-    auto inst = gInstances.find(pid);
-    if (inst == gInstances.end()) continue;
+    auto inst = instances_.find(pid);
+    if (inst == instances_.end()) continue;
     sendDeliverFrame(inst->second, senderPfx, data + 11, payloadLen);
   }
 }
@@ -3156,8 +3199,8 @@ bool _computeTestReadProcSample(int pid,
   return true;
 }
 
-void _computeTestForceTick() {
-  CesServer* server = gServer.load();
+void ComputeHandler::testForceTick() {
+  CesServer* server = server_;
   if (!server) return;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return;
@@ -3167,7 +3210,7 @@ void _computeTestForceTick() {
   std::condition_variable cv;
   bool done = false;
   boost::asio::post(ex, [&]() {
-    supervisorTick();
+    supervisorTick(*this);
     std::lock_guard lk(m);
     done = true;
     cv.notify_all();
@@ -3176,8 +3219,8 @@ void _computeTestForceTick() {
   cv.wait(lk, [&]{ return done; });
 }
 
-size_t _computeTestFloodDeliver(uint64_t pid, size_t count) {
-  CesServer* server = gServer.load();
+size_t ComputeHandler::testFloodDeliver(uint64_t pid, size_t count) {
+  CesServer* server = server_;
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return 0;
@@ -3192,8 +3235,8 @@ size_t _computeTestFloodDeliver(uint64_t pid, size_t count) {
   bool done = false;
   size_t depth = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(pid);
-    if (it != gInstances.end()) {
+    auto it = instances_.find(pid);
+    if (it != instances_.end()) {
       std::array<uint8_t, 8> sender{};
       std::array<uint8_t, 16> payload{};
       for (size_t i = 0; i < count; ++i)
@@ -3209,8 +3252,8 @@ size_t _computeTestFloodDeliver(uint64_t pid, size_t count) {
   return depth;
 }
 
-uint16_t _computeTestInstanceClientPort(uint64_t pid) {
-  CesServer* server = gServer.load();
+uint16_t ComputeHandler::testInstanceClientPort(uint64_t pid) {
+  CesServer* server = server_;
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return 0;
@@ -3219,8 +3262,8 @@ uint16_t _computeTestInstanceClientPort(uint64_t pid) {
   bool done = false;
   uint16_t port = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(pid);
-    if (it != gInstances.end()) port = it->second->clientPort;
+    auto it = instances_.find(pid);
+    if (it != instances_.end()) port = it->second->clientPort;
     std::lock_guard lk(m);
     done = true;
     cv.notify_all();
@@ -3230,8 +3273,8 @@ uint16_t _computeTestInstanceClientPort(uint64_t pid) {
   return port;
 }
 
-uint16_t _computeTestInstanceRpcPort(uint64_t pid) {
-  CesServer* server = gServer.load();
+uint16_t ComputeHandler::testInstanceRpcPort(uint64_t pid) {
+  CesServer* server = server_;
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return 0;
@@ -3240,8 +3283,8 @@ uint16_t _computeTestInstanceRpcPort(uint64_t pid) {
   bool done = false;
   uint16_t port = 0;
   boost::asio::post(ex, [&]() {
-    auto it = gInstances.find(pid);
-    if (it != gInstances.end()) port = it->second->rpcPort;
+    auto it = instances_.find(pid);
+    if (it != instances_.end()) port = it->second->rpcPort;
     std::lock_guard lk(m);
     done = true;
     cv.notify_all();
@@ -3252,17 +3295,17 @@ uint16_t _computeTestInstanceRpcPort(uint64_t pid) {
 }
 
 // ---------------------------------------------------------------------------
-// /ces/lua/1 cross-handler primitives — the lua handler calls into
-// these from rpcTaskIO_'s strand. See include/ces/l2/compute_handler.h.
+// /ces/lua/1 + /ces/peer/1 cross-handler primitives — the lua / peer handlers
+// call into these from rpcTaskIO_'s strand. See compute_handler.h.
 // ---------------------------------------------------------------------------
 
-bool computeInstanceExists(uint64_t pid) {
-  return gInstances.find(pid) != gInstances.end();
+bool ComputeHandler::instanceExists(uint64_t pid) {
+  return instances_.find(pid) != instances_.end();
 }
 
-std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
+std::vector<ComputeInstanceStat> ComputeHandler::snapshot() {
   std::vector<ComputeInstanceStat> out;
-  CesServer* server = gServer.load();
+  CesServer* server = server_;
   if (!server) return out;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return out;
@@ -3271,8 +3314,8 @@ std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
   std::condition_variable cv;
   bool done = false;
   boost::asio::post(ex, [&]() {
-    out.reserve(gInstances.size());
-    for (auto& [pid, inst] : gInstances) {
+    out.reserve(instances_.size());
+    for (auto& [pid, inst] : instances_) {
       ComputeInstanceStat s;
       s.pid = inst->pid;
       s.source = inst->sourceName;
@@ -3294,16 +3337,16 @@ std::vector<ComputeInstanceStat> computeHandlerSnapshot() {
   return out;
 }
 
-bool computeInstanceAcceptsConnections(uint64_t pid) {
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) return false;
+bool ComputeHandler::instanceAcceptsConnections(uint64_t pid) {
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return false;
   return it->second->acceptsConnections;
 }
 
-uint64_t computeOpenConnection(uint64_t pid,
+uint64_t ComputeHandler::openConnection(uint64_t pid,
                                 const std::array<uint8_t, 32>& userPubkey) {
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) return 0;
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return 0;
   auto inst = it->second;
   uint64_t connId = inst->nextConnId++;
   // Body: [u64 conn_id BE][32B user_pubkey].
@@ -3316,10 +3359,10 @@ uint64_t computeOpenConnection(uint64_t pid,
   return connId;
 }
 
-void computeSendConnDataIn(uint64_t pid, uint64_t connId,
+void ComputeHandler::sendConnDataIn(uint64_t pid, uint64_t connId,
                             const uint8_t* data, std::size_t len) {
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) return;
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return;
   // Body: [u64 conn_id BE][u32 BE len][len bytes].
   ces::Bytes body;
   body.reserve(sizeof(uint64_t) + sizeof(uint32_t) + len);
@@ -3330,10 +3373,10 @@ void computeSendConnDataIn(uint64_t pid, uint64_t connId,
                                          body.data(), body.size()));
 }
 
-void computeSendConnClosed(uint64_t pid, uint64_t connId,
+void ComputeHandler::sendConnClosed(uint64_t pid, uint64_t connId,
                             uint8_t reason) {
-  auto it = gInstances.find(pid);
-  if (it == gInstances.end()) return;
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return;
   // Body: [u64 conn_id BE][u8 reason].
   ces::Bytes body;
   body.reserve(sizeof(uint64_t) + sizeof(uint8_t));
@@ -3343,12 +3386,34 @@ void computeSendConnClosed(uint64_t pid, uint64_t connId,
                                          body.data(), body.size()));
 }
 
-void computeHandlerDeliverGossip(const minx::Hash& author,
+void ComputeHandler::routePeerMsg(const std::string& service, const minx::Hash& fromKey,
+                         const uint8_t* data, std::size_t len) {
+  // Route an inbound /ces/peer/1 message (from the peer handler) to the local
+  // instance that registered `service` via ces.peer.listen. Single instance,
+  // not a broadcast.
+  auto sit = serviceTags_.find(service);
+  if (sit == serviceTags_.end()) return;
+  auto it = instances_.find(sit->second);
+  if (it == instances_.end()) return;
+  // Body to child: [32 from][u16 service_len][service][u32 BE len][payload].
+  ces::Bytes body;
+  body.reserve(sizeof(minx::Hash) + sizeof(uint16_t) + service.size()
+               + sizeof(uint32_t) + len);
+  body.insert(body.end(), fromKey.begin(), fromKey.end());
+  ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(service.size()));
+  body.insert(body.end(), service.begin(), service.end());
+  ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(len));
+  if (len > 0) body.insert(body.end(), data, data + len);
+  enqueueOutbound(it->second, makeFrame(kIpcTagPeerMsgIn, 0,
+                                         body.data(), body.size()));
+}
+
+void ComputeHandler::deliverGossip(const minx::Hash& author,
                                  const minx::Hash& sender,
                                  const minx::Hash& msgId,
                                  const minx::Hash& dest,
                                  const uint8_t* msg, std::size_t len) {
-  if (gInstances.empty()) return;
+  if (instances_.empty()) return;
   // Body: [32 author][32 sender][32 msgId][32 dest][u32 BE len][len bytes].
   ces::Bytes body;
   body.reserve(4 * sizeof(minx::Hash) + sizeof(uint32_t) + len);
@@ -3359,18 +3424,9 @@ void computeHandlerDeliverGossip(const minx::Hash& author,
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(len));
   if (len > 0) body.insert(body.end(), msg, msg + len);
   // Fan to every local instance; the child calls its on_gossip if defined.
-  for (auto& [pid, inst] : gInstances)
+  for (auto& [pid, inst] : instances_)
     enqueueOutbound(inst, makeFrame(kIpcTagGossipIn, 0,
                                     body.data(), body.size()));
 }
 
 } // namespace ces
-
-// ---------------------------------------------------------------------------
-// Static registration: map protocol name "compute" → gComputeHandler.
-// ---------------------------------------------------------------------------
-
-REGISTER_CESPLEX_BUILTIN("compute", ::ces::gComputeHandler, ComputeHandler)
-
-// TU anchor — cesplex/mux.cpp references this via its anchor array.
-extern "C" { int compute_handler_anchor = 1; }

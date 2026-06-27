@@ -413,7 +413,7 @@ BOOST_AUTO_TEST_CASE(FileApiFeesDrainSource) {
     std::array<uint8_t, 32> ownerPk;
     uint64_t bal = 0;
     BOOST_REQUIRE(
-      ces::fileHandlerReadOwnerAndBalance(scriptPath, ownerPk, bal));
+      server->fileHandler()->readOwnerAndBalance(scriptPath, ownerPk, bal));
     return bal;
   };
   uint64_t before = readSourceBalance();
@@ -503,10 +503,10 @@ BOOST_AUTO_TEST_CASE(CpuAndRssReportedForBusyLuaProgram) {
   // Let the Lua program get to its busy loop + allocation.
   std::this_thread::sleep_for(std::chrono::milliseconds(200));
   // First tick: baseline sample (sets lastCpuTicks / lastSampleUs).
-  ces::_computeTestForceTick();
+  server->computeHandler()->testForceTick();
   // Give the child measurable CPU between samples, then sample again.
   std::this_thread::sleep_for(std::chrono::milliseconds(500));
-  ces::_computeTestForceTick();
+  server->computeHandler()->testForceTick();
 
   CesComputeClient cc;
   cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
@@ -669,7 +669,7 @@ BOOST_AUTO_TEST_CASE(DeliverFloodIsBounded) {
   // anything drains). Without the cap the outbox would hold all 5000 (and
   // keep climbing under a sustained flood → server OOM); with the cap it
   // saturates near kMaxDeliverBacklog (1024).
-  size_t depth = ces::_computeTestFloodDeliver(instId, 5000);
+  size_t depth = server->computeHandler()->testFloodDeliver(instId, 5000);
   BOOST_CHECK_MESSAGE(depth > 0 && depth < 2000,
     "deliver flood must saturate at the cap, not the flood size; depth="
     << depth);
@@ -1030,7 +1030,7 @@ BOOST_FIXTURE_TEST_CASE(ExecTargetInsufficientKeepsSource, LuaComputeFixture) {
   uint64_t srcBal = 0;
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
   BOOST_CHECK_MESSAGE(
-    ces::fileHandlerReadOwnerAndBalance(scriptPath, srcOwner, srcBal),
+    server->fileHandler()->readOwnerAndBalance(scriptPath, srcOwner, srcBal),
     "source file was wrongly deleted by a target-side INSUFFICIENT");
 }
 
