@@ -43,6 +43,14 @@ local me = ces.owner_pubkey and ces.owner_pubkey() or nil
 -- launch AND on every live on_config push, so both paths share one set of
 -- defaults — a knob omitted from the file always reverts to the same default.
 local DEFAULT_SEEDS = { "ces.pubcom.org:53830" }  -- production rendezvous default
+
+-- Typed-broadcast dest for the self-announce gossip. 128 leading zero bits mark
+-- it as "not a pubkey, a typed broadcast" (CES-wide convention; the gossip core
+-- skips sink routing and floods it); the low 128 bits are the discovery announce
+-- protocol id. Receivers demux by filtering on_gossip's meta.dest. (16 zero bytes
+-- + a 16-byte constant id.)
+local ANNOUNCE_DEST = string.rep("\0", 16) .. "CES.DISCOVERY.01"
+
 local function build_opts(c)
   return {
     min_peer_target = conf.num(c, "min_peer_target", 100000000),  -- 1 credit floor
@@ -59,6 +67,12 @@ local function build_opts(c)
     probe_ms        = conf.num(c, "probe_ms", 3000),           -- per-ping reply wait (ces.ping)
     dead_after      = conf.num(c, "dead_after", 10),           -- failed revalidations before give-up
     peer_min_credit = conf.num(c, "peer_min_credit", 100000000),  -- floor balance per peer (1.0)
+    -- Self-announce over gossip: `announce` is our own reachable address to
+    -- broadcast (empty = off; the operator knows the public address). Pushed once
+    -- on boot then every announce_ms; budget is small (pay-to-be-found anti-spam).
+    announce        = c.announce or "",
+    announce_ms     = conf.num(c, "announce_ms", 86400000),       -- 24h
+    announce_budget = conf.num(c, "announce_budget", 1000000),    -- 0.01 credit
     -- A "seeds = ..." line (including empty "seeds =") overrides the default.
     -- Seeds are untrusted rumors, validated by the crawl's ces.ping.
     seeds           = c.seeds ~= nil and conf.list(c, "seeds") or DEFAULT_SEEDS,
@@ -73,6 +87,25 @@ ces.log("discovery: up, registry=" .. reg:count())
 
 local agent = Agent.new(reg, opts)
 agent:start()
+
+-- Inbound self-announce from another discovery: a typed broadcast on the announce
+-- dest carrying a server address. Fold it into the registry; the crawl pings,
+-- validates and promotes it like any rumor (self is dropped by the registry).
+function on_gossip(msg, meta)
+  if meta and meta.dest == ANNOUNCE_DEST and msg and #msg > 0 then
+    reg:hear(msg, "gossip")
+  end
+end
+
+-- Outbound self-announce: once on boot (immediate, so it is easy to observe),
+-- then every announce_ms. Off when `announce` is unset.
+local function announce()
+  if opts.announce ~= "" and ces.gossip and ces.gossip.send then
+    ces.gossip.send(opts.announce, opts.announce_budget, ANNOUNCE_DEST)
+  end
+end
+announce()
+ces.every(opts.announce_ms, announce)
 
 admin.attach(reg)   -- observability over the relay (cesh dial); inbound-only, not a mesh
 

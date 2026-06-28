@@ -4830,6 +4830,18 @@ void CesServer::unregisterSinkTarget(const minx::Hash& pubkey) {
   });
 }
 
+// A gossip `dest` with 128 leading zero bits is NOT a real pubkey: the low 128
+// bits are a protocol/type id (a TYPED BROADCAST, delivered to on_gossip for
+// demux), or, if fully zero, an untyped broadcast. Such a dest can never be a
+// sink, so it floods like a broadcast and we skip the sink path. Only a real
+// pubkey (high 128 bits nonzero) is a sink candidate. Reserving the
+// 128-zero-prefix space as "not a pubkey" is a CES-wide convention.
+static bool gossipDestIsSinkablePubkey(const minx::Hash& dest) {
+  for (int i = 0; i < 16; ++i)
+    if (dest[i] != 0) return true;
+  return false;
+}
+
 void CesServer::handleGossip(const CesGossip& req, const SockAddr& addr,
                              const MinxMessage& msg) {
   // Runs on logicStrand_: race-free dedup and all ledger touches on one thread.
@@ -4849,8 +4861,9 @@ void CesServer::handleGossip(const CesGossip& req, const SockAddr& addr,
     // the gossip is terminal. Drain the sender and credit `dest`'s account here,
     // no fan-out. Reply paid == skim so the sender mirrors only the toll (leg 1);
     // the delivered remainder has no leg 1. Deduped by msgId so a retransmit
-    // re-acks without re-draining.
-    if (req.dest != Hash{}) {
+    // re-acks without re-draining. A typed-broadcast dest (128 leading zero bits)
+    // is never a sink -> skip straight to the broadcast fan-out below.
+    if (gossipDestIsSinkablePubkey(req.dest)) {
       HashPrefix destPfx = Account::getMapKey(req.dest);
       auto sit = localSinkKeys_.find(destPfx);
       if (sit != localSinkKeys_.end() && sit->second.first == req.dest) {

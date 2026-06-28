@@ -59,7 +59,7 @@ inline void writeFile(const fs::path& p, const std::string& content) {
 // client networking (ces.ping / ces.file_client); 0 = local-only (no ports).
 inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
                          const std::string& name, const std::string& conf,
-                         uint16_t computePorts = 0) {
+                         uint16_t computePorts = 0, uint16_t mainPort = 0) {
   n.dir = makeUniqueTempDir("ext_" + std::to_string(idx));
   minx::Hash priv;
   priv.fill(static_cast<uint8_t>(0x41 + idx));
@@ -101,7 +101,7 @@ inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
   }
 
   n.server = std::make_unique<CesServer>(cfg);
-  n.mainPort = n.server->start(0);
+  n.mainPort = n.server->start(mainPort);
   BOOST_REQUIRE_MESSAGE(n.mainPort > 0, "node " << idx << " main bind failed");
   n.rpcPort = n.server->_rpcBoundPort();
   BOOST_REQUIRE_MESSAGE(n.rpcPort > 0, "node " << idx << " rpc bind failed");
@@ -123,6 +123,20 @@ inline int64_t balanceOnLedger(CesServer* s, const minx::Hash& pubkey) {
   s->unsignedQueryAccount(Account::getMapKey(pubkey), bal, nonce, dest,
                           lastAmt, lastTime);
   return bal;
+}
+
+// Fund a one-way gossip corridor `from` -> `to` with printed money (no mining):
+//  - `from` gets `to` as a reachable peer whose SETTLEMENT endpoint is `to`'s
+//    MAIN port (gossip rides the main/settlement port, not the rpc port), so a
+//    fan-out from `from` reaches `to`.
+//  - `to` is credited `from`'s reserve on its ledger, so `to` can COLLECT a
+//    gossip whose immediate sender is `from` (else it rejects as insufficient).
+inline void fundGossipCorridor(ExtNode& from, ExtNode& to, int64_t reserve) {
+  const auto v6lo =
+    boost::asio::ip::address(boost::asio::ip::address_v6::loopback());
+  from.server->_testAddPeerWithRpc(
+    to.pub, "[::1]:" + std::to_string(to.mainPort), v6lo, to.mainPort);
+  to.server->_brr(from.pub, reserve);
 }
 
 inline void stopExt(ExtNode& n) {

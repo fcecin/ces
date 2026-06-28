@@ -16,6 +16,17 @@ go unreachable are retried, given up after a few failures, and dropped.
 No mesh, no persistent connections: it is a periodic crawler built out
 of the same client primitives any program has.
 
+It can also PUSH itself: if `announce` is configured with the host's own
+address, discovery broadcasts it over CES_GOSSIP once on boot and every
+`announce_ms` (default 24h). Other discoveries that hear the announce
+`reg:hear` the address and validate it like any rumor. The announce rides
+a typed-broadcast dest (128 leading zero bits mark it "not a pubkey", the
+low bits a protocol id), so the gossip core floods it and on_gossip demuxes
+it. Gossip injects through funded corridors, so a brand-new zero-peer node
+still needs a `seeds` entry for its first peer; once it has one funded peer,
+self-announce reaches far beyond its direct peers (a reach-expander, not a
+cold boot). It complements peerfunder, which creates the funded corridors.
+
 The full design lives in the cesdk source tree (`apps/discovery/`); this file
 is the built single-file bundle the operator deploys.
 
@@ -108,6 +119,10 @@ probe_ms = 3000                # per-ping reply wait; lower to give up on dead
                                #   hosts faster (the ces.ping default is 3s)
 dead_after = 10                # failed re-validations before a host is dropped
 peer_min_credit = 100000000    # reserve floor (1.0 credit) to keep at each peer
+announce =                     # our own address to self-announce over gossip
+                               #   (empty = off); the operator's public host:port
+announce_ms = 86400000         # self-announce interval (24h); also once on boot
+announce_budget = 1000000      # gossip budget per announce (0.01 credit)
 ```
 
 `ces.pubcom.org:53830` is the built-in default seed (the `:53830`
