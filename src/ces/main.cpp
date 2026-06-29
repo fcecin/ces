@@ -139,6 +139,11 @@ peer_target = )" << DEFAULT_PEER_TARGET << R"(
 # 10000 = 1:1, 20000 = 2x, 5000 = half. Outbound peers ignore this.
 peer_pow_inbound_reciprocation_bps = )" << DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS << R"(
 
+# Peer-table size: peers persisted to disk and exposed to ces.peers(). The number
+# held in RAM is 3x this (headroom so grief-banned tombstones do not crowd out live
+# peers). Small values bound each node's candidate view; raise for larger meshes.
+max_peers = )" << DEFAULT_MAX_PEERS << R"(
+
 # Async settlement max retries per operation (1 = no retries, for testing)
 settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
 
@@ -378,6 +383,7 @@ int main(int argc, char* argv[]) {
   uint64_t optPeerTarget = DEFAULT_PEER_TARGET;
   uint64_t optPeerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
   int optPeerMinerInterval = DEFAULT_PEER_MINER_INTERVAL_SECS;
+  uint64_t optMaxPeers = DEFAULT_MAX_PEERS;
   int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
   uint64_t optMaxPeerReserveDisturbance = DEFAULT_MAX_PEER_RESERVE_DISTURBANCE;
   uint32_t optGossipFanoutDegree = DEFAULT_GOSSIP_FANOUT_DEGREE;
@@ -519,6 +525,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--peerminerinterval", optPeerMinerInterval,
       "Seconds between peer miner cycles (default 60; lower for local/dev)")
       ->default_val(std::to_string(DEFAULT_PEER_MINER_INTERVAL_SECS));
+    app.add_option("--maxpeers", optMaxPeers,
+      "Peer-table size (persisted/exposed; RAM holds 3x). Small bounds the view")
+      ->default_val(std::to_string(DEFAULT_MAX_PEERS));
     app.add_option("--settlementretries", optSettlementMaxRetries,
       "Async settlement max retries (1 = no retries)")
       ->default_val(std::to_string(CesClientAsync::DEFAULT_MAX_RETRIES));
@@ -750,6 +759,7 @@ int main(int argc, char* argv[]) {
                      "--peerpowinboundreciprocationbps");
       applyIfDefault("peer_miner_interval", optPeerMinerInterval,
                      "--peerminerinterval");
+      applyIfDefault("max_peers", optMaxPeers, "--maxpeers");
       applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
       applyIfDefault("max_peer_reserve_disturbance", optMaxPeerReserveDisturbance,
                      "--maxpeerreservedisturbance");
@@ -982,6 +992,7 @@ int main(int argc, char* argv[]) {
   config.peerTarget = optPeerTarget;
   config.peerPowInboundReciprocationBps = optPeerPowInboundReciprocationBps;
   config.peerMinerIntervalSecs = optPeerMinerInterval;
+  config.maxPeers = static_cast<size_t>(optMaxPeers < 1 ? 1 : optMaxPeers);
   config.settlementMaxRetries = optSettlementMaxRetries;
   config.maxPeerReserveDisturbance = optMaxPeerReserveDisturbance;
   config.gossipFanoutDegree = optGossipFanoutDegree;

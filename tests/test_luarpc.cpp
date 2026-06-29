@@ -199,6 +199,67 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
+// Regression: a program that opens a /ces/luarpc/1 endpoint and then returns (no
+// ces.conn.run()) makes the child reach static destruction on exit. That path used
+// to SEGV in ~ChannelMeter, which logs through an already-destroyed Boost.Log core
+// (static destruction order fiasco). The child must exit cleanly, never by a signal
+// -- asserted via the supervisor's crashedCount().
+BOOST_FIXTURE_TEST_CASE(InstanceCleanShutdownNoCrash, LuaRpcFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/exit.bin";
+  // set_listener opens the endpoint (so a ChannelMeter exists); the main chunk then
+  // returns, so the child exits and runs its static destructors.
+  const std::string src =
+    "ces.conn.set_listener({ on_open = function(c) end, "
+    "on_data = function(c, b) end, on_close = function(c) end })\n";
+  deploy(path, src);
+  const uint64_t id = launch(path);
+
+  // Drive the supervisor synchronously until it reaps the exited child. Bounded:
+  // the program has no run loop, so it exits promptly. testForceTick runs one
+  // supervisor pass (waitpid + accounting) on the CesPlex strand and blocks.
+  bool reaped = false;
+  for (int i = 0; i < 100 && !reaped; ++i) {
+    server->computeHandler()->testForceTick();
+    bool present = false;
+    for (const auto& s : server->computeHandler()->snapshot())
+      if (s.pid == id) { present = true; break; }
+    reaped = !present;
+    if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_REQUIRE_MESSAGE(reaped, "instance never exited / was reaped");
+  BOOST_CHECK_EQUAL(server->computeHandler()->crashedCount(), 0u);
+}
+
+// serverSign is /s/-gated: a NON-/s/ user program (here under /h/) must be DENIED, so a
+// malicious user program cannot forge a server-key attestation (the coalition's accountable
+// formation relies on this gate). The probe proves it both RAN and was denied: it transfers
+// 3 on the denied path and would transfer 7 if serverSign had returned a signature.
+BOOST_FIXTURE_TEST_CASE(ServerSignDeniedForUserProgram, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);   // beacon starts at 1
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/probe.bin";
+  const std::string src =
+    "local sig = ces.serverSign('forge-me')\n"
+    "if sig then ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "else ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 3) end\n"
+    "ces.run()\n";
+  const auto probePk = deploy(path, src);
+  server->_brr(probePk, 1'000'000'000);   // fund the probe's transfer
+  launch(path);
+
+  // Observe: beacon reaches 1 + 3 = 4 (denied path); a bypass would have made it 1 + 7.
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 4; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 4);   // ran AND was denied; 8 would mean the /s/ gate was bypassed
+}
+
 // Gossip consumer: a program that defines a global on_gossip receives flooded
 // messages, including ones THIS node originates itself (self-delivery). On
 // receipt the handler (a coroutine — it calls the yielding ces.transfer)

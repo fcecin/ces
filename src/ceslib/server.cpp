@@ -922,6 +922,7 @@ CesServer::CesServer(const CesConfig& config)
   // Seed the runtime peer target from config. The miner reads this atomic
   // (not cfg_.peerTarget) so the dashboard can change it live.
   peerTarget_.store(cfg_.peerTarget, std::memory_order_relaxed);
+  maxPeers_.store(cfg_.maxPeers < 1 ? 1 : cfg_.maxPeers, std::memory_order_relaxed);
   // Seed the live extension-funding rate from config (the dashboard sets it live
   // thereafter; the bucket reads this member, not cfg_). Start the bucket full so
   // a boot-configured budget is available immediately, like a dashboard set.
@@ -5068,6 +5069,9 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
   std::lock_guard lock(peerTableMutex_);
   for (auto& p : peerTable_) {
     if (p.ckey == ckey) {
+      // Banned: refuse to re-add or upgrade until the ban expires, so neither the
+      // peer maintenance nor an extension can resurrect a grief-banned peer.
+      if (p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil) return;
       // Address-claim policy. An UNVERIFIED entry's address is up for grabs:
       // whatever PoW spoke last wins (unverified claims brawl to the death, and
       // none is trusted while they do). But a VERIFIED address is STICKY — an
@@ -5113,16 +5117,20 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
   // comparing that against residents' accumulated PoW would lock every new peer
   // out forever. Outbound (operator-pinned) peers are never evicted; if every
   // slot is one, drop the newcomer.
-  if (inboundCredit > 0 && peerTable_.size() >= MAX_INMEM_PEERS) {
+  if (inboundCredit > 0 && peerTable_.size() >= maxInmemPeers()) {
+    const uint64_t nowSecs = minx::getSecsSinceEpoch();
     auto victim = peerTable_.end();
     for (auto it = peerTable_.begin(); it != peerTable_.end(); ++it) {
       if (it->outbound) continue;
+      // Never evict an active ban: the tombstone must outlive the newcomer, or the
+      // banned peer would be silently re-admitted.
+      if (it->bannedUntil != 0 && nowSecs < it->bannedUntil) continue;
       if (victim == peerTable_.end() ||
           it->totalInboundPoW < victim->totalInboundPoW)
         victim = it;
     }
     if (victim == peerTable_.end())
-      return;  // every slot is an operator-pinned outbound peer
+      return;  // every slot is outbound-pinned or an active ban
     peerTable_.erase(victim);
   }
   PeerEntry pe;
@@ -5156,7 +5164,9 @@ bool CesServer::_isPeerReachable(const minx::Hash& ckey) {
 bool CesServer::_isPeerByKey(const minx::Hash& ckey) {
   std::lock_guard lock(peerTableMutex_);
   for (const auto& p : peerTable_) {
-    if (p.ckey == ckey) return true;
+    if (p.ckey == ckey)
+      // A banned peer is not a peer: the bind gate rejects it.
+      return !(p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil);
   }
   return false;
 }
@@ -5171,10 +5181,22 @@ std::vector<PeerLinkTarget> CesServer::_peerLinkTargets() {
     // reconcile tears its link down; it reappears when reachable again.
     // This is the liveness signal that replaces a channel keepalive.
     if (!p.reachable) continue;
+    if (p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil) continue;
     PeerLinkTarget t;
     t.ckey = p.ckey;
     t.dialable = (p.rpcPort != 0) && !p.resolvedIP.is_unspecified();
-    if (t.dialable) t.endpoint = minx::SockAddr(p.resolvedIP, p.rpcPort);
+    if (t.dialable) {
+      // The rpc RUDP socket is IPv6 dual-stack (v6_only=false), so it reports a
+      // v4 peer's address in v4-mapped form (::ffff:a.b.c.d). Dial a v4 peer
+      // under that mapped form, else the outbound channel is keyed by the bare
+      // v4 address while the acceptor's bind reply arrives as ::ffff:..., the
+      // keys never match, and the handshake stalls (SYN delivered, reply lost).
+      auto ip = p.resolvedIP;
+      if (ip.is_v4())
+        ip = boost::asio::ip::make_address_v6(boost::asio::ip::v4_mapped,
+                                              ip.to_v4());
+      t.endpoint = minx::SockAddr(ip, p.rpcPort);
+    }
     out.push_back(t);
   }
   return out;
@@ -5214,6 +5236,20 @@ void CesServer::_testAddPeerWithRpc(const minx::Hash& ckey,
   pe.reachable = true;
   pe.outbound = true;
   peerTable_.push_back(pe);
+}
+
+void CesServer::_testCompletePeering(const minx::Hash& ckey, int64_t reserve,
+                                     uint64_t inboundPoW) {
+  std::lock_guard lock(peerTableMutex_);
+  for (auto& p : peerTable_) {
+    if (p.ckey == ckey) {
+      p.verified = true;
+      p.reachable = true;
+      p.ourBalanceThere = std::max(p.ourBalanceThere, reserve);
+      if (p.totalInboundPoW < inboundPoW) p.totalInboundPoW = inboundPoW;
+      return;
+    }
+  }
 }
 
 void CesServer::_mountCesPlexHandler(const std::string& proto,
@@ -5360,6 +5396,8 @@ std::vector<CesServer::PeerInfo> CesServer::_peerSnapshot() {
     pi.lastCheckTime = p.lastCheckTime;
     pi.pingFailures = p.pingFailures;
     pi.rpcPort = p.rpcPort;
+    pi.grief = p.grief;
+    pi.bannedUntil = p.bannedUntil;
     out.push_back(std::move(pi));
   }
   return out;
@@ -5404,10 +5442,78 @@ bool CesServer::_removePeer(const minx::Hash& ckey) {
   return removed;
 }
 
+uint32_t CesServer::griefPeer(const minx::Hash& ckey, uint32_t amount) {
+  if (amount == 0) amount = 1;
+  uint32_t result = 0;
+  bool banned = false;
+  {
+    std::lock_guard lock(peerTableMutex_);
+    for (auto& p : peerTable_) {
+      if (p.ckey != ckey) continue;
+      uint64_t now = minx::getSecsSinceEpoch();
+      if (p.bannedUntil != 0 && now >= p.bannedUntil) { p.grief = 0; p.bannedUntil = 0; }
+      p.grief += amount;
+      p.lastDecayTime = now;   // a fresh offense restarts the decay clock
+      if (cfg_.peerGriefBanThreshold != 0 && p.grief >= cfg_.peerGriefBanThreshold &&
+          p.bannedUntil == 0) {
+        p.bannedUntil = now + cfg_.peerBanSecs;
+        banned = true;
+      }
+      result = p.grief;
+      break;
+    }
+  }
+  if (banned) {
+    savePeerData();
+    LOGINFO << "peer banned for grief" << SVAR(minx::hashToString(ckey));
+  }
+  return result;
+}
+
+void CesServer::banPeer(const minx::Hash& ckey) {
+  // Conclusive evidence (an extension is certain, e.g. an incompatible params hash an
+  // honest peer cannot emit): ban immediately, not via the accumulating counter. The
+  // ban is enforced and lifted exactly like a grief ban (hidden from ces.peers(),
+  // refused at bind, not dialed, removed when it expires).
+  bool banned = false;
+  {
+    std::lock_guard lock(peerTableMutex_);
+    for (auto& p : peerTable_) {
+      if (p.ckey != ckey) continue;
+      if (p.bannedUntil == 0) {
+        p.bannedUntil = minx::getSecsSinceEpoch() + cfg_.peerBanSecs;
+        banned = true;
+      }
+      break;
+    }
+  }
+  if (banned) {
+    savePeerData();
+    LOGINFO << "peer banned (conclusive)" << SVAR(minx::hashToString(ckey));
+  }
+}
+
+Signature CesServer::serverSign(const uint8_t* data, size_t len) {
+  static constexpr char kAttestTag[] = "CES_EXT_ATTEST_V1";
+  constexpr size_t tagLen = sizeof(kAttestTag) - 1;
+  std::vector<uint8_t> buf;
+  buf.reserve(tagLen + len);
+  buf.insert(buf.end(), kAttestTag, kAttestTag + tagLen);
+  buf.insert(buf.end(), data, data + len);
+  minx::Hash digest = sha256(buf.data(), buf.size());
+  return serverKeyPair_.signData(std::span<const uint8_t>(digest.data(), digest.size()));
+}
+
 void CesServer::_setPeerTarget(uint64_t target) {
   peerTarget_.store(target);
   LOGINFO << "peer target set via admin" << VAR(target);
   if (target > 0) ensurePeerMinerStarted();
+}
+
+void CesServer::_setMaxPeers(size_t n) {
+  if (n < 1) n = 1;
+  maxPeers_.store(n);
+  LOGINFO << "max peers set via admin" << VAR(n);
 }
 
 CesServer::RemoteServerInfo CesServer::_inspectRemoteServer(
@@ -5671,6 +5777,7 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "peer_miner_interval = " << cfg_.peerMinerIntervalSecs << "\n";
     o << "peer_pow_inbound_reciprocation_bps = "
       << cfg_.peerPowInboundReciprocationBps << "\n";
+    o << "max_peers = " << maxPeers_.load() << "\n";
     o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n";
     o << "max_peer_reserve_disturbance = "
       << cfg_.maxPeerReserveDisturbance << "\n";
@@ -5822,16 +5929,22 @@ void CesServer::savePeerData() {
   std::lock_guard lock(peerTableMutex_);
   auto path = (cfg_.dataDir / "peerdata.toml").string();
 
-  // Sort by totalInboundPoW descending, take top 100
+  // Never persist a banned peer: the ban is RAM-only (a restart clears all bans),
+  // and writing it would either leave junk in the file or reload it as a live peer.
+  const uint64_t nowSecs = minx::getSecsSinceEpoch();
   auto sorted = peerTable_;
+  sorted.erase(std::remove_if(sorted.begin(), sorted.end(),
+    [&](const PeerEntry& p) { return p.bannedUntil != 0 && nowSecs < p.bannedUntil; }),
+    sorted.end());
+  // Sort by totalInboundPoW descending, take top 100
   std::sort(sorted.begin(), sorted.end(), [](const PeerEntry& a, const PeerEntry& b) {
     return a.totalInboundPoW > b.totalInboundPoW;
   });
-  if (sorted.size() > MAX_PERSISTED_PEERS) sorted.resize(MAX_PERSISTED_PEERS);
+  if (sorted.size() > maxPersistedPeers()) sorted.resize(maxPersistedPeers());
 
   try {
     std::ofstream f(path);
-    f << "# CES peer data (auto-generated, top MAX_PERSISTED_PEERS by inbound PoW)\n\n";
+    f << "# CES peer data (auto-generated, top peers by inbound PoW)\n\n";
     for (auto& pe : sorted) {
       f << "[[peers]]\n";
       f << "key = \"" << minx::hashToString(pe.ckey) << "\"\n";
@@ -5897,15 +6010,34 @@ void CesServer::peerMinerLoop() {
    // A background maintenance thread must never take the process down: any
    // error in a cycle is logged and the loop keeps going (next cycle retries).
    try {
-    // Evict peers with too many consecutive ping failures
+    // Peer-table maintenance: evict dead peers, drop expired bans, decay grief.
     {
       std::lock_guard lock(peerTableMutex_);
+      const uint64_t nowSecs = minx::getSecsSinceEpoch();
+      // A grief ban that has expired removes the peer outright: it re-enters fresh
+      // (grief 0) if it returns and is worth re-discovering, otherwise it is gone.
+      // Combined with the ping-failure eviction in one pass.
       auto it = std::remove_if(peerTable_.begin(), peerTable_.end(),
-        [](const PeerEntry& p) { return p.pingFailures >= PEER_EVICTION_THRESHOLD; });
+        [&](const PeerEntry& p) {
+          if (p.pingFailures >= PEER_EVICTION_THRESHOLD) return true;
+          if (p.bannedUntil != 0 && nowSecs >= p.bannedUntil) return true;
+          return false;
+        });
       if (it != peerTable_.end()) {
-        LOGINFO << "peer miner: evicting " << std::distance(it, peerTable_.end())
-                << " peer(s) with PEER_EVICTION_THRESHOLD+ ping failures";
+        LOGINFO << "peer miner: removing " << std::distance(it, peerTable_.end())
+                << " dead/ban-expired peer(s)";
         peerTable_.erase(it, peerTable_.end());
+      }
+      // Decay sub-threshold grief on the survivors. Never decay a banned peer (it is
+      // serving its ban); only decay a peer that has grief and is not banned.
+      for (auto& p : peerTable_) {
+        if (p.grief == 0 || p.bannedUntil != 0) continue;
+        if (p.lastDecayTime == 0) { p.lastDecayTime = nowSecs; continue; }
+        if (nowSecs <= p.lastDecayTime) continue;
+        uint64_t steps = (nowSecs - p.lastDecayTime) / PEER_GRIEF_DECAY_SECS;
+        if (steps == 0) continue;
+        p.grief = (steps >= p.grief) ? 0 : (p.grief - static_cast<uint32_t>(steps));
+        p.lastDecayTime += steps * PEER_GRIEF_DECAY_SECS;
       }
     }
 
@@ -5919,7 +6051,7 @@ void CesServer::peerMinerLoop() {
       [](const PeerEntry& a, const PeerEntry& b) {
         return a.totalInboundPoW > b.totalInboundPoW;
       });
-    if (candidates.size() > MAX_PERSISTED_PEERS) candidates.resize(MAX_PERSISTED_PEERS);
+    if (candidates.size() > maxPersistedPeers()) candidates.resize(maxPersistedPeers());
 
     // Two disjoint mining modes, selected by peer.outbound:
     //   outbound (trusted): maintain a CREDIT LEVEL — target = peerTarget,
@@ -5939,8 +6071,13 @@ void CesServer::peerMinerLoop() {
                                   + (hin % 10000) * inboundBps / 10000);
     };
     auto mineProgress = [](const PeerEntry& p) -> int64_t {
-      return p.outbound ? p.ourBalanceThere
-                        : static_cast<int64_t>(p.totalOutboundPoW);
+      // Outbound peering needs BOTH a credit reserve and a PoW stake at target;
+      // mine while either lags. Using min() means funding (peerfunder, a peer's
+      // bonus) can fill the reserve but cannot stand in for our PoW: a funded
+      // reserve with zero PoW still mines until the PoW reaches target.
+      return p.outbound
+          ? std::min(p.ourBalanceThere, static_cast<int64_t>(p.totalOutboundPoW))
+          : static_cast<int64_t>(p.totalOutboundPoW);
     };
 
     // Merge probe + mining results for every candidate we touched this round
@@ -6057,6 +6194,7 @@ void CesServer::peerMinerLoop() {
                     << " via signed server-info";
           }
         }
+
         if (!wasReachable || !everChecked) {
           LOGINFO << "peer miner: reachable " << peer.declaredAddress
                   << " verified=" << peer.verified;
@@ -6152,15 +6290,30 @@ void CesServer::peerMinerLoop() {
 
             // Mark "actively mining" only around the real PoW work, so the
             // dashboard can distinguish hashing from a merely-looping thread.
+            const uint64_t expectedHashes =
+                mineDiff < 64 ? (uint64_t{1} << mineDiff) : UINT64_MAX;
+            uint64_t chunkIters = expectedHashes / 64;
+            if (chunkIters < 256) chunkIters = 256;
+            if (chunkIters > (1u << 20)) chunkIters = 1u << 20;
             {
               std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
               peerMinerMining_ = true;
               peerMinerMiningPeer_ = peer.declaredAddress;
               peerMinerMiningDiff_ = mineDiff;
               peerMinerMiningStartSecs_ = minx::getSecsSinceEpoch();
+              peerMinerHashesTried_ = 0;
+              peerMinerExpectedHashes_ = expectedHashes;
             }
             auto mineT0 = std::chrono::steady_clock::now();
-            auto result = mineOnce(client, mineDiff - peerDiff, appData);
+            // Chunked search so the dashboard sees live hashes-tried during a
+            // long solve (a single solve at high difficulty can take minutes).
+            auto result = mineOnce(
+                client, mineDiff - peerDiff, appData, 1, nullptr,
+                [this](uint64_t tried) {
+                  std::lock_guard<std::mutex> lk(peerMinerActivityMutex_);
+                  peerMinerHashesTried_ = tried;
+                },
+                chunkIters);
             double mineSecs = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - mineT0).count();
             {
@@ -6175,6 +6328,8 @@ void CesServer::peerMinerLoop() {
                     ? 0.5 * peerMinerHashRate_ + 0.5 * rate
                     : rate;
               }
+              peerMinerHashesTried_ = 0;
+              peerMinerExpectedHashes_ = 0;
             }
             if (result.success) {
               LOGDEBUG << "peer miner: mined " << result.credit

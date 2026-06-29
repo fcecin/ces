@@ -188,9 +188,16 @@ struct MineResult {
 // interrupted (ces::notInterrupted). Calls statusCallback with the
 // proveWork return code on each submission attempt (may be called
 // from the same thread).
+//
+// If progressCallback is set and chunkIters > 0, the search runs in
+// chunkIters-sized nonce windows and progressCallback(hashesTried) fires after
+// each unsolved window, so a long solve can report live progress. With either
+// unset the search is a single unbounded call (the default; no progress).
 MineResult mineOnce(CesClient& client, int extraDifficulty = 1,
                     const std::map<std::string, std::string>& appData = {},
                     int numThreads = 1,
-                    std::function<void(int)> statusCallback = nullptr);
+                    std::function<void(int)> statusCallback = nullptr,
+                    std::function<void(uint64_t)> progressCallback = nullptr,
+                    uint64_t chunkIters = 0);
 
 } // namespace ces

@@ -393,9 +393,12 @@ BOOST_AUTO_TEST_CASE(OnDataIsAYieldingCoroutine) {
 //     would never get past it;
 //   * an inbound on_data answering WHILE the tick is parked proves the timer no
 //     longer freezes the VM (the whole point of Item 1);
-//   * `entered` staying at 1 across the ~40 re-fires that come due during one
-//     800ms park proves skip-if-busy (a long tick never laps itself).
+//   * `entered` staying at 1 across the many re-fires that come due during one
+//     long park proves skip-if-busy (a long tick never laps itself).
 // The program replies [entered][exited] as two ascii digits to each conn write.
+// The park is deliberately long (seconds) so probe 1 lands inside the first park
+// regardless of how long the attach handshake takes under load; the property under
+// test is order-of-events, not wall-clock, so a generous margin removes the race.
 BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   const std::string scriptPath =
     "/h/" + ownerKey.getPublicKeyHexStr() + "/h_timer.lua";
@@ -403,7 +406,7 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
     "local entered, exited = 0, 0\n"
     "ces.every(20, function()\n"
     "  entered = entered + 1\n"
-    "  ces.sleep(800)\n"            // long park; the 20ms re-fires must be skipped
+    "  ces.sleep(3000)\n"           // long park; the 20ms re-fires must be skipped
     "  exited = exited + 1\n"
     "end)\n"
     "ces.conn.set_listener({\n"
@@ -434,9 +437,9 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   BOOST_REQUIRE(peerReadExact(peer, g1, 2, std::chrono::seconds(5)));
   BOOST_CHECK_EQUAL(std::string(g1.begin(), g1.end()), "10");
 
-  // Wait past the full 800ms park (the tick was already in flight at probe 1,
-  // so 900ms guarantees it resumed past ces.sleep and a later tick has begun).
-  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+  // Wait past the full 3000ms park (the tick was already in flight at probe 1,
+  // so 3300ms guarantees it resumed past ces.sleep and a later tick has begun).
+  std::this_thread::sleep_for(std::chrono::milliseconds(3300));
 
   // Probe 2: exited incremented -> the body resumed past ces.sleep (a real
   // coroutine); entered advanced -> the timer kept ticking after the long one.

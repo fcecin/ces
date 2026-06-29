@@ -4,9 +4,11 @@
 #include <ces/util/resolver.h>
 #include <ces/util/fileperm.h>
 
+#include <chrono>
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <optional>
 
 #include <minx/blog.h>
 
@@ -334,10 +336,41 @@ ClientSession::~ClientSession() {
 MineResult mineOnce(CesClient& client, int extraDifficulty,
                     const std::map<std::string, std::string>& appData,
                     int numThreads,
-                    std::function<void(int)> statusCallback) {
-  auto w = client.mine(extraDifficulty, appData, numThreads);
-  if (!w)
-    return {false, 0, -1};
+                    std::function<void(int)> statusCallback,
+                    std::function<void(uint64_t)> progressCallback,
+                    uint64_t chunkIters) {
+  std::optional<minx::MinxProveWork> w;
+  if (progressCallback && chunkIters > 0) {
+    // Bounded-window search so a long solve reports live progress. mine()
+    // returns nullopt when a window is exhausted (continue, next window) OR on a
+    // ticket/engine failure (returns ~instantly without hashing); distinguish by
+    // the call's wall time and bail after a few instant failures.
+    // MinxProveWork is move-constructible but not move-assignable (const member),
+    // so populate the optional with emplace (construction), never assignment.
+    uint64_t nonce = 0;
+    int instantFails = 0;
+    while (ces::notInterrupted()) {
+      auto t0 = std::chrono::steady_clock::now();
+      auto found = client.mine(extraDifficulty, appData, numThreads, nonce,
+                               chunkIters);
+      if (found) { w.emplace(std::move(*found)); break; }
+      double secs = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - t0).count();
+      if (secs < 0.02) {
+        if (++instantFails >= 5) return {false, 0, -1};
+      } else {
+        instantFails = 0;
+        nonce += chunkIters;
+        progressCallback(nonce);
+      }
+    }
+    if (!w) return {false, 0, 0};
+  } else {
+    auto found = client.mine(extraDifficulty, appData, numThreads);
+    if (!found)
+      return {false, 0, -1};
+    w.emplace(std::move(*found));
+  }
 
   int attempts = 0;
   while (ces::notInterrupted()) {

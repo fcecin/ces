@@ -75,7 +75,10 @@ ChannelMeter::~ChannelMeter() {
     boost::system::error_code ec;
     timer_->cancel(ec);
   }
-  LOGINFO << "ChannelMeter stopped";
+  // No logging here. This destructor can run during static destruction (its owner
+  // is a file-scope global in cesluajitd's luarpc endpoint), after Boost.Log's core
+  // is already destroyed, which would SEGV. Lifecycle is visible from the matching
+  // construction log instead.
 }
 
 void ChannelMeter::track(const minx::SockAddr& peer, uint32_t channelId,

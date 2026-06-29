@@ -280,6 +280,9 @@ constexpr uint16_t METHOD_PEER_REMOVE      = 0x0232;
 constexpr uint16_t METHOD_PEER_TARGET_SET  = 0x0233;
 constexpr uint16_t METHOD_PEER_TARGET_GET  = 0x0234;
 constexpr uint16_t METHOD_REQUEST_FUNDS    = 0x0235;
+constexpr uint16_t METHOD_PEER_GRIEF       = 0x0236;
+constexpr uint16_t METHOD_PEER_BAN         = 0x0237;
+constexpr uint16_t METHOD_SERVER_SIGN      = 0x0238;
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
@@ -1168,6 +1171,48 @@ int lua_ces_verify(lua_State* L) {
   } catch (...) {
     // A malformed pubkey or signature must verify as false, never throw
     // through LuaJIT.
+    ok = false;
+  }
+  lua_pushboolean(L, ok ? 1 : 0);
+  return 1;
+}
+
+// The reserved domain tag for ces.serverSign / ces.serverVerify. MUST match
+// CesServer::serverSign in src/ceslib/server.cpp byte-for-byte: the signer (CES core)
+// and the verifier (here) live in different processes, so the tag is duplicated and
+// the two must agree. Signing hashes SHA256(tag || bytes); verify mirrors it.
+constexpr char kExtAttestTag[] = "CES_EXT_ATTEST_V1";
+
+// ces.serverVerify(server_pubkey(32), bytes, sig(65)) -> bool. Verifies a server-key
+// attestation produced by ces.serverSign on some server. Pure local crypto (no host
+// round-trip): apply the same domain tag, hash, and verify against the claimed server
+// pubkey. The 32-byte digest is passed to verifySignature directly (it treats a
+// 32-byte input as the message digest), matching the host's tagged-digest signing.
+int lua_ces_server_verify(lua_State* L) {
+  size_t pkn = 0, dn = 0, sn = 0;
+  const char* pk = luaL_checklstring(L, 1, &pkn);
+  const char* data = luaL_checklstring(L, 2, &dn);
+  const char* sigs = luaL_checklstring(L, 3, &sn);
+  if (pkn != 32 || sn != ces::SIG_SIZE) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  Sha256Ctx c;
+  sha256_init(c);
+  sha256_update(c, reinterpret_cast<const uint8_t*>(kExtAttestTag),
+                sizeof(kExtAttestTag) - 1);
+  sha256_update(c, reinterpret_cast<const uint8_t*>(data), dn);
+  uint8_t digest[32];
+  sha256_final(c, digest);
+  ces::Hash pkh{};
+  std::memcpy(pkh.data(), pk, 32);
+  ces::PublicKey pub(pkh);
+  ces::Signature sig{};
+  std::memcpy(sig.data(), sigs, ces::SIG_SIZE);
+  bool ok = false;
+  try {
+    ok = pub.verifySignature(reinterpret_cast<const char*>(digest), 32, sig);
+  } catch (...) {
     ok = false;
   }
   lua_pushboolean(L, ok ? 1 : 0);
@@ -2449,6 +2494,71 @@ int lua_ces_remove_peer(lua_State* L) {
   if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
   lua_pushboolean(L, reply.body.size() >= 2 && reply.body[1] != 0);
   return 1;
+  });
+}
+
+// ces.grief_peer(pubkey(32) [, amount]) -> true | nil,err. Raise a peer's grief in
+// the C++ peer table by `amount` (default 1 = confidence in the offense); the C++
+// side bans the peer once grief crosses the threshold and decays it otherwise.
+int lua_ces_grief_peer(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L); lua_pushstring(L, "peer pubkey must be 32 bytes"); return 2;
+  }
+  lua_Integer amt = luaL_optinteger(L, 2, 1);
+  if (amt < 1) amt = 1;
+  if (amt > 0xFFFFFFFF) amt = 0xFFFFFFFF;
+  std::vector<uint8_t> args;
+  put_bytes(args, pk, 32);
+  put_u32(args, static_cast<uint32_t>(amt));
+  return io_call(L, METHOD_PEER_GRIEF, args, [](lua_State* L, const Frame& reply) -> int {
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  lua_pushboolean(L, 1);
+  return 1;
+  });
+}
+
+// ces.ban_peer(pubkey(32)) -> true | nil,err. Ban a peer immediately on conclusive
+// evidence (bypasses the accumulating grief counter), e.g. a params hash an honest
+// peer cannot produce. For uncertain evidence use ces.grief_peer instead.
+int lua_ces_ban_peer(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L); lua_pushstring(L, "peer pubkey must be 32 bytes"); return 2;
+  }
+  std::vector<uint8_t> args;
+  put_bytes(args, pk, 32);
+  return io_call(L, METHOD_PEER_BAN, args, [](lua_State* L, const Frame& reply) -> int {
+  uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  lua_pushboolean(L, 1);
+  return 1;
+  });
+}
+
+// ces.serverSign(bytes) -> sig(65) | nil,err. Sign `bytes` with the SERVER key for a
+// privileged /s/ extension. The server private key never enters the sandbox: the host
+// (CES core) applies the reserved domain tag, hashes SHA256(tag || bytes), signs, and
+// returns only the signature. Denied (nil) for a non-/s/ program. Pairs with
+// ces.serverVerify. Used by formation to make a relayed attestation attributable to
+// the member's server identity.
+int lua_ces_server_sign(lua_State* L) {
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  std::vector<uint8_t> args;
+  put_bytes(args, s, n);
+  return io_call(L, METHOD_SERVER_SIGN, args, [](lua_State* L, const Frame& reply) -> int {
+    uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
+    if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+    if (reply.body.size() != 1 + ces::SIG_SIZE) {
+      lua_pushnil(L); lua_pushstring(L, "internal"); return 2;
+    }
+    lua_pushlstring(L, reinterpret_cast<const char*>(reply.body.data() + 1),
+                    ces::SIG_SIZE);
+    return 1;
   });
 }
 
@@ -5450,6 +5560,8 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_log>);           lua_setfield(L, -2, "log");
   lua_pushcfunction(L, guarded<lua_ces_sign>);          lua_setfield(L, -2, "sign");
   lua_pushcfunction(L, guarded<lua_ces_verify>);        lua_setfield(L, -2, "verify");
+  lua_pushcfunction(L, guarded<lua_ces_server_sign>);   lua_setfield(L, -2, "serverSign");
+  lua_pushcfunction(L, guarded<lua_ces_server_verify>); lua_setfield(L, -2, "serverVerify");
   lua_pushcfunction(L, guarded<lua_ces_every>);         lua_setfield(L, -2, "every");
   lua_pushcfunction(L, guarded<lua_ces_cancel>);        lua_setfield(L, -2, "cancel");
   lua_pushcfunction(L, guarded<lua_ces_spawn>);         lua_setfield(L, -2, "spawn");
@@ -5480,6 +5592,8 @@ void install_ces_api(lua_State* L) {
   if (g_privileged) {
     lua_pushcfunction(L, guarded<lua_ces_add_peer>);        lua_setfield(L, -2, "add_peer");
     lua_pushcfunction(L, guarded<lua_ces_remove_peer>);     lua_setfield(L, -2, "remove_peer");
+    lua_pushcfunction(L, guarded<lua_ces_grief_peer>);      lua_setfield(L, -2, "grief_peer");
+    lua_pushcfunction(L, guarded<lua_ces_ban_peer>);        lua_setfield(L, -2, "ban_peer");
     lua_pushcfunction(L, guarded<lua_ces_set_peer_target>); lua_setfield(L, -2, "set_peer_target");
     lua_pushcfunction(L, guarded<lua_ces_peer_target>);     lua_setfield(L, -2, "peer_target");
   }
@@ -5728,14 +5842,22 @@ int main(int argc, char** argv) {
     lua_close(L);
     return 1;
   }
+  int rc = 0;
   if (lua_pcall(L, 0, 0, 0) != 0) {
     host_log(4, std::string("run failed: ") + lua_err_str(L));
-    lua_close(L);
-    return 1;
+    rc = 1;
   }
   g_pool_main.shutdown();
   g_pool_client.shutdown();
+  // Tear down the lazily-opened /ces/luarpc/1 endpoint and its host HERE, while the
+  // asio runtime and Boost.Log are still alive. As file-scope globals they would
+  // otherwise be destroyed at static-destruction time, where ~CesPlexEndpoint ->
+  // ~ChannelMeter logs through an already-destroyed Boost.Log core and SEGVs on exit
+  // (static destruction order fiasco). reset() is a no-op if the endpoint never opened.
+  g_luarpc_meter = nullptr;
+  g_luarpc_endpoint.reset();
+  g_luarpc_host.reset();
   if (g_luarpc_wakefd >= 0) { ::close(g_luarpc_wakefd); g_luarpc_wakefd = -1; }
   lua_close(L);
-  return 0;
+  return rc;
 }

@@ -183,6 +183,11 @@ public:
   uint16_t testInstanceClientPort(uint64_t pid);
   uint16_t testInstanceRpcPort(uint64_t pid);
 
+  // Count of child instances that terminated by a signal (a crash, e.g. SIGSEGV
+  // on a bad shutdown). Surfaced in the supervisor WARNING; lets a test assert
+  // an instance shut down cleanly.
+  std::size_t crashedCount() const { return crashedInstances_.load(); }
+
   // Per-server supervisor state. Public so this translation unit's free
   // helpers reach it via server->computeHandler(); not a stable API.
   CesServer* server_ = nullptr;
@@ -199,6 +204,7 @@ public:
   std::atomic<bool> tickRunning_{false};
   std::atomic<int> fundingInFlight_{0};
   std::atomic<bool> stopped_{false};
+  std::atomic<std::size_t> crashedInstances_{0};
 };
 
 // Test hook: reads CPU ticks (utime + stime from /proc/<pid>/stat) and

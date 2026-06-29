@@ -66,6 +66,30 @@ constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB = 100;
 constexpr uint64_t DEFAULT_PEER_TARGET     = 500000000;  // 5 full credits; 0 = no peering
 constexpr uint64_t DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS = 0;
 constexpr int      DEFAULT_PEER_MINER_INTERVAL_SECS  = 60;
+constexpr uint32_t DEFAULT_PEER_GRIEF_BAN_THRESHOLD  = 20;      // grief points to ban
+constexpr uint64_t DEFAULT_PEER_BAN_SECS             = 604800;  // 1 week. Post-decision
+                                                               // only (does not affect the
+                                                               // detector); a threshold-
+                                                               // crossing peer is excluded
+                                                               // regardless of intent, and
+                                                               // removal-on-expiry + a large
+                                                               // peer population make a long
+                                                               // ban free, so set it long.
+constexpr uint64_t PEER_GRIEF_DECAY_SECS             = 86400;   // 1 day to shed 1 grief
+                                                               // point (forgiveness; never
+                                                               // applied to a banned peer).
+                                                               // Relaxed to the L2 timescale:
+                                                               // a coalition griefs a
+                                                               // withholder on the order of
+                                                               // once an hour, so the decay
+                                                               // must be slower than that for
+                                                               // sustained grief to ban.
+constexpr size_t   DEFAULT_MAX_PEERS                 = 100;     // peer-table size: peers
+                                                               // persisted/exposed. In-mem
+                                                               // hard cap is 3x for ban-
+                                                               // tombstone headroom. Small
+                                                               // values bound the candidate
+                                                               // view (useful for testing).
 constexpr uint64_t DEFAULT_MAX_PEER_RESERVE_DISTURBANCE = 100'000;
 constexpr uint32_t DEFAULT_GOSSIP_FANOUT_DEGREE      = 6;
 constexpr size_t   DEFAULT_PRESENCE_CACHE_SIZE       = 250'000;
@@ -142,6 +166,15 @@ struct CesConfig {
   // PoW received. 0 = off. 10000 = 1:1. Outbound peers ignore it (use peerTarget).
   uint64_t peerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
   int peerMinerIntervalSecs = DEFAULT_PEER_MINER_INTERVAL_SECS;
+  // Grief/ban: an extension raises a peer's grief via ces.grief_peer; at the
+  // threshold the C++ side bans it for peerBanSecs (hidden from ces.peers(),
+  // refused at bind, not dialed, not re-added). 0 threshold disables the ban.
+  uint32_t peerGriefBanThreshold = DEFAULT_PEER_GRIEF_BAN_THRESHOLD;
+  uint64_t peerBanSecs = DEFAULT_PEER_BAN_SECS;
+  // Peer-table size: peers persisted to disk and exposed to ces.peers(). The in-memory
+  // hard cap is 3x this (ban-tombstone headroom). Small values bound each node's
+  // candidate view, which is what makes larger-scale formation testable.
+  size_t maxPeers = DEFAULT_MAX_PEERS;
   std::vector<PeerConfig> peers;
   int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
 
@@ -717,6 +750,14 @@ public:
                            const boost::asio::ip::address& ip,
                            uint16_t rpcPort);
 
+  // TEST-ONLY (`_`-prefixed). Marks an existing peer as fully reciprocated
+  // (reserve held, inbound PoW proved, verified), as a completed mining cycle
+  // would, so an in-process test drives the discovery/clusterer/coalition stack
+  // without RandomX. No production path reaches this: real reciprocation comes
+  // only from the peer miner.
+  void _testCompletePeering(const minx::Hash& ckey, int64_t reserve,
+                            uint64_t inboundPoW);
+
   // TEST-ONLY (`_`-prefixed). Mounts an arbitrary CesPlex handler object on
   // the live bus, for tests that exercise a non-core handler (e.g. echo).
   // This is NOT a production extension point: prod handlers are mounted only
@@ -836,6 +877,8 @@ public:
     uint64_t lastCheckTime = 0;
     uint32_t pingFailures = 0;
     uint16_t rpcPort = 0;   // peer's CesPlex rpc port (0 = not yet probed)
+    uint32_t grief = 0;         // L2-reported grief (ces.grief_peer)
+    uint64_t bannedUntil = 0;   // unix seconds; 0 = not banned
   };
   // Author and fan out a gossip from this server (no client, no ticket).
   // Returns the amount actually fanned out; the caller may refund budget minus
@@ -879,6 +922,21 @@ public:
   // Remove a peer entirely. Returns true if an entry was erased.
   bool _removePeer(const minx::Hash& ckey);
 
+  // Raise a peer's grief by `amount` (called by extensions via ces.grief_peer).
+  // At peerGriefBanThreshold the peer is banned for peerBanSecs. An expired ban is
+  // reset here before the new grief is applied. Returns the resulting grief.
+  uint32_t griefPeer(const minx::Hash& ckey, uint32_t amount);
+
+  // Ban a peer immediately on conclusive evidence (bypasses the accumulating counter).
+  void banPeer(const minx::Hash& ckey);
+
+  // Sign `data` with the server key for a privileged /s/ extension (ces.serverSign).
+  // The host applies a reserved domain tag and hashes, so the signed message is always
+  // SHA256(tag || data): an extension attestation can never collide with another
+  // server-key op, and a 32-byte payload cannot be a raw pre-image of one. The server
+  // private key never leaves C++.
+  Signature serverSign(const uint8_t* data, size_t len);
+
   // Test seams: drive the inbound-PoW peer-table path (inboundCredit > 0) and set
   // the verified flag, so the address-claim policy (a verified address is sticky
   // against an unsigned inbound claim; unverified entries are freely overwritten)
@@ -900,6 +958,8 @@ public:
   // is runtime-only — it does not rewrite the TOML, so it resets on restart.
   uint64_t _peerTarget() const { return peerTarget_.load(); }
   void _setPeerTarget(uint64_t target);
+  size_t _maxPeers() const { return maxPeers_.load(); }
+  void _setMaxPeers(size_t n);
   bool _peerMinerRunning() const { return peerMinerRunning_.load(); }
   // Peer miner heartbeat for the dashboard: unix seconds of the last completed
   // cycle (0 = never), and a cumulative cycle count.
@@ -914,11 +974,14 @@ public:
     uint8_t difficulty = 0;
     uint64_t startSecs = 0;   // unix secs this solve began (0 = not mining)
     double hashRate = 0.0;    // smoothed H/s from completed solves (0 = unknown)
+    uint64_t hashesTried = 0; // hashes tried so far in the current solve (live)
+    uint64_t expectedHashes = 0; // 2^difficulty: mean hashes for one solution
   };
   PeerMinerActivity _peerMinerActivity() const {
     std::lock_guard<std::mutex> lock(peerMinerActivityMutex_);
     return {peerMinerMining_, peerMinerMiningPeer_, peerMinerMiningDiff_,
-            peerMinerMiningStartSecs_, peerMinerHashRate_};
+            peerMinerMiningStartSecs_, peerMinerHashRate_,
+            peerMinerHashesTried_, peerMinerExpectedHashes_};
   }
 
   // Export the current effective server config (knobs, with the LIVE runtime
@@ -1749,6 +1812,16 @@ private:
     bool outbound = false;
     uint32_t pingFailures = 0;
     uint16_t rpcPort = 0;   // peer's CesPlex rpc port, learned at probe time
+    // Grief: raised by extensions (ces.grief_peer, amount = confidence) when a peer
+    // misbehaves at L2. The peer maintenance pass decays it toward 0 (PEER_GRIEF_DECAY_SECS
+    // per point) while the peer is well-behaved, so a one-off does not accumulate; only a
+    // sustained pattern outruns the decay. At peerGriefBanThreshold the C++ side bans the
+    // peer until bannedUntil: hidden from ces.peers(), refused at the bind gate, not
+    // dialed, not re-added. A banned peer's grief never decays; when the ban expires the
+    // maintenance pass removes the peer outright (it re-enters fresh if it returns).
+    uint32_t grief = 0;
+    uint64_t bannedUntil = 0;   // unix seconds; 0 = not banned
+    uint64_t lastDecayTime = 0; // unix seconds; decay clock, reset on each grief increment
   };
 
   std::mutex peerTableMutex_;
@@ -1760,8 +1833,11 @@ private:
   static constexpr uint64_t DEDUP_WINDOW_US = CES_NONCELESS_DEDUP_WINDOW_US;
   static constexpr uint64_t DEDUP_FUTURE_DRIFT_US = 300ULL * 1000000;
 
-  static constexpr size_t MAX_PERSISTED_PEERS = 100;
-  static constexpr size_t MAX_INMEM_PEERS = 2 * MAX_PERSISTED_PEERS;
+  // Peer-table caps, driven by the runtime-settable maxPeers_ (seeded from cfg_.maxPeers).
+  // The persisted/exposed cap is maxPeers; the in-mem hard cap is 3x, headroom so
+  // grief-banned tombstones (held until their ban expires) do not crowd out live peers.
+  size_t maxPersistedPeers() const { return maxPeers_.load(); }
+  size_t maxInmemPeers() const { return 3 * maxPeers_.load(); }
   static constexpr uint32_t PEER_EVICTION_THRESHOLD = 5000;
 
   // Peer management
@@ -1780,6 +1856,7 @@ private:
   // so the miner thread is created exactly once even if peering is turned on
   // at runtime from a server that booted with target 0.
   std::atomic<uint64_t> peerTarget_{0};
+  std::atomic<size_t> maxPeers_{DEFAULT_MAX_PEERS};
   void ensurePeerMinerStarted();
 
   // Peer miner heartbeat — unix seconds of the last completed cycle and a
@@ -1796,6 +1873,8 @@ private:
   uint8_t peerMinerMiningDiff_ = 0;
   uint64_t peerMinerMiningStartSecs_ = 0;  // when the current solve began
   double peerMinerHashRate_ = 0.0;         // EMA H/s from completed solves
+  uint64_t peerMinerHashesTried_ = 0;      // live hashes tried in current solve
+  uint64_t peerMinerExpectedHashes_ = 0;   // 2^difficulty for current solve
 
   // Auto-nonce dedup table
   std::mutex dedupMutex_;

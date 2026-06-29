@@ -369,6 +369,26 @@ std::vector<std::string> hostIpList() {
   return normal;
 }
 
+// Emit the peer-miner activity fields (leading commas, appended to an open JSON
+// object). Shared by /api/status (header bar) and /api/peers so the two cannot
+// drift. miningElapsedSecs is now-startSecs, only while actively mining.
+void appendMinerActivityJson(std::ostream& o, CesServer& s) {
+  auto act = s._peerMinerActivity();
+  uint64_t now = minx::getSecsSinceEpoch();
+  uint64_t elapsed = (act.mining && act.startSecs && now >= act.startSecs)
+                         ? (now - act.startSecs) : 0;
+  o << ",\"minerRunning\":" << (s._peerMinerRunning() ? "true" : "false")
+    << ",\"lastCycle\":" << s._peerMinerLastCycle()
+    << ",\"cycles\":" << s._peerMinerCycles()
+    << ",\"miningActive\":" << (act.mining ? "true" : "false")
+    << ",\"miningPeer\":" << jstr(act.peer)
+    << ",\"miningDifficulty\":" << static_cast<int>(act.difficulty)
+    << ",\"miningElapsedSecs\":" << elapsed
+    << ",\"hashRate\":" << static_cast<uint64_t>(act.hashRate)
+    << ",\"hashesTried\":" << act.hashesTried
+    << ",\"expectedHashes\":" << act.expectedHashes;
+}
+
 std::string buildStatus(CesServer& s) {
   const CesConfig& c = s._config();
   auto stats = s._adminStats();
@@ -414,7 +434,7 @@ std::string buildStatus(CesServer& s) {
     << ",\"powReady\":" << (s.isPoWEngineReady() ? "true" : "false") << "}";
   o << ",\"peerCount\":" << s._peerSnapshot().size();
   o << ",\"peerTarget\":" << s._peerTarget();
-  o << ",\"minerRunning\":" << (s._peerMinerRunning() ? "true" : "false");
+  appendMinerActivityJson(o, s);
   o << ",\"hello\":" << jstr(s._getHello());
   o << "}";
   return o.str();
@@ -422,7 +442,6 @@ std::string buildStatus(CesServer& s) {
 
 std::string buildPeers(CesServer& s) {
   auto peers = s._peerSnapshot();
-  auto act = s._peerMinerActivity();
   // The vostro half of each pair: the peer's account on THIS server (what we owe
   // them). Looked up from the ledger, not the peer table.
   std::vector<minx::Hash> peerKeys;
@@ -431,21 +450,18 @@ std::string buildPeers(CesServer& s) {
   auto vostro = s._peerVostroBalances(peerKeys);
   std::ostringstream o;
   o << "{\"target\":" << s._peerTarget()
-    << ",\"minerRunning\":" << (s._peerMinerRunning() ? "true" : "false")
-    << ",\"lastCycle\":" << s._peerMinerLastCycle()
-    << ",\"cycles\":" << s._peerMinerCycles()
-    << ",\"miningActive\":" << (act.mining ? "true" : "false")
-    << ",\"miningPeer\":" << jstr(act.peer)
-    << ",\"miningDifficulty\":" << static_cast<int>(act.difficulty)
-    << ",\"miningElapsedSecs\":"
-    << ((act.mining && act.startSecs &&
-         minx::getSecsSinceEpoch() >= act.startSecs)
-            ? (minx::getSecsSinceEpoch() - act.startSecs) : 0)
-    << ",\"hashRate\":" << static_cast<uint64_t>(act.hashRate)
-    << ",\"peers\":[";
+    << ",\"maxPeers\":" << s._maxPeers();
+  appendMinerActivityJson(o, s);
+  o << ",\"peers\":[";
+  bool first = true;
   for (size_t i = 0; i < peers.size(); ++i) {
     const auto& p = peers[i];
-    if (i) o << ",";
+    // A banned peer is a RAM-only tombstone; it is hidden everywhere else
+    // (ces.peers(), dial, bind), so omit it from the dashboard too. The maintenance
+    // pass removes it when the ban expires.
+    if (p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil) continue;
+    if (!first) o << ",";
+    first = false;
     o << "{\"key\":" << jstr(hexOfHash(p.ckey))
       << ",\"address\":" << jstr(p.declaredAddress)
       << ",\"resolvedIP\":" << jstr(p.resolvedIP)
@@ -459,7 +475,8 @@ std::string buildPeers(CesServer& s) {
       << ",\"totalOutboundPoW\":" << p.totalOutboundPoW
       << ",\"lastInboundTime\":" << p.lastInboundTime
       << ",\"lastCheckTime\":" << p.lastCheckTime
-      << ",\"pingFailures\":" << p.pingFailures;
+      << ",\"pingFailures\":" << p.pingFailures
+      << ",\"grief\":" << p.grief;
     // /ces/peer/1 mesh link state: "up" if a channel is live now; "down"
     // if the peer is dialable (advertises a plex port) but unlinked;
     // "none" if it advertises no plex port (the mesh can't reach it).
@@ -1041,6 +1058,17 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
       return;
     }
 
+    if (path == "/api/max_peers") {
+      uint64_t n = 0;
+      if (!parseU64(getParam(form, "max_peers"), n) || n < 1) {
+        respondJson("{\"error\":\"max_peers must be a positive integer\"}");
+        return;
+      }
+      server_._setMaxPeers(static_cast<size_t>(n));
+      respondJson("{\"ok\":true,\"message\":\"max peers set\"}");
+      return;
+    }
+
     if (path == "/api/config_export") {
       std::string err;
       std::string p = server_._exportConfig(&err);
@@ -1490,6 +1518,7 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
     <span class="ky" id="srvKey" title="click to copy">&hellip;</span>
   </div>
   <div class="spacer"></div>
+  <span class="pill" id="minerState"></span>
   <span class="pill" id="srvPorts">&hellip;</span>
   <span class="pill" id="srvVer"></span>
   <span class="pill" id="upPill">up &hellip;</span>
@@ -1523,14 +1552,27 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
 
   <!-- PEERS -->
   <section class="panel" id="panel-peers">
-    <div class="section">
+    <div class="row" style="align-items:stretch;gap:14px;flex-wrap:wrap;margin-bottom:18px">
+    <div class="section" style="flex:1;min-width:300px;margin:0">
       <h2>Peering target <span class="sub">credits to maintain on each outbound peer</span></h2>
       <div class="row" style="align-items:center">
         <input type="number" id="peerTarget" class="addr" min="0" step="any" placeholder="credits, e.g. 0.5">
         <button class="green" id="setTargetBtn" onclick="setTarget()">Set target</button>
-        <span class="muted">current: <b id="curTarget" class="mono">&mdash;</b></span>
-        <span id="minerState" class="pill"></span>
       </div>
+      <div class="row" style="align-items:center;margin-top:8px">
+        <span class="muted">current: <b id="curTarget" class="mono">&mdash;</b></span>
+      </div>
+    </div>
+    <div class="section" style="flex:1;min-width:300px;margin:0">
+      <h2>Peer table size <span class="sub">peers kept and exposed; RAM holds 3x this</span></h2>
+      <div class="row" style="align-items:center">
+        <input type="number" id="maxPeers" class="addr" min="1" step="1" placeholder="e.g. 100">
+        <button class="green" id="setMaxPeersBtn" onclick="setMaxPeers()">Set size</button>
+      </div>
+      <div class="row" style="align-items:center;margin-top:8px">
+        <span class="muted">current: <b id="curMaxPeers" class="mono">&mdash;</b></span>
+      </div>
+    </div>
     </div>
     <div class="section">
       <h2>Add an outbound peer</h2>
@@ -1750,15 +1792,17 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
 
   <!-- CONFIG -->
   <section class="panel" id="panel-config">
-    <div class="section">
+    <div class="row" style="align-items:stretch;gap:14px;flex-wrap:wrap;margin-bottom:18px">
+    <div class="section" style="flex:1;min-width:300px;margin:0">
       <h2>Config persistence <span class="sub">runtime values → a file you can feed back</span></h2>
       <p class="hint">A booted server reads its config once, but the dashboard changes some values live (the peer target). Rather than rewrite your hand-edited config, <b>export</b> the current effective config to <span class="mono">&lt;data_dir&gt;/ces.toml</span>, then boot with <span class="mono">ces --config &lt;data_dir&gt;/ces.toml</span> to persist them.</p>
       <div class="row"><button class="green" onclick="exportConfig()" id="cfgExportBtn">Export config to data dir</button><span id="cfgExportState" class="mono"></span></div>
     </div>
-    <div class="section">
+    <div class="section" style="flex:1;min-width:300px;margin:0">
       <h2>Maintenance <span class="sub">ledger snapshot</span></h2>
       <button class="ghost" onclick="snapshot()" id="snapBtn">Write snapshot now</button>
       <p class="hint">Forks and writes a full ledger snapshot, compacting the event log.</p>
+    </div>
     </div>
     <div class="section">
       <h2>Minimum PoW difficulty <span class="sub">live &middot; export to persist</span></h2>
@@ -1844,6 +1888,21 @@ function setHeader(s){
   $('#srvVer').textContent=s.version?('v '+s.version):'';
   $('#srvPorts').textContent='udp '+s.port+(s.rpcPort?(' · rpc '+s.rpcPort):'');
   $('#upPill').textContent='up '+fmtDur(s.uptime);
+  const ms=$('#minerState');
+  if(ms){
+    if(s.miningActive){
+      const done=s.hashesTried||0, exp=s.expectedHashes||0, el=s.miningElapsedSecs;
+      let t='⛏ mining '+esc(s.miningPeer)+' @ diff '+s.miningDifficulty;
+      if(exp>0) t+=' · '+done+'/'+exp+' hashes';
+      if(el!=null){
+        if(done>0&&exp>0) t+=' · '+el+'/'+Math.round(exp*el/done)+'s';
+        else t+=' · '+el+'s';
+      }
+      ms.textContent=t;ms.style.color='var(--accent)';}
+    else if(s.minerRunning){ms.textContent='↻ loop alive · '+s.cycles+' cycles'+(s.lastCycle?(' · last '+ago(s.lastCycle)):' · starting…')+' · not hashing';ms.style.color='var(--muted)';}
+    else if(s.peerTarget>0){ms.textContent='⚠ miner idle';ms.style.color='var(--warn)';}
+    else{ms.textContent='miner off';ms.style.color='var(--muted)';}
+  }
 }
 async function loadOverview(){
   let s;try{s=await api('/api/status');}catch(e){setLive(false);return;}
@@ -1882,20 +1941,10 @@ function useAddr(key,addr){const k=$('#addKey'),a=$('#addAddr');if(k)k.value=key
 async function loadPeers(){
   let d;try{d=await api('/api/peers');}catch(e){return;}
   $('#curTarget').textContent=fmtCredits(d.target)+' cr';
+  if(d.maxPeers!=null){$('#curMaxPeers').textContent=d.maxPeers+' ('+(d.maxPeers*3)+' in RAM)';
+    if(!$('#maxPeers').value)$('#maxPeers').placeholder=String(d.maxPeers);}
   $('#peerCount').textContent=d.peers.length+' peer(s)';
   const cOut=d.peers.filter(p=>p.outbound).length,cIn=d.peers.filter(p=>p.inbound).length,cRch=d.peers.filter(p=>p.reachable).length;
-  const ms=$('#minerState');
-  if(d.miningActive){
-    const D=d.miningDifficulty,iters=Math.pow(2,D);
-    const cn=n=>n>=1e6?(n/1e6).toFixed(1)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':Math.round(n).toString();
-    let t='⛏ mining '+esc(d.miningPeer)+' @ diff '+D+' · ~'+cn(iters)+' iters avg';
-    if(d.miningElapsedSecs!=null)t+=' · '+d.miningElapsedSecs+'s in';
-    if(d.hashRate>0){const exp=Math.max(1,Math.round(iters/d.hashRate));
-      t+=' · ~'+cn(d.hashRate)+' H/s · ~'+exp+'s expected'+(d.miningElapsedSecs>2*exp?' (unlucky!)':'');}
-    ms.textContent=t;ms.style.color='var(--accent)';}
-  else if(d.minerRunning){ms.textContent='↻ loop alive · '+d.cycles+' cycles'+(d.lastCycle?(' · last '+ago(d.lastCycle)):' · starting…')+' · not hashing';ms.style.color='var(--muted)';}
-  else if(cOut>0){ms.textContent='⚠ idle — set a target to start probing/mining';ms.style.color='var(--warn)';}
-  else{ms.textContent='miner idle';ms.style.color='var(--muted)';}
   const reachCell=p=>{
     if(!p.lastCheckTime)return '<span class="muted">not checked</span>';
     if(p.reachable)return '<span class="sdot ok"></span> '+(p.verified?'verified':'<span style="color:var(--warn)">unverified</span>');
@@ -1903,7 +1952,7 @@ async function loadPeers(){
   };
   $('#peerSummary').innerHTML=`<span class="feat on">${cOut} outbound</span><span class="feat ${cIn?'on':''}">${cIn} inbound</span><span class="feat ${cRch?'on':''}">${cRch} reachable</span>`;
   const dir=p=>{let b='';if(p.outbound)b+='<span class="badge out">OUT</span> ';if(p.inbound)b+='<span class="badge in">IN</span>';return b||'<span class="muted">—</span>';};
-  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th>rpc link</th><th></th></tr>`+
+  $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th title="L2-reported grief score; banned peers shown red">grief</th><th>rpc link</th><th></th></tr>`+
     (d.peers.length?d.peers.map(p=>`<tr>
       <td style="white-space:nowrap">${dir(p)}</td>
       <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${esc(p.key)}','${esc(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
@@ -1915,9 +1964,10 @@ async function loadPeers(){
       <td class="num">${fmtCredits(p.totalInboundPoW)}</td>
       <td class="muted">${ago(p.lastCheckTime)}</td>
       <td class="num">${p.pingFailures||0}</td>
+      <td class="num">${p.grief||0}</td>
       <td style="white-space:nowrap">${p.rpcLink==='up'?'<span style="color:var(--accent)">up</span>':(p.rpcLink==='down'?'<span class="muted">down</span>':'<span class="muted">&mdash;</span>')}</td>
       <td><button class="danger sm" onclick="rmPeer('${esc(p.key)}')">remove</button></td></tr>`).join('')
-     :`<tr><td colspan="12" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
+     :`<tr><td colspan="13" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
 }
 async function setTarget(){
   const credits=parseFloat($('#peerTarget').value||'0');
@@ -1929,6 +1979,15 @@ async function setTarget(){
     else toast(r.error||'failed','err');}
   catch(e){toast('set target failed — server not responding','err');}
   finally{b.disabled=false;b.textContent='Set target';}}
+async function setMaxPeers(){
+  const n=parseInt($('#maxPeers').value||'0',10);
+  if(!isFinite(n)||n<1){toast('enter a positive integer','err');return;}
+  const b=$('#setMaxPeersBtn');b.disabled=true;b.textContent='Setting…';
+  try{const r=await post('/api/max_peers',{max_peers:String(n)});
+    if(r.ok){toast('peer table size set to '+n,'ok');$('#maxPeers').value='';loadPeers();}
+    else toast(r.error||'failed','err');}
+  catch(e){toast('set size failed - server not responding','err');}
+  finally{b.disabled=false;b.textContent='Set size';}}
 async function addPeer(){const key=$('#addKey').value.trim(),addr=$('#addAddr').value.trim();
   if(!key||!addr){toast('key and address required','err');return;}
   const b=$('#addPeerBtn');b.disabled=true;b.textContent='Verifying…';
@@ -2209,7 +2268,7 @@ async function exportConfig(){const b=$('#cfgExportBtn');b.disabled=true;b.textC
 
 function onEnter(id,fn){const el=$('#'+id);if(el)el.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();fn();}});}
 onEnter('inspAddr',doInspect);onEnter('accKey',lookupAccount);onEnter('astKey',lookupAsset);onEnter('fileLookupPath',lookupFile);
-onEnter('addAddr',addPeer);onEnter('addKey',addPeer);onEnter('peerTarget',setTarget);
+onEnter('addAddr',addPeer);onEnter('addKey',addPeer);onEnter('peerTarget',setTarget);onEnter('maxPeers',setMaxPeers);
 
 /* extensions - table-like rows; each row expands inline into a control center */
 let extExpanded=new Set(), extSig='', extOpenConfig=null;

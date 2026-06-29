@@ -235,6 +235,9 @@ constexpr uint16_t kApiMethodPeerTargetGet = 0x0234;
 // at remote `addr` — a regular server-signed transfer at the remote (NOT
 // settlement), gated by the global funding rate.
 constexpr uint16_t kApiMethodRequestFunds  = 0x0235;
+constexpr uint16_t kApiMethodPeerGrief     = 0x0236;
+constexpr uint16_t kApiMethodPeerBan       = 0x0237;
+constexpr uint16_t kApiMethodServerSign    = 0x0238;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -388,6 +391,11 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // Identity, reported live via ces.manifest{} (EXT_MANIFEST). Independent of the
   // contract — a program may have a manifest with no contract (dice) or both.
   std::string extName, extVersion, extDescription;
+  // Launched via [extension] / launchInternal (operator infrastructure), not a user
+  // LAUNCH verb. Exempt from computeMaxInstances: that cap bounds USER instances, and a
+  // user filling it must never block the operator's own extensions. Extensions are
+  // bounded by the configured compute port range instead.
+  bool internalLaunch = false;
   // Admin contract. Populated when the child sends EXT_REGISTER
   // (ces.extension_admin{}); honored only for /s/ instances.
   bool isExtension = false;
@@ -453,10 +461,13 @@ struct LaunchSlot {
   LaunchSlot& operator=(const LaunchSlot&) = delete;
 };
 
-// Launch slots spoken for = registered instances + in-flight launches.
-// The LAUNCH cap is checked against this, never instances_ alone.
+// USER launch slots spoken for = user instances + in-flight launches. The LAUNCH cap is
+// checked against this. Operator extensions (internalLaunch) are exempt -- bounded by the
+// compute port range, not this cap -- so a user filling the cap never blocks an extension.
 inline std::size_t launchSlotsInUse(ComputeHandler& H) {
-  return H.instances_.size() + static_cast<std::size_t>(H.pendingLaunches_);
+  std::size_t n = static_cast<std::size_t>(H.pendingLaunches_);
+  for (const auto& kv : H.instances_) if (!kv.second->internalLaunch) ++n;
+  return n;
 }
 
 // L2 compute program port allocator. Each running instance gets one UDP
@@ -1630,6 +1641,11 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }
     auto peers = server->_peerSnapshot();
+    // A grief-banned peer must not register to extensions: hide it from ces.peers().
+    const uint64_t nowSecs = minx::getSecsSinceEpoch();
+    peers.erase(std::remove_if(peers.begin(), peers.end(),
+      [&](const CesServer::PeerInfo& p) {
+        return p.bannedUntil != 0 && nowSecs < p.bannedUntil; }), peers.end());
     ces::Bytes body;
     ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(peers.size()));
     for (const auto& p : peers) {
@@ -1692,6 +1708,53 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     ces::Bytes body;
     body.push_back(removed ? 1 : 0);
     sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
+  // ces.grief_peer(pubkey) — raise a peer's grief; the C++ side bans it at the
+  //   threshold. Request: [32B pubkey]. Reply: [u8 status].
+  if (method == kApiMethodPeerGrief) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    if (mlen < 32) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    minx::Hash ckey{};
+    std::memcpy(ckey.data(), mbody, 32);
+    // Optional [u32 BE amount] after the pubkey; absent (older callers) => 1.
+    uint32_t amount = (mlen >= 36) ? ces::Buffer::peek<uint32_t>(mbody + 32) : 1;
+    server->griefPeer(ckey, amount);
+    sendApiReply(inst, corr_id, kApiStatusOk);
+    return;
+  }
+
+  if (method == kApiMethodPeerBan) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    if (mlen < 32) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    minx::Hash ckey{};
+    std::memcpy(ckey.data(), mbody, 32);
+    server->banPeer(ckey);
+    sendApiReply(inst, corr_id, kApiStatusOk);
+    return;
+  }
+
+  // ces.serverSign(bytes) — sign with the server key for a privileged /s/ extension.
+  //   The host applies the reserved domain tag and hashes (server.cpp), so the signed
+  //   message is always SHA256(tag || bytes). Request: [bytes]. Reply: [u8 status][sig].
+  if (method == kApiMethodServerSign) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    ces::Signature sig = server->serverSign(mbody, mlen);
+    ces::Bytes tail(sig.begin(), sig.end());
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, tail);
     return;
   }
 
@@ -2246,7 +2309,7 @@ struct LaunchAccept {
 void allocateAndSpawnInstance(
     CesServer* server, const std::string& name,
     const std::array<uint8_t, 32>& ownerPk,
-    uint64_t upfront, uint64_t now,
+    uint64_t upfront, uint64_t now, bool internal,
     std::shared_ptr<LaunchSlot> slot,
     std::shared_ptr<PortLease> portLease,
     std::shared_ptr<PortLease> rpcPortLease,
@@ -2275,6 +2338,7 @@ void allocateAndSpawnInstance(
   inst->progPrefix = progPrefixOf(name);
   inst->socketPath = instanceSocketPath(cfg, pid).string();
   inst->upfrontDeposit = upfront;
+  inst->internalLaunch = internal;
 
   int lfd = createListenSocket(inst->socketPath);
   if (lfd < 0) {
@@ -2524,7 +2588,7 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 
     uint64_t now = getMicrosSinceEpoch();
     allocateAndSpawnInstance(
-      reqServer(ctx), name, ownerPk, upfront, now, std::move(launchSlot),
+      reqServer(ctx), name, ownerPk, upfront, now, /*internal=*/false, std::move(launchSlot),
       std::move(portLease), std::move(rpcPortLease),
       [ctx, now](uint64_t pid) {
         if (pid == 0) {
@@ -2866,8 +2930,15 @@ void supervisorTick(ComputeHandler& H) {
     int status = 0;
     pid_t r = ::waitpid(inst->ospid, &status, WNOHANG);
     if (r == inst->ospid) {
-      LOGDEBUG << "child exited"
-               << VAR(pid) << VAR(status);
+      // A child terminated by a signal crashed (e.g. SIGSEGV on a bad shutdown).
+      // Surface it loudly: a silent DEBUG line is why such crashes went unnoticed.
+      if (WIFSIGNALED(status)) {
+        ++H.crashedInstances_;
+        LOGWARNING << "compute instance crashed" << VAR(pid)
+                   << " signal=" << WTERMSIG(status) << SVAR(inst->sourceName);
+      } else {
+        LOGDEBUG << "child exited" << VAR(pid) << VAR(status);
+      }
       toKill.push_back(pid);
     }
   }
@@ -3121,9 +3192,9 @@ uint8_t ComputeHandler::launchInternal(const std::string& name) {
   if (!server) return CES_ERROR_COMPUTE_DISABLED;
   const auto& cfg = server->_config();
   if (cfg.computeMaxInstances == 0) return CES_ERROR_COMPUTE_DISABLED;
-  if (launchSlotsInUse(*this) >= cfg.computeMaxInstances) {
-    return CES_ERROR_COMPUTE_MAX_INSTANCES;
-  }
+  // No user-cap check: extensions are operator infrastructure, exempt from
+  // computeMaxInstances (which bounds USER instances). A user filling the cap must never
+  // block the operator's own extensions; they are bounded by the compute port range.
   uint16_t clientPort = 0;
   allocateComputePort(*this, cfg, clientPort);   // best-effort; 0 = local-only
   auto portLease = std::make_shared<PortLease>(this, clientPort);
@@ -3156,7 +3227,7 @@ uint8_t ComputeHandler::launchInternal(const std::string& name) {
   // or failure is logged from the callback. CES_OK here means
   // "validated + spawn started," not "child connected."
   uint64_t now = getMicrosSinceEpoch();
-  allocateAndSpawnInstance(server, name, ownerPk, 0, now,
+  allocateAndSpawnInstance(server, name, ownerPk, 0, now, /*internal=*/true,
     std::make_shared<LaunchSlot>(this), std::move(portLease), std::move(rpcPortLease),
     [name](uint64_t pid) {
       if (pid == 0) {
