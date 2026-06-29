@@ -268,12 +268,16 @@ public:
   const KeyPair& signerKey() const { return *signerKey_; }
   uint64_t boundSessionToken() const { return boundSessionToken_; }
 
-  // Reopen the channel with a fresh channel_id + select handshake, used
-  // after the server closes the channel following an error. A short
-  // delay lets the peer's HS_CLOSE for the old channel land first.
+  // Reopen the channel with a fresh channel_id + select handshake, used after
+  // the server closes the channel following an error. The old channel's
+  // per-peer slot is freed in doSelect (RST) before the new bind: Rudp owns the
+  // channel handler, so resetting our stream does not release it -- the old
+  // channel lingers ESTABLISHED and would hit rpcRudpMaxChannelsPerPeer.
+  // Closing it is deterministic; waiting on the peer's HS_CLOSE to free the
+  // slot is not (its arrival is RTT-bound, unbounded under loss).
   uint8_t reselect() {
+    closeBeforeSelect_ = channel_;
     stream_.reset();
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
     std::mt19937 rng(std::random_device{}());
     channel_ = 0;
     while (channel_ == 0) channel_ = rng();
@@ -526,6 +530,14 @@ private:
       // Seed Rudp's clock before registerChannel so the fresh channel
       // isn't idle-GC'd on the next tick.
       rudp_->tick(nowMicros());
+      // Free a prior (errored) channel's per-peer slot before binding the new
+      // one, ordered before registerChannel on this same IO thread. RST frees
+      // the slot now and tells the peer to drop its side (a no-op if the peer
+      // already closed). Skipped on the initial select (closeBeforeSelect_==0).
+      if (closeBeforeSelect_ != 0) {
+        rudp_->closeChannel(peer_, closeBeforeSelect_);
+        closeBeforeSelect_ = 0;
+      }
       stream_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
       if (!rudp_->registerChannel(peer_, channel_, stream_)) {
         run->set_value(CES_ERROR_INTERNAL);
@@ -587,6 +599,7 @@ private:
   uint64_t opSalt_ = 1;          // per-op envelope uniquifier (see buildEnvelope)
 
   bool streamDirty_ = false;
+  uint32_t closeBeforeSelect_ = 0;  // old channel to RST in doSelect before rebind
 };
 
 // ---- CesPlexChannel public forwards ----

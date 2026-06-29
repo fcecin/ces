@@ -76,7 +76,7 @@ struct KvFixture {
     startServer();
     server->_brr(serverKey.getPublicKeyAsHash(), 100'000'000'000ull);
     server->_brr(ownerKey.getPublicKeyAsHash(), 100'000'000'000ull);
-    wait_net();
+    server->_drainLogic();
 
     // Billing source: a /s/ file (unmetered → deposits mint, write cost waived).
     auto fc = std::make_unique<CesFileClient>();

@@ -786,7 +786,7 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetCreate) {
   BOOST_REQUIRE(queryClient.connect());
   // Need a tiny balance for the signed query op.
   server->_brr(queryKey.getPublicKeyAsHash(), 1'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   std::vector<AssetEntry> results;
   uint8_t qrc = queryClient.queryAssetSigned(assetIdHash, 0, results);
@@ -813,7 +813,7 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetCreate) {
   // recipient a tiny balance so we can issue the update op as the
   // owner.
   server->_brr(recipientKey.getPublicKeyAsHash(), 1'000'000'000);
-  wait_net();
+  server->_drainLogic();
   CesClient ownerClient(testServerEp(serverPort), false);
   ownerClient.start(0);
   ownerClient.setKey(recipientKey);
@@ -910,7 +910,7 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetHashStableAcrossMints) {
   qc.setKey(qk);
   BOOST_REQUIRE(qc.connect());
   server->_brr(qk.getPublicKeyAsHash(), 1'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   std::vector<AssetEntry> r1, r2;
   CES_REQUIRE_OK(qc.queryAssetSigned(aid1Hash, 0, r1));

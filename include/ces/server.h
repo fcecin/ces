@@ -771,6 +771,11 @@ public:
   // Production callers go through the one-shot boot post in start().
   void _runAutoexecSync();
 
+  // Test hook: barrier on logicStrand_. Posts a no-op and blocks until it runs,
+  // so every mutation posted earlier (e.g. _brr) has been applied. Deterministic
+  // replacement for a timed settle. Caller MUST NOT run on logicStrand_.
+  void _drainLogic();
+
   // Test hook: fire a scheduled (cron) VM run synchronously — build a
   // ScheduledRun, post it onto logicStrand_, and block until it completes.
   // Bypasses the cron timer so crash-recovery tests can drive the cron path

@@ -504,7 +504,7 @@ protected:
     BOOST_REQUIRE(client->connect());
 
     server->_brr(clientKey.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    server->_drainLogic();
 
     // Start the mock server.
     mock = std::make_unique<MockRpcServer>(&rot13DoubleTransform);
@@ -646,10 +646,11 @@ AssetData buildObservableGatewayProgram() {
 }
 
 // Transform that sleeps before replying. Used by the TimeoutAsync
-// test: the CesServer's per-session timer should fire while the mock
-// is still asleep, delivering CES_ERROR_TIMEOUT.
+// test: the CesServer's per-session timer (rpcResponseTimeoutMs=200) should
+// fire while the mock is still asleep, delivering CES_ERROR_TIMEOUT. 600ms is
+// well past the 200ms timeout while keeping the test fast.
 ces::Bytes slowTransform(const ces::Bytes& in) {
-  std::this_thread::sleep_for(std::chrono::seconds(3));
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
   return in;
 }
 
@@ -1018,7 +1019,7 @@ struct NoRpcPortFixture {
     BOOST_REQUIRE(client->connect());
 
     server->_brr(clientKey.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    server->_drainLogic();
   }
 
   ~NoRpcPortFixture() {

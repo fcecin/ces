@@ -144,7 +144,7 @@ BOOST_AUTO_TEST_CASE(Test10_BuyAsset) {
   buyer.setKey(buyerKey);
   buyer.connect();
   server->_brr(buyerKey.getPublicKeyAsHash(), 100'000'000'000LL);
-  wait_net();
+  server->_drainLogic();
 
   // Snapshot the seller's balance just before the buy so we can check the
   // transfer leg of buyAsset actually credited them. Without this the test
@@ -214,7 +214,7 @@ BOOST_AUTO_TEST_CASE(Test13_AssetCollision) {
   bob.connect();
 
   server->_brr(bobKey.getPublicKeyAsHash(), (2 + 10) * BASE_FEE_ASSET + BASE_FEE_TRANSACTION);
-  wait_net();
+  server->_drainLogic();
 
   rc = bob.createAsset(aid, d, 10);
   CES_CHECK_RC_EQ(rc, CES_ERROR_ASSET_EXISTS);
@@ -237,7 +237,7 @@ BOOST_AUTO_TEST_CASE(Test14_AssetTheftProtection) {
   thief.connect();
 
   server->_brr(thiefKey.getPublicKeyAsHash(), 100'000'000);
-  wait_net();
+  server->_drainLogic();
 
   // Try Update
   uint8_t rc =
@@ -266,7 +266,7 @@ BOOST_AUTO_TEST_CASE(Test15_BuyValidation) {
   buyer.setKey(buyerKey);
   buyer.connect();
   server->_brr(buyerKey.getPublicKeyAsHash(), 100'000'000'000LL);
-  wait_net();
+  server->_drainLogic();
 
   // 1. Try Lowball (Offer 1 when price is 5)
   uint64_t lowball = (uint64_t)1 * ces::PRICE_UNIT;
@@ -378,18 +378,18 @@ BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt8191) {
   // Fund the account enough to cover two max-days fund operations
   int64_t fundCost = static_cast<int64_t>(8191) * BASE_FEE_ASSET + BASE_FEE_TRANSACTION;
   server->_brr(clientKey.getPublicKeyAsHash(), fundCost * 3);
-  wait_net();
+  server->_drainLogic();
 
   minx::Hash aid = makeHash("CAP_TEST");
   AssetData data{};
   uint8_t rc = client->createAsset(aid, data, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Fund with 8191 — should cap at 0x1FFF, not overflow into flag bits.
   rc = client->fundAsset(aid, 8191);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData content;
@@ -404,7 +404,7 @@ BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt8191) {
   // Fund again — should stay capped
   rc = client->fundAsset(aid, 8191);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   rc = client->queryAsset(aid, owner, content, days, price);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
@@ -420,7 +420,7 @@ BOOST_AUTO_TEST_CASE(PrivateAssetUnsignedQueryHidesContent) {
   data.fill(0xAA);
   uint8_t rc = client->createAsset(aid, data, 30, true);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Unsigned query should return zero content
   HashPrefix owner;
@@ -442,7 +442,7 @@ BOOST_AUTO_TEST_CASE(PrivateAssetSignedQueryByOwnerShowsContent) {
   data.fill(0xBB);
   uint8_t rc = client->createAsset(aid, data, 30, true);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Signed query by owner should return real content
   std::vector<AssetEntry> results;
@@ -458,7 +458,7 @@ BOOST_AUTO_TEST_CASE(PublicAssetUnsignedQueryShowsContent) {
   data.fill(0xCC);
   uint8_t rc = client->createAsset(aid, data, 30, false);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData content;
@@ -475,12 +475,12 @@ BOOST_AUTO_TEST_CASE(PrivateAssetSignedQueryByNonOwnerHidesContent) {
   data.fill(0xDD);
   uint8_t rc = client->createAsset(aid, data, 30, true);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Create a second client with a different key
   KeyPair otherKey;
   server->_brr(otherKey.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   boost::asio::ip::udp::endpoint ep(
     boost::asio::ip::address_v6::loopback(), serverPort);
@@ -503,12 +503,12 @@ BOOST_AUTO_TEST_CASE(FundPrivateAssetPreservesPrivacy) {
   data.fill(0xEE);
   uint8_t rc = client->createAsset(aid, data, 10, true);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Fund it
   rc = client->fundAsset(aid, 20);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Unsigned query should still hide content
   HashPrefix owner;
@@ -540,12 +540,12 @@ BOOST_AUTO_TEST_CASE(PrivateAssetSkippedInRangeQuery) {
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   rc = client->createAsset(aid3, d3, 30, false);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Create a second client
   KeyPair otherKey;
   server->_brr(otherKey.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   boost::asio::ip::udp::endpoint ep(
     boost::asio::ip::address_v6::loopback(), serverPort);
@@ -578,7 +578,7 @@ BOOST_AUTO_TEST_CASE(ImmutableAssetCreate) {
   uint8_t rc = client->createAsset(aid, data, 30, /*priv=*/false,
                                    /*immutable=*/true);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData got;
@@ -596,14 +596,14 @@ BOOST_AUTO_TEST_CASE(ImmutableAssetRejectsUpdate) {
   data.fill(0x11);
   uint8_t rc = client->createAsset(aid, data, 30, false, /*immutable=*/true);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Try full update — must fail with CES_ERROR_IMMUTABLE
   AssetData newData;
   newData.fill(0x22);
   rc = client->updateAsset(aid, getMyId(), newData, 0);
   CES_CHECK_RC_EQ(rc, CES_ERROR_IMMUTABLE);
-  wait_net();
+  server->_drainLogic();
 
   // Content unchanged
   HashPrefix owner;
@@ -621,13 +621,13 @@ BOOST_AUTO_TEST_CASE(ImmutableAssetRejectsUpdateFast) {
   data.fill(0x33);
   uint8_t rc = client->createAsset(aid, data, 30, false, true);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   AssetData newData;
   newData.fill(0x44);
   rc = client->updateAssetFast(aid, newData);
   CES_CHECK_RC_EQ(rc, CES_ERROR_IMMUTABLE);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData got;
@@ -645,12 +645,12 @@ BOOST_AUTO_TEST_CASE(ImmutableAssetAllowsMetaUpdate) {
   data.fill(0x55);
   uint8_t rc = client->createAsset(aid, data, 30, false, true);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Set a price (owner unchanged, content unchanged) — should succeed.
   rc = client->updateAssetMeta(aid, getMyId(), 42);
   CES_CHECK_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData got;
@@ -670,18 +670,18 @@ BOOST_AUTO_TEST_CASE(ImmutableAssetAllowsFunding) {
   data.fill(0x77);
   uint8_t rc = client->createAsset(aid, data, 30, false, true);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   rc = client->fundAsset(aid, 100);
   CES_CHECK_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Content still rejects update (IMMUTABLE bit preserved through funding).
   AssetData newData;
   newData.fill(0x99);
   rc = client->updateAsset(aid, getMyId(), newData, 0);
   CES_CHECK_RC_EQ(rc, CES_ERROR_IMMUTABLE);
-  wait_net();
+  server->_drainLogic();
 }
 
 BOOST_AUTO_TEST_CASE(NonImmutableAssetCanBeUpdated) {
@@ -691,13 +691,13 @@ BOOST_AUTO_TEST_CASE(NonImmutableAssetCanBeUpdated) {
   data.fill(0xCC);
   uint8_t rc = client->createAsset(aid, data, 30); // default immutable=false
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   AssetData newData;
   newData.fill(0xDD);
   rc = client->updateAsset(aid, getMyId(), newData, 0);
   CES_CHECK_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix owner;
   AssetData got;

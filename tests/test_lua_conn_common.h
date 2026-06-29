@@ -422,7 +422,7 @@ struct LuaConnFixture {
 
     server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
     server->_brr(userKey.getPublicKeyAsHash(),  10'000'000'000);
-    wait_net();
+    server->_drainLogic();
   }
 
   ~LuaConnFixture() {

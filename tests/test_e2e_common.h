@@ -214,7 +214,7 @@ struct E2EServerFixture {
   FreshKey makeFunded(int64_t amount = 1'000'000'000) {
     FreshKey fk;
     server->_brr(fk.kp.getPublicKeyAsHash(), amount);
-    wait_net();
+    server->_drainLogic();
     return fk;
   }
 

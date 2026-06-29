@@ -13,7 +13,7 @@ BOOST_AUTO_TEST_CASE(Receipt_SingleTransfer) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 5000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix dest;
   uint64_t amount;
@@ -36,7 +36,7 @@ BOOST_AUTO_TEST_CASE(Receipt_NewAccountZero) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(alice.getPublicKeyAsHash(), 1000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Alice was just created, she hasn't sent anything
   HashPrefix dest;
@@ -66,11 +66,11 @@ BOOST_AUTO_TEST_CASE(Receipt_OverwriteOnSecondTransfer) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 1000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   rc = client->openTransfer(carol.getPublicKeyAsHash(), 2000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix dest;
   uint64_t amount;
@@ -92,11 +92,11 @@ BOOST_AUTO_TEST_CASE(Receipt_CreditDoesNotClobber) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 3000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Credit the sender (simulating PoW or _brr)
   server->_brr(clientKey.getPublicKeyAsHash(), 999);
-  wait_net();
+  server->_drainLogic();
 
   HashPrefix dest;
   uint64_t amount;
@@ -125,7 +125,7 @@ BOOST_AUTO_TEST_CASE(Receipt_BulkDoesNotWrite) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 1000, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Now do a bulk transfer
   std::vector<BulkTransferItem> items;
@@ -133,7 +133,7 @@ BOOST_AUTO_TEST_CASE(Receipt_BulkDoesNotWrite) {
   uint8_t successCount = 0;
   rc = client->bulkTransfer(items, newBal, successCount);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // xfer fields should still show the single transfer to bob, not the bulk
   HashPrefix dest;
@@ -157,7 +157,7 @@ BOOST_AUTO_TEST_CASE(Receipt_QueryViaClient) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 8888, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   // Query our own account via the client API (unsigned)
   int64_t bal = 0;
@@ -183,7 +183,7 @@ BOOST_AUTO_TEST_CASE(Receipt_SignedQueryReturnsXferFields) {
   int64_t newBal;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), 6666, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
 
   std::vector<AccountEntry> accounts;
   rc = client->queryAccountSigned(getMyId(), 0, accounts);

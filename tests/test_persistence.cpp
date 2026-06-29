@@ -32,13 +32,13 @@ BOOST_AUTO_TEST_CASE(Test_FastUpdate_Volatile_Crash) {
 
     // 1. Create (Persisted via WAL)
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
     cli.createAsset(aid, originalContent, 10);
-    wait_net();
+    srv._drainLogic();
 
     // 2. Fast Update (Memory Only)
     cli.updateAssetFast(aid, fastContent);
-    wait_net();
+    srv._drainLogic();
 
     // Sanity Check: Verify it is updated in memory
     HashPrefix o;
@@ -104,16 +104,16 @@ BOOST_AUTO_TEST_CASE(Test_FastUpdate_Persist_On_Snapshot) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     AssetData initial;
     initial.fill(0x00);
     cli.createAsset(aid, initial, 10);
-    wait_net();
+    srv._drainLogic();
 
     // Fast Update
     cli.updateAssetFast(aid, fastContent);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     srv.stop(false);
@@ -170,15 +170,15 @@ BOOST_AUTO_TEST_CASE(Test_MetaUpdate_PartialPersistence) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     // 1. Create
     cli.createAsset(aid, heavyContent, 10);
-    wait_net();
+    srv._drainLogic();
 
     // 2. Meta Update (Set Price = 999)
     cli.updateAssetMeta(aid, Account::getMapKey(user.getPublicKeyAsHash()), 999);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     srv.stop(); // Clean stop
@@ -240,15 +240,15 @@ BOOST_AUTO_TEST_CASE(Test_Mixed_Mode_Partial_Isolation) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     // 1. Create (Content A) -> Writes to WAL
     cli.createAsset(aid, contentA, 10);
-    wait_net();
+    srv._drainLogic();
 
     // 2. Fast Update (Content B) -> RAM Only
     cli.updateAssetFast(aid, contentB);
-    wait_net();
+    srv._drainLogic();
 
     // Check RAM is B
     HashPrefix o;
@@ -260,7 +260,7 @@ BOOST_AUTO_TEST_CASE(Test_Mixed_Mode_Partial_Isolation) {
 
     // 3. Meta Update (Price 999) -> Writes Partial Event to WAL
     cli.updateAssetMeta(aid, Account::getMapKey(user.getPublicKeyAsHash()), 999);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // 4. Crash (Skip Snapshot)
@@ -323,12 +323,12 @@ BOOST_AUTO_TEST_CASE(Receipt_SurvivesWALReplay) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     int64_t newBal;
     uint8_t rc = cli.openTransfer(bob.getPublicKeyAsHash(), 4242, newBal);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // NO srv.stop() — simulate crash, no snapshot written
@@ -381,18 +381,18 @@ BOOST_AUTO_TEST_CASE(Receipt_BalanceNonceDoesNotClobberOnReplay) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     int64_t newBal;
     uint8_t rc = cli.openTransfer(bob.getPublicKeyAsHash(), 3333, newBal);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     // This credit writes a BalanceNonce (0x01) WAL entry AFTER the
     // Transfer (0x03) entry. On replay, the 0x01 entry must not
     // zero out the xfer fields that were set by the 0x03 entry.
     srv._brr(user.getPublicKeyAsHash(), 500);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // NO srv.stop() — crash
@@ -445,12 +445,12 @@ BOOST_AUTO_TEST_CASE(Receipt_PersistsThroughRestart) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     int64_t newBal;
     uint8_t rc = cli.openTransfer(bob.getPublicKeyAsHash(), 7777, newBal);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     // Verify before shutdown
     HashPrefix dest;
@@ -510,13 +510,13 @@ BOOST_AUTO_TEST_CASE(Asset_BalanceUpdate_SurvivesCrash) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     cli.createAsset(aid, content, 5);
-    wait_net();
+    srv._drainLogic();
 
     cli.fundAsset(aid, 20);
-    wait_net();
+    srv._drainLogic();
 
     // Verify in RAM: balance should be 1+5+20 = 26
     HashPrefix o;
@@ -580,18 +580,18 @@ BOOST_AUTO_TEST_CASE(Asset_BalanceDoesNotClobberOnReplay) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     cli.createAsset(aid, content, 10);
-    wait_net();
+    srv._drainLogic();
 
     // Set a price via meta update
     cli.updateAssetMeta(aid, Account::getMapKey(user.getPublicKeyAsHash()), 555);
-    wait_net();
+    srv._drainLogic();
 
     // Fund (writes Balance-only WAL entry after the Meta entry)
     cli.fundAsset(aid, 5);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // NO srv.stop() — crash
@@ -658,18 +658,18 @@ BOOST_AUTO_TEST_CASE(Asset_TransferOwnership_SurvivesCrash) {
     cli.connect();
 
     srv._brr(creator.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     cli.createAsset(aid, content, 10);
-    wait_net();
+    srv._drainLogic();
 
     // Set a price first
     cli.updateAssetMeta(aid, creatorId, 1000);
-    wait_net();
+    srv._drainLogic();
 
     // Give away (transferOwnership sets owner=receiver, price=0)
     cli.giveAsset(aid, receiverId);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // NO srv.stop() — crash
@@ -729,14 +729,14 @@ BOOST_AUTO_TEST_CASE(Asset_FullUpdate_SurvivesCrash) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     cli.createAsset(aid, contentA, 10);
-    wait_net();
+    srv._drainLogic();
 
     // Full update: new content + price
     cli.updateAsset(aid, userId, contentB, 777);
-    wait_net();
+    srv._drainLogic();
 
     cli.stop();
     // NO srv.stop() — crash
@@ -833,7 +833,7 @@ static void runVmCommitProbe(const std::string& tag, const VmCommitProbe& p) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     if (p.prep) {
       p.prep(srv, cli, port, user);
@@ -842,14 +842,14 @@ static void runVmCommitProbe(const std::string& tag, const VmCommitProbe& p) {
 
     uint8_t rc = cli.createAsset(progId, p.build(user), 30);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     ces::Bytes in = p.input ? p.input(user) : ces::Bytes{};
     uint64_t vmError = 0, budgetUsed = 0;
     ces::Bytes output;
     rc = cli.runAsset(progId, 1'000'000'000, in, vmError, budgetUsed, output);
     BOOST_REQUIRE_EQUAL(vmError, p.expectVmError);
-    wait_net();
+    srv._drainLogic();
 
     totalAfterRun = srv._getTotalCredits();
 
@@ -908,7 +908,7 @@ BOOST_AUTO_TEST_CASE(VmTransfer_SurvivesWALReplay) {
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
     srv._brr(dest.getPublicKeyAsHash(), kDestSeed);
-    wait_net();
+    srv._drainLogic();
 
     // Program: SYS_TRANSFER caller -> (dest key from input), kAmount.
     VmProgram pgm;
@@ -919,7 +919,7 @@ BOOST_AUTO_TEST_CASE(VmTransfer_SurvivesWALReplay) {
 
     uint8_t rc = cli.createAsset(progId, pgm.buildBootBlock(), 30);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     ces::Bytes input(dest.getPublicKeyAsHash().begin(),
                      dest.getPublicKeyAsHash().end());
@@ -928,7 +928,7 @@ BOOST_AUTO_TEST_CASE(VmTransfer_SurvivesWALReplay) {
     rc = cli.runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
     CES_REQUIRE_OK(rc);
     BOOST_REQUIRE_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
-    wait_net();
+    srv._drainLogic();
 
     // Capture the committed, in-RAM truth before the crash.
     HashPrefix xd; uint64_t xa; uint32_t xt, xn;
@@ -991,7 +991,7 @@ BOOST_AUTO_TEST_CASE(VmCreateAsset_SurvivesWALReplay) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     // Program: SYS_CREATE_ASSET at (key from input) with 10 days.
     VmProgram pgm;
@@ -1003,7 +1003,7 @@ BOOST_AUTO_TEST_CASE(VmCreateAsset_SurvivesWALReplay) {
 
     uint8_t rc = cli.createAsset(progId, pgm.buildBootBlock(), 30);
     CES_REQUIRE_OK(rc);
-    wait_net();
+    srv._drainLogic();
 
     ces::Bytes input(bornId.begin(), bornId.end());
     uint64_t vmError = 0, budgetUsed = 0;
@@ -1011,7 +1011,7 @@ BOOST_AUTO_TEST_CASE(VmCreateAsset_SurvivesWALReplay) {
     rc = cli.runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
     CES_REQUIRE_OK(rc);
     BOOST_REQUIRE_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
-    wait_net();
+    srv._drainLogic();
 
     // Sanity: the VM-born asset exists in RAM (1 + 10 days).
     HashPrefix o; AssetData c; uint16_t d = 0; uint32_t p;
@@ -1053,7 +1053,6 @@ BOOST_AUTO_TEST_CASE(VmFundAsset_SurvivesWALReplay) {
   p.prep = [target](CesServer&, CesClient& cli, uint16_t, const KeyPair&) {
     AssetData content; content.fill(0x10);
     CES_REQUIRE_OK(cli.createAsset(target, content, 5)); // 1 + 5 = 6 days
-    wait_net();
   };
   p.build = [](const KeyPair&) {
     VmProgram pgm;
@@ -1084,7 +1083,6 @@ BOOST_AUTO_TEST_CASE(VmUpdateAsset_SurvivesWALReplay) {
   p.prep = [target](CesServer&, CesClient& cli, uint16_t, const KeyPair&) {
     AssetData a; a.fill(0xA1);
     CES_REQUIRE_OK(cli.createAsset(target, a, 10));
-    wait_net();
   };
   p.build = [](const KeyPair&) {
     VmProgram pgm;
@@ -1117,7 +1115,6 @@ BOOST_AUTO_TEST_CASE(VmUpdateAssetMeta_SurvivesWALReplay) {
   p.prep = [target](CesServer&, CesClient& cli, uint16_t, const KeyPair&) {
     AssetData a; a.fill(0x3C);
     CES_REQUIRE_OK(cli.createAsset(target, a, 10));
-    wait_net();
   };
   p.build = [](const KeyPair&) {
     VmProgram pgm;
@@ -1153,7 +1150,6 @@ BOOST_AUTO_TEST_CASE(VmGiveAsset_SurvivesWALReplay) {
   p.prep = [target](CesServer&, CesClient& cli, uint16_t, const KeyPair&) {
     AssetData a; a.fill(0x5A);
     CES_REQUIRE_OK(cli.createAsset(target, a, 10));
-    wait_net();
   };
   p.build = [](const KeyPair&) {
     VmProgram pgm;
@@ -1192,16 +1188,16 @@ BOOST_AUTO_TEST_CASE(VmBuyAsset_SurvivesWALReplay) {
   p.prep = [target, seller, sellerId](CesServer& srv, CesClient&, uint16_t port,
                                        const KeyPair&) {
     srv._brr(seller.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
     CesClient sc(testServerEp(port), false);
     sc.start(0);
     sc.setKey(seller);
     sc.connect();
     AssetData a; a.fill(0x77);
     CES_REQUIRE_OK(sc.createAsset(target, a, 10));
-    wait_net();
+    srv._drainLogic();
     CES_REQUIRE_OK(sc.updateAssetMeta(target, sellerId, 1)); // price 1 -> 1*PRICE_UNIT
-    wait_net();
+    srv._drainLogic();
     sc.stop();
   };
   p.build = [](const KeyPair&) {
@@ -1330,12 +1326,12 @@ BOOST_AUTO_TEST_CASE(VmRefund_SurvivesWALReplay) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     VmProgram pgm;
     pgm.term();
     CES_REQUIRE_OK(cli.createAsset(progId, pgm.buildBootBlock(), 30));
-    wait_net();
+    srv._drainLogic();
 
     uint64_t vmError = 0, budgetUsed = 0;
     ces::Bytes output;
@@ -1343,7 +1339,7 @@ BOOST_AUTO_TEST_CASE(VmRefund_SurvivesWALReplay) {
                               output);
     CES_REQUIRE_OK(rc);
     BOOST_REQUIRE_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
-    wait_net();
+    srv._drainLogic();
 
     HashPrefix xd; uint64_t xa; uint32_t xt, xn;
     srv.unsignedQueryAccount(userId, userBalAfterRun, xn, xd, xa, xt);
@@ -1402,7 +1398,7 @@ BOOST_AUTO_TEST_CASE(CronTransfer_SurvivesWALReplay) {
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
     srv._brr(dest.getPublicKeyAsHash(), kDestSeed);
-    wait_net();
+    srv._drainLogic();
 
     VmProgram pgm;
     Region destKeyReg = pgm.allocHash();
@@ -1410,7 +1406,7 @@ BOOST_AUTO_TEST_CASE(CronTransfer_SurvivesWALReplay) {
     pgm.sysTransfer({destKeyReg, Imm(kAmount)});
     pgm.term();
     CES_REQUIRE_OK(cli.createAsset(progId, pgm.buildBootBlock(), 30));
-    wait_net();
+    srv._drainLogic();
 
     // Drive the CRON path (executeScheduledRun), not the wire path.
     ces::Bytes input(dest.getPublicKeyAsHash().begin(),
@@ -1419,7 +1415,7 @@ BOOST_AUTO_TEST_CASE(CronTransfer_SurvivesWALReplay) {
       userId, progId, 1'000'000'000,
       std::numeric_limits<uint64_t>::max(), input);
     BOOST_REQUIRE(ok);
-    wait_net();
+    srv._drainLogic();
 
     HashPrefix xd; uint64_t xa; uint32_t xt, xn;
     srv.unsignedQueryAccount(destId, destBalAfterRun, xn, xd, xa, xt);
@@ -1478,7 +1474,7 @@ BOOST_AUTO_TEST_CASE(CronAbortThenCrash_NoLeak) {
     cli.connect();
 
     srv._brr(user.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    srv._drainLogic();
 
     VmProgram pgm;
     Region d = pgm.allocHash(); pgm.copyFromInput(d, 0);
@@ -1489,7 +1485,7 @@ BOOST_AUTO_TEST_CASE(CronAbortThenCrash_NoLeak) {
     pgm.abort();
     pgm.term();
     CES_REQUIRE_OK(cli.createAsset(progId, pgm.buildBootBlock(), 30));
-    wait_net();
+    srv._drainLogic();
 
     ces::Bytes input;
     input.insert(input.end(), dest.getPublicKeyAsHash().begin(),
@@ -1499,7 +1495,7 @@ BOOST_AUTO_TEST_CASE(CronAbortThenCrash_NoLeak) {
       userId, progId, 1'000'000'000,
       std::numeric_limits<uint64_t>::max(), input);
     BOOST_REQUIRE(ok); // executeScheduledRun returns true even on VM abort
-    wait_net();
+    srv._drainLogic();
 
     totalAfterRun = srv._getTotalCredits();
     cli.stop();

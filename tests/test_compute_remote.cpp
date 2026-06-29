@@ -345,7 +345,7 @@ BOOST_AUTO_TEST_CASE(RemoteAccountReadSuccess) {
   // Fund a known account X on server B.
   KeyPair x;
   serverB->_brr(x.getPublicKeyAsHash(), 5000);
-  wait_net();
+  serverB->_drainLogic();
 
   // op 1: read X on B.
   ces::Bytes c; c.push_back(1);
@@ -416,7 +416,7 @@ BOOST_AUTO_TEST_CASE(RemoteTransferSuccess) {
   // but here Y pre-exists, so this checks the credit-existing path.)
   KeyPair y;
   serverB->_brr(y.getPublicKeyAsHash(), 1);
-  wait_net();
+  serverB->_drainLogic();
 
   // op 2: transfer 3000 from program account to Y on B.
   ces::Bytes c; c.push_back(2);
@@ -500,7 +500,7 @@ BOOST_AUTO_TEST_CASE(RemoteTransferInsufficient) {
 
   KeyPair y;
   serverB->_brr(y.getPublicKeyAsHash(), 1);
-  wait_net();
+  serverB->_drainLogic();
 
   ces::Bytes c; c.push_back(2);
   auto ypk = y.getPublicKeyAsHash();

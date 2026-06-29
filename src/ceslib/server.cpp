@@ -5862,6 +5862,13 @@ void CesServer::_runAutoexecSync() {
   done.get_future().wait();
 }
 
+void CesServer::_drainLogic() {
+  if (!running_) return;
+  std::promise<void> done;
+  postLogic( [&done]() { done.set_value(); });
+  done.get_future().wait();
+}
+
 bool CesServer::_executeScheduledRunSync(const HashPrefix& callerPrefix,
                                          const minx::Hash& assetId,
                                          uint64_t budget, uint64_t allowance,

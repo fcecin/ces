@@ -1571,7 +1571,7 @@ struct RpcFileE2EFixture {
     ceshBin = findCeshBinary();
     fundedWalletHex = "00" + fundedKey.getPrivateKeyHexStr();
     server->_brr(fundedKey.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    server->_drainLogic();
   }
 
   ~RpcFileE2EFixture() {

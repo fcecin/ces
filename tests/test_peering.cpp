@@ -343,11 +343,11 @@ BOOST_AUTO_TEST_CASE(CrossServerTransfer) {
 
   // Fund Alice on Server A
   serverA->_brr(alice.getPublicKeyAsHash(), 10000);
-  wait_net();
+  serverA->_drainLogic();
 
   // Fund Server A's account on Server B (the bilateral reserve)
   serverB->_brr(kpA.getPublicKeyAsHash(), 50000);
-  wait_net();
+  serverB->_drainLogic();
 
   // Register B as a reachable peer on A
   serverA->_markPeerReachable(kpB.getPublicKeyAsHash(), addrB);
@@ -473,11 +473,11 @@ BOOST_AUTO_TEST_CASE(CrossServerPaymentSettlement) {
 
   // Fund Alice on A
   serverA->_brr(alice.getPublicKeyAsHash(), 100000);
-  wait_net();
+  serverA->_drainLogic();
 
   // Fund A's reserve on B (bilateral liquidity)
   serverB->_brr(kpA.getPublicKeyAsHash(), 500000);
-  wait_net();
+  serverB->_drainLogic();
 
   // Register B as reachable peer on A
   serverA->_markPeerReachable(kpB.getPublicKeyAsHash(), addrB);
@@ -490,7 +490,7 @@ BOOST_AUTO_TEST_CASE(CrossServerPaymentSettlement) {
     client.setKey(bob);
     // Bob needs funds to create the payment — fund him first
     serverB->_brr(bob.getPublicKeyAsHash(), 50000);
-    wait_net();
+    serverB->_drainLogic();
 
     client.start(0);
     BOOST_REQUIRE(client.connect());
@@ -658,7 +658,7 @@ BOOST_AUTO_TEST_CASE(DedupReplayViaWire) {
   const int64_t aliceFunding = 1'000'000;
   const uint64_t xferAmount = 1000;
   server->_brr(alice.getPublicKeyAsHash(), aliceFunding);
-  wait_net();
+  server->_drainLogic();
 
   // Stand up a raw MINX client — bypasses CesClient so we can replay bytes.
   RawMinxListener listener;
@@ -791,7 +791,8 @@ BOOST_AUTO_TEST_CASE(DedupTimeRejection) {
   // Fund Alice on A and the reserve on B
   serverA->_brr(alice.getPublicKeyAsHash(), 100000);
   serverB->_brr(kpA.getPublicKeyAsHash(), 500000);
-  wait_net();
+  serverA->_drainLogic();
+  serverB->_drainLogic();
 
   // Register B as reachable peer on A
   serverA->_markPeerReachable(kpB.getPublicKeyAsHash(), addrB);
@@ -892,11 +893,11 @@ BOOST_AUTO_TEST_CASE(VmCrossTransfer) {
 
   // Alice: enough for runAsset gas budget + cross-transfer amount.
   serverA->_brr(alice.getPublicKeyAsHash(), 50000);
-  wait_net();
+  serverA->_drainLogic();
 
   // Bilateral liquidity — A's reserve on B.
   serverB->_brr(kpA.getPublicKeyAsHash(), 50000);
-  wait_net();
+  serverB->_drainLogic();
 
   // Register B as a reachable peer on A.
   serverA->_markPeerReachable(kpB.getPublicKeyAsHash(), addrB);

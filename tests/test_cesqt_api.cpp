@@ -91,7 +91,7 @@ struct CesqtApiFixture {
     // Fund accounts
     server->_brr(fundedKey.getPublicKeyAsHash(), 10'000'000'000);
     server->_brr(originKey.getPublicKeyAsHash(), 1'000'000'000);
-    wait_net();
+    server->_drainLogic();
 
     // Create sandboxed datadir
     fs::path dataDir = tempDir / "cesqtdata";

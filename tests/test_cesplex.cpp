@@ -407,7 +407,7 @@ BOOST_AUTO_TEST_CASE(NackUnknownProtocol) {
 
   ces::KeyPair signer;
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
   auto r = peer.select(fx.rpcPort, "/ces/nope/1", signer);
   BOOST_CHECK_EQUAL(int(r.status), 0x00);
   BOOST_CHECK(r.stream == nullptr);
@@ -421,7 +421,7 @@ BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
 
   ces::KeyPair signer;
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
   auto r = peer.select(fx.rpcPort, "/ces/test/echo/1", signer);
   BOOST_REQUIRE_EQUAL(int(r.status), 0x01);
   BOOST_REQUIRE(r.stream != nullptr);
@@ -492,7 +492,7 @@ BOOST_AUTO_TEST_CASE(FileSelectAccepts) {
   BOOST_REQUIRE(peer.start() != 0);
   ces::KeyPair signer;
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
   auto r = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_CHECK_EQUAL(int(r.status), 0x01);
   BOOST_REQUIRE(r.stream != nullptr);
@@ -509,7 +509,7 @@ BOOST_AUTO_TEST_CASE(BindRejectsStaleTime) {
   BOOST_REQUIRE(peer.start() != 0);
   ces::KeyPair signer;
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
   // Bind timestamp 10 minutes in the past — beyond CES_PLEX_BIND_MAX_AGE_US (5m).
   const uint64_t staleUs =
     ces::getMicrosSinceEpoch() - 10ull * 60 * 1'000'000;
@@ -1192,7 +1192,7 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   minx::Hash priv; priv.fill(0xA1);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1241,7 +1241,7 @@ BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
   minx::Hash priv; priv.fill(0xD1);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1293,7 +1293,7 @@ BOOST_AUTO_TEST_CASE(FileWriteRead) {
   minx::Hash priv; priv.fill(0xA1);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1337,7 +1337,7 @@ BOOST_AUTO_TEST_CASE(FileCrossSignerEconomics) {
   ces::KeyPair a(privA), b(privB);
   fx.server->_brr(a.getPublicKeyAsHash(), 10'000'000'000);
   fx.server->_brr(b.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto selA = peerA.select(fx.rpcPort, "/ces/file/1", a);
   BOOST_REQUIRE_EQUAL(int(selA.status), 0x01);
@@ -1392,7 +1392,7 @@ BOOST_AUTO_TEST_CASE(FileNonOwnerWriteRejected) {
   ces::KeyPair a(privA), b(privB);
   fx.server->_brr(a.getPublicKeyAsHash(), 10'000'000'000);
   fx.server->_brr(b.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto selA = peerA.select(fx.rpcPort, "/ces/file/1", a);
   BOOST_REQUIRE_EQUAL(int(selA.status), 0x01);
@@ -1425,7 +1425,7 @@ BOOST_AUTO_TEST_CASE(FileAppendExtendsSize) {
   minx::Hash priv; priv.fill(0xA5);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1471,7 +1471,7 @@ BOOST_AUTO_TEST_CASE(FileResizeGrowAndShrink) {
   minx::Hash priv; priv.fill(0xA6);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1524,7 +1524,7 @@ BOOST_AUTO_TEST_CASE(FileRentKillsBrokeFile) {
   minx::Hash priv; priv.fill(0xA4);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1554,7 +1554,7 @@ BOOST_AUTO_TEST_CASE(FileCreateRejectsUnderfundedDeposit) {
   minx::Hash priv; priv.fill(0xA7);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1592,7 +1592,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirSelfOwnedAllowed) {
   minx::Hash priv; priv.fill(0xC1);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1618,7 +1618,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirWrongSignerRejected) {
   ces::KeyPair bob(privB);
   fx.server->_brr(alice.getPublicKeyAsHash(), 10'000'000'000);
   fx.server->_brr(bob.getPublicKeyAsHash(),   10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   // Bind the channel to Bob (the trespasser) — server will reject
   // his create under Alice's home dir.
@@ -1648,7 +1648,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceRequiresAsset) {
   minx::Hash priv; priv.fill(0xC4);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1670,7 +1670,7 @@ BOOST_AUTO_TEST_CASE(FileBadZoneRejected) {
   minx::Hash priv; priv.fill(0xC5);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1695,7 +1695,7 @@ BOOST_AUTO_TEST_CASE(FileSidecarSurvivesQuotesAndNewlines) {
   minx::Hash priv; priv.fill(0x5C);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
@@ -1721,7 +1721,7 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
   minx::Hash priv; priv.fill(0xD7);
   ces::KeyPair signer(priv);
   fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  fx.server->_drainLogic();
 
   auto sel = peer.select(fx.rpcPort, "/ces/file/1", signer);
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);

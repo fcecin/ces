@@ -1876,7 +1876,7 @@ BOOST_FIXTURE_TEST_CASE(RunAssetOwnerTransferProgram, CesFixture) {
   // Account B runs the program created by `client` (account A).
   KeyPair accountB;
   server->_brr(accountB.getPublicKeyAsHash(), 100'000'000);
-  wait_net();
+  server->_drainLogic();
   boost::asio::ip::udp::endpoint ep(
     boost::asio::ip::address_v6::loopback(), serverPort);
   CesClient clientB(ep, false);
@@ -2299,7 +2299,7 @@ BOOST_FIXTURE_TEST_CASE(AutoexecAsset, CesFixture) {
 
   rc = client->createAsset(autoKey, *autoContent, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Counter should be 0 before autoexec
   {
@@ -2315,7 +2315,7 @@ BOOST_FIXTURE_TEST_CASE(AutoexecAsset, CesFixture) {
 
   // Simulate server boot
   server->_runAutoexecSync();
-  wait_net();
+  server->_drainLogic();
 
   // Counter should be 1 after autoexec
   {
@@ -2354,7 +2354,7 @@ BOOST_FIXTURE_TEST_CASE(AutoexecDeletesGarbage, CesFixture) {
   garbage[0] = 0xFF; // bad length prefix
   uint8_t rc = client->createAsset(autoKey, garbage, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // Verify it exists
   HashPrefix owner;
@@ -2366,7 +2366,7 @@ BOOST_FIXTURE_TEST_CASE(AutoexecDeletesGarbage, CesFixture) {
 
   // runAutoexec should delete it
   server->_runAutoexecSync();
-  wait_net();
+  server->_drainLogic();
 
   // Verify the asset is gone. Unsigned queryAsset returns CES_OK with
   // zeroed fields when the asset doesn't exist.
@@ -2396,11 +2396,11 @@ BOOST_FIXTURE_TEST_CASE(AutoexecDeletesBroke, CesFixture) {
   BOOST_REQUIRE(autoContent);
   rc = client->createAsset(autoKey, *autoContent, 30);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  wait_net();
+  server->_drainLogic();
 
   // runAutoexec: account can't pay → should delete autoexec asset
   server->_runAutoexecSync();
-  wait_net();
+  server->_drainLogic();
 
   // Verify the asset is gone. Unsigned queryAsset returns CES_OK with
   // zeroed fields when the asset doesn't exist.
@@ -2451,7 +2451,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramAuthWritesCrossOwner, CesFixture) {
   // Create account B and fund it
   KeyPair accountB;
   server->_brr(accountB.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   // Account B runs the program (owned by A) with dataAsset as input
   // B connects as a separate client
@@ -2570,7 +2570,7 @@ BOOST_FIXTURE_TEST_CASE(DualAuthPrivateAssetCrossOwner, CesFixture) {
   // Account B
   KeyPair accountB;
   server->_brr(accountB.getPublicKeyAsHash(), 10'000'000'000);
-  wait_net();
+  server->_drainLogic();
 
   boost::asio::ip::udp::endpoint ep(
     boost::asio::ip::address_v6::loopback(), serverPort);
@@ -3165,7 +3165,7 @@ BOOST_FIXTURE_TEST_CASE(ScheduleRollsBackOnAbort, CesFixture) {
     ces::Bytes output;
     client->runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
     BOOST_CHECK_EQUAL(vmError, static_cast<uint64_t>(CESVM_ABORT));
-    wait_net();
+    server->_drainLogic();
     BOOST_CHECK_EQUAL(server->_scheduledRunCount(), 0u);
   }
 
@@ -3177,7 +3177,7 @@ BOOST_FIXTURE_TEST_CASE(ScheduleRollsBackOnAbort, CesFixture) {
     ces::Bytes output;
     client->runAsset(progId, 1'000'000'000, input, vmError, budgetUsed, output);
     BOOST_CHECK_EQUAL(vmError, static_cast<uint64_t>(CESVM_OK));
-    wait_net();
+    server->_drainLogic();
     BOOST_CHECK_EQUAL(server->_scheduledRunCount(), 1u);
   }
 }

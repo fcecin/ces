@@ -56,6 +56,7 @@ BOOST_AUTO_TEST_CASE(GossipFloodReachesAllPeersOnce) {
   blog::set_level(blog::info);
 
   const int N = 3;
+  const uint64_t kReserve = 10'000'000;
   std::vector<bfs::path> dirs;
   std::vector<minx::Hash> privs;
   std::vector<minx::Hash> pubkeys;
@@ -70,71 +71,33 @@ BOOST_AUTO_TEST_CASE(GossipFloodReachesAllPeersOnce) {
 
   std::vector<std::unique_ptr<CesServer>> servers(N);
   std::vector<uint16_t> ports(N);
-
-  auto waitPoW = [&]() {
-    for (int t = 0; t < 300; ++t) {
-      bool all = true;
-      for (int i = 0; i < N; ++i)
-        if (!servers[i]->isPoWEngineReady()) all = false;
-      if (all) return;
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-  };
-
-  // Phase 1: start on port 0 to learn the assigned ports.
   for (int i = 0; i < N; ++i) {
     servers[i] =
       std::make_unique<CesServer>(makeGossipConfig(dirs[i], privs[i]));
     ports[i] = servers[i]->start(0);
     BOOST_REQUIRE(ports[i] > 0);
-    servers[i]->createPoWEngine(false);  // cache-only
   }
-  waitPoW();
+
+  // Seed a fully-reciprocated, funded all-to-all mesh directly (reachable +
+  // verified peer, reserve held, inbound PoW proved) as a completed mining
+  // cycle would, so the flood runs without RandomX or the peer miner. Sender
+  // i's reserve at receiver j lives on j's ledger keyed by i.
   for (int i = 0; i < N; ++i)
-    BOOST_REQUIRE(servers[i]->isPoWEngineReady());
-
-  // Rebuild with all-to-all peer configs, restart on the same ports.
-  for (int i = 0; i < N; ++i) servers[i]->stop();
-  for (int i = 0; i < N; ++i) servers[i].reset();
-
-  for (int i = 0; i < N; ++i) {
-    CesConfig cfg = makeGossipConfig(dirs[i], privs[i]);
-    cfg.peerTarget = 2000;
     for (int j = 0; j < N; ++j) {
-      if (j == i) continue;
-      cfg.peers.push_back({minx::hashToString(pubkeys[j]),
-                           "localhost:" + std::to_string(ports[j])});
+      if (i == j) continue;
+      servers[i]->_markPeerReachable(pubkeys[j],
+                                     "localhost:" + std::to_string(ports[j]));
+      servers[i]->_testCompletePeering(pubkeys[j],
+                                       static_cast<int64_t>(kReserve), 1);
+      servers[j]->_brr(pubkeys[i], static_cast<int64_t>(kReserve));
     }
-    servers[i] = std::make_unique<CesServer>(cfg);
-    uint16_t p2 = servers[i]->start(ports[i]);
-    BOOST_REQUIRE_EQUAL(p2, ports[i]);
-    servers[i]->createPoWEngine(false);
-  }
-  waitPoW();
-  for (int i = 0; i < N; ++i) servers[i]->startPeerMiner();
-
-  // Wait until every server has verified its N-1 peers (authenticated paths up).
-  auto verifiedCount = [&](int idx) {
-    int n = 0;
-    for (auto& p : servers[idx]->_peerSnapshot())
-      if (p.verified) ++n;
-    return n;
-  };
-  bool ready = false;
-  for (int t = 0; t < 2400 && !ready; ++t) {  // up to ~120s
-    ready = true;
-    for (int i = 0; i < N; ++i)
-      if (verifiedCount(i) < N - 1) ready = false;
-    if (!ready) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
-  BOOST_REQUIRE_MESSAGE(ready, "peers did not all verify each other");
 
   // Server 0 originates a broadcast gossip (dest all-zero = everyone).
   ces::Bytes payload;
   const char* text = "hello gossip mesh";
   payload.insert(payload.end(), text, text + std::strlen(text));
   Hash broadcast{};
-  servers[0]->originateGossip(payload, 1'000'000, broadcast);
+  servers[0]->originateGossip(payload, 500'000, broadcast);
 
   // Poll: every other server should receive it.
   bool reachedAll = false;

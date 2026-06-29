@@ -163,7 +163,7 @@ struct CesFixture {
 
     // FUNDING: 10 Billion Credits for main client
     server->_brr(clientKey.getPublicKeyAsHash(), 10'000'000'000);
-    wait_net();
+    server->_drainLogic();
   }
 
   ~CesFixture() {
@@ -171,7 +171,6 @@ struct CesFixture {
       client->stop();
     if (server)
       server->stop();
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
     boost::system::error_code ec;
     fs::remove_all(tempDir, ec);
   }

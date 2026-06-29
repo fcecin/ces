@@ -209,9 +209,17 @@ case "$ACTION" in
                 # don't clobber each other's output/tally.
                 logf=$(mktemp "${TMPDIR:-/tmp}/cestests.XXXXXX.log")
                 set +e
+                test_start=$(date +%s.%N)
                 "$BIN" $BOOST_ARGS 2>&1 | tee "$logf"
                 rc=${PIPESTATUS[0]}
+                test_end=$(date +%s.%N)
                 set -e
+                # Wall-clock for the test run itself (not the build), for any
+                # filter. Sub-minute: "12.3s"; longer: "83.0s (1m 23s)".
+                elapsed=$(awk -v a="$test_start" -v b="$test_end" 'BEGIN{
+                  d=b-a; if(d<0)d=0;
+                  if(d>=60){m=int(d/60);r=d-m*60;printf "%.1fs (%dm %.0fs)",d,m,r}
+                  else printf "%.1fs",d}')
                 # Build a one-line tally from the Boost short report. Never drive
                 # by the exit code alone (a wrapping command can mask it).
                 cases=$(grep -aoE '[0-9]+ test cases? out of [0-9]+ (passed|failed)' "$logf" | tail -1)
@@ -223,12 +231,12 @@ case "$ACTION" in
                 failed=$(grep -aoE '\*\*\* [0-9]+ failures? (are|is) detected|has failed with' "$logf" | tail -1)
                 if [ $rc -ne 0 ] || [ -n "$failed" ]; then
                     # Keep the log for inspection on failure; print its path.
-                    echo "❌ $LABEL FAILED (exit code $rc) — ${summary:-see output above}"
+                    echo "❌ $LABEL FAILED (exit code $rc) in $elapsed — ${summary:-see output above}"
                     echo "   log: $logf"
                     exit 1
                 else
                     rm -f "$logf"
-                    echo "✅ $LABEL passed — ${summary:-no tally}"
+                    echo "✅ $LABEL passed in $elapsed — ${summary:-no tally}"
                 fi
             else
                 echo "⚠️  cestests not found: $BIN"

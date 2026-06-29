@@ -578,7 +578,7 @@ BOOST_AUTO_TEST_CASE(ComputeLaunchAcceptTimeoutIsClean) {
   server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
   std::string ownerPath = "/h/" + ownerKey.getPublicKeyHexStr() + "/prog.bin";
 
-  wait_net();
+  server->_drainLogic();
 
   // Source file, funded so the upfront commitment fee clears.
   {
@@ -659,7 +659,7 @@ BOOST_AUTO_TEST_CASE(LaunchIsNotDeduped) {
   server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
   std::string ownerPath = "/h/" + ownerKey.getPublicKeyHexStr() + "/prog.bin";
 
-  wait_net();
+  server->_drainLogic();
 
   // Source, funded so the per-launch upfront (from file_balance, not the
   // account) never limits us — the account only pays feeQuery per launch.
@@ -747,7 +747,7 @@ struct PortServer {
     rpcPort = server->_rpcBoundPort();
     server->_brr(ownerKey.getPublicKeyAsHash(), 10'000'000'000);
     src = "/h/" + ownerKey.getPublicKeyHexStr() + "/p.bin";
-    wait_net();
+    server->_drainLogic();
     CesFileClient fc;
     fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
     CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));

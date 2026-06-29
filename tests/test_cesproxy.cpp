@@ -147,7 +147,7 @@ struct ProxyFixture {
 
     // Fund the test key
     server->_brr(fundedKey.getPublicKeyAsHash(), 10'000'000'000LL);
-    wait_net();
+    server->_drainLogic();
 
     // Start CesProxy (owns its own io_context and thread)
     tcp::endpoint listenEp(asio::ip::address::from_string("127.0.0.1"), 0);

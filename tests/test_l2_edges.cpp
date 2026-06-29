@@ -56,7 +56,7 @@ struct L2EdgeFixture {
     server->_brr(ownerKey.getPublicKeyAsHash(), 100'000'000'000ull);
     base = "/h/" + ownerKey.getPublicKeyHexStr() + "/";
 
-    wait_net();
+    server->_drainLogic();
   }
 
   ~L2EdgeFixture() {

@@ -149,7 +149,7 @@ BOOST_AUTO_TEST_CASE(Test03_InsufficientFunds) {
   // Create a poor account (1000 credits) to avoid 64-bit protocol ambiguity
   KeyPair poor;
   server->_brr(poor.getPublicKeyAsHash(), 1000);
-  wait_net();
+  server->_drainLogic();
 
   CesClient poorClient(testServerEp(serverPort), false);
   poorClient.start(0);
@@ -170,7 +170,7 @@ BOOST_AUTO_TEST_CASE(Test05_SignedQuery) {
   LOGINFO << "TEST: Starting SignedQuery";
   KeyPair k1;
   server->_brr(k1.getPublicKeyAsHash(), 5000);
-  wait_net();
+  server->_drainLogic();
 
   std::vector<AccountEntry> res;
   HashPrefix target = Account::getMapKey(k1.getPublicKeyAsHash());
@@ -206,7 +206,7 @@ BOOST_AUTO_TEST_CASE(Test12_AccountRentLogic) {
   LOGINFO << "TEST: Starting AccountRentLogic";
   KeyPair poor;
   server->_brr(poor.getPublicKeyAsHash(), BASE_FEE_ACCOUNT);
-  wait_net();
+  server->_drainLogic();
 
   CesClient observer(testServerEp(serverPort), false);
   observer.start(0);
@@ -232,7 +232,7 @@ BOOST_AUTO_TEST_CASE(Test17_InsufficientFundsForAccountCreation) {
   // Fund with enough for the tx fee but not enough for tx fee + account creation
   uint64_t poorFund = BASE_FEE_TRANSACTION + 1000;
   server->_brr(poor.getPublicKeyAsHash(), poorFund);
-  wait_net();
+  server->_drainLogic();
 
   CesClient poorClient(testServerEp(serverPort), false);
   poorClient.start(0);
@@ -313,7 +313,7 @@ BOOST_AUTO_TEST_CASE(Test19_Pagination) {
     server->_brr(k.getPublicKeyAsHash(), 10000); // Fund to persist
     createdKeys.insert(k.getPublicKeyAsHash());
   }
-  wait_net();
+  server->_drainLogic();
 
   std::vector<AccountEntry> accRes;
 
@@ -449,20 +449,20 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   int64_t bobAmount = RENT * 2;
   uint8_t rc = client->openTransfer(bob.getPublicKeyAsHash(), bobAmount, newBal);
   CES_REQUIRE_OK(rc);
-  wait_net();
+  server->_drainLogic();
   expected -= (TX + CREATE3); // amount neutral, fees burned
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
 
   // --- 2. Mint via _brr to existing account ---
   server->_brr(clientKey.getPublicKeyAsHash(), 5000);
-  wait_net();
+  server->_drainLogic();
   expected += 5000;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
 
   // --- 3. Mint via _brr to NEW account ---
   KeyPair fresh;
   server->_brr(fresh.getPublicKeyAsHash(), 7777);
-  wait_net();
+  server->_drainLogic();
   expected += 7777;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
 
@@ -470,7 +470,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   KeyPair bulkDest1, bulkDest2;
   server->_brr(bulkDest1.getPublicKeyAsHash(), 1);
   server->_brr(bulkDest2.getPublicKeyAsHash(), 1);
-  wait_net();
+  server->_drainLogic();
   expected += 2;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
 
@@ -502,7 +502,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   KeyPair sacrificial;
   int64_t sacrificialFund = RENT * 2;
   server->_brr(sacrificial.getPublicKeyAsHash(), sacrificialFund);
-  wait_net();
+  server->_drainLogic();
   expected += sacrificialFund;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
   rc = server->transfer(sacrificial.getPublicKeyAsHash(), clientKey.getPublicKeyAsHash(),
@@ -563,7 +563,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
 
   // --- 14. Buy asset: price neutral, buyFee (txFee) burned ---
   server->_brr(bob.getPublicKeyAsHash(), 500'000'000);
-  wait_net();
+  server->_drainLogic();
   expected += 500'000'000;
   // Set price=1 (stored), which is 1 * PRICE_UNIT effective
   rc = server->updateAssetMeta(clientKey.getPublicKeyAsHash(), assetId, getMyId(), 1,
@@ -595,7 +595,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   KeyPair payer;
   int64_t payerFund = RENT * 2 + TX + 50000;
   server->_brr(payer.getPublicKeyAsHash(), payerFund);
-  wait_net();
+  server->_drainLogic();
   expected += payerFund;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
   rc = server->transfer(payer.getPublicKeyAsHash(), payee.getPublicKeyAsHash(), 50000,
@@ -610,7 +610,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   // Create a poor account that will be erased by maintenance
   KeyPair poorGuy;
   server->_brr(poorGuy.getPublicKeyAsHash(), RENT);
-  wait_net();
+  server->_drainLogic();
   expected += RENT;
   BOOST_CHECK_EQUAL(server->_getTotalCredits(), expected);
 
@@ -620,7 +620,7 @@ BOOST_AUTO_TEST_CASE(TotalCredits_Tracking) {
   int64_t preMaintenanceCredits = server->_getTotalCredits();
   BOOST_CHECK_EQUAL(preMaintenanceCredits, expected);
   server->_runDailyMaintenance();
-  wait_net();
+  server->_drainLogic();
   // Just verify credits decreased (fees burned + accounts erased)
   BOOST_CHECK(server->_getTotalCredits() < preMaintenanceCredits);
   // And that the tracker still matches a fresh sum (sanity)
@@ -633,7 +633,7 @@ BOOST_AUTO_TEST_CASE(Test_Burn) {
   // Fund a fresh account
   KeyPair target;
   server->_brr(target.getPublicKeyAsHash(), 5000);
-  wait_net();
+  server->_drainLogic();
 
   // Verify initial balance
   auto mapKey = Account::getMapKey(target.getPublicKeyAsHash());
@@ -644,14 +644,14 @@ BOOST_AUTO_TEST_CASE(Test_Burn) {
 
   // Burn some
   server->_burn(target.getPublicKeyAsHash(), 3000);
-  wait_net();
+  server->_drainLogic();
 
   client->queryAccount(mapKey, bal, nonce);
   BOOST_CHECK_EQUAL(bal, 2000);
 
   // Burn more than balance — should cap at balance
   server->_burn(target.getPublicKeyAsHash(), 9999);
-  wait_net();
+  server->_drainLogic();
 
   client->queryAccount(mapKey, bal, nonce);
   BOOST_CHECK_EQUAL(bal, 0);
@@ -659,7 +659,7 @@ BOOST_AUTO_TEST_CASE(Test_Burn) {
   // Burn on nonexistent account — should not crash
   KeyPair ghost;
   server->_burn(ghost.getPublicKeyAsHash(), 100);
-  wait_net();
+  server->_drainLogic();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

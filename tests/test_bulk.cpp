@@ -59,7 +59,7 @@ BOOST_AUTO_TEST_CASE(Test_BulkTransfer_StopAndCommit) {
   KeyPair poorSender;
   int64_t perTransfer = 1000 + BASE_FEE_TRANSACTION + 3 * BASE_FEE_ACCOUNT;
   server->_brr(poorSender.getPublicKeyAsHash(), perTransfer * 2 + perTransfer / 2);
-  wait_net();
+  server->_drainLogic();
 
   CesClient poorClient(testServerEp(serverPort), false);
   poorClient.start(0);

@@ -406,7 +406,7 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
     "local entered, exited = 0, 0\n"
     "ces.every(20, function()\n"
     "  entered = entered + 1\n"
-    "  ces.sleep(3000)\n"           // long park; the 20ms re-fires must be skipped
+    "  ces.sleep(1200)\n"           // long park; the 20ms re-fires must be skipped
     "  exited = exited + 1\n"
     "end)\n"
     "ces.conn.set_listener({\n"
@@ -429,7 +429,7 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   auto r = peer.attach(userKey, sessionToken, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
-  // Probe 1, during the first tick's 800ms park: on_data answers (VM not
+  // Probe 1, during the first tick's 1200ms park: on_data answers (VM not
   // frozen), exactly one tick has started (skip-if-busy), none has finished.
   ces::Bytes p1{'a'};
   BOOST_REQUIRE(peerWrite(peer, p1));
@@ -437,9 +437,9 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   BOOST_REQUIRE(peerReadExact(peer, g1, 2, std::chrono::seconds(5)));
   BOOST_CHECK_EQUAL(std::string(g1.begin(), g1.end()), "10");
 
-  // Wait past the full 3000ms park (the tick was already in flight at probe 1,
-  // so 3300ms guarantees it resumed past ces.sleep and a later tick has begun).
-  std::this_thread::sleep_for(std::chrono::milliseconds(3300));
+  // Wait past the full 1200ms park (the tick was already in flight at probe 1,
+  // so 1500ms guarantees it resumed past ces.sleep and a later tick has begun).
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
 
   // Probe 2: exited incremented -> the body resumed past ces.sleep (a real
   // coroutine); entered advanced -> the timer kept ticking after the long one.

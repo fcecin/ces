@@ -104,7 +104,7 @@ struct FileE2EFixture {
     secondWalletHex = "00" + secondKey.getPrivateKeyHexStr();
     server->_brr(secondKey.getPublicKeyAsHash(), 10'000'000'000);
 
-    wait_net();
+    server->_drainLogic();
   }
 
   ~FileE2EFixture() {

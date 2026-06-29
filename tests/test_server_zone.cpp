@@ -77,7 +77,7 @@ struct ServerZoneFixture {
     server->_brr(serverKey.getPublicKeyAsHash(), 10'000'000'000);
     server->_brr(otherKey.getPublicKeyAsHash(),  10'000'000'000);
 
-    wait_net();
+    server->_drainLogic();
   }
 
   ~ServerZoneFixture() {
