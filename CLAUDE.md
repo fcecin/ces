@@ -247,7 +247,7 @@ Created via `CES_CREATE_PAYMENT`. Cost = `(2 + days) * feeAccount`. New account:
 - Regular accounts (balance >= 0): deduct `feeAccount`; delete if balance <= fee.
 - Assets: decrement balance by 1; delete if balance <= 1.
 
-Logs a per-pass summary and triggers an auto-snapshot. The file-store has no periodic rent pass (lazy on every non-DEPOSIT touch; JIT GC fires on CREATE if the cap is exceeded). Compute instances are billed on the supervisor tick, not maintenance.
+Logs a per-pass summary and triggers an auto-snapshot. Flat files have no periodic rent pass: rent is lazy (every non-DEPOSIT op rolls it forward; JIT GC fires on CREATE if the cap is exceeded). KV-file cells, by contrast, ARE swept on this daily pass: `sweepKvRent` charges each cell its per-byte rent and erases zero-balance keys (the daily tick is the only place kv-cell rent is charged; kv ops do not roll rent per-touch like flat files do). Compute instances are billed on the supervisor tick, not maintenance.
 
 ## Inter-server settlement
 

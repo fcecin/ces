@@ -201,7 +201,10 @@ set_target_properties(cescompmockd PROPERTIES OUTPUT_NAME "cescompmockd")
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LUAJIT REQUIRED luajit)
-add_executable(cesluajitd src/cesluajitd/main.cpp)
+add_executable(cesluajitd
+  src/cesluajitd/main.cpp
+  src/cesluajitd/sha256.cpp
+)
 target_include_directories(cesluajitd PRIVATE ${LUAJIT_INCLUDE_DIRS})
 target_link_libraries(cesluajitd PRIVATE ${LUAJIT_LIBRARIES} ceslib)
 target_link_directories(cesluajitd PRIVATE ${LUAJIT_LIBRARY_DIRS})

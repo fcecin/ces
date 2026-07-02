@@ -2184,13 +2184,17 @@ void dispatchResize(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
 }
 
 // ---------------------------------------------------------------------------
-// kv-file cores. Mirror the flat cores' billing exactly: rent rolls forward on
-// every op; a PUT that grows the logical size (sum key+value bytes) pays the
-// per-KB write cost and the 15-min upfront rent on the delta from the file's
-// own program account, plus feeQuery from the source. Logical size lives in
-// the sidecar (size). The logkv store is accessed under the kv cache mutex; the
-// ledger transaction is taken while holding it (no path takes the store-meta
-// mutex then the kv mutex, so the brief store-meta acquisitions here cannot deadlock).
+// kv-file cores. Billing differs from the flat cores: a kv cell's RENT is NOT
+// rolled per-op. It is charged only by the daily sweep (sweepKvRent, run from
+// CesServer::dailyTaskTick), which charges every cell its per-byte rent and
+// erases zero-balance keys. A PUT pays the per-KB write cost (feeFileWrite; 0 in
+// the /s/ zone) plus feeQuery from the bound signer, credits any deposit into the
+// cell balance and the file's program account, and on growth runs the cap/GC
+// check (checkCapAndMaybeGc) -- there is no 15-min upfront rent on kv puts.
+// Logical size lives in the sidecar (size). The logkv store is accessed under the
+// kv cache mutex; the ledger transaction is taken while holding it (no path takes
+// the store-meta mutex then the kv mutex, so the brief store-meta acquisitions
+// here cannot deadlock).
 // ---------------------------------------------------------------------------
 
 struct KvPutOutcome     { uint8_t status; uint64_t balance; uint64_t size; };
