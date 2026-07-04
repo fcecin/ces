@@ -119,6 +119,13 @@ public:
   // started," not "child connected."
   uint8_t launchInternal(const std::string& name);
 
+  // Enable an extension by source path: idempotent, singleton, thread-safe. Marshals
+  // onto rpcTaskIO_ (blocking post+wait) so the launch is serialized with the IPC
+  // readers/kills, and refuses a duplicate if the source already has a live instance
+  // OR a spawn in flight. Returns true if it is now (or was already) running; on
+  // failure sets errOut to the extension's own last log line (crash diagnostic) if any.
+  bool enableExtension(const std::string& source, std::string& errOut);
+
   // Deliver an inbound CES_APP_COMPUTE_MSG-shaped packet. Called from
   // CesServer::incomingApplication after the hop onto rpcTaskIO_. `senderPfx`
   // is the 8-byte prefix of the sending client's pubkey (reply-to target for
@@ -194,6 +201,13 @@ public:
   std::map<uint64_t, std::shared_ptr<Instance>> instances_;
   std::map<std::array<uint8_t, 8>, std::set<uint64_t>> byPrefix_;
   std::map<std::string, std::set<uint64_t>> byName_;
+  // Source path -> expiry (us) of a spawn in flight. Bridges the async connect-back
+  // window so a rapid second enable does not double-launch a singleton extension;
+  // byName_ takes over once the child registers. Short TTL -> never a stuck entry.
+  std::map<std::string, uint64_t> launchingUntil_;
+  // Source path -> {when(us), diagnostic} of the most recent instance death, so a
+  // failed enable can surface WHY it died (the extension's own last log line).
+  std::map<std::string, std::pair<uint64_t, std::string>> lastExtDeath_;
   std::map<std::string, uint64_t> serviceTags_;
   uint64_t nextPid_ = 1;
   std::map<uint16_t, std::shared_ptr<ExtPending>> extPending_;

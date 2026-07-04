@@ -19,6 +19,8 @@ print_help() {
     echo "                  Faster but NOT portable -- local dev/bench only."
     echo "                  Default is -march=x86-64-v3 (portable, shippable)."
     echo "  --asan          Enables AddressSanitizer."
+    echo "  --hyle          Fetch + link the hyle consensus engine (core + services)"
+    echo "                  into cesluajitd. Pulls Rust/malachite-cpp; first build is slow."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
     echo "                    --test                Run all tests"
@@ -75,6 +77,10 @@ build_one_config() {
         EXTRA_ARGS="-DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
     fi
 
+    # hyle consensus engine on/off (explicit each run so it is not a sticky cache value).
+    local HYLE_ARG="-DCES_HYLE=OFF"
+    [ "$ENABLE_HYLE" = true ] && HYLE_ARG="-DCES_HYLE=ON"
+
     # Portable -march by default; --native pins to the build host.
     local MARCH="x86-64-v3"
     [ "$ENABLE_NATIVE" = true ] && MARCH="native"
@@ -86,6 +92,7 @@ build_one_config() {
     cmake -S . -B "$BUILD_DIR" \
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}" \
         -DCES_MARCH="${MARCH}" \
+        $HYLE_ARG \
         $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
@@ -101,6 +108,7 @@ TEST_FILTER=""
 DO_CLEAN=false
 ENABLE_ASAN=false
 ENABLE_NATIVE=false
+ENABLE_HYLE=false
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter
@@ -136,6 +144,9 @@ while [ $i -lt ${#ARGS[@]} ]; do
             ;;
         --native)
             ENABLE_NATIVE=true
+            ;;
+        --hyle)
+            ENABLE_HYLE=true
             ;;
         --asan)
             ENABLE_ASAN=true

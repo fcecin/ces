@@ -339,6 +339,7 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // monotonic, never reused. This is what Lua, the protocol, and the UI speak.
   uint64_t pid = 0;
   std::string sourceName;
+  std::string lastLog;  // last ces.log / host line this instance emitted; its crash diagnostic
   std::array<uint8_t, 32> ownerPk{};
   // Program account pubkey from the source file's sidecar.
   std::array<uint8_t, 32> programPubkey{};
@@ -713,6 +714,9 @@ void killByPid(ComputeHandler& H, uint64_t pid) {
   auto it = H.instances_.find(pid);
   if (it == H.instances_.end()) return;
   auto inst = it->second;
+  // Record why this instance is going away (its last log line), so a failed enable
+  // can tell the operator what the extension actually said before it died.
+  H.lastExtDeath_[inst->sourceName] = { getMicrosSinceEpoch(), inst->lastLog };
   // Tear down any /ces/lua/1 connections routed to this instance
   // before we drop the registry entry, so the lua handler can
   // still find it (and so the bytes-and-onClosed cascade fires
@@ -972,12 +976,17 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
 // Async-read one frame from the child. On success, dispatches and
 // re-arms itself for the next frame.
 void startIpcReader(std::shared_ptr<Instance> inst) {
-  if (!inst->peer) return;
+  // Hold the socket shared_ptr for the whole read: teardownInstance() may close()
+  // and reset() inst->peer while a read is pending (rampant when instances churn
+  // under rapid enable/disable). Capturing `sock` keeps the UnixSocket alive so a
+  // concurrent teardown becomes a clean operation_aborted here, not a use-after-free.
+  auto sock = inst->peer;
+  if (!sock) return;
   boost::asio::async_read(
-    *inst->peer, boost::asio::buffer(inst->rxLenBuf),
-    [inst](const boost::system::error_code& ec, std::size_t) {
+    *sock, boost::asio::buffer(inst->rxLenBuf),
+    [inst, sock](const boost::system::error_code& ec, std::size_t) {
       if (ec) {
-        // Child closed its end. Reap and clean up.
+        // Child closed its end (or the socket was torn down). Reap and clean up.
         killByPid(*inst->owner, inst->pid);
         return;
       }
@@ -990,14 +999,16 @@ void startIpcReader(std::shared_ptr<Instance> inst) {
       }
       inst->rxBodyBuf.assign(len, 0);
       boost::asio::async_read(
-        *inst->peer, boost::asio::buffer(inst->rxBodyBuf),
-        [inst](const boost::system::error_code& ec2, std::size_t) {
+        *sock, boost::asio::buffer(inst->rxBodyBuf),
+        [inst, sock](const boost::system::error_code& ec2, std::size_t) {
           if (ec2) {
             killByPid(*inst->owner, inst->pid);
             return;
           }
           handleChildFrame(inst);
-          if (inst->owner->instances_.count(inst->pid))
+          // Re-arm only if the instance is still live AND still owns this socket
+          // (teardown nulls inst->peer). startIpcReader re-checks inst->peer too.
+          if (inst->owner->instances_.count(inst->pid) && inst->peer == sock)
             startIpcReader(inst);
         });
     });
@@ -1176,9 +1187,11 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     uint8_t level = body[kIpcHdr];
     size_t mlen = body.size() - kIpcHdr - 1;
     if (mlen > kLuaProgramLogMax) mlen = kLuaProgramLogMax;
-    emitProgramLog(
-      inst->pid, inst->sourceName, level,
-      reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
+    const char* msg = reinterpret_cast<const char*>(body.data() + kIpcHdr + 1);
+    // Remember the last thing the program said: if it dies right after, this is the
+    // crash diagnostic surfaced to the operator (e.g. by a failed enable).
+    inst->lastLog.assign(msg, mlen);
+    emitProgramLog(inst->pid, inst->sourceName, level, msg, mlen);
     return;
   }
   if (tag == kIpcTagHostLog) {
@@ -1191,9 +1204,9 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     uint8_t level = body[kIpcHdr];
     size_t mlen = body.size() - kIpcHdr - 1;
     if (mlen > kLuaProgramLogMax) mlen = kLuaProgramLogMax;
-    emitHostLog(
-      inst->pid, inst->sourceName, level,
-      reinterpret_cast<const char*>(body.data() + kIpcHdr + 1), mlen);
+    const char* msg = reinterpret_cast<const char*>(body.data() + kIpcHdr + 1);
+    inst->lastLog.assign("[host] ").append(msg, mlen);  // host-side death diagnostic
+    emitHostLog(inst->pid, inst->sourceName, level, msg, mlen);
     return;
   }
   if (tag == kIpcTagNetUsage) {
@@ -2457,6 +2470,7 @@ void allocateAndSpawnInstance(
       H.instances_[inst->pid] = inst;
       H.byPrefix_[inst->progPrefix].insert(inst->pid);
       H.byName_[inst->sourceName].insert(inst->pid);
+      H.launchingUntil_.erase(inst->sourceName);  // registered; byName_ now dedups
       // Make this program's account a gossip sink target.
       if (CesServer* sv = H.server_)
         sv->registerSinkTarget(inst->programPubkey);
@@ -3410,6 +3424,71 @@ std::vector<ComputeInstanceStat> ComputeHandler::snapshot() {
   std::unique_lock lk(m);
   cv.wait(lk, [&] { return done; });
   return out;
+}
+
+bool ComputeHandler::enableExtension(const std::string& source, std::string& errOut) {
+  CesServer* server = server_;
+  if (!server) return false;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return false;
+  uint64_t launchStart = getMicrosSinceEpoch();
+  // Run `fn` on the compute strand and block for it (like snapshot()).
+  auto onStrand = [&](auto&& fn) {
+    std::mutex m;
+    std::condition_variable cv;
+    bool done = false;
+    boost::asio::post(ex, [&]() {
+      fn();
+      std::lock_guard lk(m);
+      done = true;
+      cv.notify_all();
+    });
+    std::unique_lock lk(m);
+    cv.wait(lk, [&] { return done; });
+  };
+  auto isRunning = [&]() {
+    bool r = false;
+    onStrand([&]() {
+      auto it = byName_.find(source);
+      r = (it != byName_.end() && !it->second.empty());
+    });
+    return r;
+  };
+
+  // Step 1: idempotent singleton launch on the strand. launchInternal MUST run there.
+  bool alreadyRunning = false, validated = false;
+  onStrand([&]() {
+    uint64_t now = getMicrosSinceEpoch();
+    auto it = byName_.find(source);
+    if (it != byName_.end() && !it->second.empty()) { alreadyRunning = true; return; }
+    auto lit = launchingUntil_.find(source);
+    if (lit != launchingUntil_.end() && lit->second > now) { validated = true; return; }
+    launchingUntil_[source] = now + 5000000ULL;  // 5s covers connect-back
+    if (launchInternal(source) == CES_OK) validated = true;
+    else launchingUntil_.erase(source);  // failed validation (bad file/owner)
+  });
+  if (alreadyRunning) return true;
+  if (!validated) return false;
+
+  // Step 2: report the TRUTH, not "spawn started". CES_OK from launchInternal means
+  // only that a child was spawned -- a broken extension (e.g. one that self-terminates
+  // on load) registers for an instant, or never, then dies. Require a STABLE running
+  // window (running on two consecutive checks). Otherwise enable honestly reports
+  // failure instead of a misleading "ok". Poll up to ~2s (good extensions connect in ~ms).
+  int stable = 0;
+  for (int i = 0; i < 20; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    if (isRunning()) { if (++stable >= 2) return true; }
+    else stable = 0;
+  }
+  // Never stabilized -> it crashed on launch or exited. Surface the extension's own
+  // last words (its final ces.log / host line), recorded on death after launchStart.
+  onStrand([&]() {
+    auto dit = lastExtDeath_.find(source);
+    if (dit != lastExtDeath_.end() && dit->second.first >= launchStart && !dit->second.second.empty())
+      errOut = dit->second.second;
+  });
+  return false;
 }
 
 bool ComputeHandler::instanceAcceptsConnections(uint64_t pid) {

@@ -7,9 +7,10 @@
 
 import { execSync, spawn as nodeSpawn, spawnSync } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync, openSync, closeSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
-const PROJECT_ROOT = resolve(import.meta.dirname, "..");
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MANIFEST = "cesnet.json";
 const USER_CREDIT = 1_000_000_000;
 const PEER_LIQUIDITY = 1_000_000_000_000;

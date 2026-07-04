@@ -156,7 +156,18 @@ std::vector<ExtensionItem> extensionList(CesServer* server) {
   for (auto& st : ch ? ch->snapshot() : std::vector<ComputeInstanceStat>{}) {
     std::string n = nameFromSource(st.source);
     if (n.empty()) continue;
-    auto& it = byName[n];
+    // Invariant: enabled => installed. A running instance whose /s/ source is gone is
+    // an ORPHAN (uninstalled out from under it, a crash, a race, or an uncooperative
+    // teardown). Never report it as enabled, and force-kill it. killBySource is an
+    // idempotent SIGKILL that does not trust the extension to cooperate, so the state
+    // converges: a later scan finds the orphan gone. This keeps the reported state
+    // machine consistent (no enabled-and-not-installed) on every query.
+    auto found = byName.find(n);
+    if (found == byName.end() || !found->second.installed) {
+      if (ch) ch->killBySource(st.source);
+      continue;
+    }
+    ExtensionItem& it = found->second;
     it.name = n;
     it.enabled = true;
     it.pid = st.pid;
@@ -211,12 +222,15 @@ bool extensionUninstall(CesServer* server, const std::string& name) {
   return true;
 }
 
-bool extensionEnable(CesServer* server, const std::string& name) {
+bool extensionEnable(CesServer* server, const std::string& name, std::string& errOut) {
   if (!validName(name)) return false;
   std::error_code ec;
   if (!fs::exists(sLua(server, name), ec)) return false;
   ComputeHandler* h = server->computeHandler();
-  return h && h->launchInternal(srcName(name)) == CES_OK;
+  // enableExtension marshals onto rpcTaskIO (launchInternal MUST run on that strand)
+  // and is idempotent + singleton, so a button-mash cannot double-launch or race the
+  // instance/port state. On failure it fills errOut with the extension's own crash line.
+  return h && h->enableExtension(srcName(name), errOut);
 }
 
 bool extensionDisable(CesServer* server, const std::string& name) {

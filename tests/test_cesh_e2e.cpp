@@ -1151,8 +1151,12 @@ struct CesnetBotFixture {
     // Locate scripts relative to test binary (build/<type>/tests/ceshe2e)
     std::string self =
       boost::unit_test::framework::master_test_suite().argv[0];
-    // build/<type>/tests/ceshe2e → 3 parent_path calls → build/, one more → project root
-    fs::path projectRoot = fs::path(self).parent_path().parent_path().parent_path().parent_path();
+    // argv[0] may be RELATIVE (build.sh runs build/<type>/tests/cestests), which
+    // would make projectRoot empty and cesnetBin a bare name that `sh -c` cannot
+    // find in PATH (exit 127). Absolutize first. build/<type>/tests/cestests → 4
+    // parent_path calls (tests → <type> → build → project root).
+    fs::path projectRoot = fs::weakly_canonical(fs::absolute(fs::path(self)))
+                             .parent_path().parent_path().parent_path().parent_path();
     cesnetBin = (projectRoot / "cesnet").string();
     cesnetbotBin = (projectRoot / "cesnetbot").string();
     BOOST_REQUIRE_MESSAGE(fs::exists(cesnetBin), "cesnet not found at " + cesnetBin);

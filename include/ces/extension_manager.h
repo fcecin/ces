@@ -42,7 +42,7 @@ std::vector<ExtensionItem> extensionList(CesServer* server);
 
 bool extensionInstall(CesServer* server, const std::string& name);    // catalog -> /s/
 bool extensionUninstall(CesServer* server, const std::string& name);  // kill + delete /s/ copy
-bool extensionEnable(CesServer* server, const std::string& name);     // launch
+bool extensionEnable(CesServer* server, const std::string& name, std::string& errOut);  // launch
 bool extensionDisable(CesServer* server, const std::string& name);    // kill
 
 // Live status k/v of a running extension. false if not enabled / not an

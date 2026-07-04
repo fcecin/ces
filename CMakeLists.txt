@@ -211,6 +211,29 @@ target_link_directories(cesluajitd PRIVATE ${LUAJIT_LIBRARY_DIRS})
 target_link_options(cesluajitd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesluajitd PROPERTIES OUTPUT_NAME "cesluajitd")
 
+# -----------------------------------------------------------------------------
+# 6. OPTIONAL: the hyle consensus engine (core + services) for cesluajitd
+# -----------------------------------------------------------------------------
+# Enabled by build.sh --hyle (-DCES_HYLE=ON). Fetches hyle from GitHub like every
+# other dep (no local paths). hyle transitively pulls malachite-cpp (its Rust core,
+# via corrosion) and builds hyle (core) + hyle_services (the node facilities: kv +
+# the a/e economy + mempool + the consensus-drive runtime; embedded, it builds the
+# libs only, not morphe's CLI or tests). cesluajitd links hyle_services (which
+# PUBLIC-links core), so the C++ side can drive a blockchain node over its own
+# transport. Wired now; unused (no #include) until cesluajitd starts using it.
+option(CES_HYLE "Fetch + link the hyle consensus engine (core + services) into cesluajitd" OFF)
+if(CES_HYLE)
+  FetchContent_Declare(
+    hyle
+    GIT_REPOSITORY https://github.com/fcecin/hyle.git
+    GIT_TAG        main
+  )
+  FetchContent_MakeAvailable(hyle)
+  target_link_libraries(cesluajitd PRIVATE hyle_services)
+  target_compile_definitions(cesluajitd PRIVATE CES_HYLE=1)
+  message(STATUS "CES_HYLE ON: cesluajitd links hyle_services (+ core) from github.com/fcecin/hyle")
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)
 find_package(Qt6 QUIET COMPONENTS Widgets Network)
 if(Qt6_FOUND)

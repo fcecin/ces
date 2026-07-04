@@ -648,6 +648,13 @@ std::string buildExtensions(CesServer& s) {
       << ",\"available\":" << (it.available ? "true" : "false")
       << ",\"installed\":" << (it.installed ? "true" : "false")
       << ",\"enabled\":" << (it.enabled ? "true" : "false")
+      // Single canonical lifecycle state (precedence enabled>installed>available).
+      // The UI renders buttons from THIS, never from the raw booleans, so a
+      // contradictory button set (e.g. Install + Disable) is impossible by
+      // construction. `enabled` already implies `installed` (enforced upstream).
+      << ",\"state\":\""
+      << (it.enabled ? "enabled" : it.installed ? "installed" : it.available ? "available" : "gone")
+      << "\""
       << ",\"pid\":" << it.pid
       << ",\"isExtension\":" << (it.isExtension ? "true" : "false")
       << ",\"caps\":" << static_cast<int>(it.caps)
@@ -1100,12 +1107,20 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
         path == "/api/extension_config_reset") {
       std::string name = getParam(form, "name");
       bool ok = false;
+      std::string err = "action failed";
       if (path == "/api/extension_install")        ok = extensionInstall(&server_, name);
-      else if (path == "/api/extension_enable")    ok = extensionEnable(&server_, name);
+      else if (path == "/api/extension_enable") {
+        std::string diag;
+        ok = extensionEnable(&server_, name, diag);
+        err = diag.empty()
+                ? "enable failed: the extension did not start (it crashed on launch or did not stay running)"
+                : ("enable failed: " + diag);
+      }
       else if (path == "/api/extension_disable")   ok = extensionDisable(&server_, name);
       else if (path == "/api/extension_uninstall") ok = extensionUninstall(&server_, name);
       else                                         ok = extensionConfigReset(&server_, name);
-      respondJson(ok ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"action failed\"}");
+      respondJson(ok ? std::string("{\"ok\":true}")
+                     : std::string("{\"ok\":false,\"error\":") + jstr(err) + "}");
       return;
     }
     if (path == "/api/extension_command") {
@@ -2271,10 +2286,11 @@ onEnter('inspAddr',doInspect);onEnter('accKey',lookupAccount);onEnter('astKey',l
 onEnter('addAddr',addPeer);onEnter('addKey',addPeer);onEnter('peerTarget',setTarget);onEnter('maxPeers',setMaxPeers);
 
 /* extensions - table-like rows; each row expands inline into a control center */
-let extExpanded=new Set(), extSig='', extOpenConfig=null;
+let extExpanded=new Set(), extSig='', extLife='', extOpenConfig=null;
 function cssid(n){return (n+'').replace(/[^a-zA-Z0-9_-]/g,'_');}
 function extBadge(it){
-  const b=it.enabled?['enabled','#16351f','#5fd38a']:it.installed?['installed','#2a2410','#d9b44a']:['available','#1a2536','#7e94b4'];
+  const M={enabled:['enabled','#16351f','#5fd38a'],installed:['installed','#2a2410','#d9b44a'],available:['available','#1a2536','#7e94b4'],gone:['gone','#2a1a1a','#d38a8a']};
+  const b=M[it.state]||M.available;
   return `<span class="extbadge" style="background:${b[1]};color:${b[2]}">${b[0]}</span>`;
 }
 function extRow(it){
@@ -2284,11 +2300,17 @@ function extRow(it){
   const title=`<b class="extttl">${esc(it.displayName||it.name)}</b>`
     +(it.version?` <span class="extver">v${esc(it.version)}</span>`:'')
     +` <span class="extfile">(${esc(it.name)}.lua)</span>`;
+  // Buttons come from the single canonical state enum, never from raw booleans,
+  // so a contradictory set (e.g. Install + Disable) cannot be rendered.
+  const N=esc(it.name);
+  const bInstall=`<button class="green sm" onclick="extAct('install','${N}')">Install</button>`;
+  const bEnable=`<button class="green sm" onclick="extAct('enable','${N}')">Enable</button>`;
+  const bDisable=`<button class="warn sm" onclick="extAct('disable','${N}')">Disable</button>`;
+  const bUninstall=`<button class="danger sm" onclick="extAct('uninstall','${N}')">Uninstall</button>`;
   let btns='';
-  if(it.available&&!it.installed) btns+=`<button class="green sm" onclick="extAct('install','${esc(it.name)}')">Install</button>`;
-  if(it.installed&&!it.enabled) btns+=`<button class="green sm" onclick="extAct('enable','${esc(it.name)}')">Enable</button>`;
-  if(it.enabled) btns+=`<button class="warn sm" onclick="extAct('disable','${esc(it.name)}')">Disable</button>`;
-  if(it.installed) btns+=`<button class="danger sm" onclick="extAct('uninstall','${esc(it.name)}')">Uninstall</button>`;
+  if(it.state==='available') btns=bInstall;
+  else if(it.state==='installed') btns=bEnable+bUninstall;
+  else if(it.state==='enabled') btns=bDisable+bUninstall;
   let body;
   if(it.enabled&&!it.isExtension){
     body=`<div class="muted">Does not implement the extension contract — nothing to configure or command (N/A).</div>`;
@@ -2363,6 +2385,11 @@ async function loadExtensions(){
   // fetches below only touch the status divs, so they keep ticking live even
   // with an editor open or a row collapsed.
   const sig=d.items.map(it=>[it.name,it.available,it.installed,it.enabled,it.pid,it.caps].join(':')).join('|');
+  // A LIFECYCLE change (install/enable/disable/uninstall, or an item appearing/vanishing)
+  // MUST reflect in the buttons even if a config editor is open: drop the editor so the
+  // rows rebuild. Only benign pid/caps jitter is suppressed while editing.
+  const life=d.items.map(it=>[it.name,it.available,it.installed,it.enabled].join(':')).join('|');
+  if(life!==extLife){extOpenConfig=null;extLife=life;}
   if(sig!==extSig && !extOpenConfig){$('#extList').innerHTML=d.items.length?d.items.map(extRow).join(''):'<p class="muted">No extensions found.</p>';extSig=sig;}
   extPollStatus();
 }
@@ -2381,9 +2408,15 @@ function extToggle(name){
   if(open) extFetchStatus(name);
 }
 async function extAct(action,name){
+  // Disable every lifecycle button immediately so a mash cannot fire overlapping
+  // actions (the source of the errors). State-forcing is server-side + idempotent.
+  document.querySelectorAll('.extbtns button').forEach(b=>b.disabled=true);
   try{const r=await post('/api/extension_'+action,{name});toast(r.ok?action+' ok':(r.error||action+' failed'),r.ok?'ok':'err');}
   catch(e){toast('server error','err');}
-  extOpenConfig=null;extSig='';setTimeout(loadExtensions,500);
+  // Force a full rebuild and refresh fast (snappy, <1s) as the instance launches or
+  // dies, rather than one lazy 500ms poll.
+  extOpenConfig=null;extSig='';extLife='';
+  loadExtensions();setTimeout(loadExtensions,250);setTimeout(loadExtensions,700);setTimeout(loadExtensions,1500);
 }
 async function extCmd(name,id){
   const el=$('#extCmdOut-'+cssid(name));

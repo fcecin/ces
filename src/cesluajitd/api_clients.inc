@@ -820,6 +820,13 @@ void install_ces_api(lua_State* L) {
   lua_setmetatable(L, -2);
   lua_setfield(L, -2, "extension_admin");
 
+#ifdef CES_HYLE
+  // ces.hyle.solo - extension-only API hosting an in-process solo hyle node (only
+  // when built with --hyle). Privileged (/s/) programs only: an extension is by
+  // definition a privileged L2 compute program, so the whole surface is gated.
+  if (g_privileged) install_ces_hyle_api(L);
+#endif
+
   lua_setglobal(L, "ces");
 }
 

@@ -109,6 +109,17 @@ extern "C" {
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
 
+#ifdef CES_HYLE
+// hyle-services (the in-process blockchain node behind ces.hyle). Included at
+// GLOBAL scope: these pull Boost/std headers that must not land inside the
+// cesluajitd namespace below, where the api_*.inc bodies live.
+#include <hyle/services/genesis.h>
+#include <hyle/services/runtime.h>
+#include <hyle/services/schema.h>
+#include <hyle/core/crypto.h>
+#include <ces/util/kvcount.h>  // ces-side a/e counter over the canonical KV dump
+#endif
+
 namespace cesluajitd {
 
 #include "ipc.inc"
@@ -124,6 +135,9 @@ namespace cesluajitd {
 #include "api_chan.inc"
 #include "api_extadmin.inc"
 #include "conn_direct.inc"
+#ifdef CES_HYLE
+#include "api_hyle.inc"
+#endif
 #include "api_clients.inc"
 }  // namespace cesluajitd
 
