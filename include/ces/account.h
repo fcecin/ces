@@ -7,32 +7,28 @@
 namespace ces {
 
 /**
- * Accounts are 64-byte cache-line-aligned structures.
+ * Ledger account, stored in logkv::Store<boost::unordered_flat_map, HashPrefix,
+ * Account>. The map entry is pair<const HashPrefix, Account>: an 8-byte key and
+ * this 56-byte value, 64 bytes total, one cache line. Fields are ordered for
+ * zero padding; the layout is pinned in tests/test_account_layout.cpp.
  *
- * Core fields:
- * - HashTail keyTail (combined with the 8-byte HashPrefix map key to form
- *   the full 32-byte account key)
- * - int64_t balance
- * - uint32_t nonce
- *
- * Last outgoing single-transfer receipt fields:
- * - HashPrefix lastXferDest
- * - uint64_t lastXferAmount
- * - uint32_t lastXferTime (Unix epoch seconds)
+ * keyTail combines with the 8-byte map key to form the full 32-byte account
+ * key. balance and nonce are the core state; lastXferDest/Amount/Time hold the
+ * last outgoing single-transfer receipt.
  */
 struct Account {
 
   Account()
-      : keyTail_{}, balance_(0), nonce_(0), lastXferDest_{}, lastXferAmount_(0),
-        lastXferTime_(0) {}
+      : keyTail_{}, balance_(0), lastXferAmount_(0), lastXferDest_{},
+        lastXferTime_(0), nonce_(0) {}
 
   Account(const HashTail& keyTail, int64_t balance, uint32_t nonce)
-      : keyTail_(keyTail), balance_(balance), nonce_(nonce), lastXferDest_{},
-        lastXferAmount_(0), lastXferTime_(0) {}
+      : keyTail_(keyTail), balance_(balance), lastXferAmount_(0),
+        lastXferDest_{}, lastXferTime_(0), nonce_(nonce) {}
 
   Account(const Hash& key, int64_t balance, uint32_t nonce)
-      : balance_(balance), nonce_(nonce), lastXferDest_{}, lastXferAmount_(0),
-        lastXferTime_(0) {
+      : balance_(balance), lastXferAmount_(0), lastXferDest_{},
+        lastXferTime_(0), nonce_(nonce) {
     setKeyTail(key);
   }
 
@@ -71,6 +67,13 @@ struct Account {
   uint32_t getLastXferTime() const { return lastXferTime_; }
   void setLastXferTime(uint32_t time) { lastXferTime_ = time; }
 
+  const HashTail*   keyTailPtr()        const { return &keyTail_; }
+  const int64_t*    balancePtr()        const { return &balance_; }
+  const uint32_t*   noncePtr()          const { return &nonce_; }
+  const HashPrefix* lastXferDestPtr()   const { return &lastXferDest_; }
+  const uint64_t*   lastXferAmountPtr() const { return &lastXferAmount_; }
+  const uint32_t*   lastXferTimePtr()   const { return &lastXferTime_; }
+
   enum class SerMode : uint8_t {
     Full = 0x00,         // all fields (account creation, snapshots)
     BalanceNonce = 0x01, // balance + nonce (PoW, credits, errors, bulk xfer)
@@ -83,10 +86,10 @@ struct Account {
 private:
   HashTail keyTail_;
   int64_t balance_;
-  uint32_t nonce_;
-  HashPrefix lastXferDest_;
   uint64_t lastXferAmount_;
+  HashPrefix lastXferDest_;
   uint32_t lastXferTime_;
+  uint32_t nonce_;
 };
 
 } // namespace ces

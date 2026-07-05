@@ -9,8 +9,11 @@ namespace ces {
 using AssetData = std::array<uint8_t, 210>;
 
 /**
- * Assets are 256-byte memory cells for rent, indexed by
- * application-defined 32-byte binary keys.
+ * Asset: a 256-byte memory cell for rent, indexed by an application-defined
+ * 32-byte key. The 256 bytes are the boost flat-map entry pair<const
+ * minx::Hash, Asset>: a 32-byte key and this 224-byte value, packed with zero
+ * padding. content (210 bytes) fills the row after the key and the 14 bytes of
+ * metadata. The layout is pinned in tests/test_asset_layout.cpp.
  *
  * Metadata fields:
  * - HashPrefix owner
@@ -43,6 +46,11 @@ struct Asset {
   void setContent(const AssetData& content) { content_ = content; }
   const AssetData& getContent() const { return content_; }
   AssetData& accessContent() { return content_; }
+
+  const HashPrefix* ownerIdPtr() const { return &ownerId_; }
+  const AssetData*  contentPtr() const { return &content_; }
+  const uint16_t*   balancePtr() const { return &balance_; }
+  const uint32_t*   pricePtr()   const { return &price_; }
 
   enum class SerMode : uint8_t {
     Full = 0x00,    // all fields (create, full update, snapshots)
