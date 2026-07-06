@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cassert>
 #include <chrono>
+#include <compare>
 #include <cstdint>
 #include <cstring>
 #include <functional>
@@ -157,7 +160,11 @@ enum error_code_t : uint8_t {
   // numeric argument). Distinct from CES_ERROR_INTERNAL: the server
   // is healthy, the *caller* sent something it shouldn't have.
   CES_ERROR_BAD_INPUT = 0x22,
-  CES_ERROR_LAST = CES_ERROR_BAD_INPUT
+  // A credit (transfer/buy/cross) would push the destination past the int48
+  // balance cap (~1.4M credits). The op reverts instead of saturating, so
+  // moved credits are never destroyed.
+  CES_ERROR_BALANCE_OVERFLOW = 0x23,
+  CES_ERROR_LAST = CES_ERROR_BALANCE_OVERFLOW
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -189,6 +196,69 @@ using Hash = minx::Hash;
 using HashTail = std::array<uint8_t, 24>;
 using HashPrefix = std::array<uint8_t, 8>;
 using PeerAddr = std::array<uint8_t, 64>;
+
+// 48-bit integers stored in 6 bytes, little-endian. Account balances use these
+// (see account.h) so the two 64-bit balance fields shed 4 bytes total, making
+// room for a 32-bit field while the account row stays one cache line. The
+// public accessors keep their int64/uint64 signatures, so call sites are
+// unchanged; only the storage narrows. Arithmetic is done in 64 bits: get()
+// widens (sign-extending for Int48), set() writes the low 6 bytes. No standard
+// or Boost type packs to 6 bytes (they target width, not footprint), so this
+// small type is the right tool, same weight as HashTail.
+static_assert(std::endian::native == std::endian::little,
+              "Int48/UInt48 assume a little-endian host");
+
+class Int48 {
+public:
+  Int48() : b_{} {}
+  Int48(int64_t v) { set(v); }
+  int64_t get() const {
+    uint64_t raw = 0;
+    std::memcpy(&raw, b_, 6);
+    return static_cast<int64_t>(raw << 16) >> 16;  // sign-extend bit 47
+  }
+  void set(int64_t v) {
+    assert(v >= -(int64_t(1) << 47) && v < (int64_t(1) << 47));
+    std::memcpy(b_, &v, 6);                         // low 6 bytes
+  }
+  std::strong_ordering operator<=>(const Int48& o) const { return get() <=> o.get(); }
+  bool operator==(const Int48& o) const { return get() == o.get(); }
+private:
+  uint8_t b_[6];
+};
+
+class UInt48 {
+public:
+  UInt48() : b_{} {}
+  UInt48(uint64_t v) { set(v); }
+  uint64_t get() const {
+    uint64_t raw = 0;
+    std::memcpy(&raw, b_, 6);
+    return raw;
+  }
+  void set(uint64_t v) {
+    assert(v < (uint64_t(1) << 48));
+    std::memcpy(b_, &v, 6);
+  }
+  std::strong_ordering operator<=>(const UInt48& o) const { return get() <=> o.get(); }
+  bool operator==(const UInt48& o) const { return get() == o.get(); }
+private:
+  uint8_t b_[6];
+};
+
+// Ledger balance range: account balances are stored in 48 bits, capping an
+// account at 2^47-1 raw units (~1.4M whole credits). Credit paths saturate
+// here instead of at INT64_MAX so a credit can never overflow the field.
+constexpr int64_t BALANCE_MAX = (int64_t(1) << 47) - 1;
+constexpr int64_t BALANCE_MIN = -(int64_t(1) << 47);
+
+// True if crediting `amount` onto a non-negative balance would exceed the
+// int48 cap. Value-movement ops (transfer/buy/cross/VM) reject rather than
+// saturate, or the moved credits vanish (a conservation break). Payment
+// accounts (balance < 0) never take a plain credit, so this returns false.
+inline bool creditWouldOverflow(int64_t balance, uint64_t amount) {
+  return balance >= 0 && amount > static_cast<uint64_t>(BALANCE_MAX - balance);
+}
 
 inline HashPrefix getHashPrefix(const Hash& full_hash) {
   HashPrefix prefix;
@@ -265,6 +335,7 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_NOT_LISTENING:                    return "CES_ERROR_NOT_LISTENING";
   case CES_ERROR_IMMUTABLE:                        return "CES_ERROR_IMMUTABLE";
   case CES_ERROR_BAD_INPUT:                        return "CES_ERROR_BAD_INPUT";
+  case CES_ERROR_BALANCE_OVERFLOW:                 return "CES_ERROR_BALANCE_OVERFLOW";
   default:                                         return "UNKNOWN_ERROR";
   }
 }

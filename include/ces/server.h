@@ -710,6 +710,21 @@ public:
   }
   int64_t _getTotalCredits() { return circulatingCredits(); }
 
+  // Test hooks: an account's current balance / nonce (0 if absent). Read
+  // accounts_ directly like circulatingCredits(); tests call them between ops,
+  // never concurrently with logicStrand mutations.
+  int64_t _balanceOf(const minx::Hash& key) {
+    auto a = accounts_.get(Account::getMapKey(key));
+    return a.exists() ? a.balance() : 0;
+  }
+  uint32_t _nonceOf(const minx::Hash& key) {
+    auto a = accounts_.get(Account::getMapKey(key));
+    return a.exists() ? a.nonce() : 0;
+  }
+  bool _accountExists(const minx::Hash& key) {
+    return accounts_.get(Account::getMapKey(key)).exists();
+  }
+
   void _runDailyMaintenance();
 
   // Test hooks for peer table. Production code reaches peer state through

@@ -1,10 +1,11 @@
 // Pins the physical byte layout of ces::Account and of the boost flat-map entry
 // pair<const HashPrefix, Account> the account store holds. The value is 56 bytes
 // with zero padding; the entry is 64 bytes (8-byte key + 56-byte value), one
-// cache line. Field sizes, alignments, offsets, and consecutive deltas are
-// checked on both a naked stack struct and a live map entry, through Account's
-// typed field pointers. A drift fails a static_assert at build time or a check
-// at run time.
+// cache line. balance and lastXferAmount are 48-bit (Int48/UInt48), which frees
+// the trailing 32-bit cordId without growing the row. Field sizes,
+// alignments, offsets, and consecutive deltas are checked on both a naked stack
+// struct and a live map entry, through Account's typed field pointers. A drift
+// fails a static_assert at build time or a check at run time.
 
 #include "test_common.h"
 
@@ -22,41 +23,45 @@ BOOST_AUTO_TEST_SUITE(AccountLayoutTests)
 using AccountMap = boost::unordered_flat_map<ces::HashPrefix, ces::Account>;
 using AccountEntry = AccountMap::value_type;   // pair<const HashPrefix, Account>
 
-// Field order: keyTail 0, balance 24, lastXferAmount 32, lastXferDest 40,
-// lastXferTime 48, nonce 52. Value 56, entry 64.
+// Field order: keyTail 0, balance 24, lastXferAmount 30, lastXferDest 36,
+// lastXferTime 44, nonce 48, cordId 52. Value 56, entry 64.
 namespace expected {
 constexpr std::size_t kSzKeyTail    = 24, kAlKeyTail    = 1;
-constexpr std::size_t kSzBalance    = 8,  kAlBalance    = 8;
-constexpr std::size_t kSzNonce      = 4,  kAlNonce      = 4;
+constexpr std::size_t kSzBalance    = 6,  kAlBalance    = 1;
+constexpr std::size_t kSzXferAmount = 6,  kAlXferAmount = 1;
 constexpr std::size_t kSzXferDest   = 8,  kAlXferDest   = 1;
-constexpr std::size_t kSzXferAmount = 8,  kAlXferAmount = 8;
 constexpr std::size_t kSzXferTime   = 4,  kAlXferTime   = 4;
+constexpr std::size_t kSzNonce      = 4,  kAlNonce      = 4;
+constexpr std::size_t kSzCordId   = 4,  kAlCordId   = 4;
 
 constexpr std::size_t kOffKeyTail    = 0;
 constexpr std::size_t kOffBalance    = 24;
-constexpr std::size_t kOffXferAmount = 32;
-constexpr std::size_t kOffXferDest   = 40;
-constexpr std::size_t kOffXferTime   = 48;
-constexpr std::size_t kOffNonce      = 52;
+constexpr std::size_t kOffXferAmount = 30;
+constexpr std::size_t kOffXferDest   = 36;
+constexpr std::size_t kOffXferTime   = 44;
+constexpr std::size_t kOffNonce      = 48;
+constexpr std::size_t kOffCordId   = 52;
 
 constexpr std::size_t kDeltaKeyTailToBalance   = 24;
-constexpr std::size_t kDeltaBalanceToAmount    = 8;
-constexpr std::size_t kDeltaAmountToXferDest   = 8;
+constexpr std::size_t kDeltaBalanceToAmount    = 6;
+constexpr std::size_t kDeltaAmountToXferDest   = 6;
 constexpr std::size_t kDeltaXferDestToXferTime = 8;
 constexpr std::size_t kDeltaXferTimeToNonce    = 4;
-constexpr std::size_t kDeltaNonceToEnd         = 4;
+constexpr std::size_t kDeltaNonceToCordId    = 4;
+constexpr std::size_t kDeltaCordIdToEnd      = 4;
 
 constexpr std::size_t kSzAccount = 56;
-constexpr std::size_t kAlAccount = 8;
+constexpr std::size_t kAlAccount = 4;
 
 constexpr std::size_t kSumPayload =
-    kSzKeyTail + kSzBalance + kSzNonce + kSzXferDest + kSzXferAmount + kSzXferTime;
+    kSzKeyTail + kSzBalance + kSzXferAmount + kSzXferDest + kSzXferTime +
+    kSzNonce + kSzCordId;
 constexpr std::size_t kPadding = kSzAccount - kSumPayload;
 
 constexpr std::size_t kSzKey     = 8;
 constexpr std::size_t kOffSecond = 8;
 constexpr std::size_t kSzEntry   = 64;
-constexpr std::size_t kAlEntry   = 8;
+constexpr std::size_t kAlEntry   = 4;
 } // namespace expected
 
 static_assert(sizeof(ces::Account) == expected::kSzAccount, "Account value is 56 bytes");
@@ -64,13 +69,20 @@ static_assert(alignof(ces::Account) == expected::kAlAccount);
 static_assert(sizeof(ces::Account) % alignof(ces::Account) == 0);
 static_assert(std::is_standard_layout_v<ces::Account>);
 static_assert(std::is_trivially_copyable_v<ces::Account>);
+static_assert(std::is_standard_layout_v<ces::Int48>);
+static_assert(std::is_trivially_copyable_v<ces::Int48>);
+static_assert(std::is_standard_layout_v<ces::UInt48>);
+static_assert(std::is_trivially_copyable_v<ces::UInt48>);
 static_assert(sizeof(ces::HashTail) == expected::kSzKeyTail);
 static_assert(alignof(ces::HashTail) == expected::kAlKeyTail);
-static_assert(sizeof(int64_t) == expected::kSzBalance);
+static_assert(sizeof(ces::Int48) == expected::kSzBalance);
+static_assert(alignof(ces::Int48) == expected::kAlBalance);
+static_assert(sizeof(ces::UInt48) == expected::kSzXferAmount);
+static_assert(alignof(ces::UInt48) == expected::kAlXferAmount);
 static_assert(sizeof(uint32_t) == expected::kSzNonce);
+static_assert(sizeof(uint32_t) == expected::kSzCordId);
 static_assert(sizeof(ces::HashPrefix) == expected::kSzXferDest);
 static_assert(alignof(ces::HashPrefix) == expected::kAlXferDest);
-static_assert(sizeof(uint64_t) == expected::kSzXferAmount);
 static_assert(sizeof(ces::HashPrefix) == expected::kSzKey);
 static_assert(sizeof(AccountEntry) == expected::kSzEntry, "account entry is 64 bytes (one cache line)");
 static_assert(alignof(AccountEntry) == expected::kAlEntry);
@@ -93,6 +105,7 @@ static void checkFullFieldLayout(const ces::Account& a, const std::string& origi
   const std::size_t offXferDest = fieldOffset(a, a.lastXferDestPtr());
   const std::size_t offXferTime = fieldOffset(a, a.lastXferTimePtr());
   const std::size_t offNonce    = fieldOffset(a, a.noncePtr());
+  const std::size_t offCordId = fieldOffset(a, a.cordIdPtr());
 
   BOOST_CHECK_EQUAL(offKeyTail,  expected::kOffKeyTail);
   BOOST_CHECK_EQUAL(offBalance,  expected::kOffBalance);
@@ -100,21 +113,24 @@ static void checkFullFieldLayout(const ces::Account& a, const std::string& origi
   BOOST_CHECK_EQUAL(offXferDest, expected::kOffXferDest);
   BOOST_CHECK_EQUAL(offXferTime, expected::kOffXferTime);
   BOOST_CHECK_EQUAL(offNonce,    expected::kOffNonce);
+  BOOST_CHECK_EQUAL(offCordId, expected::kOffCordId);
 
   BOOST_CHECK_EQUAL(offBalance  - offKeyTail,  expected::kDeltaKeyTailToBalance);
   BOOST_CHECK_EQUAL(offAmount   - offBalance,  expected::kDeltaBalanceToAmount);
   BOOST_CHECK_EQUAL(offXferDest - offAmount,   expected::kDeltaAmountToXferDest);
   BOOST_CHECK_EQUAL(offXferTime - offXferDest, expected::kDeltaXferDestToXferTime);
   BOOST_CHECK_EQUAL(offNonce    - offXferTime, expected::kDeltaXferTimeToNonce);
-  BOOST_CHECK_EQUAL(sizeof(ces::Account) - offNonce, expected::kDeltaNonceToEnd);
+  BOOST_CHECK_EQUAL(offCordId - offNonce,    expected::kDeltaNonceToCordId);
+  BOOST_CHECK_EQUAL(sizeof(ces::Account) - offCordId, expected::kDeltaCordIdToEnd);
 
   BOOST_CHECK_EQUAL(offKeyTail, 0u);
-  BOOST_CHECK_EQUAL(offNonce + expected::kSzNonce, sizeof(ces::Account));
+  BOOST_CHECK_EQUAL(offCordId + expected::kSzCordId, sizeof(ces::Account));
 
   const std::size_t tiled =
       (offBalance - offKeyTail) + (offAmount - offBalance) +
       (offXferDest - offAmount) + (offXferTime - offXferDest) +
-      (offNonce - offXferTime) + (sizeof(ces::Account) - offNonce);
+      (offNonce - offXferTime) + (offCordId - offNonce) +
+      (sizeof(ces::Account) - offCordId);
   BOOST_CHECK_EQUAL(tiled, sizeof(ces::Account));
 }
 
@@ -129,14 +145,16 @@ static ces::HashPrefix makeKey(uint8_t seed) {
 BOOST_AUTO_TEST_CASE(TypeSizesAndAligns) {
   BOOST_CHECK_EQUAL(sizeof(ces::HashTail),    expected::kSzKeyTail);
   BOOST_CHECK_EQUAL(alignof(ces::HashTail),   expected::kAlKeyTail);
-  BOOST_CHECK_EQUAL(sizeof(int64_t),          expected::kSzBalance);
-  BOOST_CHECK_EQUAL(alignof(int64_t),         expected::kAlBalance);
+  BOOST_CHECK_EQUAL(sizeof(ces::Int48),       expected::kSzBalance);
+  BOOST_CHECK_EQUAL(alignof(ces::Int48),      expected::kAlBalance);
+  BOOST_CHECK_EQUAL(sizeof(ces::UInt48),      expected::kSzXferAmount);
+  BOOST_CHECK_EQUAL(alignof(ces::UInt48),     expected::kAlXferAmount);
   BOOST_CHECK_EQUAL(sizeof(uint32_t),         expected::kSzNonce);
   BOOST_CHECK_EQUAL(alignof(uint32_t),        expected::kAlNonce);
+  BOOST_CHECK_EQUAL(sizeof(uint32_t),         expected::kSzCordId);
+  BOOST_CHECK_EQUAL(alignof(uint32_t),        expected::kAlCordId);
   BOOST_CHECK_EQUAL(sizeof(ces::HashPrefix),  expected::kSzXferDest);
   BOOST_CHECK_EQUAL(alignof(ces::HashPrefix), expected::kAlXferDest);
-  BOOST_CHECK_EQUAL(sizeof(uint64_t),         expected::kSzXferAmount);
-  BOOST_CHECK_EQUAL(alignof(uint64_t),        expected::kAlXferAmount);
 }
 
 // Struct size, alignment, standard-layout traits.
@@ -164,6 +182,7 @@ BOOST_AUTO_TEST_CASE(NakedStruct_FieldOffsets) {
   BOOST_CHECK_EQUAL(fieldOffset(a, a.lastXferDestPtr()),   expected::kOffXferDest);
   BOOST_CHECK_EQUAL(fieldOffset(a, a.lastXferTimePtr()),   expected::kOffXferTime);
   BOOST_CHECK_EQUAL(fieldOffset(a, a.noncePtr()),          expected::kOffNonce);
+  BOOST_CHECK_EQUAL(fieldOffset(a, a.cordIdPtr()),       expected::kOffCordId);
 }
 
 // Naked stack struct: consecutive field deltas.
@@ -174,7 +193,8 @@ BOOST_AUTO_TEST_CASE(NakedStruct_FieldDeltas) {
   BOOST_CHECK_EQUAL(fieldOffset(a, a.lastXferDestPtr())   - fieldOffset(a, a.lastXferAmountPtr()), expected::kDeltaAmountToXferDest);
   BOOST_CHECK_EQUAL(fieldOffset(a, a.lastXferTimePtr())   - fieldOffset(a, a.lastXferDestPtr()),   expected::kDeltaXferDestToXferTime);
   BOOST_CHECK_EQUAL(fieldOffset(a, a.noncePtr())          - fieldOffset(a, a.lastXferTimePtr()),   expected::kDeltaXferTimeToNonce);
-  BOOST_CHECK_EQUAL(sizeof(ces::Account)                  - fieldOffset(a, a.noncePtr()),          expected::kDeltaNonceToEnd);
+  BOOST_CHECK_EQUAL(fieldOffset(a, a.cordIdPtr())       - fieldOffset(a, a.noncePtr()),          expected::kDeltaNonceToCordId);
+  BOOST_CHECK_EQUAL(sizeof(ces::Account)                  - fieldOffset(a, a.cordIdPtr()),       expected::kDeltaCordIdToEnd);
 }
 
 BOOST_AUTO_TEST_CASE(NakedStruct_FullLayout) {
@@ -224,6 +244,7 @@ BOOST_AUTO_TEST_CASE(MapEntry_FieldOffsets) {
   BOOST_CHECK_EQUAL(fieldOffset(v, v.lastXferDestPtr()),   expected::kOffXferDest);
   BOOST_CHECK_EQUAL(fieldOffset(v, v.lastXferTimePtr()),   expected::kOffXferTime);
   BOOST_CHECK_EQUAL(fieldOffset(v, v.noncePtr()),          expected::kOffNonce);
+  BOOST_CHECK_EQUAL(fieldOffset(v, v.cordIdPtr()),       expected::kOffCordId);
 }
 
 // Live map entry: consecutive field deltas.
@@ -238,7 +259,8 @@ BOOST_AUTO_TEST_CASE(MapEntry_FieldDeltas) {
   BOOST_CHECK_EQUAL(fieldOffset(v, v.lastXferDestPtr())   - fieldOffset(v, v.lastXferAmountPtr()), expected::kDeltaAmountToXferDest);
   BOOST_CHECK_EQUAL(fieldOffset(v, v.lastXferTimePtr())   - fieldOffset(v, v.lastXferDestPtr()),   expected::kDeltaXferDestToXferTime);
   BOOST_CHECK_EQUAL(fieldOffset(v, v.noncePtr())          - fieldOffset(v, v.lastXferTimePtr()),   expected::kDeltaXferTimeToNonce);
-  BOOST_CHECK_EQUAL(sizeof(ces::Account)                  - fieldOffset(v, v.noncePtr()),          expected::kDeltaNonceToEnd);
+  BOOST_CHECK_EQUAL(fieldOffset(v, v.cordIdPtr())       - fieldOffset(v, v.noncePtr()),          expected::kDeltaNonceToCordId);
+  BOOST_CHECK_EQUAL(sizeof(ces::Account)                  - fieldOffset(v, v.cordIdPtr()),       expected::kDeltaCordIdToEnd);
 }
 
 BOOST_AUTO_TEST_CASE(MapEntry_FullLayout) {
@@ -268,7 +290,8 @@ BOOST_AUTO_TEST_CASE(MapEntry_AbsoluteFieldOffsetsWithinEntry) {
   BOOST_CHECK_EQUAL(absOff(v.lastXferDestPtr()),   expected::kOffSecond + expected::kOffXferDest);
   BOOST_CHECK_EQUAL(absOff(v.lastXferTimePtr()),   expected::kOffSecond + expected::kOffXferTime);
   BOOST_CHECK_EQUAL(absOff(v.noncePtr()),          expected::kOffSecond + expected::kOffNonce);
-  BOOST_CHECK_EQUAL(absOff(v.noncePtr()) + expected::kSzNonce, sizeof(AccountEntry));
+  BOOST_CHECK_EQUAL(absOff(v.cordIdPtr()),       expected::kOffSecond + expected::kOffCordId);
+  BOOST_CHECK_EQUAL(absOff(v.cordIdPtr()) + expected::kSzCordId, sizeof(AccountEntry));
 }
 
 // Naked struct and mapped value report identical field offsets.
@@ -285,6 +308,117 @@ BOOST_AUTO_TEST_CASE(NakedAndMap_IdenticalFieldOffsets) {
   BOOST_CHECK_EQUAL(fieldOffset(naked, naked.lastXferDestPtr()),   fieldOffset(mapped, mapped.lastXferDestPtr()));
   BOOST_CHECK_EQUAL(fieldOffset(naked, naked.lastXferTimePtr()),   fieldOffset(mapped, mapped.lastXferTimePtr()));
   BOOST_CHECK_EQUAL(fieldOffset(naked, naked.noncePtr()),          fieldOffset(mapped, mapped.noncePtr()));
+  BOOST_CHECK_EQUAL(fieldOffset(naked, naked.cordIdPtr()),       fieldOffset(mapped, mapped.cordIdPtr()));
+}
+
+// Value round-trip: Int48/UInt48 preserve every boundary value, and an
+// Account's balance/lastXferAmount survive storage in 6 bytes. This locks the
+// sign-extension (the only real logic in the 48-bit codec), which the layout
+// checks above do not exercise.
+BOOST_AUTO_TEST_CASE(Int48ValueRoundTrip) {
+  constexpr int64_t kI48Max = (int64_t(1) << 47) - 1;   // 2^47-1
+  constexpr int64_t kI48Min = -(int64_t(1) << 47);      // -2^47
+  const int64_t signedCases[] = {
+      0, 1, -1, 2, -2, 255, -255, 65535, -65535, 1000, -1000,
+      10'000'000'000LL,           // fixture prefund
+      int64_t(1) << 46,           // self-account target (bit 46 set)
+      kI48Max, kI48Min, kI48Max - 1, kI48Min + 1};
+  for (int64_t v : signedCases) {
+    BOOST_TEST_INFO("v=" << v);
+    BOOST_CHECK_EQUAL(ces::Int48(v).get(), v);
+    ces::Account a;
+    a.setBalance(v);
+    BOOST_CHECK_EQUAL(a.getBalance(), v);
+  }
+
+  constexpr uint64_t kU48Max = (uint64_t(1) << 48) - 1;   // 2^48-1
+  const uint64_t unsignedCases[] = {
+      0, 1, 2, 255, 65535, 1000, 10'000'000'000ULL,
+      uint64_t(1) << 32, uint64_t(1) << 47, kU48Max, kU48Max - 1};
+  for (uint64_t v : unsignedCases) {
+    BOOST_TEST_INFO("v=" << v);
+    BOOST_CHECK_EQUAL(ces::UInt48(v).get(), v);
+    ces::Account a;
+    a.setLastXferAmount(v);
+    BOOST_CHECK_EQUAL(a.getLastXferAmount(), v);
+  }
+}
+
+// An Account with every field set to a distinct recognizable value. If any
+// accessor or serializer step clobbered a neighbor, one of these read-backs
+// would come out wrong.
+static ces::Account makeDistinctAccount() {
+  ces::Account a;
+  ces::HashTail kt; kt.fill(0x11);
+  a.setKeyTail(kt);
+  a.setBalance(0x1122334455LL);          // fits int48
+  a.setLastXferAmount(0xAABBCCDDEEull);  // fits uint48
+  ces::HashPrefix dst; dst.fill(0x22);
+  a.setLastXferDest(dst);
+  a.setLastXferTime(0x33445566u);
+  a.setNonce(0x778899AAu);
+  a.setCordId(0xCAFEBABEu);
+  return a;
+}
+
+static void checkAllFields(const ces::Account& a) {
+  ces::HashTail kt; kt.fill(0x11);
+  ces::HashPrefix dst; dst.fill(0x22);
+  BOOST_CHECK(a.getKeyTail() == kt);
+  BOOST_CHECK_EQUAL(a.getBalance(), 0x1122334455LL);
+  BOOST_CHECK_EQUAL(a.getLastXferAmount(), 0xAABBCCDDEEull);
+  BOOST_CHECK(a.getLastXferDest() == dst);
+  BOOST_CHECK_EQUAL(a.getLastXferTime(), 0x33445566u);
+  BOOST_CHECK_EQUAL(a.getNonce(), 0x778899AAu);
+  BOOST_CHECK_EQUAL(a.getCordId(), 0xCAFEBABEu);
+}
+
+// cordId is real and no accessor clobbers a neighbor: set all seven fields to
+// distinct values, read all seven back.
+BOOST_AUTO_TEST_CASE(AllFieldsIndependentThroughAccessors) {
+  checkAllFields(makeDistinctAccount());
+}
+
+// cordId survives serialization: the Full path (create / snapshot) round-trips
+// every field, including cordId, which is otherwise always 0 in the suite.
+BOOST_AUTO_TEST_CASE(FullSerializerRoundTripIncludingCordId) {
+  ces::Account in = makeDistinctAccount();
+  char buf[256];
+  size_t n;
+  {
+    ces::Account::SerModeGuard guard(ces::Account::SerMode::Full);
+    n = logkv::serializer<ces::Account>::write(buf, sizeof(buf), in);
+  }
+  BOOST_REQUIRE(n > 0 && n <= sizeof(buf));
+  ces::Account out;
+  logkv::serializer<ces::Account>::read(buf, n, out);   // header-driven
+  checkAllFields(out);
+  BOOST_CHECK(in == out);
+}
+
+// A hot-path partial write (BalanceNonce) must NOT clobber a cordId set by an
+// earlier Full write — the WAL-replay case: create (Full, carries cordId) then
+// balance-update (BalanceNonce, must preserve it).
+BOOST_AUTO_TEST_CASE(PartialModeWritePreservesCordId) {
+  ces::Account target = makeDistinctAccount();   // cordId 0xCAFEBABE
+  ces::Account update;
+  update.setBalance(0x0000AAAAAAAAll);
+  update.setNonce(0x0000BBBBu);
+
+  char buf[64];
+  size_t n;
+  {
+    ces::Account::SerModeGuard guard(ces::Account::SerMode::BalanceNonce);
+    n = logkv::serializer<ces::Account>::write(buf, sizeof(buf), update);
+  }
+  logkv::serializer<ces::Account>::read(buf, n, target);
+
+  BOOST_CHECK_EQUAL(target.getBalance(), 0x0000AAAAAAAAll);   // updated
+  BOOST_CHECK_EQUAL(target.getNonce(), 0x0000BBBBu);          // updated
+  BOOST_CHECK_EQUAL(target.getCordId(), 0xCAFEBABEu);         // preserved
+  ces::HashPrefix dst; dst.fill(0x22);
+  BOOST_CHECK(target.getLastXferDest() == dst);               // preserved
+  BOOST_CHECK_EQUAL(target.getLastXferTime(), 0x33445566u);   // preserved
 }
 
 BOOST_AUTO_TEST_SUITE_END()

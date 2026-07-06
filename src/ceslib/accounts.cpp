@@ -175,12 +175,12 @@ void Accounts::ActiveAccount::credit(uint64_t amount) {
 
   int64_t current = balance();
   int64_t newBal;
-  if (static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) -
+  if (static_cast<uint64_t>(BALANCE_MAX) -
         static_cast<uint64_t>(current) >=
       amount) {
     newBal = current + static_cast<int64_t>(amount);
   } else {
-    newBal = std::numeric_limits<int64_t>::max();
+    newBal = BALANCE_MAX;
   }
   parent.totalCredits_ += (newBal - current);
   data().setBalance(newBal);

@@ -128,14 +128,15 @@ static inline uint8_t checkAssetWriteAuth(const Asset& asset,
   return CES_OK;
 }
 
-// Saturating credit: add `amount` to an int64 balance, clamping at INT64_MAX
-// instead of wrapping — matching the wire path's ActiveAccount::credit so the
-// VM-host and wire credit paths never diverge on overflow. Unreachable in
-// practice (total minted << INT64_MAX), but keeps the two paths symmetric.
+// Saturating credit: add `amount` to a balance, clamping at BALANCE_MAX (the
+// int48 account cap) instead of wrapping — matching the wire path's
+// ActiveAccount::credit so the VM-host and wire credit paths never diverge on
+// overflow. Reachable only at ~1.4M credits on one account; keeps the two
+// paths symmetric and stops a credit from overflowing the 48-bit field.
 static inline int64_t saturatingAddBalance(int64_t cur, uint64_t amount) {
   if (cur >= 0 &&
-      static_cast<uint64_t>(std::numeric_limits<int64_t>::max() - cur) < amount)
-    return std::numeric_limits<int64_t>::max();
+      static_cast<uint64_t>(BALANCE_MAX - cur) < amount)
+    return BALANCE_MAX;
   return cur + static_cast<int64_t>(amount);
 }
 
@@ -534,18 +535,21 @@ public:
 
   // ---- Value-bearing writes ----------------------------------------------
   uint8_t transfer(const minx::Hash& dest, uint64_t amount) override {
+    if (uint8_t rc = checkCredit(dest, amount); rc != CES_OK) return rc;
     if (uint8_t rc = debitCaller(amount); rc != CES_OK) return rc;
     creditDest(dest, amount);
     return CES_OK;
   }
 
   uint8_t ownerTransfer(const minx::Hash& dest, uint64_t amount) override {
+    if (uint8_t rc = checkCredit(dest, amount); rc != CES_OK) return rc;
     if (uint8_t rc = debitProgramOwner(amount); rc != CES_OK) return rc;
     creditDest(dest, amount);
     return CES_OK;
   }
 
   uint8_t deposit(uint64_t amount) override {
+    if (uint8_t rc = checkCredit(programOwnerPrefix_, amount); rc != CES_OK) return rc;
     if (uint8_t rc = debitCaller(amount); rc != CES_OK) return rc;
     auto ownerIt = server_.accounts_->find(programOwnerPrefix_);
     if (ownerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
@@ -559,6 +563,7 @@ public:
     // programOwner -> caller. Not allowance-bound (the owner deployed the
     // bytecode, so they consented). Caller is the recipient — must exist
     // (they signed the run) so the credit always lands.
+    if (uint8_t rc = checkCredit(caller_, amount); rc != CES_OK) return rc;
     if (uint8_t rc = debitProgramOwner(amount); rc != CES_OK) return rc;
     auto callerIt = server_.accounts_->find(caller_);
     if (callerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
@@ -816,6 +821,18 @@ private:
   }
   void maybeSaveAsset(const minx::Hash& key) {
     if (saveAssetFn_) saveAssetFn_(key);
+  }
+
+  // Returns CES_ERROR_BALANCE_OVERFLOW if crediting `amount` onto the account
+  // at `prefix` (or a fresh 0-balance account) would exceed the int48 cap.
+  // Value moves check this before debiting, so a move never saturate-burns.
+  uint8_t checkCredit(const HashPrefix& prefix, uint64_t amount) {
+    auto it = server_.accounts_->find(prefix);
+    int64_t bal = (it != server_.accounts_->end()) ? it->second.getBalance() : 0;
+    return creditWouldOverflow(bal, amount) ? CES_ERROR_BALANCE_OVERFLOW : CES_OK;
+  }
+  uint8_t checkCredit(const minx::Hash& key, uint64_t amount) {
+    return checkCredit(Account::getMapKey(key), amount);
   }
 
   // Credit-side of any transfer. Both transfer (caller-as-source) and
@@ -1822,6 +1839,13 @@ uint8_t CesServer::transfer(const minx::Hash& originKey,
       return CES_ERROR_INSUFFICIENT_BALANCE_WITH_CREATE;
     }
 
+    if (creditWouldOverflow(0, amount)) {
+      origin.chargeError(errFee);
+      outOriginBalance = origin.balance();
+      LOGDEBUG << "transfer: create would exceed balance cap";
+      return CES_ERROR_BALANCE_OVERFLOW;
+    }
+
     Account newAccount;
     if (mode == TransferMode::Payment) {
       newAccount =
@@ -1856,6 +1880,12 @@ uint8_t CesServer::transfer(const minx::Hash& originKey,
       }
       dest.settlePayment(amount);
     } else {
+      if (creditWouldOverflow(dest.balance(), amount)) {
+        origin.chargeError(errFee);
+        outOriginBalance = origin.balance();
+        LOGDEBUG << "transfer: destination would exceed balance cap";
+        return CES_ERROR_BALANCE_OVERFLOW;
+      }
       dest.credit(amount);
     }
   }
@@ -1922,6 +1952,12 @@ uint8_t CesServer::bulkTransfer(const minx::Hash& originKey,
         break;
       }
 
+      if (creditWouldOverflow(0, item.amount)) {
+        origin.chargeError(errFee);
+        rc = CES_ERROR_BALANCE_OVERFLOW;
+        break;
+      }
+
       Account newAccount(item.destKey, item.amount, 0);
       accounts_.createAccount(destId, newAccount);
     } else {
@@ -1944,6 +1980,11 @@ uint8_t CesServer::bulkTransfer(const minx::Hash& originKey,
         }
         dest.settlePayment(item.amount);
       } else {
+        if (creditWouldOverflow(dest.balance(), item.amount)) {
+          origin.chargeError(errFee);
+          rc = CES_ERROR_BALANCE_OVERFLOW;
+          break;
+        }
         dest.credit(item.amount);
       }
     }
@@ -2157,13 +2198,24 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
     return CES_ERROR_QUEUE_FULL;
   }
 
-  // 4. Debit origin, credit peer's vostro
+  // 4. Reject before any debit if the peer's vostro can't hold the amount, so
+  // a cross-transfer never destroys credits by saturating; then debit origin
+  // and credit the vostro.
   uint64_t totalDeduction = amount + txFee;
-  origin.debitTransfer(totalDeduction,
-                       Account::getMapKey(peerKey), amount);
+  HashPrefix peerMapKey = Account::getMapKey(peerKey);
+  {
+    ActiveAccount v = accounts_.get(peerMapKey);
+    int64_t vbal = v.exists() ? v.balance() : 0;
+    if (creditWouldOverflow(vbal, amount)) {
+      origin.chargeError(errFee);
+      outOriginBalance = origin.balance();
+      LOGDEBUG << "crossTransfer: vostro would exceed balance cap";
+      return CES_ERROR_BALANCE_OVERFLOW;
+    }
+  }
+  origin.debitTransfer(totalDeduction, peerMapKey, amount);
   outOriginBalance = origin.balance();
 
-  HashPrefix peerMapKey = Account::getMapKey(peerKey);
   ActiveAccount peerVostro = accounts_.get(peerMapKey);
   if (peerVostro.exists()) {
     peerVostro.credit(amount);
@@ -2471,11 +2523,19 @@ uint8_t CesServer::buyAsset(const minx::Hash& originKey,
   if (rc != CES_OK)
     return rc;
 
+  // Reject before debiting the buyer if the seller can't hold the price, so a
+  // purchase never destroys credits by saturating.
+  ActiveAccount seller = accounts_.get(asset.getOwnerId());
+  if (seller.exists() && creditWouldOverflow(seller.balance(), price)) {
+    buyer.chargeError(errFee);
+    LOGDEBUG << "buyAsset: seller would exceed balance cap";
+    return CES_ERROR_BALANCE_OVERFLOW;
+  }
+
   uint64_t totalCost = price + buyFee;
   buyer.debit(totalCost);
   accounts_.checkFlush(totalCost);
 
-  ActiveAccount seller = accounts_.get(asset.getOwnerId());
   if (seller.exists()) {
     seller.credit(price);
   }
@@ -4041,6 +4101,9 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
             << VAR(accFeeDeleted) << VAR(accFeeDebited)
             << VAR(creditsDelta)
             << VAR(astBefore) << VAR(astExpired);
+    // Re-clamp the server's own account so incoming transfers can't drift its
+    // 48-bit balance toward the cap between reboots.
+    topUpServerAccount();
     doSnapshot("daily maintenance");
   });
 
@@ -4115,19 +4178,20 @@ void CesServer::launchExtensions() {
   }
 }
 
-// Boot-time reset of the server's own account to exactly TARGET. Created
-// at TARGET if absent; otherwise its balance is forced to TARGET whether
-// it was below or above.
+// Resets the server's own account to exactly TARGET, at boot and on every
+// daily maintenance pass. Created at TARGET if absent; otherwise its balance
+// is forced to TARGET whether it was below or above.
 //
-// TARGET is far below INT64_MAX so signed-int64 addition for incoming
-// transfers (dice bets, fee receipts) cannot overflow, yet still leaves
-// the credit tally (which counts this balance) far from saturation.
-// Forcing rather than topping up heals a stale balance corrupted
-// (negative or near-saturation) by an older build.
+// Account balances are 48-bit (BALANCE_MAX), so TARGET sits at 2^46: a deeply
+// bottomless balance that still leaves 2^46 of headroom before the cap, with
+// the daily re-clamp keeping incoming transfers (dice bets, fee receipts) from
+// drifting it toward that ceiling between reboots. Forcing rather than topping
+// up heals a stale balance corrupted (negative or near-saturation) by an
+// older build.
 //
 // Runs on logicStrand_ (caller posts it there).
 void CesServer::topUpServerAccount() {
-  static constexpr int64_t TARGET = int64_t(1) << 50;
+  static constexpr int64_t TARGET = int64_t(1) << 46;
   const minx::Hash& serverPubKey = serverKeyPair_.getPublicKeyAsHash();
   ActiveAccount acc = accounts_.get(serverPubKey);
 
