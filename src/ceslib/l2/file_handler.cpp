@@ -347,9 +347,23 @@ using KvStore = logkv::Store<KvMap, logkv::Bytes, logkv::Bytes>;
 struct FileKvCache {
   std::mutex mutex;
   std::unordered_map<std::string, std::unique_ptr<KvStore>> stores;
+  // Live byte size per open store: sum of (key + stored value) bytes in the RAM
+  // map. Seeded from the map on open, updated by the mutation cores, re-derived
+  // on the daily sweep. Drives event-log compaction. Keyed by absolute content
+  // path, like `stores`.
+  std::unordered_map<std::string, uint64_t> liveBytes;
+  // Last value written to the sidecar `size` for this store (its estimated disk
+  // use = live bytes + events-on-disk, floored). Cached so the per-op check
+  // needs no sidecar read, and held equal to the sidecar so the global store
+  // meta stays consistent (global total == sum of sidecar sizes).
+  std::unordered_map<std::string, uint64_t> reservedBytes;
 };
 
 namespace {
+
+// Compact a kv store's append-only events log once it outgrows the live data by
+// more than this floor (so a small store does not snapshot on every write).
+constexpr uint64_t kKvCompactFloorBytes = 64 * 1024;
 
 // Open (or return the cached) logkv store for kv-file `name`. The content
 // directory must already exist (the driver creates it at CREATE). Returns
@@ -372,13 +386,19 @@ KvStore* kvStoreOpenLocked(CesServer* server, const std::string& dir,
     // inversion with gcReclaim, which deletes under the store-meta mutex).
     if (std::filesystem::is_directory(cPath, ec)) return it->second.get();
     stores.erase(it);
+    server->fileHandler()->kv_->liveBytes.erase(key);
+    server->fileHandler()->kv_->reservedBytes.erase(key);
     return nullptr;
   }
   if (!std::filesystem::is_directory(cPath, ec)) return nullptr;
   try {
     auto st = std::make_unique<KvStore>(cPath.string());   // loads existing data
     KvStore* raw = st.get();
+    // Seed the live byte size from the just-loaded map.
+    uint64_t lb = 0;
+    for (auto& kv : raw->getObjects()) lb += kv.first.size() + kv.second.size();
     stores.emplace(key, std::move(st));
+    server->fileHandler()->kv_->liveBytes[key] = lb;
     return raw;
   } catch (...) {
     return nullptr;
@@ -398,10 +418,13 @@ inline ces::Bytes fromLogkvBytes(const logkv::Bytes& b) {
 // ---------------------------------------------------------------------------
 // Per-cell billing header. Every kv value is stored as
 //   [balance u64 BE][last_charged_us u64 BE][user bytes]
-// The file service owns the 16-byte header: KV_DEPOSIT funds it, the daily
-// sweep charges rent against it and erases the key at balance 0, and GET strips
-// it (the program sees only its own bytes). Invariant: a store's program-account
-// balance equals the sum of its cell balances.
+// The file service owns the 16-byte header: KV_DEPOSIT/KV_PUT fund the cell,
+// the daily sweep counts rent down against it and erases the key at balance 0,
+// and GET strips it (the program sees only its own bytes). `balance` is a
+// prepaid rent counter in credits (not a days-to-live: rent is recomputed at
+// the live fee rate, so a fee change can never strand a cell). The credits that
+// fund a cell are burned to the server on deposit; a kv file has NO program
+// account, so this header is the sole record.
 // ---------------------------------------------------------------------------
 constexpr size_t kKvHeaderLen = 16;
 
@@ -484,13 +507,17 @@ struct Sidecar {
   uint32_t version = kSidecarVersion;
   std::string name;
   std::array<uint8_t, 32> owner_pubkey{};
-  // The file's "program account" in accountStore_, allocated at CREATE and
-  // referenced by every running instance. Real ed25519 keypair: program_pubkey
-  // keys the account; program_privkey is the private half the program signs its
-  // own remote ops with. The private half lives only here on disk (server-side)
-  // - STAT never returns it (allowlist), and the sidecar is unreachable as
-  // content (.sidecar.toml is a reserved suffix). Inbound transfers work
-  // normally; the account pays daily rent like any account.
+  // The file's "program account" keypair, allocated at CREATE. For a FLAT file
+  // this keys a real Account in accountStore_ (the file's withdrawable balance,
+  // referenced by every running instance): program_pubkey keys the account,
+  // program_privkey is the private half the program signs its own remote ops
+  // with. The private half lives only here on disk (server-side) - STAT never
+  // returns it (allowlist), and the sidecar is unreachable as content
+  // (.sidecar.toml is a reserved suffix). Inbound transfers work normally; the
+  // account pays daily rent like any account. A kv file carries the same
+  // keypair for symmetry but does NOT back a ledger account: its cells hold
+  // prepaid rent burned at deposit, so there is nothing to hold, withdraw, or
+  // sum against.
   std::array<uint8_t, 32> program_pubkey{};
   std::array<uint8_t, 32> program_privkey{};
   uint64_t price_per_kb = 0;
@@ -882,6 +909,10 @@ bool chargeRentOrDelete(CesServer* server,
   // exhaustion. Caller may skip writing the sidecar (last_rent_us
   // is never advanced).
   if (isServerZone(sc.name)) return true;
+  // kv files pay rent per cell (the daily sweep counts down each cell's prepaid
+  // header), not per whole-file byte, and have no program account to debit.
+  // They never accrue whole-file rent here, and never die of it.
+  if (sc.type == kFileTypeKv) return true;
   uint64_t now = getMicrosSinceEpoch();
   uint64_t owed = computeOwedRent(
     sc.size, feeRent, sc.last_rent_us, now);
@@ -1218,11 +1249,13 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     if (capRc != CES_OK) return { capRc, 0, 0 };
   }
   uint64_t upfrontBurn = 0;
-  if (!serverZone) {
+  if (serverZone || type == kFileTypeKv) {
+    // /s/ is unmetered; a kv store starts empty and has no store-level pot
+    // (cells are funded, and burned, per-key). Neither mints a program account.
+    initialDeposit = 0;
+  } else {
     upfrontBurn = computeOwedRent(size, cfg.feeFileRent, 0, kGcDebounceUs);
     if (initialDeposit < upfrontBurn) return { CES_ERROR_INSUFFICIENT_BALANCE, 0, 0 };
-  } else {
-    initialDeposit = 0;       // /s/ unmetered: file_balance is decorative
   }
   const uint64_t programAccountInitial =
       initialDeposit > upfrontBurn ? initialDeposit - upfrontBurn : 0;
@@ -1239,7 +1272,11 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     L2ChargeResult c = bill(t, static_cast<int64_t>(costDebited));
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; return; }
-    t.credit(progPub, static_cast<int64_t>(programAccountInitial));   // mint
+    // Flat files hold a real, withdrawable balance in a program account. kv
+    // files hold none: each cell carries prepaid rent burned at deposit, so no
+    // account is minted (the sidecar keypair stays, unbacked).
+    if (type != kFileTypeKv)
+      t.credit(progPub, static_cast<int64_t>(programAccountInitial));
     status = CES_OK;
   });
   if (status != CES_OK) return { status, 0, 0 };
@@ -1273,7 +1310,9 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   std::memcpy(s.program_pubkey.data(), progPub.data(), 32);
   std::memcpy(s.program_privkey.data(), progPriv.data(), 32);
   s.price_per_kb = pricePerKb;
-  s.size = size;
+  // A flat file's sidecar size is its byte length; a kv store's is its estimated
+  // disk use (live + events), which starts at the compaction floor.
+  s.size = (type == kFileTypeKv) ? kKvCompactFloorBytes : size;
   s.type = type;
   s.created_us = getMicrosSinceEpoch();
   s.modified_us = s.created_us;
@@ -1284,7 +1323,8 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   }
   if (!serverZone) {
     std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, +1, static_cast<int64_t>(size));
+    adjustStoreMeta(cfg.cesFileStoreDir, +1,
+        static_cast<int64_t>(type == kFileTypeKv ? kKvCompactFloorBytes : size));
   }
   noteServerZoneMutation(server, name);
   return { CES_OK, programAccountInitial, costDebited };
@@ -1800,7 +1840,19 @@ StatOutcome statCore(CesServer* server, const std::string& name,
     return { CES_ERROR_FILE_NOT_FOUND, {}, 0, 0, 0, 0, 0 };
   if (!chargeRentOrDelete(server, cPath, sPath, sc, cfg.feeFileRent, cfg.cesFileStoreDir))
     return { CES_ERROR_FILE_NOT_FOUND, {}, 0, 0, 0, 0, 0 };
-  writeSidecar(sPath, sc);
+  // For a kv file the reported size is its live data (the counter), not the
+  // sidecar's disk-use estimate; and kv rent is per-cell (chargeRentOrDelete is
+  // a no-op for kv) so there is no rent advance to persist -- skip the sidecar
+  // write. Flat files persist the rent advance.
+  uint64_t reportSize = sc.size;
+  if (sc.type == kFileTypeKv) {
+    std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
+    if (kvStoreOpenLocked(server, cfg.cesFileStoreDir, name))
+      reportSize = server->fileHandler()->kv_->liveBytes[
+          resolveContentPath(cfg.cesFileStoreDir, name).string()];
+  } else {
+    writeSidecar(sPath, sc);
+  }
 
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
@@ -1813,7 +1865,7 @@ StatOutcome statCore(CesServer* server, const std::string& name,
     status = CES_OK;
   });
   if (status != CES_OK) return { status, {}, 0, 0, 0, 0, 0 };
-  return { CES_OK, sc.owner_pubkey, bal, sc.price_per_kb, sc.size,
+  return { CES_OK, sc.owner_pubkey, bal, sc.price_per_kb, reportSize,
            sc.created_us, sc.modified_us };
 }
 
@@ -2206,11 +2258,79 @@ struct KvRangeOutcome   { uint8_t status; ces::Bytes effectiveHi;
                           std::vector<ces::Bytes> keys;
                           std::vector<ces::Bytes> values; };
 
-// Store (or overwrite) a key's record, adding `deposit` to the cell's rent
-// balance. No whole-store rent here; the daily sweep charges rent. The funder
-// pays a one-time write cost (burned) plus `deposit` (moved into the store pot
-// and credited to the cell balance). An overwrite keeps the existing cell
-// balance and last-charged stamp, so funding survives content updates.
+// Update a kv store's sidecar `size` -- its estimated disk use (live bytes +
+// current events log, floored) -- and the matching global store meta, but only
+// when that estimate has moved by at least the floor since the last write, so
+// ordinary ops write no sidecar. reservedBytes caches the last-written size
+// (seeded from the sidecar on first touch) so the check needs no sidecar read
+// and stays equal to the sidecar (global total == sum of sidecar sizes). Caller
+// holds the kv mutex.
+void kvRefreshQuotaLocked(CesServer* server, const std::string& dir,
+                          const std::string& name, KvStore* st) {
+  auto& cache = *server->fileHandler()->kv_;
+  std::string key = resolveContentPath(dir, name).string();
+  auto sPath = resolveSidecarPath(dir, name);
+
+  auto rit = cache.reservedBytes.find(key);
+  Sidecar sc{};
+  bool haveSc = false;
+  uint64_t reserved;
+  if (rit == cache.reservedBytes.end()) {
+    // First touch since open: seed the reservation from the persisted sidecar.
+    if (!readSidecar(sPath, sc)) return;
+    haveSc = true;
+    reserved = sc.size;
+    cache.reservedBytes[key] = reserved;
+  } else {
+    reserved = rit->second;
+  }
+
+  uint64_t live = cache.liveBytes[key];
+  uint64_t estDisk =
+      std::max<uint64_t>(kKvCompactFloorBytes, live + st->getEventsFileSize());
+  uint64_t diff = estDisk > reserved ? estDisk - reserved : reserved - estDisk;
+  if (diff < kKvCompactFloorBytes) return;                 // immaterial: no write
+
+  if (!haveSc && !readSidecar(sPath, sc)) return;
+  sc.size = estDisk;
+  sc.modified_us = getMicrosSinceEpoch();
+  if (!writeSidecar(sPath, sc)) return;
+  if (!isServerZone(name)) {
+    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
+    adjustStoreMeta(dir, 0,
+        static_cast<int64_t>(estDisk) - static_cast<int64_t>(reserved));
+  }
+  cache.reservedBytes[key] = estDisk;
+}
+
+// After a kv mutation: update the live byte counter (sizeDelta bytes, 0 for a
+// deposit that only rewrites the fixed header), compact the events log if it has
+// outgrown the live data, then update the sidecar disk-size estimate. Returns
+// the new live size. Caller holds the kv mutex.
+uint64_t kvOnMutationLocked(CesServer* server, const std::string& dir,
+                            const std::string& name, KvStore* st, int64_t sizeDelta) {
+  auto& cache = *server->fileHandler()->kv_;
+  std::string key = resolveContentPath(dir, name).string();
+  uint64_t& lb = cache.liveBytes[key];
+  if (sizeDelta < 0) {
+    uint64_t d = static_cast<uint64_t>(-sizeDelta);
+    lb = lb > d ? lb - d : 0;
+  } else {
+    lb += static_cast<uint64_t>(sizeDelta);
+  }
+  uint64_t logSize = st->getEventsFileSize();
+  if (logSize > kKvCompactFloorBytes && logSize > lb)
+    st->save(logkv::StoreSaveMode::syncSave);
+  uint64_t live = lb;
+  kvRefreshQuotaLocked(server, dir, name, st);
+  return live;
+}
+
+// Store (or overwrite) a key's record, adding `deposit` to the cell's prepaid
+// rent (burned to the server, recorded in the cell header). No whole-store rent
+// here; the daily sweep charges rent. The funder pays a one-time write cost. An
+// overwrite keeps the existing cell balance and last-charged stamp, so funding
+// survives content updates.
 KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
                        const ces::Bytes& key, const ces::Bytes& value,
                        const minx::Hash& caller, uint64_t deposit,
@@ -2228,8 +2348,6 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
     return { CES_ERROR_NOT_OWNER, 0, 0 };
 
   const bool serverZone = isServerZone(name);
-  minx::Hash prog{};
-  std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
   logkv::Bytes k = toLogkvBytes(key);
   uint64_t now = getMicrosSinceEpoch();
 
@@ -2262,7 +2380,9 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
     L2ChargeResult c = bill(t, static_cast<int64_t>(writeCost + deposit));
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; return; }
-    if (deposit > 0) t.credit(prog, static_cast<int64_t>(deposit));
+    // The deposit is burned here (charged via bill, never credited to any
+    // account), exactly like writeCost; the cell header below holds it as
+    // prepaid rent.
     status = CES_OK;
   });
   if (status != CES_OK) return { status, 0, 0 };
@@ -2273,23 +2393,14 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
       reinterpret_cast<const char*>(value.data()), value.size());
   st->update(k, nv);
   st->flush(true);
-
-  Sidecar sc2{};
-  if (!readSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
-  uint64_t base = sc2.size > oldStored ? sc2.size - oldStored : 0;
-  sc2.size = base + newStored;
-  sc2.modified_us = now;
-  if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
-  if (storedDelta != 0 && !serverZone) {
-    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, 0, storedDelta);
-  }
-  return { CES_OK, cellBalance, sc2.size };
+  uint64_t live =
+      kvOnMutationLocked(server, cfg.cesFileStoreDir, name, st, storedDelta);
+  return { CES_OK, cellBalance, live };
 }
 
-// Add `amount` to an existing key's rent balance. Any signer; no owner check.
-// Moves `amount` into the store pot and the cell balance. The key must already
-// exist.
+// Add `amount` to an existing key's prepaid rent. Any signer; no owner check.
+// The amount is burned (charged to the signer, credited nowhere) and recorded
+// in the cell header. The key must already exist.
 KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
                                const ces::Bytes& key, uint64_t amount,
                                const L2Billing& bill) {
@@ -2302,8 +2413,6 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
   Sidecar sc{};
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
   if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, 0 };
-  minx::Hash prog{};
-  std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
   logkv::Bytes k = toLogkvBytes(key);
 
   std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
@@ -2322,7 +2431,8 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
     L2ChargeResult ch = bill(t, static_cast<int64_t>(amount));
     if (ch.rc != CES_OK) { status = ch.rc; return; }
     if (ch.duplicate) { duplicate = true; status = CES_OK; return; }
-    t.credit(prog, static_cast<int64_t>(amount));
+    // Burned, not credited: the cell's prepaid-rent counter (updated below) is
+    // the only record; there is no program account to hold it.
     status = CES_OK;
   });
   if (status != CES_OK) return { status, 0 };
@@ -2330,6 +2440,9 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
 
   st->update(k, nv);
   st->flush(true);
+  // A deposit rewrites only the fixed header, so the live size is unchanged;
+  // still check compaction, since the rewrite appended to the events log.
+  kvOnMutationLocked(server, cfg.cesFileStoreDir, name, st, 0);
   return { CES_OK, c.balance + amount };
 }
 
@@ -2371,9 +2484,7 @@ KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
   if (sc.type != kFileTypeKv) return { CES_ERROR_BAD_INPUT, 0 };
   if (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) != 0)
     return { CES_ERROR_NOT_OWNER, 0 };
-  const bool serverZone = isServerZone(name);
-
-  uint64_t oldStored = 0, forfeit = 0;
+  uint64_t live = 0;
   {
     std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
     KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
@@ -2381,26 +2492,18 @@ KvEraseOutcome kvEraseCore(CesServer* server, const std::string& name,
     logkv::Bytes k = toLogkvBytes(key);
     auto it = st->find(k);
     if (it != st->end()) {
-      KvCell c{}; if (kvCellParse(it->second, c)) forfeit = c.balance;
-      oldStored = key.size() + it->second.size();
+      uint64_t oldStored = key.size() + it->second.size();
       st->erase(k); st->flush(true);
+      live = kvOnMutationLocked(server, cfg.cesFileStoreDir, name, st,
+                                -static_cast<int64_t>(oldStored));
+    } else {
+      live = server->fileHandler()->kv_->liveBytes[
+          resolveContentPath(cfg.cesFileStoreDir, name).string()];
     }
   }
-  // Burn the cell's forfeited balance from the store pot to keep the pot equal
-  // to the sum of live cell balances. The kv mutex is released; no lock is held
-  // across the logicStrand hop.
-  if (forfeit > 0 && !serverZone) debitProgramAccount(server, sc, forfeit);
-
-  Sidecar sc2{};
-  if (!readSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0 };
-  sc2.size = sc2.size > oldStored ? sc2.size - oldStored : 0;
-  sc2.modified_us = getMicrosSinceEpoch();
-  if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0 };
-  if (oldStored > 0 && !serverZone) {
-    std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, 0, -static_cast<int64_t>(oldStored));
-  }
-  return { CES_OK, sc2.size };
+  // The cell's prepaid rent was burned at deposit, so erase forfeits nothing to
+  // reclaim; kvOnMutationLocked updates the live counter and the sidecar size.
+  return { CES_OK, live };
 }
 
 KvIterOutcome kvIterCore(CesServer* server, const std::string& name,
@@ -3038,8 +3141,7 @@ void FileHandler::sweepKvRent() {
       if (!readSidecar(sPath, sc)) continue;       // GC'd between walk and now
       if (sc.type != kFileTypeKv) continue;
 
-      uint64_t totalCharge = 0;
-      int64_t sizeDelta = 0;
+      uint64_t liveBytes = 0;
       {
         std::lock_guard<std::mutex> kvLk(server->fileHandler()->kv_->mutex);
         KvStore* st = kvStoreOpenLocked(server, cfg.cesFileStoreDir, name);
@@ -3052,33 +3154,31 @@ void FileHandler::sweepKvRent() {
           uint64_t bytes = kv.first.size() + kv.second.size();
           uint64_t owed = computeOwedRent(bytes, feeRent, c.lastChargedUs, now);
           uint64_t charge = owed < c.balance ? owed : c.balance;
-          totalCharge += charge;
           uint64_t nb = c.balance - charge;
           if (nb == 0) {
             toErase.push_back(kv.first);
-            sizeDelta -= static_cast<int64_t>(bytes);
           } else {
             // Copy user bytes now: c.user points into the stored value.
             toUpdate.emplace_back(kv.first, kvCellBuild(nb, now, c.user, c.userLen));
+            liveBytes += bytes;
           }
         }
         for (auto& [k, v] : toUpdate) st->update(k, v);
         for (auto& k : toErase) st->erase(k);
         if (!toUpdate.empty() || !toErase.empty()) st->flush(true);
-      }
-      // Burn the rent from the store pot. The kv mutex is released, so the
-      // logicStrand hop holds no kv lock.
-      if (totalCharge > 0) debitProgramAccount(server, sc, totalCharge);
-      if (sizeDelta != 0) {
-        Sidecar sc2{};
-        if (readSidecar(sPath, sc2)) {
-          uint64_t dec = static_cast<uint64_t>(-sizeDelta);
-          sc2.size = sc2.size > dec ? sc2.size - dec : 0;
-          sc2.modified_us = now;
-          writeSidecar(sPath, sc2);
-          std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
-          adjustStoreMeta(cfg.cesFileStoreDir, 0, sizeDelta);
-        }
+        // The sweep iterated the whole live map, so set the live counter from
+        // it (correcting any drift), then compact: the sweep's rewrites have
+        // grown the events log; once it outgrows the live data, fold it into a
+        // fresh snapshot.
+        server->fileHandler()->kv_->liveBytes[
+            resolveContentPath(cfg.cesFileStoreDir, name).string()] = liveBytes;
+        uint64_t logSize = st->getEventsFileSize();
+        if (logSize > kKvCompactFloorBytes && logSize > liveBytes)
+          st->save(logkv::StoreSaveMode::syncSave);
+        // Rent was prepaid (burned) at deposit; the sweep only counts it down in
+        // each cell header and evicts at 0. No ledger debit. Update the sidecar
+        // disk-size estimate against the now-smaller live data.
+        kvRefreshQuotaLocked(server, cfg.cesFileStoreDir, name, st);
       }
     } catch (const std::exception& e) {
       LOGDEBUG << "kv rent sweep skipped a store" << SVAR(name) << SVAR(e.what());

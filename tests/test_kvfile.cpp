@@ -5,10 +5,11 @@
 //
 // Each kv value is stored as [balance u64][last_charged_us u64][user bytes]:
 // a file-service-owned billing header the program never sees (GET strips it).
-// A key is funded with a deposit (KV_PUT seed / KV_DEPOSIT top-up), pays its
-// own rent (feeFileRent x (key+value bytes) x time) on the daily sweep, and is
-// evicted when its balance hits 0. The store's program-account balance ==
-// sum of live cell balances. These tests drive fileHandlerExec directly (the
+// A key is funded with a deposit (KV_PUT seed / KV_DEPOSIT top-up) whose credits
+// are burned to the server, then it pays its own rent (feeFileRent x (key+value
+// bytes) x time) on the daily sweep and is evicted when its balance hits 0. A kv
+// file has no program account and no whole-file rent: the per-cell headers are
+// the sole balance record. These tests drive fileHandlerExec directly (the
 // in-process path builtin:compute uses) and call the sweep directly.
 
 #define BOOST_TEST_DYN_LINK
@@ -161,6 +162,16 @@ struct KvFixture {
   }
   uint64_t statSize(const std::string& name) {
     return exec(req(FLAT_STAT, name)).size;
+  }
+  // The sidecar `size` field read straight off disk (the store's disk-use estimate).
+  uint64_t sidecarSize(const std::string& name) {
+    fs::path p = fs::path(server->_config().cesFileStoreDir) /
+                 (name.substr(1) + ".sidecar.toml");
+    std::ifstream f(p.string());
+    std::string line;
+    while (std::getline(f, line))
+      if (line.rfind("size = ", 0) == 0) return std::stoull(line.substr(7));
+    return 0;
   }
 };
 
@@ -363,6 +374,101 @@ BOOST_AUTO_TEST_CASE(DataReloadsFromDiskAfterServerRestart) {
   CES_REQUIRE_OK(resp.status);
   BOOST_REQUIRE(resp.found);
   BOOST_CHECK_EQUAL(s_(resp.value), "on-disk");
+}
+
+// Per-op compaction keeps the append-only events log bounded relative to the
+// live data, so a heavily-overwritten store does not grow on disk without bound
+// even between daily sweeps, and it reloads from the compacted snapshot intact.
+BOOST_AUTO_TEST_CASE(EventsLogStaysBoundedAndReloads) {
+  auto treeBytes = [](const fs::path& p) -> uint64_t {
+    uint64_t total = 0;
+    boost::system::error_code ec;
+    for (fs::recursive_directory_iterator it(p, ec), end; it != end;
+         it.increment(ec)) {
+      boost::system::error_code fec;
+      if (fs::is_regular_file(it->path(), fec))
+        total += static_cast<uint64_t>(fs::file_size(it->path(), fec));
+    }
+    return total;
+  };
+  const fs::path storeRoot = server->_config().cesFileStoreDir;
+
+  const std::string name = home() + "compact.kv";
+  createStore(name);
+  // Hammer ONE key: the live data stays a single ~1KB cell, while an un-compacted
+  // log would reach ~2MB over 2000 overwrites. Per-op compaction must keep the
+  // on-disk footprint bounded WITHOUT any sweep.
+  const std::string big(1024, 'x');
+  for (int i = 0; i < 2000; ++i)
+    CES_REQUIRE_OK(put(name, "k", big, 1'000'000'000'000ull));
+
+  const uint64_t bytes = treeBytes(storeRoot);
+  BOOST_TEST_MESSAGE("kv store bytes after 2000 overwrites, no sweep: " << bytes);
+  // Bounded to a few compaction cycles, nowhere near the ~2MB an un-compacted
+  // log would reach.
+  BOOST_CHECK_LT(bytes, 256u * 1024);
+
+  // Data intact after all the compactions...
+  { auto r2 = req(KV_GET, name); r2.key = b_("k");
+    auto rp = exec(r2);
+    CES_REQUIRE_OK(rp.status);
+    BOOST_REQUIRE(rp.found);
+    BOOST_CHECK_EQUAL(s_(rp.value), big); }
+
+  // ...and reloads from the compacted snapshot after a restart.
+  restartServer();
+  { auto r2 = req(KV_GET, name); r2.key = b_("k");
+    auto rp = exec(r2);
+    CES_REQUIRE_OK(rp.status);
+    BOOST_REQUIRE(rp.found);
+    BOOST_CHECK_EQUAL(s_(rp.value), big); }
+}
+
+// The sidecar `size` is the store's estimated disk use (live data + events on
+// disk, floored), updated lazily and decoupled from STAT, which reports the
+// live data.
+BOOST_AUTO_TEST_CASE(SidecarSizeIsDiskEstimateDecoupledFromStat) {
+  const std::string name = home() + "quota.kv";
+  createStore(name);
+  // Fresh store reserves the compaction floor on disk; STAT reports 0 logical.
+  BOOST_CHECK_GE(sidecarSize(name), 64u * 1024);
+  BOOST_CHECK_EQUAL(statSize(name), 0u);
+
+  // Grow with distinct keys so live data climbs well past the floor.
+  const std::string val(512, 'x');
+  for (int i = 0; i < 300; ++i)
+    CES_REQUIRE_OK(put(name, "k" + std::to_string(i), val, 1'000'000'000'000ull));
+
+  const uint64_t logical = statSize(name);     // STAT = live data
+  const uint64_t estDisk = sidecarSize(name);  // sidecar = disk (live + events)
+  BOOST_TEST_MESSAGE("logical=" << logical << " sidecar-disk=" << estDisk);
+  BOOST_CHECK_GT(logical, 100u * 1024);        // real data accounted by STAT
+  BOOST_CHECK_GE(estDisk, logical);            // estimate covers the disk
+  BOOST_CHECK_GE(estDisk, 64u * 1024);         // never below the floor
+}
+
+// Regression: flat ops (STAT et al.) roll whole-file rent via
+// chargeRentOrDelete. That used to debit a kv file's program account -- which
+// no longer exists -- and delete the store on the first post-gap STAT. kv files
+// must accrue NO whole-file rent (only per-cell sweep rent), so a kv file
+// survives repeated flat ops under high rent across a time gap.
+BOOST_AUTO_TEST_CASE(KvFileImmuneToWholeFileRentOnFlatOps) {
+  const std::string name = home() + "rentsafe.kv";
+  createStore(name);
+  CES_REQUIRE_OK(put(name, "k", "v", 1000));
+
+  // feeFileRent is high (see buildConfig). A whole-file rent roll over this gap
+  // would owe far more than the file could pay and delete it.
+  std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+  // Each STAT rolls rent for a flat file; the kv file and its cell must survive.
+  for (int i = 0; i < 5; ++i)
+    CES_REQUIRE_OK(exec(req(FLAT_STAT, name)).status);   // not FILE_NOT_FOUND
+  auto r = req(KV_GET, name); r.key = b_("k");
+  auto rp = exec(r);
+  CES_REQUIRE_OK(rp.status);
+  BOOST_REQUIRE(rp.found);
+  BOOST_CHECK_EQUAL(s_(rp.value), "v");
 }
 
 // The trustless "anyone funds any entry there" path: an external funder binds
