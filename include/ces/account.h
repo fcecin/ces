@@ -16,21 +16,21 @@ namespace ces {
  * key. balance and nonce are the core state; lastXferDest/Amount/Time hold the
  * last outgoing single-transfer receipt. balance and lastXferAmount are stored
  * in 48 bits (Int48/UInt48, capping an account at ~1.4M credits) to free the
- * 32-bit cordId without growing the row.
+ * 32-bit aliasId without growing the row.
  */
 struct Account {
 
   Account()
       : keyTail_{}, balance_(0), lastXferAmount_(0), lastXferDest_{},
-        lastXferTime_(0), nonce_(0), cordId_(0) {}
+        lastXferTime_(0), nonce_(0), aliasId_(0) {}
 
   Account(const HashTail& keyTail, int64_t balance, uint32_t nonce)
       : keyTail_(keyTail), balance_(balance), lastXferAmount_(0),
-        lastXferDest_{}, lastXferTime_(0), nonce_(nonce), cordId_(0) {}
+        lastXferDest_{}, lastXferTime_(0), nonce_(nonce), aliasId_(0) {}
 
   Account(const Hash& key, int64_t balance, uint32_t nonce)
       : balance_(balance), lastXferAmount_(0), lastXferDest_{},
-        lastXferTime_(0), nonce_(nonce), cordId_(0) {
+        lastXferTime_(0), nonce_(nonce), aliasId_(0) {
     setKeyTail(key);
   }
 
@@ -69,8 +69,8 @@ struct Account {
   uint32_t getLastXferTime() const { return lastXferTime_; }
   void setLastXferTime(uint32_t time) { lastXferTime_ = time; }
 
-  uint32_t getCordId() const { return cordId_; }
-  void setCordId(uint32_t cordId) { cordId_ = cordId; }
+  uint32_t getAliasId() const { return aliasId_; }
+  void setAliasId(uint32_t aliasId) { aliasId_ = aliasId; }
 
   const HashTail*   keyTailPtr()        const { return &keyTail_; }
   const Int48*      balancePtr()        const { return &balance_; }
@@ -78,7 +78,7 @@ struct Account {
   const HashPrefix* lastXferDestPtr()   const { return &lastXferDest_; }
   const UInt48*     lastXferAmountPtr() const { return &lastXferAmount_; }
   const uint32_t*   lastXferTimePtr()   const { return &lastXferTime_; }
-  const uint32_t*   cordIdPtr()       const { return &cordId_; }
+  const uint32_t*   aliasIdPtr()       const { return &aliasId_; }
 
   enum class SerMode : uint8_t {
     Full = 0x00,         // all fields (account creation, snapshots)
@@ -96,7 +96,7 @@ private:
   HashPrefix lastXferDest_;
   uint32_t lastXferTime_;
   uint32_t nonce_;
-  uint32_t cordId_;
+  uint32_t aliasId_;
 };
 
 } // namespace ces
@@ -117,13 +117,13 @@ struct serializer<ces::Account> {
   static constexpr size_t SZ_XFER_DEST = sizeof(ces::HashPrefix);
   static constexpr size_t SZ_XFER_AMOUNT = 6;   // 48-bit, low32 + high16
   static constexpr size_t SZ_XFER_TIME = sizeof(uint32_t);
-  static constexpr size_t SZ_CORD_ID = sizeof(uint32_t);
+  static constexpr size_t SZ_ALIAS_ID = sizeof(uint32_t);
 
   static constexpr size_t SZ_HEADER = 1;
   static constexpr size_t SZ_BALANCE_NONCE = SZ_BALANCE + SZ_NONCE;
   static constexpr size_t SZ_XFER = SZ_XFER_DEST + SZ_XFER_AMOUNT + SZ_XFER_TIME;
   static constexpr size_t SZ_ALL =
-      SZ_KEY_TAIL + SZ_BALANCE_NONCE + SZ_XFER + SZ_CORD_ID;
+      SZ_KEY_TAIL + SZ_BALANCE_NONCE + SZ_XFER + SZ_ALIAS_ID;
 
   // 48-bit codec: low 32 bits then high 16 bits, in the Writer's byte order.
   static void write48(Writer& w, uint64_t v) {
@@ -177,7 +177,7 @@ struct serializer<ces::Account> {
         writer.write(obj.getLastXferDest());
         write48(writer, obj.getLastXferAmount());
         writer.write(obj.getLastXferTime());
-        writer.write(obj.getCordId());
+        writer.write(obj.getAliasId());
         return writer.bytes_processed();
       }
 
@@ -201,7 +201,7 @@ struct serializer<ces::Account> {
           writer.write(obj.getLastXferDest());
           write48(writer, obj.getLastXferAmount());
           writer.write(obj.getLastXferTime());
-          writer.write(obj.getCordId());
+          writer.write(obj.getAliasId());
           break;
         case SerMode::BalanceNonce:
           write48(writer, static_cast<uint64_t>(obj.getBalance()));
@@ -232,21 +232,21 @@ struct serializer<ces::Account> {
       if (isSnapshot) {
         ces::HashTail kt;
         ces::HashPrefix xferDest;
-        uint32_t nonce, xferTime, cordId;
+        uint32_t nonce, xferTime, aliasId;
         reader.read(kt);
         int64_t bal = static_cast<int64_t>(read48(reader) << 16) >> 16;
         reader.read(nonce);
         reader.read(xferDest);
         uint64_t xferAmount = read48(reader);
         reader.read(xferTime);
-        reader.read(cordId);
+        reader.read(aliasId);
         obj.getKeyTail() = kt;
         obj.setBalance(bal);
         obj.setNonce(nonce);
         obj.setLastXferDest(xferDest);
         obj.setLastXferAmount(xferAmount);
         obj.setLastXferTime(xferTime);
-        obj.setCordId(cordId);
+        obj.setAliasId(aliasId);
         return reader.bytes_processed();
       }
 
@@ -260,21 +260,21 @@ struct serializer<ces::Account> {
       case SerMode::Full: {
         ces::HashTail kt;
         ces::HashPrefix xferDest;
-        uint32_t nonce, xferTime, cordId;
+        uint32_t nonce, xferTime, aliasId;
         reader.read(kt);
         int64_t bal = static_cast<int64_t>(read48(reader) << 16) >> 16;
         reader.read(nonce);
         reader.read(xferDest);
         uint64_t xferAmount = read48(reader);
         reader.read(xferTime);
-        reader.read(cordId);
+        reader.read(aliasId);
         obj.getKeyTail() = kt;
         obj.setBalance(bal);
         obj.setNonce(nonce);
         obj.setLastXferDest(xferDest);
         obj.setLastXferAmount(xferAmount);
         obj.setLastXferTime(xferTime);
-        obj.setCordId(cordId);
+        obj.setAliasId(aliasId);
         break;
       }
       case SerMode::BalanceNonce: {

@@ -204,6 +204,13 @@ public:
                      AssetData& outContent, uint16_t& outBalance,
                      uint32_t& outPrice);
 
+  // --- Alias Operations ---
+  uint8_t setAlias(uint16_t op, const AliasData& content,
+                   uint32_t& outAliasId);
+  uint8_t deleteAlias();
+  uint8_t queryAlias(uint32_t aliasId, HashPrefix& outOwner, uint16_t& outOp,
+                     AliasData& outContent, bool& outFound);
+
   /**
    * Query a peer-table slot (Unsigned/Public) for discovery.
    * @return CES_OK (outFound says whether the slot held a peer) or
@@ -357,6 +364,25 @@ private:
   std::vector<AccountEntry> accSignedQueryAccounts_;
   uint8_t accSignedQueryResultCode_ = 0;
   std::atomic<uint64_t> accSignedQueryGen_ = 0;
+
+  // Alias Results
+  HashPrefix setAliasResultOriginId_{};
+  uint32_t setAliasResultNonce_ = 0;
+  uint32_t setAliasResultId_ = 0;
+  uint8_t setAliasResultCode_ = 0;
+  std::atomic<uint64_t> setAliasGen_ = 0;
+
+  HashPrefix deleteAliasResultOriginId_{};
+  uint32_t deleteAliasResultNonce_ = 0;
+  uint8_t deleteAliasResultCode_ = 0;
+  std::atomic<uint64_t> deleteAliasGen_ = 0;
+
+  uint32_t queryAliasResultId_ = 0;
+  HashPrefix queryAliasResultOwner_{};
+  uint16_t queryAliasResultOp_ = 0;
+  AliasData queryAliasResultContent_{};
+  uint8_t queryAliasResultFound_ = 0;
+  std::atomic<uint64_t> queryAliasGen_ = 0;
 
   // Asset Results
   HashPrefix createAssetResultOriginId_;

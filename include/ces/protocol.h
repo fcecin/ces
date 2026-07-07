@@ -1,6 +1,7 @@
 #pragma once
 
 #include <ces/asset.h>
+#include <ces/alias.h>
 #include <ces/keys.h>
 #include <ces/types.h>
 #include <minx/buffer.h>
@@ -856,6 +857,64 @@ struct CesQueryAssetResult {
     }
   }
   CES_INJECT_SIGNED_METHODS(CES_QUERY_ASSET_RESULT)
+};
+
+// --- CES_SET_ALIAS (set this account's alias: create on first use, edit in
+// place after; the id is stable across edits, delete to drop it) ---
+#define CES_SET_ALIAS_FIELDS(X)                                                \
+  X(Hash, originId) X(HashPrefix, serverId)                                    \
+  X(uint32_t, reqNonce) X(uint16_t, op) X(AliasData, content)
+struct CesSetAlias {
+  CES_DECLARE_FIELDS(CES_SET_ALIAS_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_SET_ALIAS_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_SET_ALIAS)
+};
+
+#define CES_SET_ALIAS_RESULT_FIELDS(X)                                         \
+  X(HashPrefix, originId) X(uint32_t, reqNonce) X(uint32_t, aliasId)           \
+    X(uint8_t, rcode)
+struct CesSetAliasResult {
+  CES_DECLARE_FIELDS(CES_SET_ALIAS_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_SET_ALIAS_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_SET_ALIAS_RESULT)
+};
+
+// --- CES_DELETE_ALIAS (erase this account's alias) ---
+#define CES_DELETE_ALIAS_FIELDS(X)                                             \
+  X(Hash, originId) X(HashPrefix, serverId) X(uint32_t, reqNonce)
+struct CesDeleteAlias {
+  CES_DECLARE_FIELDS(CES_DELETE_ALIAS_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_DELETE_ALIAS_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_DELETE_ALIAS)
+};
+
+#define CES_DELETE_ALIAS_RESULT_FIELDS(X)                                      \
+  X(HashPrefix, originId) X(uint32_t, reqNonce) X(uint8_t, rcode)
+struct CesDeleteAliasResult {
+  CES_DECLARE_FIELDS(CES_DELETE_ALIAS_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_DELETE_ALIAS_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_DELETE_ALIAS_RESULT)
+};
+
+// --- CES_QUERY_ALIAS (unsigned: read an alias by id) ---
+#define CES_QUERY_ALIAS_FIELDS(X) X(uint32_t, aliasId)
+struct CesQueryAlias {
+  CES_DECLARE_FIELDS(CES_QUERY_ALIAS_FIELDS)
+  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_QUERY_ALIAS_FIELDS)
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_ALIAS)
+};
+
+#define CES_QUERY_ALIAS_RESULT_FIELDS(X)                                       \
+  X(uint32_t, aliasId) X(HashPrefix, owner) X(uint16_t, op)                    \
+    X(AliasData, content) X(uint8_t, found)
+struct CesQueryAliasResult {
+  CES_DECLARE_FIELDS(CES_QUERY_ALIAS_RESULT_FIELDS)
+  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_QUERY_ALIAS_RESULT_FIELDS)
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_ALIAS_RESULT)
 };
 
 // --- UNSIGNED ASSET QUERIES & SERVER INFO ---

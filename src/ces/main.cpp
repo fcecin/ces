@@ -110,6 +110,10 @@ max_accounts = )" << DEFAULT_MAX_ACC << R"(
 min_assets = )" << DEFAULT_MIN_ASSET << R"(
 max_assets = )" << DEFAULT_MAX_ASSET << R"(
 
+# Alias DB capacity (power of 2). RAM is ~64 bytes/alias plus load factor.
+min_aliases = )" << DEFAULT_MIN_ALIAS << R"(
+max_aliases = )" << DEFAULT_MAX_ALIAS << R"(
+
 # Minimum value delta before flushing to OS buffers. 0 = flush every change
 # (max durability); a larger batch cuts write syscalls under load.
 flush_value = )" << DEFAULT_FLUSH_VALUE << R"(
@@ -359,6 +363,8 @@ int main(int argc, char* argv[]) {
   uint64_t optMaxAcc;
   uint64_t optMinAsset;
   uint64_t optMaxAsset;
+  uint64_t optMinAlias;
+  uint64_t optMaxAlias;
   uint8_t optMinDiff;
   uint64_t optPoWDelay;
   uint64_t optSpendSlotSize;
@@ -477,6 +483,12 @@ int main(int argc, char* argv[]) {
     app.add_option("--maxasset", optMaxAsset,
       "Maximum asset DB size")
       ->default_val(std::to_string(DEFAULT_MAX_ASSET));
+    app.add_option("--minalias", optMinAlias,
+      "Reserved alias DB store capacity")
+      ->default_val(std::to_string(DEFAULT_MIN_ALIAS));
+    app.add_option("--maxalias", optMaxAlias,
+      "Maximum alias DB size")
+      ->default_val(std::to_string(DEFAULT_MAX_ALIAS));
     app.add_option("--flushvalue", optFlushValue,
       "Minimum value delta for flushing")
       ->default_val(std::to_string(DEFAULT_FLUSH_VALUE));
@@ -750,6 +762,8 @@ int main(int argc, char* argv[]) {
       applyIfDefault("max_accounts", optMaxAcc, "--maxacc");
       applyIfDefault("min_assets", optMinAsset, "--minasset");
       applyIfDefault("max_assets", optMaxAsset, "--maxasset");
+      applyIfDefault("min_aliases", optMinAlias, "--minalias");
+      applyIfDefault("max_aliases", optMaxAlias, "--maxalias");
       applyIfDefault("flush_value", optFlushValue, "--flushvalue");
       applyIfDefault("max_log_size_gb", optMaxLogSizeGB, "--maxlogsize");
       applyIfDefault("server_name", optServerName, "--servername");
@@ -963,6 +977,8 @@ int main(int argc, char* argv[]) {
   config.maxAcc = optMaxAcc;
   config.minAsset = optMinAsset;
   config.maxAsset = optMaxAsset;
+  config.minAlias = optMinAlias;
+  config.maxAlias = optMaxAlias;
   config.minDiff = optMinDiff;
   config.spendSlotSize = optSpendSlotSize;
   config.taskThreads = optTaskThreads;

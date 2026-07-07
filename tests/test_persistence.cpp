@@ -1,4 +1,5 @@
 #include "test_common.h"
+#include <ces/alias.h>
 #include <ces/cesvm.h>
 #include <ces/util/vmprogram.h>
 #include <functional>
@@ -1519,6 +1520,83 @@ BOOST_AUTO_TEST_CASE(CronAbortThenCrash_NoLeak) {
 
   boost::system::error_code ec;
   fs::remove_all(pDir, ec);
+}
+
+// An alias, the account->alias link, and the id-generator's counter must all
+// survive a clean stop + snapshot + reload. The killer assertion: a fresh
+// account creating an alias on the reloaded server gets a DISTINCT id, proving
+// entry 0 (the generator) persisted its counter rather than restarting from 1.
+BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
+  LOGINFO << "TEST: Starting Alias_Persists_Across_Reload";
+
+  fs::path pDir = makeUniqueTempDir("ces_alias_persist");
+  minx::Hash sPriv;
+  sPriv.fill(0xEE);
+
+  KeyPair a;
+  ces::AliasData content{};
+  const char* s = "persist me";
+  for (std::size_t i = 0; s[i]; ++i) content[i] = static_cast<uint8_t>(s[i]);
+
+  uint32_t id = 0;
+
+  // --- PHASE 1: create an alias, clean stop, explicit snapshot ---
+  {
+    CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
+    cfg.feeAccount = 0;   // isolate persistence from rent
+    cfg.feeQuery = 0;
+    cfg.maxAlias = 1000;
+    CesServer srv(cfg);
+    srv.start(0);
+
+    srv._brr(a.getPublicKeyAsHash(), 10'000'000);
+    srv._drainLogic();
+
+    BOOST_REQUIRE_EQUAL(
+      srv.setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, content, 0, id),
+      CES_OK);
+    srv._drainLogic();
+    BOOST_REQUIRE(id != 0);
+
+    srv.stop(false);
+    srv._save();   // snapshot the alias store + generator cell
+  }
+
+  // --- PHASE 2: reload; alias, link, and generator all survive ---
+  {
+    CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
+    cfg.feeAccount = 0;
+    cfg.feeQuery = 0;
+    cfg.maxAlias = 1000;
+    CesServer srv2(cfg);
+    srv2.start(0);
+
+    // The alias cell reloaded intact.
+    ces::Alias out;
+    BOOST_CHECK(srv2.queryAlias(id, out));
+    BOOST_CHECK_EQUAL(out.getOp(), ces::ALIAS_OP_STRING);
+    BOOST_CHECK(out.getOwner() ==
+                ces::Account::getMapKey(a.getPublicKeyAsHash()));
+    BOOST_CHECK_EQUAL(out.getContent()[0], static_cast<uint8_t>('p'));
+
+    // The account->alias link reloaded.
+    BOOST_CHECK_EQUAL(srv2._aliasIdOf(a.getPublicKeyAsHash()), id);
+
+    // The generator counter persisted: a new account gets a fresh, distinct id.
+    KeyPair b;
+    srv2._brr(b.getPublicKeyAsHash(), 10'000'000);
+    srv2._drainLogic();
+    uint32_t id2 = 0;
+    BOOST_REQUIRE_EQUAL(
+      srv2.setAlias(b.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, content, 0, id2),
+      CES_OK);
+    srv2._drainLogic();
+    BOOST_CHECK(id2 != 0);
+    BOOST_CHECK(id2 != id);   // no id reuse -> entry-0 next-id survived reload
+
+    srv2.stop();
+  }
+  fs::remove_all(pDir);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

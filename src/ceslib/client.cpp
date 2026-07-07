@@ -620,6 +620,80 @@ uint8_t CesClient::createAsset(const Hash& assetId, const AssetData& content,
   });
 }
 
+uint8_t CesClient::setAlias(uint16_t op, const AliasData& content,
+                            uint32_t& outAliasId) {
+  outAliasId = 0;
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesSetAlias req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.op = op;
+  req.content = content;
+  uint8_t rc = sendSigned(req, setAliasGen_, setAliasResultCode_, [&] {
+    return setAliasResultNonce_ == reqNonce &&
+           setAliasResultOriginId_ == myId;
+  });
+  if (rc == CES_OK)
+    outAliasId = setAliasResultId_;
+  return rc;
+}
+
+uint8_t CesClient::deleteAlias() {
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesDeleteAlias req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  return sendSigned(req, deleteAliasGen_, deleteAliasResultCode_, [&] {
+    return deleteAliasResultNonce_ == reqNonce &&
+           deleteAliasResultOriginId_ == myId;
+  });
+}
+
+uint8_t CesClient::queryAlias(uint32_t aliasId, HashPrefix& outOwner,
+                              uint16_t& outOp, AliasData& outContent,
+                              bool& outFound) {
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+  CesQueryAlias req{aliasId};
+  minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
+                        req.toBytes()};
+  uint64_t g = queryAliasGen_;
+  int staleCount = 0;
+  for (int i = 0; i < tries_; ++i) {
+    transport_->sendMessage(msg);
+    auto res =
+      ces::waitFor(retryIntervalMs_, [&]() { return g < queryAliasGen_; });
+    switch (res) {
+    case ces::WaitResult::Success:
+      if (queryAliasResultId_ != aliasId) {
+        g = queryAliasGen_;
+        if (++staleCount < tries_) { --i; }
+        continue;
+      }
+      outFound = queryAliasResultFound_ != 0;
+      outOwner = queryAliasResultOwner_;
+      outOp = queryAliasResultOp_;
+      outContent = queryAliasResultContent_;
+      return CES_OK;
+    case ces::WaitResult::Interrupted:
+      return CES_ERROR_INTERNAL;
+    case ces::WaitResult::Timeout:
+      break;
+    }
+  }
+  return CES_ERROR_TIMEOUT;
+}
+
 uint8_t CesClient::updateAsset(const Hash& assetId, const HashPrefix& newOwner,
                                const AssetData& content, uint32_t price) {
   LOGTRACE << "updateAsset";
@@ -1109,6 +1183,35 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         accSignedQueryReqNonce_ = r.reqNonce;
         accSignedQueryResultCode_ = r.rcode;
         accSignedQueryAccounts_ = r.accounts;
+      });
+      break;
+
+    case CES_SET_ALIAS_RESULT:
+      handleSigned(CesSetAliasResult{}, "set alias", setAliasGen_,
+                   [&](auto& r) {
+        setAliasResultOriginId_ = r.originId;
+        setAliasResultNonce_ = r.reqNonce;
+        setAliasResultId_ = r.aliasId;
+        setAliasResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_DELETE_ALIAS_RESULT:
+      handleSigned(CesDeleteAliasResult{}, "delete alias", deleteAliasGen_,
+                   [&](auto& r) {
+        deleteAliasResultOriginId_ = r.originId;
+        deleteAliasResultNonce_ = r.reqNonce;
+        deleteAliasResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_QUERY_ALIAS_RESULT:
+      handleUnsigned(CesQueryAliasResult{}, queryAliasGen_, [&](auto& r) {
+        queryAliasResultId_ = r.aliasId;
+        queryAliasResultOwner_ = r.owner;
+        queryAliasResultOp_ = r.op;
+        queryAliasResultContent_ = r.content;
+        queryAliasResultFound_ = r.found;
       });
       break;
 

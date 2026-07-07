@@ -150,6 +150,7 @@ BOOST_AUTO_TEST_CASE(StatusEndpoint) {
   BOOST_CHECK_EQUAL(r.status, 200);
   BOOST_CHECK(has(r.body, "\"pubkey\""));
   BOOST_CHECK(has(r.body, "\"circulating\""));
+  BOOST_CHECK(has(r.body, "\"aliases\""));
   BOOST_CHECK(has(r.body, "\"gauges\""));
   BOOST_CHECK(has(r.body, "\"features\""));
   BOOST_CHECK(has(r.body, "\"hello\""));
@@ -301,6 +302,7 @@ BOOST_AUTO_TEST_CASE(ConfigEndpoint) {
   BOOST_CHECK(has(r.body, "\"knobs\""));
   BOOST_CHECK(has(r.body, "\"multipliers\""));
   BOOST_CHECK(has(r.body, "feeAccount"));
+  BOOST_CHECK(has(r.body, "maxAliases"));
 }
 
 BOOST_AUTO_TEST_CASE(ConfigSetKnobLive) {
@@ -549,6 +551,7 @@ BOOST_AUTO_TEST_CASE(ConfigExportWritesFile) {
   BOOST_CHECK(toml.find("rpc_max_pending") != std::string::npos);     // rpc backpressure
   BOOST_CHECK(toml.find("compute_client_pool_size") != std::string::npos);
   BOOST_CHECK(toml.find("ext_funding_per_day") != std::string::npos);
+  BOOST_CHECK(toml.find("max_aliases") != std::string::npos);         // capacity caps
   BOOST_CHECK(toml.find("[rpc_rudp]") != std::string::npos);          // tables
 }
 

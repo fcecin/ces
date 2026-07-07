@@ -416,6 +416,7 @@ std::string buildStatus(CesServer& s) {
   o << ",\"circulating\":" << stats.circulating;
   o << ",\"accounts\":" << stats.accounts;
   o << ",\"assets\":" << stats.assets;
+  o << ",\"aliases\":" << stats.aliases;
   o << ",\"txCount\":" << stats.txCount;
   o << ",\"tps\":" << s.getTps();
   o << ",\"minDifficulty\":" << static_cast<unsigned>(c.minDiff);
@@ -538,6 +539,8 @@ std::string buildConfig(CesServer& s) {
   kv(o, "maxAccounts", c.maxAcc, false);
   kv(o, "minAssets", c.minAsset, false);
   kv(o, "maxAssets", c.maxAsset, false);
+  kv(o, "minAliases", c.minAlias, false);
+  kv(o, "maxAliases", c.maxAlias, false);
   kv(o, "cesFileStoreMaxBytes", c.cesFileStoreMaxBytes, false);
   kv(o, "computeMaxInstances", c.computeMaxInstances, false);
   kv(o, "computePortBase", c.computePortBase, false);
@@ -1927,6 +1930,7 @@ async function loadOverview(){
     ['Credits in circulation',fmtCredits(s.circulating),'green','ultrawide'],
     ['Accounts',fmtNum(s.accounts),'','wide'],
     ['Assets',fmtNum(s.assets),'','wide'],
+    ['Aliases',fmtNum(s.aliases),'','wide'],
     ['Transactions',fmtNum(s.txCount),'','wide'],
     ['TPS',fmtNum(s.tps),'','wide'],
     ['Peers',fmtNum(s.peerCount!==undefined?s.peerCount:'-'),''],

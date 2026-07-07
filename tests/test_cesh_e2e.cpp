@@ -1046,6 +1046,55 @@ BOOST_AUTO_TEST_CASE(BareGossipShowsHelp) {
   assertContains(r.out, "budget");
 }
 
+// ===========================================================================
+// Alias (L1 account sidecar)
+// ===========================================================================
+
+BOOST_AUTO_TEST_CASE(AliasHelpListsVerbs) {
+  auto r = run(cmd("alias --help"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "set");
+  assertContains(r.out, "rm");
+  assertContains(r.out, "get");
+}
+
+// Full CLI round-trip: set an alias on the funded account, parse the server-
+// assigned id from quiet JSON, read it back by id via the unsigned get.
+BOOST_AUTO_TEST_CASE(AliasSetGetRoundTrip) {
+  auto set = run(cmd("-q alias set --content hello --op 1"));
+  BOOST_CHECK_EQUAL(set.exitCode, 0);
+  assertContains(set.out, "\"aliasId\":");
+
+  std::smatch m;
+  BOOST_REQUIRE(std::regex_search(set.out, m, std::regex("\"aliasId\":([0-9]+)")));
+  std::string id = m[1].str();
+  BOOST_CHECK(id != "0");
+
+  auto get = run(cmd("-q alias get " + id));
+  BOOST_CHECK_EQUAL(get.exitCode, 0);
+  assertContains(get.out, "\"op\":1");
+  assertContains(get.out, "68656c6c6f");   // "hello" in the contentHex field
+  assertNotContains(get.out, "===", "quiet alias get must be JSON only");
+}
+
+// Human-mode rendering is schema-aware: op=STRING prints content as text,
+// op=NONE (raw) prints it as hex (never mojibake).
+BOOST_AUTO_TEST_CASE(AliasGetRendersTextVsHexByOp) {
+  auto s1 = run(cmd("-q alias set --content shopname --op 1"));
+  std::smatch m1;
+  BOOST_REQUIRE(std::regex_search(s1.out, m1, std::regex("\"aliasId\":([0-9]+)")));
+  auto g1 = run(cmd("alias get " + m1[1].str()));   // human mode
+  BOOST_CHECK_EQUAL(g1.exitCode, 0);
+  assertContains(g1.out, "shopname");               // rendered as text
+
+  auto s2 = run(cmd("-q alias set --hexcontent deadbeef --op 0"));
+  std::smatch m2;
+  BOOST_REQUIRE(std::regex_search(s2.out, m2, std::regex("\"aliasId\":([0-9]+)")));
+  auto g2 = run(cmd("alias get " + m2[1].str()));   // human mode
+  BOOST_CHECK_EQUAL(g2.exitCode, 0);
+  assertContains(g2.out, "deadbeef");               // rendered as hex
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // ============================================================================

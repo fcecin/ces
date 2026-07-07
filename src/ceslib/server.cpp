@@ -104,6 +104,7 @@ constexpr uint8_t PEER_MINER_MAX_DIFF_ABOVE = 5;
 
 constexpr const char* ACCOUNTS_DATA_SUBDIRECTORY = "accounts";
 constexpr const char* ASSETS_DATA_SUBDIRECTORY = "assets";
+constexpr const char* ALIASES_DATA_SUBDIRECTORY = "aliases";
 
 // Shared write-auth check for VM host callbacks.
 // - Immutable assets: nobody may write.
@@ -922,6 +923,8 @@ CesServer::CesServer(const CesConfig& config)
                 config.accountStoreBufferSize),
       assets_((config.dataDir / ASSETS_DATA_SUBDIRECTORY).string(),
               config.minAsset, config.flushValue, config.assetStoreBufferSize),
+      aliases_((config.dataDir / ALIASES_DATA_SUBDIRECTORY).string(),
+               config.minAlias, config.flushValue),
       presence_(config.presenceCacheSize) {
   // Default every fee multiplier to full price (10000 bp). The metrics
   // pulse overwrites these once a tick from the gauge each kind is
@@ -1660,6 +1663,7 @@ bool CesServer::doSnapshot(const char* reason) {
   LOGINFO << "snapshot" << VAL("reason", reason);
   accounts_->flush(true);
   accounts_->save(logkv::StoreSaveMode::forkSave);
+  aliases_->save(logkv::StoreSaveMode::forkSave);
   assets_->flush(true);
   assets_->save(logkv::StoreSaveMode::forkSave);
   return true;
@@ -2105,6 +2109,7 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
 
   kv("totalAccounts", std::to_string(accounts_->getObjects().size()));
   kv("totalAssets", std::to_string(assets_->getObjects().size()));
+  kv("totalAliases", std::to_string(aliases_->getObjects().size()));
   kv("totalCredits", std::to_string(circulatingCredits()));
   kv("feeAccount", std::to_string(cfg_.feeAccount));
   kv("feeAsset", std::to_string(cfg_.feeAsset));
@@ -2120,6 +2125,8 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
   kv("maxAccounts", std::to_string(cfg_.maxAcc));
   kv("minAssets", std::to_string(cfg_.minAsset));
   kv("maxAssets", std::to_string(cfg_.maxAsset));
+  kv("minAliases", std::to_string(cfg_.minAlias));
+  kv("maxAliases", std::to_string(cfg_.maxAlias));
   kv("minDifficulty", std::to_string(cfg_.minDiff));
   kv("spendSlotSize", std::to_string(cfg_.spendSlotSize));
   kv("tps", std::to_string(tpsCurrent_.load()));
@@ -2546,6 +2553,151 @@ uint8_t CesServer::buyAsset(const minx::Hash& originKey,
   checkAutoSnapshot();
   LOGTRACE << "buyAsset ok" << VAR(assetId) << VAR(price);
   return CES_OK;
+}
+
+// ===========================================================================
+// Alias ops (local/aliases.md)
+// ===========================================================================
+
+// Allocate the next alias id from the generator cell (id 0). Seeds it if
+// absent, finds a free id at/after next-id (wrapping past 2^32, skipping id 0
+// and occupied slots; live count << 2^32, so a free slot is always near),
+// bumps next-id first (a crash between skips one id, harmless), and returns
+// the id for the caller to insert at.
+static uint32_t allocAliasId(Aliases& aliases) {
+  Alias gen;
+  auto g0 = aliases.get(0);
+  if (g0.exists())
+    gen = g0.data();
+  else
+    gen.setOp(ALIAS_OP_SYSTEM);   // reserved: never empty, never billed
+
+  uint32_t next = 0;
+  std::memcpy(&next, gen.getContent().data(), sizeof(next));
+  if (next == 0) next = 1;
+
+  uint32_t id = next;
+  while (id == 0 || aliases.get(id).exists())
+    id = (id == UINT32_MAX) ? 1u : id + 1;
+
+  uint32_t bumped = (id == UINT32_MAX) ? 1u : id + 1;
+  std::memcpy(gen.accessContent().data(), &bumped, sizeof(bumped));
+  Alias::SerModeGuard guard(Alias::SerMode::Full);
+  aliases->update(0, gen);
+  return id;
+}
+
+void CesServer::_setAliasNextId(uint32_t next) {
+  Alias gen;
+  auto g0 = aliases_.get(0);
+  if (g0.exists())
+    gen = g0.data();
+  else
+    gen.setOp(ALIAS_OP_SYSTEM);
+  std::memcpy(gen.accessContent().data(), &next, sizeof(next));
+  Alias::SerModeGuard guard(Alias::SerMode::Full);
+  aliases_->update(0, gen);
+}
+
+uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
+                            const AliasData& content, uint32_t providedNonce,
+                            uint32_t& outAliasId, int64_t fee,
+                            int64_t errFee) {
+  fee = discountedFlatFee(fee, cfg_.feeAccount, FeeKind::AccountRent);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+  outAliasId = 0;
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  uint8_t rc = origin.validateSpend(0, static_cast<uint64_t>(fee),
+                                    providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  uint32_t id = origin.data().getAliasId();
+  Aliases::ActiveAlias existing = aliases_.get(id);
+  bool haveOwn = id != 0 && existing.exists() && existing.getOwner() == origin.id;
+
+  if (haveOwn) {
+    // Edit in place: keep the id so it stays dependable across edits.
+    existing.updateFull(origin.id, op, content);   // persists Full
+    outAliasId = id;
+  } else {
+    // No live alias of ours (fresh account, or a stale link whose cell was
+    // reclaimed): allocate a fresh id and bind it to the account.
+    if (aliases_->getObjects().size() >= cfg_.maxAlias) {
+      origin.chargeError(errFee);
+      LOGDEBUG << "setAlias: max aliases reached";
+      return CES_ERROR_INTERNAL;
+    }
+    uint32_t newId = allocAliasId(aliases_);
+    {
+      Alias newAlias(origin.id, op, content);
+      Alias::SerModeGuard guard(Alias::SerMode::Full);
+      aliases_->update(newId, newAlias);
+    }
+    {
+      origin.data().setAliasId(newId);
+      Account::SerModeGuard guard(Account::SerMode::Full);
+      accounts_->persist(origin.it);
+    }
+    outAliasId = newId;
+  }
+
+  // Charge the day (debit persists BalanceNonce, advancing the nonce and
+  // preserving aliasId).
+  origin.debit(static_cast<uint64_t>(fee));
+  accounts_.checkFlush(static_cast<uint64_t>(fee));
+  aliases_.checkFlush(static_cast<uint64_t>(fee));
+  checkAutoSnapshot();
+  LOGTRACE << "setAlias ok" << VAR(outAliasId) << VAR(op);
+  return CES_OK;
+}
+
+uint8_t CesServer::deleteAlias(const minx::Hash& originKey,
+                               uint32_t providedNonce, int64_t errFee) {
+  int64_t fee = discountedFlatFee(-1, cfg_.feeQuery, FeeKind::Query);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  uint8_t rc = origin.validateSpend(0, static_cast<uint64_t>(fee),
+                                    providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  uint32_t id = origin.data().getAliasId();
+  if (id == 0 || !aliases_.get(id).exists()) {
+    origin.chargeError(errFee);
+    return CES_ERROR_ALIAS_NOT_FOUND;
+  }
+
+  aliases_->erase(id);
+  {
+    origin.data().setAliasId(0);
+    Account::SerModeGuard guard(Account::SerMode::Full);
+    accounts_->persist(origin.it);
+  }
+  origin.debit(static_cast<uint64_t>(fee));
+
+  accounts_.checkFlush(static_cast<uint64_t>(fee));
+  checkAutoSnapshot();
+  LOGTRACE << "deleteAlias ok" << VAR(id);
+  return CES_OK;
+}
+
+bool CesServer::queryAlias(uint32_t aliasId, Alias& out) {
+  if (aliasId == 0)
+    return false;   // id 0 is the generator cell, not a user alias
+  auto a = aliases_.get(aliasId);
+  if (!a.exists())
+    return false;
+  out = a.data();
+  return true;
 }
 
 uint8_t CesServer::giveAsset(const minx::Hash& originKey,
@@ -3011,6 +3163,60 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           }
           sendSignedReply(addr, msg, std::move(res));
         });
+      break;
+    }
+
+    case CES_SET_ALIAS: {
+      CesSetAlias req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesSetAlias& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint32_t outId = 0;
+          uint8_t rc = setAlias(req.originId, req.op, req.content,
+                                req.reqNonce, outId);
+          CesSetAliasResult res;
+          res.originId = originPrefix;
+          res.reqNonce = req.reqNonce;
+          res.aliasId = outId;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_DELETE_ALIAS: {
+      CesDeleteAlias req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesDeleteAlias& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint8_t rc = deleteAlias(req.originId, req.reqNonce);
+          CesDeleteAliasResult res;
+          res.originId = originPrefix;
+          res.reqNonce = req.reqNonce;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_QUERY_ALIAS: {
+      CesQueryAlias req;
+      req.fromBytes(msg.data);
+      postLogic( [this, addr, msg, req]() {
+        Alias al;
+        bool found = queryAlias(req.aliasId, al);
+        CesQueryAliasResult res;
+        res.aliasId = req.aliasId;
+        res.owner = found ? al.getOwner() : HashPrefix{};
+        res.op = found ? al.getOp() : static_cast<uint16_t>(0);
+        res.content = found ? al.getContent() : AliasData{};
+        res.found = found ? 1 : 0;
+        sendUnsignedReply(addr, msg, std::move(res));
+      });
       break;
     }
 
@@ -4096,11 +4302,45 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
         return false;
       });
     }
+    // Alias rent: each alias costs its owner one day (feeAccount rate), charged
+    // in RAM like account/asset rent (the snapshot below captures it). Owner
+    // gone or unable to pay -> erase the alias and clear its aliasId. The
+    // id-generator cell (id 0) is never billed.
+    size_t aliasBefore = 0, aliasReclaimed = 0;
+    {
+      uint64_t dailyAliasFee =
+        discountFee(FeeKind::AccountRent, cfg_.feeAccount);
+      auto& map = aliases_->getObjects();
+      aliasBefore = map.size();
+      int64_t aliasCreditsDelta = 0;
+      boost::unordered::erase_if(map, [&](auto& pair) {
+        if (pair.first == 0)
+          return false;   // id-generator cell, never billed
+        HashPrefix ownerPfx = pair.second.getOwner();
+        ActiveAccount owner = accounts_.get(ownerPfx);
+        if (!owner.exists()) {
+          ++aliasReclaimed;
+          return true;
+        }
+        int64_t bal = owner.balance();
+        if (bal <= static_cast<int64_t>(dailyAliasFee)) {
+          if (owner.data().getAliasId() == pair.first)
+            owner.data().setAliasId(0);
+          ++aliasReclaimed;
+          return true;
+        }
+        owner.data().setBalance(bal - static_cast<int64_t>(dailyAliasFee));
+        aliasCreditsDelta -= static_cast<int64_t>(dailyAliasFee);
+        return false;
+      });
+      accounts_.adjustTotalCredits(aliasCreditsDelta);
+    }
     LOGINFO << "daily maintenance"
             << VAR(accBefore) << VAR(accPayExpired)
             << VAR(accFeeDeleted) << VAR(accFeeDebited)
             << VAR(creditsDelta)
-            << VAR(astBefore) << VAR(astExpired);
+            << VAR(astBefore) << VAR(astExpired)
+            << VAR(aliasBefore) << VAR(aliasReclaimed);
     // Re-clamp the server's own account so incoming transfers can't drift its
     // 48-bit balance toward the cap between reboots.
     topUpServerAccount();
@@ -4733,6 +4973,7 @@ void CesServer::_save() {
     throw std::runtime_error("_save() cannot be called while server is running");
   accounts_->flush(true);
   accounts_->save(logkv::StoreSaveMode::syncSave);
+  aliases_->save(logkv::StoreSaveMode::syncSave);
   assets_->flush(true);
   assets_->save(logkv::StoreSaveMode::syncSave);
 }
@@ -5338,6 +5579,7 @@ CesServer::AdminStats CesServer::_adminStats() {
     s.circulating = circulatingCredits();
     s.accounts = accounts_->getObjects().size();
     s.assets = assets_->getObjects().size();
+    s.aliases = aliases_->getObjects().size();
     s.txCount = txCount_.load();
     pr.set_value(s);
   });
@@ -5801,6 +6043,8 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "max_accounts = " << cfg_.maxAcc << "\n";
     o << "min_assets = " << cfg_.minAsset << "\n";
     o << "max_assets = " << cfg_.maxAsset << "\n";
+    o << "min_aliases = " << cfg_.minAlias << "\n";
+    o << "max_aliases = " << cfg_.maxAlias << "\n";
     o << "flush_value = " << cfg_.flushValue << "\n";
     o << "max_log_size_gb = "
       << (cfg_.maxLogBytes / (1024ULL * 1024 * 1024)) << "\n\n";

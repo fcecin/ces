@@ -14,6 +14,8 @@
 #include <ces/accounts.h>
 #include <ces/asset.h>
 #include <ces/assets.h>
+#include <ces/alias.h>
+#include <ces/aliases.h>
 #include <ces/cesvm.h>
 #include <ces/client.h>
 #include <ces/clientasync.h>
@@ -58,6 +60,8 @@ constexpr uint64_t DEFAULT_MIN_ACC         = 131072;
 constexpr uint64_t DEFAULT_MAX_ACC         = 16777216;
 constexpr uint64_t DEFAULT_MIN_ASSET       = 131072;
 constexpr uint64_t DEFAULT_MAX_ASSET       = 16777216;
+constexpr uint64_t DEFAULT_MIN_ALIAS       = 131072;
+constexpr uint64_t DEFAULT_MAX_ALIAS       = 16777216;
 constexpr uint8_t  DEFAULT_MIN_DIFF        = 10;
 constexpr uint64_t DEFAULT_POW_DELAY       = 0;
 constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
@@ -125,6 +129,8 @@ struct CesConfig {
 
   uint64_t minAsset = DEFAULT_MIN_ASSET;
   uint64_t maxAsset = DEFAULT_MAX_ASSET;
+  uint64_t minAlias = DEFAULT_MIN_ALIAS;
+  uint64_t maxAlias = DEFAULT_MAX_ALIAS;
 
   // Runtime default is hardware_concurrency/2 - 2 (computed in main.cpp); this
   // is the floor used by direct construction (tests override it).
@@ -672,6 +678,22 @@ public:
                    uint64_t priceLimit, uint32_t providedNonce,
                    int64_t buyFee = -1, int64_t errFee = -1);
 
+  // Alias ops: a dependable, account-owned 64-byte sidecar (local/aliases.md).
+  // setAlias binds/edits the origin account's single alias: with no live alias
+  // it allocates a fresh id, otherwise it overwrites the existing one in place
+  // (the id is stable across edits; delete to drop or rotate it). Charges one
+  // day at the feeAccount rate. deleteAlias erases it and clears the account
+  // link; queryAlias is a public read. All run on logicStrand_.
+  uint8_t setAlias(const minx::Hash& originKey, uint16_t op,
+                   const AliasData& content, uint32_t providedNonce,
+                   uint32_t& outAliasId, int64_t fee = -1,
+                   int64_t errFee = -1);
+
+  uint8_t deleteAlias(const minx::Hash& originKey, uint32_t providedNonce,
+                      int64_t errFee = -1);
+
+  bool queryAlias(uint32_t aliasId, Alias& out);
+
   uint8_t giveAsset(const minx::Hash& originKey, const minx::Hash& assetId,
                     const HashPrefix& newOwnerId, uint32_t providedNonce,
                     int64_t giveFee = -1, int64_t errFee = -1);
@@ -724,6 +746,14 @@ public:
   bool _accountExists(const minx::Hash& key) {
     return accounts_.get(Account::getMapKey(key)).exists();
   }
+  uint32_t _aliasIdOf(const minx::Hash& key) {
+    auto a = accounts_.get(Account::getMapKey(key));
+    return a.exists() ? a.data().getAliasId() : 0;
+  }
+  // Force the id-generator's next-id (entry 0). Test-only: drives the allocator
+  // to the wrap boundary or onto an occupied slot without minting 2^32 aliases.
+  // Call on a quiescent logic strand (drain first).
+  void _setAliasNextId(uint32_t next);
 
   void _runDailyMaintenance();
 
@@ -833,6 +863,7 @@ public:
     int64_t  circulating = 0;  // credits in circulation (server-self excluded)
     uint64_t accounts = 0;
     uint64_t assets = 0;
+    uint64_t aliases = 0;
     uint64_t txCount = 0;
   };
   AdminStats _adminStats();
@@ -1585,6 +1616,7 @@ private:
 
   Accounts accounts_;
   Assets assets_;
+  Aliases aliases_;
 
   // Scheduled (delayed) runAsset entries — RAM only, not persisted.
   struct ScheduledRun {

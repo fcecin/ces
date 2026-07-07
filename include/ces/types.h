@@ -40,7 +40,10 @@ enum op_code_t : uint8_t {
   CES_CROSS_TRANSFER = 0x12,     // inter-server transfer via peer
   CES_RUN_ASSET = 0x13,           // execute asset bytecode (CesVM)
   CES_QUERY_PEER_INFO = 0x14,          // unsigned: peer-table slot lookup (discovery)
-  CES_GOSSIP = 0x15                    // signed: flood/route a message across the server mesh
+  CES_GOSSIP = 0x15,                   // signed: flood/route a message across the server mesh
+  CES_SET_ALIAS = 0x16,                // signed: set this account's alias (create on first use, edit in place after)
+  CES_DELETE_ALIAS = 0x17,             // signed: erase this account's alias
+  CES_QUERY_ALIAS = 0x18               // unsigned: read an alias by id
 };
 
 /**
@@ -84,6 +87,9 @@ enum result_code_t : uint8_t {
   CES_RUN_ASSET_RESULT = 0x13,
   CES_QUERY_PEER_INFO_RESULT = 0x14,
   CES_GOSSIP_RESULT = 0x15,
+  CES_SET_ALIAS_RESULT = 0x16,
+  CES_DELETE_ALIAS_RESULT = 0x17,
+  CES_QUERY_ALIAS_RESULT = 0x18,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };
@@ -164,7 +170,9 @@ enum error_code_t : uint8_t {
   // balance cap (~1.4M credits). The op reverts instead of saturating, so
   // moved credits are never destroyed.
   CES_ERROR_BALANCE_OVERFLOW = 0x23,
-  CES_ERROR_LAST = CES_ERROR_BALANCE_OVERFLOW
+  // Alias op referenced an id / account-selector that has no live alias.
+  CES_ERROR_ALIAS_NOT_FOUND = 0x24,
+  CES_ERROR_LAST = CES_ERROR_ALIAS_NOT_FOUND
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -336,6 +344,7 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_IMMUTABLE:                        return "CES_ERROR_IMMUTABLE";
   case CES_ERROR_BAD_INPUT:                        return "CES_ERROR_BAD_INPUT";
   case CES_ERROR_BALANCE_OVERFLOW:                 return "CES_ERROR_BALANCE_OVERFLOW";
+  case CES_ERROR_ALIAS_NOT_FOUND:                  return "CES_ERROR_ALIAS_NOT_FOUND";
   default:                                         return "UNKNOWN_ERROR";
   }
 }

@@ -375,6 +375,30 @@ int main(int argc, char* argv[]) {
     cmd_asset->add_subcommand("squery", "Signed asset query (paid)");
   cmd_asq->add_option("id", asset_id_arg, "Asset ID or name")->required();
 
+  // ---- Subcommand: alias (L1 account sidecar) ----
+  auto* cmd_alias =
+    app.add_subcommand("alias", "Account alias (L1 dependable sidecar)");
+  cmd_alias->require_subcommand(0, 1);
+  uint32_t alias_id_arg = 0;
+  uint16_t alias_op_arg = ces::ALIAS_OP_STRING;
+  std::string alias_content_arg, alias_hexcontent_arg;
+
+  auto* cmd_alias_set =
+    cmd_alias->add_subcommand(
+      "set", "Set this account's alias (creates on first use, edits in place after)");
+  cmd_alias_set->add_option("--content", alias_content_arg,
+                            "Content (text, <= 50 bytes)");
+  cmd_alias_set->add_option("--hexcontent", alias_hexcontent_arg,
+                            "Content (hex bytes, <= 50)");
+  cmd_alias_set->add_option("--op", alias_op_arg, "Op code (default 1 = STRING)");
+
+  auto* cmd_alias_rm =
+    cmd_alias->add_subcommand("rm", "Delete this account's alias");
+
+  auto* cmd_alias_get =
+    cmd_alias->add_subcommand("get", "Read an alias by id (unsigned)");
+  cmd_alias_get->add_option("id", alias_id_arg, "Alias id")->required();
+
   // ---- ramfile subcommands ----
   // In-ledger RAM-backed asset-chain file API (L1) — distinct from the
   // `file` command's L2 disk-backed store on rpc_port. Suited to small
@@ -953,6 +977,52 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  if (cmd_alias_get->parsed()) {
+    try {
+      auto sess = makeSession();
+      auto& cc = sess->client();
+      HashPrefix owner{};
+      uint16_t op = 0;
+      AliasData content{};
+      bool found = false;
+      uint8_t rc = cc.queryAlias(alias_id_arg, owner, op, content, found);
+      if (rc != CES_OK) {
+        std::cerr << "Query Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (!found) {
+        if (g_quiet) std::cout << "{\"found\":false}\n";
+        else std::cerr << "Alias not found.\n";
+        return g_quiet ? 0 : 1;
+      }
+      size_t len = 0;
+      while (len < content.size() && content[len] != 0) ++len;
+      std::string txt(reinterpret_cast<const char*>(content.data()), len);
+      if (g_quiet) {
+        std::cout << "{\"aliasId\":" << alias_id_arg
+                  << ",\"owner\":\"" << jesc(hashPrefixToString(owner))
+                  << "\",\"op\":" << op
+                  << ",\"contentHex\":\"" << ces::bytesToHex(content) << "\"}\n";
+      } else {
+        print_header("Alias (Unsigned)");
+        print_field("Alias ID", std::to_string(alias_id_arg));
+        print_field("Owner ID", hashPrefixToString(owner));
+        print_field("Op", std::to_string(op));
+        // op is the content schema: STRING renders as text, everything else
+        // (NONE/raw and any unknown op) renders as hex.
+        if (op == ces::ALIAS_OP_STRING)
+          print_field("Content", txt);
+        else
+          print_field("Content", ces::bytesToHex(content));
+        std::cout << std::endl;
+      }
+    } catch (std::exception& e) {
+      std::cerr << "Error: " << e.what() << "\n";
+      return 1;
+    }
+    return 0;
+  }
+
   // ---- All remaining subcommands need an actor key ----
 
   if (cmd_asset->parsed() && cmd_asset->get_subcommands().empty()) {
@@ -991,7 +1061,8 @@ int main(int argc, char* argv[]) {
      cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
-     cmd_gossip->parsed());
+     cmd_gossip->parsed() || cmd_alias_set->parsed() ||
+     cmd_alias_rm->parsed());
 
   if (!needs_actor)
     return 0;
@@ -1025,6 +1096,45 @@ int main(int argc, char* argv[]) {
   try {
     auto sess = makeSession(&actorKey);
     auto& cc = sess->client();
+
+    // ---- alias signed handlers (set / update / rm) ----
+    auto resolveAliasContent = [&]() -> AliasData {
+      AliasData d{};
+      ces::Bytes bytes;
+      if (!alias_hexcontent_arg.empty())
+        bytes = ces::parseHex(alias_hexcontent_arg);
+      else if (!alias_content_arg.empty())
+        bytes.assign(alias_content_arg.begin(), alias_content_arg.end());
+      if (bytes.size() > d.size())
+        throw std::runtime_error("alias content exceeds 50 bytes");
+      for (size_t i = 0; i < bytes.size(); ++i) d[i] = bytes[i];
+      return d;
+    };
+    if (cmd_alias_set->parsed()) {
+      AliasData ctn = resolveAliasContent();
+      uint32_t id = 0;
+      uint8_t rc = cc.setAlias(alias_op_arg, ctn, id);
+      if (rc != CES_OK) {
+        std::cerr << "Alias set failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (g_quiet) std::cout << "{\"aliasId\":" << id << "}\n";
+      else {
+        print_header("Alias Set");
+        print_field("Alias ID", std::to_string(id));
+        std::cout << "Success.\n";
+      }
+      return 0;
+    }
+    if (cmd_alias_rm->parsed()) {
+      uint8_t rc = cc.deleteAlias();
+      if (rc != CES_OK) {
+        std::cerr << "Alias delete failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (!g_quiet) { print_header("Alias Deleted"); std::cout << "Success.\n"; }
+      return 0;
+    }
 
     // ---- handleAsset handler ----
     auto handleAsset = [&]() -> int {
