@@ -1018,7 +1018,7 @@ BOOST_AUTO_TEST_CASE(VmCreateAsset_SurvivesWALReplay) {
     HashPrefix o; AssetData c; uint16_t d = 0; uint32_t p;
     rc = cli.queryAsset(bornId, o, c, d, p);
     CES_REQUIRE_OK(rc);
-    BOOST_REQUIRE_EQUAL(d & 0x1FFF, 11);
+    BOOST_REQUIRE_EQUAL(d & 0x0FFF, 11);
 
     cli.stop();
     // NO srv.stop() — crash.
@@ -1037,7 +1037,7 @@ BOOST_AUTO_TEST_CASE(VmCreateAsset_SurvivesWALReplay) {
     HashPrefix o; AssetData c; uint16_t d = 0; uint32_t p;
     uint8_t rc = cli2.queryAsset(bornId, o, c, d, p);
     BOOST_CHECK_EQUAL(rc, static_cast<uint8_t>(CES_OK));  // today: ASSET_NOT_FOUND
-    BOOST_CHECK_EQUAL(d & 0x1FFF, 11);
+    BOOST_CHECK_EQUAL(d & 0x0FFF, 11);
 
     cli2.stop();
     srv2.stop();

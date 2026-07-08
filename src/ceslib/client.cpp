@@ -596,7 +596,8 @@ CesClient::mine(const uint8_t extraDifficulty,
 // =============================================================================
 
 uint8_t CesClient::createAsset(const Hash& assetId, const AssetData& content,
-                               uint16_t days, bool private_, bool immutable) {
+                               uint16_t days, bool private_, bool immutable,
+                               bool ownerPays) {
   LOGTRACE << "createAsset";
   uint32_t reqNonce;
   if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
@@ -611,7 +612,7 @@ uint8_t CesClient::createAsset(const Hash& assetId, const AssetData& content,
   req.reqNonce = reqNonce;
   req.assetId = assetId;
   req.content = content;
-  req.amount = assetBalance(days, private_, /*aowned=*/false, immutable);
+  req.amount = assetBalance(days, private_, /*aowned=*/false, immutable, ownerPays);
   req.price = 0;
 
   return sendSigned(req, createAssetGen_, createAssetResultCode_, [&] {
@@ -740,6 +741,24 @@ uint8_t CesClient::updateAssetMeta(const Hash& assetId,
   return sendSigned(req, updateAssetMetaGen_, updateAssetMetaResultCode_, [&] {
     return updateAssetMetaResultNonce_ == reqNonce &&
            updateAssetMetaResultOwnerId_ == myId;
+  });
+}
+
+uint8_t CesClient::setAssetOwnerPays(const Hash& assetId, bool ownerPays) {
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesSetAssetOwnerPays req;
+  req.ownerId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.assetId = assetId;
+  req.ownerPays = ownerPays ? 1 : 0;
+  return sendSigned(req, setAssetOwnerPaysGen_, setAssetOwnerPaysResultCode_, [&] {
+    return setAssetOwnerPaysResultNonce_ == reqNonce &&
+           setAssetOwnerPaysResultOwnerId_ == myId;
   });
 }
 
@@ -1269,6 +1288,15 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         updateAssetMetaResultOwnerId_ = r.ownerId;
         updateAssetMetaResultNonce_ = r.reqNonce;
         updateAssetMetaResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_SET_ASSET_OWNER_PAYS_RESULT:
+      handleSigned(CesSetAssetOwnerPaysResult{}, "set asset owner-pays",
+                   setAssetOwnerPaysGen_, [&](auto& r) {
+        setAssetOwnerPaysResultOwnerId_ = r.ownerId;
+        setAssetOwnerPaysResultNonce_ = r.reqNonce;
+        setAssetOwnerPaysResultCode_ = r.rcode;
       });
       break;
 

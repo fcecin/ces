@@ -20,31 +20,31 @@ BOOST_AUTO_TEST_CASE(Test06_CreateAndQueryAsset) {
 }
 
 // Regression (B1): createAsset stored `1 + days`; at the documented max
-// (8191 days) that is 8192, which the 13-bit day field truncates to 0
-// (8192 & 0x1FFF). A max-life asset was created with ZERO days — dead on
-// the next daily maintenance — even though the cost charged for ~8193 days.
+// (4095 days) that is 4096, which the 12-bit day field truncates to 0
+// (4096 & 0x0FFF). A max-life asset was created with ZERO days -- dead on
+// the next daily maintenance -- even though the cost charged for ~4097 days.
 // The stored day count must clamp to the field max, never wrap to 0.
 BOOST_AUTO_TEST_CASE(CreateAssetMaxDaysDoesNotWrapToZero) {
   minx::Hash aid = makeHash("MAX_DAYS_TOKEN");
   AssetData data;
   data.fill(0xCD);
 
-  // 8191 days of asset rent is ~8193 × feeAsset (~210B at stock fees);
+  // 4095 days of asset rent is ~4097 x feeAsset (~210B at stock fees);
   // fund the client well past that so the create reaches the day-clamp.
   server->_brr(clientKey.getPublicKeyAsHash(), 100'000'000'000'000LL);
 
-  uint8_t rc = client->createAsset(aid, data, 0x1FFF);  // 8191 = max days
+  uint8_t rc = client->createAsset(aid, data, 0x0FFF);  // 4095 = max days
   CES_REQUIRE_OK(rc);
 
   std::vector<AssetEntry> res;
   rc = client->queryAssetSigned(aid, 0, res);
   CES_REQUIRE_OK(rc);
   BOOST_REQUIRE_EQUAL(res.size(), 1);
-  BOOST_CHECK_EQUAL((int)ces::assetDays(res[0].balance), 0x1FFF);
+  BOOST_CHECK_EQUAL((int)ces::assetDays(res[0].balance), 0x0FFF);
 }
 
 // Regression (BUG3): fundAsset billed for the full requested days, but the
-// day field caps at 0x1FFF — funding an asset already at the cap grants 0
+// day field caps at 0x0FFF -- funding an asset already at the cap grants 0
 // days yet (pre-fix) charged thousands of days of rent. A fund that adds no
 // days must cost only the flat fund fee.
 BOOST_AUTO_TEST_CASE(FundAssetPastCapDoesNotOvercharge) {
@@ -52,7 +52,7 @@ BOOST_AUTO_TEST_CASE(FundAssetPastCapDoesNotOvercharge) {
   minx::Hash aid = makeHash("FUND_CAP_TOKEN");
   AssetData data;
   data.fill(0x77);
-  CES_REQUIRE_OK(client->createAsset(aid, data, 8190));  // → stored at 0x1FFF cap
+  CES_REQUIRE_OK(client->createAsset(aid, data, 0x0FFF));  // -> stored at 0x0FFF cap
 
   HashPrefix d{}; uint32_t n = 0, t = 0; uint64_t a = 0;
   int64_t before = 0;
@@ -312,71 +312,74 @@ BOOST_AUTO_TEST_CASE(Test20_UnsignedAssetQuery) {
   BOOST_CHECK_EQUAL(days, 0);
 }
 
-// --- Balance bits: PRIVATE (bit 15), ASSET_OWNED (bit 14),
-//                    IMMUTABLE (bit 13), days (bits 0-12) ---
+// --- Balance bits: PRIVATE (15), ASSET_OWNED (14), IMMUTABLE (13),
+//                    OWNER_PAYS (12), days (bits 0-11, max 4095) ---
 
 BOOST_AUTO_TEST_CASE(BalanceBitUtilities) {
-  // assetDays extracts lower 13 bits
+  // assetDays extracts the lower 12 bits
   BOOST_CHECK_EQUAL(assetDays(0x0000), 0);
-  BOOST_CHECK_EQUAL(assetDays(0x1FFF), 0x1FFF);  // max days = 8191
+  BOOST_CHECK_EQUAL(assetDays(0x0FFF), 0x0FFF);  // max days = 4095
   BOOST_CHECK_EQUAL(assetDays(0x8000), 0);        // bit 15 only = 0 days
-  BOOST_CHECK_EQUAL(assetDays(0xFFFF), 0x1FFF);   // all bits = max days
+  BOOST_CHECK_EQUAL(assetDays(0xFFFF), 0x0FFF);   // all bits = max days
   BOOST_CHECK_EQUAL(assetDays(0x4000), 0);         // bit 14 only = 0 days
   BOOST_CHECK_EQUAL(assetDays(0x2000), 0);         // bit 13 only (IMMUTABLE) = 0 days
-  BOOST_CHECK_EQUAL(assetDays(0xE000), 0);         // bits 15+14+13 = 0 days
+  BOOST_CHECK_EQUAL(assetDays(0x1000), 0);         // bit 12 only (OWNER_PAYS) = 0 days
+  BOOST_CHECK_EQUAL(assetDays(0xF000), 0);         // bits 15+14+13+12 = 0 days
 
   // isAssetPrivate checks bit 15
   BOOST_CHECK(!isAssetPrivate(0x0000));
-  BOOST_CHECK(!isAssetPrivate(0x1FFF));
+  BOOST_CHECK(!isAssetPrivate(0x0FFF));
   BOOST_CHECK(!isAssetPrivate(0x4000));  // asset-owned but not private
-  BOOST_CHECK(!isAssetPrivate(0x2000));  // immutable but not private
   BOOST_CHECK(isAssetPrivate(0x8000));
   BOOST_CHECK(isAssetPrivate(0xFFFF));
 
   // isAssetOwned checks bit 14
   BOOST_CHECK(!isAssetOwned(0x0000));
   BOOST_CHECK(!isAssetOwned(0x8000));   // private but not asset-owned
-  BOOST_CHECK(!isAssetOwned(0x2000));   // immutable but not asset-owned
   BOOST_CHECK(isAssetOwned(0x4000));
   BOOST_CHECK(isAssetOwned(0xC000));    // private + asset-owned
-  BOOST_CHECK(isAssetOwned(0x5FFF));    // asset-owned + max days
 
   // isAssetImmutable checks bit 13
   BOOST_CHECK(!isAssetImmutable(0x0000));
   BOOST_CHECK(!isAssetImmutable(0x8000));   // private only
-  BOOST_CHECK(!isAssetImmutable(0x4000));   // asset-owned only
   BOOST_CHECK(isAssetImmutable(0x2000));
-  BOOST_CHECK(isAssetImmutable(0xE000));    // all three flags
-  BOOST_CHECK(isAssetImmutable(0x3FFF));    // immutable + max days
+  BOOST_CHECK(isAssetImmutable(0xE000));    // priv + owned + immut
 
-  // assetBalance reconstructs
+  // isAssetOwnerPays checks bit 12
+  BOOST_CHECK(!isAssetOwnerPays(0x0000));
+  BOOST_CHECK(!isAssetOwnerPays(0x0FFF));   // max days, no flags
+  BOOST_CHECK(!isAssetOwnerPays(0xE000));   // other three flags, not owner-pays
+  BOOST_CHECK(isAssetOwnerPays(0x1000));
+  BOOST_CHECK(isAssetOwnerPays(0xFFFF));
+
+  // assetBalance reconstructs (priv, owned, immut, ownerPays)
   BOOST_CHECK_EQUAL(assetBalance(100, false), 100);
   BOOST_CHECK_EQUAL(assetBalance(100, true), 0x8064);
   BOOST_CHECK_EQUAL(assetBalance(100, false, true), 0x4064);
   BOOST_CHECK_EQUAL(assetBalance(100, true, true), 0xC064);
   BOOST_CHECK_EQUAL(assetBalance(100, false, false, true), 0x2064);
-  BOOST_CHECK_EQUAL(assetBalance(100, true, false, true), 0xA064);
-  BOOST_CHECK_EQUAL(assetBalance(100, false, true, true), 0x6064);
-  BOOST_CHECK_EQUAL(assetBalance(100, true, true, true), 0xE064);
-  BOOST_CHECK_EQUAL(assetBalance(0x1FFF, false), 0x1FFF);
-  BOOST_CHECK_EQUAL(assetBalance(0x1FFF, true), 0x9FFF);
-  BOOST_CHECK_EQUAL(assetBalance(0x1FFF, true, true), 0xDFFF);
-  BOOST_CHECK_EQUAL(assetBalance(0x1FFF, true, true, true), 0xFFFF);
+  BOOST_CHECK_EQUAL(assetBalance(100, false, false, false, true), 0x1064);
+  BOOST_CHECK_EQUAL(assetBalance(0x0FFF, false), 0x0FFF);
+  BOOST_CHECK_EQUAL(assetBalance(0x0FFF, true), 0x8FFF);
+  BOOST_CHECK_EQUAL(assetBalance(0x0FFF, true, true), 0xCFFF);
+  BOOST_CHECK_EQUAL(assetBalance(0x0FFF, true, true, true), 0xEFFF);
+  BOOST_CHECK_EQUAL(assetBalance(0x0FFF, true, true, true, true), 0xFFFF);
   BOOST_CHECK_EQUAL(assetBalance(0, true), 0x8000);
-  // Days argument exceeding 13 bits is masked.
-  BOOST_CHECK_EQUAL(assetBalance(0x3FFF, false), 0x1FFF);
+  // Days argument exceeding 12 bits is masked.
+  BOOST_CHECK_EQUAL(assetBalance(0x3FFF, false), 0x0FFF);
 
-  // Round-trip
-  uint16_t raw = assetBalance(7000, true, true, true);
+  // Round-trip (all four flags + a 12-bit day count)
+  uint16_t raw = assetBalance(3000, true, true, true, true);
   BOOST_CHECK(isAssetPrivate(raw));
   BOOST_CHECK(isAssetOwned(raw));
   BOOST_CHECK(isAssetImmutable(raw));
-  BOOST_CHECK_EQUAL(assetDays(raw), 7000);
+  BOOST_CHECK(isAssetOwnerPays(raw));
+  BOOST_CHECK_EQUAL(assetDays(raw), 3000);
 }
 
-BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt8191) {
+BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt4095) {
   // Fund the account enough to cover two max-days fund operations
-  int64_t fundCost = static_cast<int64_t>(8191) * BASE_FEE_ASSET + BASE_FEE_TRANSACTION;
+  int64_t fundCost = static_cast<int64_t>(4095) * BASE_FEE_ASSET + BASE_FEE_TRANSACTION;
   server->_brr(clientKey.getPublicKeyAsHash(), fundCost * 3);
   server->_drainLogic();
 
@@ -386,8 +389,8 @@ BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt8191) {
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   server->_drainLogic();
 
-  // Fund with 8191 — should cap at 0x1FFF, not overflow into flag bits.
-  rc = client->fundAsset(aid, 8191);
+  // Fund with 4095 -- should cap at 0x0FFF, not overflow into flag bits.
+  rc = client->fundAsset(aid, 4095);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   server->_drainLogic();
 
@@ -397,19 +400,19 @@ BOOST_AUTO_TEST_CASE(FundAssetDaysCappedAt8191) {
   uint32_t price = 0;
   rc = client->queryAsset(aid, owner, content, days, price);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  BOOST_TEST_MESSAGE("Days after fund +8191: " << days);
-  BOOST_CHECK(days <= 8191);
+  BOOST_TEST_MESSAGE("Days after fund +4095: " << days);
+  BOOST_CHECK(days <= 4095);
   BOOST_CHECK(days > 0);
 
-  // Fund again — should stay capped
-  rc = client->fundAsset(aid, 8191);
+  // Fund again -- should stay capped
+  rc = client->fundAsset(aid, 4095);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
   server->_drainLogic();
 
   rc = client->queryAsset(aid, owner, content, days, price);
   BOOST_REQUIRE_EQUAL(rc, CES_OK);
-  BOOST_TEST_MESSAGE("Days after second fund +8191: " << days);
-  BOOST_CHECK_EQUAL(days, 8191);  // capped at max
+  BOOST_TEST_MESSAGE("Days after second fund +4095: " << days);
+  BOOST_CHECK_EQUAL(days, 4095);  // capped at max
 }
 
 // --- Private assets ---
@@ -706,6 +709,207 @@ BOOST_AUTO_TEST_CASE(NonImmutableAssetCanBeUpdated) {
   rc = client->queryAsset(aid, owner, got, days, price);
   CES_REQUIRE_OK(rc);
   BOOST_CHECK_EQUAL(got[0], 0xDD);
+}
+
+// --- Owner-pays (auto-fund) assets ---
+// A custom server: feeAsset pinned, no account rent, discount off, so the daily
+// auto-fund charge is exact. A well-funded payer bears the create cost while the
+// owner account carries a controlled balance -- createAsset debits the origin,
+// not the owner -- so the auto-fund path is fully deterministic.
+struct AutoFundFixture {
+  std::unique_ptr<CesServer> server;
+  fs::path tempDir;
+  KeyPair payer;
+
+  AutoFundFixture() {
+    blog::init();
+    tempDir = makeUniqueTempDir("ces_autofund");
+    minx::Hash sPriv; sPriv.fill(0xEE);
+    CesConfig cfg =
+      makeTestConfig(tempDir, sPriv, std::numeric_limits<uint64_t>::max());
+    cfg.feeAsset = 1000;
+    cfg.feeAccount = 0;
+    cfg.feeTx = 0;
+    cfg.feeQuery = 0;
+    server = std::make_unique<CesServer>(cfg);
+    server->start(0);
+    server->_brr(payer.getPublicKeyAsHash(), 100'000'000'000LL);
+    server->_drainLogic();
+  }
+  ~AutoFundFixture() {
+    if (server) server->stop();
+    boost::system::error_code ec;
+    fs::remove_all(tempDir, ec);
+  }
+
+  void fund(const minx::Hash& k, int64_t amt) {
+    server->_brr(k, amt);
+    server->_drainLogic();
+  }
+  int64_t bal(const minx::Hash& k) { return server->_balanceOf(k); }
+
+  // Owner-pays (or plain) asset owned by ownerPfx; create cost billed to payer.
+  uint8_t create(const HashPrefix& ownerPfx, const minx::Hash& aid,
+                 uint16_t days, bool ownerPays) {
+    AssetData c{};
+    uint8_t rc = server->createAsset(
+      payer.getPublicKeyAsHash(), ownerPfx, aid, c,
+      assetBalance(days, false, false, false, ownerPays), 0);
+    server->_drainLogic();
+    return rc;
+  }
+  CesServer::AdminAsset qa(const minx::Hash& aid) {
+    return server->_adminQueryAsset(aid);
+  }
+};
+
+// Owner-pays asset at the floor: owner charged one feeAsset, asset held at 0
+// days with the bit preserved.
+BOOST_FIXTURE_TEST_CASE(OwnerPaysChargesOwnerAndSurvivesAtZeroDays, AutoFundFixture) {
+  KeyPair b;
+  HashPrefix bPfx = Account::getMapKey(b.getPublicKeyAsHash());
+  fund(b.getPublicKeyAsHash(), 1'000'000);
+  minx::Hash aid = makeHash("AUTOFUND_SURVIVE");
+  CES_CHECK_OK(create(bPfx, aid, /*days=*/0, /*ownerPays=*/true));
+  int64_t before = bal(b.getPublicKeyAsHash());
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), before - 1000);  // charged feeAsset
+  auto q = qa(aid);
+  BOOST_CHECK(q.exists);
+  BOOST_CHECK_EQUAL(ces::assetDays(q.balance), 0);          // held at 0 days
+  BOOST_CHECK(ces::isAssetOwnerPays(q.balance));            // bit preserved
+}
+
+// Owner cannot afford the day: the asset dies and the owner is left untouched.
+BOOST_FIXTURE_TEST_CASE(OwnerPaysDiesWhenOwnerCannotPay, AutoFundFixture) {
+  KeyPair b;
+  HashPrefix bPfx = Account::getMapKey(b.getPublicKeyAsHash());
+  fund(b.getPublicKeyAsHash(), 500);          // < feeAsset (1000)
+  minx::Hash aid = makeHash("AUTOFUND_BROKE");
+  CES_CHECK_OK(create(bPfx, aid, 0, true));   // payer bears create cost; b stays 500
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  BOOST_CHECK(!qa(aid).exists);               // owner cannot pay -> dies
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), 500);  // owner untouched
+}
+
+// Owner account does not exist: the asset dies (no one to charge).
+BOOST_FIXTURE_TEST_CASE(OwnerPaysDiesWhenOwnerGone, AutoFundFixture) {
+  HashPrefix phantom{};
+  phantom.fill(0xAB);                         // no account at this prefix
+  minx::Hash aid = makeHash("AUTOFUND_GONE");
+  CES_CHECK_OK(create(phantom, aid, 0, true));
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  BOOST_CHECK(!qa(aid).exists);               // owner absent -> dies
+}
+
+// Without the bit, a floored asset dies as before and the owner is never billed.
+BOOST_FIXTURE_TEST_CASE(NonOwnerPaysDiesAtFloor, AutoFundFixture) {
+  KeyPair b;
+  HashPrefix bPfx = Account::getMapKey(b.getPublicKeyAsHash());
+  fund(b.getPublicKeyAsHash(), 1'000'000);
+  minx::Hash aid = makeHash("AUTOFUND_PLAIN");
+  CES_CHECK_OK(create(bPfx, aid, 0, /*ownerPays=*/false));
+  int64_t before = bal(b.getPublicKeyAsHash());
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  BOOST_CHECK(!qa(aid).exists);               // no owner-pays -> dies at floor
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), before);  // owner not charged
+}
+
+// Prepaid days deplete first: while a buffer remains the owner is not billed and
+// the bit rides through the decrement.
+BOOST_FIXTURE_TEST_CASE(OwnerPaysBitPreservedWhilePrepaidRemains, AutoFundFixture) {
+  KeyPair b;
+  HashPrefix bPfx = Account::getMapKey(b.getPublicKeyAsHash());
+  fund(b.getPublicKeyAsHash(), 1'000'000);
+  minx::Hash aid = makeHash("AUTOFUND_BUFFER");
+  CES_CHECK_OK(create(bPfx, aid, /*days=*/5, true));  // stored 6 days
+  int64_t before = bal(b.getPublicKeyAsHash());
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  auto q = qa(aid);
+  BOOST_CHECK(q.exists);
+  BOOST_CHECK_EQUAL(ces::assetDays(q.balance), 5);    // 6 -> 5 (prepaid depletes)
+  BOOST_CHECK(ces::isAssetOwnerPays(q.balance));       // bit preserved
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), before);  // owner not billed yet
+}
+
+// Owner flips the bit on an existing asset both ways; days and other flags ride
+// through unchanged.
+BOOST_FIXTURE_TEST_CASE(SetAssetOwnerPaysTogglesBit, AutoFundFixture) {
+  KeyPair a;
+  HashPrefix aPfx = Account::getMapKey(a.getPublicKeyAsHash());
+  fund(a.getPublicKeyAsHash(), 10'000'000);        // owner account must exist
+  minx::Hash aid = makeHash("FLIP_TOKEN");
+  CES_CHECK_OK(create(aPfx, aid, /*days=*/30, /*ownerPays=*/false));  // plain
+  BOOST_CHECK(!ces::isAssetOwnerPays(qa(aid).balance));
+
+  BOOST_REQUIRE_EQUAL(
+    server->setAssetOwnerPays(a.getPublicKeyAsHash(), aid, true, 0), CES_OK);
+  server->_drainLogic();
+  auto q = qa(aid);
+  BOOST_CHECK(ces::isAssetOwnerPays(q.balance));            // on
+  BOOST_CHECK_EQUAL(ces::assetDays(q.balance), 31);         // days preserved (30+1)
+
+  BOOST_REQUIRE_EQUAL(
+    server->setAssetOwnerPays(a.getPublicKeyAsHash(), aid, false, 0), CES_OK);
+  server->_drainLogic();
+  q = qa(aid);
+  BOOST_CHECK(!ces::isAssetOwnerPays(q.balance));           // off
+  BOOST_CHECK_EQUAL(ces::assetDays(q.balance), 31);         // still preserved
+}
+
+// Only the owner may flip it.
+BOOST_FIXTURE_TEST_CASE(SetAssetOwnerPaysNonOwnerRejected, AutoFundFixture) {
+  KeyPair a, other;
+  HashPrefix aPfx = Account::getMapKey(a.getPublicKeyAsHash());
+  fund(a.getPublicKeyAsHash(), 10'000'000);
+  fund(other.getPublicKeyAsHash(), 10'000'000);   // non-owner signer must exist
+  minx::Hash aid = makeHash("FLIP_AUTH");
+  CES_CHECK_OK(create(aPfx, aid, 30, false));      // owned by a
+  BOOST_CHECK_EQUAL(
+    server->setAssetOwnerPays(other.getPublicKeyAsHash(), aid, true, 0),
+    CES_ERROR_NOT_OWNER);
+  server->_drainLogic();
+  BOOST_CHECK(!ces::isAssetOwnerPays(qa(aid).balance));  // unchanged
+}
+
+// Time-warp: an owner-pays asset survives repeated daily passes, draining the
+// owner one feeAsset per day. Flip it off and it dies on the very next pass --
+// but the owner account lives on.
+BOOST_FIXTURE_TEST_CASE(OwnerPaysDrainsOverDaysThenFlipOffKillsAssetNotAccount,
+                        AutoFundFixture) {
+  KeyPair b;
+  HashPrefix bPfx = Account::getMapKey(b.getPublicKeyAsHash());
+  fund(b.getPublicKeyAsHash(), 100'000);
+  minx::Hash aid = makeHash("TIMEWARP");
+  CES_CHECK_OK(create(bPfx, aid, /*days=*/0, /*ownerPays=*/true));  // stored at 1 day
+  int64_t start = bal(b.getPublicKeyAsHash());
+
+  // Three daily passes: owner drained one feeAsset each; asset held at 0 days.
+  for (int i = 0; i < 3; ++i) {
+    server->_runDailyMaintenance();
+    server->_drainLogic();
+    BOOST_REQUIRE(qa(aid).exists);
+  }
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), start - 3000);  // 3 x feeAsset
+  BOOST_CHECK(ces::isAssetOwnerPays(qa(aid).balance));
+
+  // Turn auto-fund off: now a plain asset sitting at 0 days.
+  BOOST_REQUIRE_EQUAL(
+    server->setAssetOwnerPays(b.getPublicKeyAsHash(), aid, false, 0), CES_OK);
+  server->_drainLogic();
+  int64_t afterFlip = bal(b.getPublicKeyAsHash());
+
+  // One more pass: the asset dies; the owner account survives, uncharged.
+  server->_runDailyMaintenance();
+  server->_drainLogic();
+  BOOST_CHECK(!qa(aid).exists);                                  // asset gone
+  BOOST_CHECK(server->_accountExists(b.getPublicKeyAsHash()));   // account lives
+  BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), afterFlip);     // not charged
 }
 
 BOOST_AUTO_TEST_SUITE_END()

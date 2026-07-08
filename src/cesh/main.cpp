@@ -313,6 +313,7 @@ int main(int argc, char* argv[]) {
 
   bool asset_private_arg = false;
   bool asset_immutable_arg = false;
+  bool asset_owner_pays_arg = false;
   auto* cmd_ac = cmd_asset->add_subcommand("create", "Create asset");
   cmd_ac->add_option("id", asset_id_arg, "Asset ID or name")->required();
   cmd_ac->add_option("--content", asset_content_arg, "Content (text string)");
@@ -320,6 +321,7 @@ int main(int argc, char* argv[]) {
   cmd_ac->add_option("--days", asset_days_arg, "Days to fund")->required();
   cmd_ac->add_flag("--private", asset_private_arg, "Make asset private (content hidden from non-owner)");
   cmd_ac->add_flag("--immutable", asset_immutable_arg, "Seal content forever (cannot be updated; owner/price/funding still mutable)");
+  cmd_ac->add_flag("--owner-pays", asset_owner_pays_arg, "Auto-fund daily rent from the owner account once prepaid days run out");
 
   auto* cmd_au = cmd_asset->add_subcommand("update", "Full asset update");
   cmd_au->add_option("id", asset_id_arg, "Asset ID or name")->required();
@@ -333,6 +335,12 @@ int main(int argc, char* argv[]) {
   cmd_am->add_option("id", asset_id_arg, "Asset ID or name")->required();
   cmd_am->add_option("--price", asset_price_arg, "Price in whole credits (0=not for sale)");
   cmd_am->add_option("--target", asset_target_arg, "New owner (key or @index)");
+
+  bool asset_owner_pays_off = false;
+  auto* cmd_aop =
+    cmd_asset->add_subcommand("owner-pays", "Toggle the owner-pays (auto-fund) bit (owner only)");
+  cmd_aop->add_option("id", asset_id_arg, "Asset ID or name")->required();
+  cmd_aop->add_flag("--off", asset_owner_pays_off, "Clear the bit (default: set it on)");
 
   auto* cmd_af =
     cmd_asset->add_subcommand("fast", "Fast content-only update");
@@ -948,6 +956,8 @@ int main(int argc, char* argv[]) {
                     << (isAssetOwned(balance) ? "true" : "false")
                     << ",\"immutable\":"
                     << (isAssetImmutable(balance) ? "true" : "false")
+                    << ",\"ownerPays\":"
+                    << (isAssetOwnerPays(balance) ? "true" : "false")
                     << ",\"price\":" << price
                     << ",\"contentHex\":\"" << ces::bytesToHex(content)
                     << "\"}\n";
@@ -956,6 +966,7 @@ int main(int argc, char* argv[]) {
           if (isAssetPrivate(balance))   flagsStr += " private";
           if (isAssetOwned(balance))     flagsStr += " asset-owned";
           if (isAssetImmutable(balance)) flagsStr += " immutable";
+          if (isAssetOwnerPays(balance)) flagsStr += " owner-pays";
           print_header("Asset (Unsigned)");
           print_field("Query ID", asset_id_arg);
           print_field("Owner ID", hashPrefixToString(owner));
@@ -1151,7 +1162,8 @@ int main(int argc, char* argv[]) {
       auto aid = parseAssetKey(asset_id_arg);
       auto ctn = resolveContent();
       uint8_t rc = cc.createAsset(aid, ctn, asset_days_arg,
-                                  asset_private_arg, asset_immutable_arg);
+                                  asset_private_arg, asset_immutable_arg,
+                                  asset_owner_pays_arg);
       if (rc == CES_OK) {
         print_header("Asset Created");
         print_field("Asset", asset_id_arg);
@@ -1211,6 +1223,21 @@ int main(int argc, char* argv[]) {
         std::cout << "Success.\n";
       } else {
         std::cerr << "Meta Update Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+
+    } else if (cmd_aop->parsed()) {
+      auto aid = parseAssetKey(asset_id_arg);
+      uint8_t rc = cc.setAssetOwnerPays(aid, !asset_owner_pays_off);
+      if (rc == CES_OK) {
+        if (!g_quiet) {
+          print_header(asset_owner_pays_off ? "Asset Owner-Pays Disabled"
+                                            : "Asset Owner-Pays Enabled");
+          print_field("Asset", asset_id_arg);
+          std::cout << "Success.\n";
+        }
+      } else {
+        std::cerr << "Owner-Pays Toggle Failed: " << errorString(rc) << "\n";
         return 1;
       }
 
@@ -1309,6 +1336,7 @@ int main(int argc, char* argv[]) {
         if (isAssetPrivate(a.balance))   flagsStr += " private";
         if (isAssetOwned(a.balance))     flagsStr += " asset-owned";
         if (isAssetImmutable(a.balance)) flagsStr += " immutable";
+        if (isAssetOwnerPays(a.balance)) flagsStr += " owner-pays";
         print_header("Asset (Signed)");
         print_field("Query ID", asset_id_arg);
         print_field("Owner ID", hashPrefixToString(a.ownerId));

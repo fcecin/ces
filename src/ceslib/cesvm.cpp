@@ -867,11 +867,11 @@ void CesVM::hostCall(CesVMHost& host) {
     HashPrefix _o; AssetData _c; uint16_t _bal = 0; uint32_t _p = 0;
     uint32_t held = host.readAsset(key, _o, _c, _bal, _p)
                       ? assetDays(_bal) : 0u;
-    // The day field caps at 0x1FFF, and VmHost::fundAsset clamps the grant
-    // to it — so bill only for the days actually granted, not the full
+    // The day field caps at 0x0FFF, and VmHost::fundAsset clamps the grant
+    // to it -- so bill only for the days actually granted, not the full
     // request (mirrors the wire fundAsset fix; otherwise funding a near-cap
     // asset overcharges for days it never receives).
-    uint32_t granted = std::min<uint32_t>(0x1FFF, held + days) - held;
+    uint32_t granted = std::min<uint32_t>(0x0FFF, held + days) - held;
     if (!billCredits(host.feeTx + computePrepayCost(host.feeAssetRaw,
                                              host.assetRentMultBp,
                                              granted, held))) return;

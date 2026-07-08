@@ -722,13 +722,15 @@ std::string buildAsset(CesServer& s, const std::string& keyHex) {
   std::ostringstream o;
   o << "{\"exists\":" << (a.exists ? "true" : "false");
   if (a.exists) {
-    uint16_t days = a.balance & 0x1FFF;
+    uint16_t days = a.balance & 0x0FFF;
+    bool ownerPays = (a.balance & 0x1000) != 0;
     bool immutable = (a.balance & 0x2000) != 0;
     bool assetOwned = (a.balance & 0x4000) != 0;
     bool isPrivate = (a.balance & 0x8000) != 0;
     o << ",\"owner\":" << jstr(hexOfPrefix(a.owner))
       << ",\"rawBalance\":" << a.balance
       << ",\"days\":" << days
+      << ",\"ownerPays\":" << (ownerPays ? "true" : "false")
       << ",\"immutable\":" << (immutable ? "true" : "false")
       << ",\"assetOwned\":" << (assetOwned ? "true" : "false")
       << ",\"private\":" << (isPrivate ? "true" : "false")

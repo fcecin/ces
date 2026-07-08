@@ -43,7 +43,8 @@ enum op_code_t : uint8_t {
   CES_GOSSIP = 0x15,                   // signed: flood/route a message across the server mesh
   CES_SET_ALIAS = 0x16,                // signed: set this account's alias (create on first use, edit in place after)
   CES_DELETE_ALIAS = 0x17,             // signed: erase this account's alias
-  CES_QUERY_ALIAS = 0x18               // unsigned: read an alias by id
+  CES_QUERY_ALIAS = 0x18,              // unsigned: read an alias by id
+  CES_SET_ASSET_OWNER_PAYS = 0x19      // signed: toggle an asset's owner-pays (auto-fund) bit
 };
 
 /**
@@ -90,6 +91,7 @@ enum result_code_t : uint8_t {
   CES_SET_ALIAS_RESULT = 0x16,
   CES_DELETE_ALIAS_RESULT = 0x17,
   CES_QUERY_ALIAS_RESULT = 0x18,
+  CES_SET_ASSET_OWNER_PAYS_RESULT = 0x19,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };
@@ -349,28 +351,35 @@ inline const char* errorString(uint8_t code) {
   }
 }
 
-// ---- Asset balance (days + privacy bit) ----
+// ---- Asset balance (days + flag bits) ----
 // The uint16_t balance field encodes:
 //   bit 15    = private (hide content from unauthorized queries)
 //   bit 14    = asset-owned (owner field is an asset key prefix, not an account prefix)
 //   bit 13    = immutable (content/value cannot be changed; once set, cannot be unset)
-//   bits 0-12 = days remaining (max 8191 ~= 22 years)
+//   bit 12    = owner-pays (daily rent auto-funds from the owner account once the
+//               prepaid days run out; a 0-day owner-pays asset stays alive while
+//               the owner can pay and dies the day it cannot)
+//   bits 0-11 = days remaining (max 4095 ~= 11 years)
 //
 // IMMUTABLE seals content only. Owner, price, and rent (days) can still
-// be updated, transferred, and funded on an immutable asset — only the
-// 210-byte content array is locked.
+// be updated, transferred, and funded on an immutable asset -- only the
+// 210-byte content array is locked. Programs reading a raw balance must mask
+// with 0x0FFF for the day count; the top four bits are flags.
 inline bool isAssetPrivate(uint16_t balance) { return balance & 0x8000; }
 inline bool isAssetOwned(uint16_t balance) { return balance & 0x4000; }
 inline bool isAssetImmutable(uint16_t balance) { return balance & 0x2000; }
-inline uint16_t assetDays(uint16_t balance) { return balance & 0x1FFF; }
+inline bool isAssetOwnerPays(uint16_t balance) { return balance & 0x1000; }
+inline uint16_t assetDays(uint16_t balance) { return balance & 0x0FFF; }
 inline uint16_t assetBalance(uint16_t days, bool priv,
                              bool assetOwned = false,
-                             bool immutable = false) {
+                             bool immutable = false,
+                             bool ownerPays = false) {
   return static_cast<uint16_t>(
     (priv ? 0x8000 : 0) |
     (assetOwned ? 0x4000 : 0) |
     (immutable ? 0x2000 : 0) |
-    (days & 0x1FFF));
+    (ownerPays ? 0x1000 : 0) |
+    (days & 0x0FFF));
 }
 
 // ---- Price conversion utilities ----

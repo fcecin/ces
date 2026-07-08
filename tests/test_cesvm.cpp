@@ -3182,7 +3182,7 @@ BOOST_FIXTURE_TEST_CASE(ScheduleRollsBackOnAbort, CesFixture) {
   }
 }
 
-// F1: SYS_FUND_ASSET must bill for days actually GRANTED (clamped at 0x1FFF),
+// F1: SYS_FUND_ASSET must bill for days actually GRANTED (clamped at 0x0FFF),
 // not the full request. Give the run a budget covering the granted-days rent
 // but NOT the full-request rent: with the fix it commits, without it (billing
 // the full request) it hits CESVM_BUDGET.
@@ -3192,9 +3192,9 @@ BOOST_FIXTURE_TEST_CASE(VmFundAssetBillsGrantedNotRequested, CesFixture) {
   // Asset already near the day cap.
   minx::Hash target; target.fill(0x6F);
   AssetData content; content.fill(0x01);
-  CES_REQUIRE_OK(client->createAsset(target, content, 8000));
+  CES_REQUIRE_OK(client->createAsset(target, content, 3900));
 
-  // Program: SYS_FUND_ASSET(+1000 days). granted = 0x1FFF - 8001 = 190;
+  // Program: SYS_FUND_ASSET(+1000 days). granted = 0x0FFF - 3901 = 194;
   // full request would be 1000.
   minx::Hash progId; progId.fill(0x6E);
   VmProgram pgm;
@@ -3216,7 +3216,7 @@ BOOST_FIXTURE_TEST_CASE(VmFundAssetBillsGrantedNotRequested, CesFixture) {
 
   HashPrefix o; AssetData c; uint16_t days = 0; uint32_t p;
   client->queryAsset(target, o, c, days, p);
-  BOOST_CHECK_EQUAL(days, 0x1FFF); // funded to the cap
+  BOOST_CHECK_EQUAL(days, 0x0FFF); // funded to the cap
 }
 
 BOOST_AUTO_TEST_SUITE_END()

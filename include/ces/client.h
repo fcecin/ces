@@ -138,7 +138,8 @@ public:
 
   uint8_t createAsset(const Hash& assetId, const AssetData& content,
                       uint16_t days, bool private_ = false,
-                      bool immutable = false);
+                      bool immutable = false, bool ownerPays = false);
+  uint8_t setAssetOwnerPays(const Hash& assetId, bool ownerPays);
 
   uint8_t updateAsset(const Hash& assetId, const HashPrefix& newOwner,
                       const AssetData& content, uint32_t price);
@@ -404,6 +405,11 @@ private:
   uint32_t updateAssetMetaResultNonce_ = 0;
   uint8_t updateAssetMetaResultCode_ = 0;
   std::atomic<uint64_t> updateAssetMetaGen_ = 0;
+
+  HashPrefix setAssetOwnerPaysResultOwnerId_;
+  uint32_t setAssetOwnerPaysResultNonce_ = 0;
+  uint8_t setAssetOwnerPaysResultCode_ = 0;
+  std::atomic<uint64_t> setAssetOwnerPaysGen_ = 0;
 
   HashPrefix fundAssetResultOriginId_;
   uint32_t fundAssetResultNonce_ = 0;

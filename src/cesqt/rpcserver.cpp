@@ -259,6 +259,7 @@ QJsonObject RpcServer::dispatch(const QJsonObject& request, int keyIndex) {
         {"owner", ownerHex},
         {"content", contentStr},
         {"days", ces::assetDays(balance)},
+        {"ownerPays", ces::isAssetOwnerPays(balance)},
         {"private", ces::isAssetPrivate(balance)},
         {"assetOwned", ces::isAssetOwned(balance)},
         {"immutable", ces::isAssetImmutable(balance)},

@@ -664,6 +664,14 @@ public:
                           uint32_t providedNonce, int64_t updateFee = -1,
                           int64_t errFee = -1);
 
+  // Owner-only toggle of the asset's owner-pays (auto-fund) bit. Preserves days
+  // and the other flags; charges feeTx. Allowed on immutable assets (the seal
+  // is content-only).
+  uint8_t setAssetOwnerPays(const minx::Hash& originKey,
+                            const minx::Hash& assetId, bool ownerPays,
+                            uint32_t providedNonce, int64_t fee = -1,
+                            int64_t errFee = -1);
+
   uint8_t updateAssetFast(const minx::Hash& originKey,
                           const minx::Hash& assetId, const AssetData& content,
                           uint32_t providedNonce, int64_t fastUpdateFee = -1,

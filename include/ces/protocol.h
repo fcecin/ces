@@ -685,6 +685,27 @@ struct CesUpdateAssetMetaResult {
   CES_INJECT_SIGNED_METHODS(CES_UPDATE_ASSET_META_RESULT)
 };
 
+// --- CES_SET_ASSET_OWNER_PAYS (owner toggles the auto-fund bit) ---
+#define CES_SET_ASSET_OWNER_PAYS_FIELDS(X)                                     \
+  X(Hash, ownerId) X(HashPrefix, serverId)                                     \
+  X(uint32_t, reqNonce) X(Hash, assetId) X(uint8_t, ownerPays)
+struct CesSetAssetOwnerPays {
+  CES_DECLARE_FIELDS(CES_SET_ASSET_OWNER_PAYS_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_SET_ASSET_OWNER_PAYS_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_SET_ASSET_OWNER_PAYS)
+};
+
+#define CES_SET_ASSET_OWNER_PAYS_RESULT_FIELDS(X)                              \
+  X(HashPrefix, ownerId) X(uint32_t, reqNonce) X(Hash, assetId)               \
+    X(uint8_t, rcode)
+struct CesSetAssetOwnerPaysResult {
+  CES_DECLARE_FIELDS(CES_SET_ASSET_OWNER_PAYS_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_SET_ASSET_OWNER_PAYS_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_SET_ASSET_OWNER_PAYS_RESULT)
+};
+
 #define CES_UPDATE_ASSET_FAST_FIELDS(X)                                        \
   X(Hash, ownerId) X(HashPrefix, serverId) X(uint32_t, reqNonce) X(Hash, assetId) X(AssetData, content)
 struct CesUpdateAssetFast {

@@ -507,9 +507,9 @@ public:
     if (!aa.exists()) return false;
     owner   = aa.data().getOwnerId();
     content = aa.data().getContent();
-    // Raw 16-bit balance: bits 0..12 days (0..8191), bit 13 immut, bit 14
-    // aowned, bit 15 priv. Programs mask with 0x1FFF for days; the unstripped
-    // form is what lets them branch on the flag bits at all.
+    // Raw 16-bit balance: bits 0..11 days (0..4095), bit 12 owner-pays, bit 13
+    // immut, bit 14 aowned, bit 15 priv. Programs mask with 0x0FFF for days;
+    // the unstripped form is what lets them branch on the flag bits at all.
     balance = aa.data().getBalance();
     price   = aa.data().getPrice();
     return true;
@@ -583,10 +583,11 @@ public:
     bool priv = isAssetPrivate(days);
     bool immut = isAssetImmutable(days);
     uint32_t storeDays = 1u + assetDays(days);
-    if (storeDays > 0x1FFF) storeDays = 0x1FFF;
+    if (storeDays > 0x0FFF) storeDays = 0x0FFF;
     Asset newAsset(caller_, content,
                    assetBalance(static_cast<uint16_t>(storeDays), priv,
-                                /*aowned=*/false, immut), 0);
+                                /*aowned=*/false, immut,
+                                isAssetOwnerPays(days)), 0);
     server_.assets_->getObjects().emplace(key, newAsset);
     return CES_OK;
   }
@@ -599,11 +600,12 @@ public:
     bool priv = isAssetPrivate(days);
     bool immut = isAssetImmutable(days);
     uint32_t storeDays = 1u + assetDays(days);
-    if (storeDays > 0x1FFF) storeDays = 0x1FFF;
+    if (storeDays > 0x0FFF) storeDays = 0x0FFF;
     HashPrefix bootOwner = Account::getMapKey(this->selfAssetKey);
     Asset newAsset(bootOwner, content,
                    assetBalance(static_cast<uint16_t>(storeDays), priv,
-                                /*aowned=*/true, immut), 0);
+                                /*aowned=*/true, immut,
+                                isAssetOwnerPays(days)), 0);
     server_.assets_->getObjects().emplace(key, newAsset);
     return CES_OK;
   }
@@ -644,9 +646,10 @@ public:
     bool immut  = isAssetImmutable(it->second.getBalance());
     uint16_t curDays = assetDays(it->second.getBalance());
     uint32_t newDays = curDays + days;
-    if (newDays > 0x1FFF) newDays = 0x1FFF;
+    if (newDays > 0x0FFF) newDays = 0x0FFF;
     it->second.setBalance(
-      assetBalance(static_cast<uint16_t>(newDays), priv, aowned, immut));
+      assetBalance(static_cast<uint16_t>(newDays), priv, aowned, immut,
+                   isAssetOwnerPays(it->second.getBalance())));
     return CES_OK;
   }
 
@@ -2291,10 +2294,11 @@ uint8_t CesServer::createAsset(const minx::Hash& originKey,
   bool priv = isAssetPrivate(balance);
   bool immut = isAssetImmutable(balance);
   uint32_t storeDays = 1u + assetDays(balance);
-  if (storeDays > 0x1FFF) storeDays = 0x1FFF;
+  if (storeDays > 0x0FFF) storeDays = 0x0FFF;
   Asset newAsset(ownerId, content,
                  assetBalance(static_cast<uint16_t>(storeDays), priv,
-                              /*aowned=*/false, immut), 0);
+                              /*aowned=*/false, immut,
+                              isAssetOwnerPays(balance)), 0);
   Asset::SerModeGuard guard(Asset::SerMode::Full);
   assets_->update(assetId, newAsset);
 
@@ -2453,9 +2457,9 @@ uint8_t CesServer::fundAsset(const minx::Hash& originKey,
   // close to full price for the trailing days.
   ActiveAsset asset = assets_.get(assetId);
   uint32_t held = asset.exists() ? assetDays(asset.getBalance()) : 0u;
-  // The day field caps at 0x1FFF, so bill only for the days actually
+  // The day field caps at 0x0FFF, so bill only for the days actually
   // added: funding past the cap grants fewer days than requested.
-  uint32_t granted = std::min<uint32_t>(0x1FFF, held + balance) - held;
+  uint32_t granted = std::min<uint32_t>(0x0FFF, held + balance) - held;
   uint64_t rentCost = attenuatedFundCost(
     FeeKind::AssetRent, rentFee, granted, held);
   uint64_t totalCost = rentCost + fundFee;
@@ -2478,13 +2482,51 @@ uint8_t CesServer::fundAsset(const minx::Hash& originKey,
   bool immut = isAssetImmutable(asset.getBalance());
   uint16_t curDays = assetDays(asset.getBalance());
   uint32_t newDays = curDays + balance;
-  if (newDays > 0x1FFF) newDays = 0x1FFF;
+  if (newDays > 0x0FFF) newDays = 0x0FFF;
   asset.setBalance(
-    assetBalance(static_cast<uint16_t>(newDays), priv, aowned, immut));
+    assetBalance(static_cast<uint16_t>(newDays), priv, aowned, immut,
+                 isAssetOwnerPays(asset.getBalance())));
 
   assets_.checkFlush(totalCost);
   checkAutoSnapshot();
   LOGTRACE << "fundAsset ok" << VAR(assetId) << VAR(newDays);
+  return CES_OK;
+}
+
+uint8_t CesServer::setAssetOwnerPays(const minx::Hash& originKey,
+                                     const minx::Hash& assetId, bool ownerPays,
+                                     uint32_t providedNonce, int64_t fee,
+                                     int64_t errFee) {
+  fee = discountedFlatFee(fee, cfg_.feeTx, FeeKind::Tx);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  uint8_t rc = origin.validateSpend(0, fee, providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  ActiveAsset asset = assets_.get(assetId);
+  if (!asset.exists()) {
+    origin.chargeError(errFee);
+    return CES_ERROR_ASSET_NOT_FOUND;
+  }
+  if (asset.getOwnerId() != origin.id) {
+    origin.chargeError(errFee);
+    LOGDEBUG << "setAssetOwnerPays: not owner";
+    return CES_ERROR_NOT_OWNER;
+  }
+
+  uint16_t bal = asset.getBalance();
+  asset.setBalance(assetBalance(assetDays(bal), isAssetPrivate(bal),
+                                isAssetOwned(bal), isAssetImmutable(bal),
+                                ownerPays));
+  origin.debit(fee);
+  accounts_.checkFlush(fee);
+  checkAutoSnapshot();
+  LOGTRACE << "setAssetOwnerPays ok" << VAR(assetId) << VAR(ownerPays);
   return CES_OK;
 }
 
@@ -3051,6 +3093,25 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           res.assetId = req.assetId;
           res.newOwnerId = req.newOwnerId;
           res.price = req.price;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_SET_ASSET_OWNER_PAYS: {
+      CesSetAssetOwnerPays req;
+      req.fromBytes(msg.data);
+      Hash key = req.ownerId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesSetAssetOwnerPays& req, const HashPrefix& ownerPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint8_t rc = setAssetOwnerPays(req.ownerId, req.assetId,
+                                         req.ownerPays != 0, req.reqNonce);
+          CesSetAssetOwnerPaysResult res;
+          res.ownerId = ownerPrefix;
+          res.reqNonce = req.reqNonce;
+          res.assetId = req.assetId;
           res.rcode = rc;
           sendSignedReply(addr, msg, std::move(res));
         });
@@ -4284,8 +4345,17 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
       });
       accounts_.adjustTotalCredits(creditsDelta);
     }
-    size_t astBefore = 0, astExpired = 0;
+    size_t astBefore = 0, astExpired = 0, astAutoFunded = 0;
     {
+      // Asset rent is prepaid days that deplete one per pass. An owner-pays
+      // asset does not die at the floor: the owner account is charged one day
+      // at the discounted feeAsset rate and the asset is held at 0 days
+      // (owner-sustained). It dies only when the owner is an asset, is gone, or
+      // cannot pay. Prepaid days deplete first, so shared funding is spent
+      // before the owner is billed. The charged rent is burned (like account
+      // rent), so it leaves circulation via adjustTotalCredits.
+      uint64_t dailyAssetFee = discountFee(FeeKind::AssetRent, cfg_.feeAsset);
+      int64_t astCreditsDelta = 0;
       auto& map = assets_->getObjects();
       astBefore = map.size();
       boost::unordered::erase_if(map, [&](auto& pair) {
@@ -4293,14 +4363,28 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
         bool priv = isAssetPrivate(asset.getBalance());
         bool aowned = isAssetOwned(asset.getBalance());
         bool immut = isAssetImmutable(asset.getBalance());
+        bool ownerPays = isAssetOwnerPays(asset.getBalance());
         uint16_t days = assetDays(asset.getBalance());
         if (days <= 1) {
+          if (ownerPays && !aowned) {
+            ActiveAccount owner = accounts_.get(asset.getOwnerId());
+            if (owner.exists() &&
+                owner.balance() > static_cast<int64_t>(dailyAssetFee)) {
+              owner.data().setBalance(owner.balance() -
+                                      static_cast<int64_t>(dailyAssetFee));
+              astCreditsDelta -= static_cast<int64_t>(dailyAssetFee);
+              asset.setBalance(assetBalance(0, priv, aowned, immut, ownerPays));
+              ++astAutoFunded;
+              return false;
+            }
+          }
           ++astExpired;
           return true;
         }
-        asset.setBalance(assetBalance(days - 1, priv, aowned, immut));
+        asset.setBalance(assetBalance(days - 1, priv, aowned, immut, ownerPays));
         return false;
       });
+      accounts_.adjustTotalCredits(astCreditsDelta);
     }
     // Alias rent: each alias costs its owner one day (feeAccount rate), charged
     // in RAM like account/asset rent (the snapshot below captures it). Owner
@@ -4339,7 +4423,7 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
             << VAR(accBefore) << VAR(accPayExpired)
             << VAR(accFeeDeleted) << VAR(accFeeDebited)
             << VAR(creditsDelta)
-            << VAR(astBefore) << VAR(astExpired)
+            << VAR(astBefore) << VAR(astExpired) << VAR(astAutoFunded)
             << VAR(aliasBefore) << VAR(aliasReclaimed);
     // Re-clamp the server's own account so incoming transfers can't drift its
     // 48-bit balance toward the cap between reboots.
@@ -4539,7 +4623,7 @@ void CesServer::deployBuiltinVmPrograms() {
   // Canonical state: server-owned, current bytecode, max days, no
   // private/asset-owned/immutable bits, no price. Same struct on
   // first boot, on every subsequent boot, and after any squat.
-  uint16_t bal = assetBalance(/*days=*/0x1FFF, /*priv=*/false,
+  uint16_t bal = assetBalance(/*days=*/0x0FFF, /*priv=*/false,
                                /*assetOwned=*/false, /*immutable=*/false);
   Asset canonical(serverOwner, content, bal, /*price=*/0);
 
