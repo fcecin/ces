@@ -1367,4 +1367,60 @@ BOOST_AUTO_TEST_CASE(SysUpdateAssetMetaEndToEnd) {
   BOOST_CHECK_EQUAL(host.capturedOwner[1], 0xBEu);
 }
 
+// ---------------------------------------------------------------------------
+// require(), signed/checked ops, dup(), stackOp(), jfStack() emission.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(RequireEmission) {
+  VmProgram pgm;
+  pgm.require(Imm(0));
+  auto raw = pgm.buildBytes();
+  BOOST_REQUIRE_EQUAL(raw.size(), 2u);
+  BOOST_TEST(raw[0] == OP_ASSERT);
+  BOOST_TEST(raw[1] == svCtrl(0));
+}
+
+BOOST_AUTO_TEST_CASE(SignedCheckedEmission) {
+  VmProgram pgm;
+  pgm.slt(Ref(8), Imm(3)).addx(Imm(1), Imm(2));
+  auto raw = pgm.buildBytes();
+  BOOST_REQUIRE_EQUAL(raw.size(), 6u);
+  BOOST_TEST(raw[0] == OP_SLT);
+  BOOST_TEST(raw[1] == rpCtrl(8));
+  BOOST_TEST(raw[2] == svCtrl(3));
+  BOOST_TEST(raw[3] == OP_ADDX);
+  BOOST_TEST(raw[4] == svCtrl(1));
+  BOOST_TEST(raw[5] == svCtrl(2));
+}
+
+BOOST_AUTO_TEST_CASE(StackOpEmission) {
+  VmProgram pgm;
+  pgm.dup().stackOp(OP_ADD).stackOp(OP_MULX);
+  auto raw = pgm.buildBytes();
+  BOOST_REQUIRE_EQUAL(raw.size(), 3u);
+  BOOST_TEST(raw[0] == OP_DUP);
+  BOOST_TEST(raw[1] == (OP_ADD | CESVM_OP_STACK));
+  BOOST_TEST(raw[2] == (OP_MULX | CESVM_OP_STACK));
+
+  // Opcodes whose stack form reads inline bytes (or has none) are
+  // rejected at build time.
+  VmProgram bad;
+  BOOST_CHECK_THROW(bad.stackOp(OP_JMP), VmProgramError);
+  BOOST_CHECK_THROW(bad.stackOp(OP_MOV), VmProgramError);
+  BOOST_CHECK_THROW(bad.stackOp(OP_JF), VmProgramError);
+}
+
+BOOST_AUTO_TEST_CASE(JfStackEmissionAndReloc) {
+  VmProgram pgm;
+  auto l = pgm.label();
+  pgm.jfStack(l);
+  pgm.place(l);
+  pgm.term();
+  auto raw = pgm.buildBytes();
+  BOOST_REQUIRE_EQUAL(raw.size(), 4u);
+  BOOST_TEST(raw[0] == (OP_JF | CESVM_OP_STACK));
+  BOOST_TEST(raw[1] == 3u);  // resolved LE16 target: offset of TERM
+  BOOST_TEST(raw[2] == 0u);
+  BOOST_TEST(raw[3] == OP_TERM);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

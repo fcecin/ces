@@ -3219,4 +3219,191 @@ BOOST_FIXTURE_TEST_CASE(VmFundAssetBillsGrantedNotRequested, CesFixture) {
   BOOST_CHECK_EQUAL(days, 0x0FFF); // funded to the cap
 }
 
+// --- Signed compares, checked arithmetic, ASSERT, DUP, stack mode ---
+
+// Build a program with `build`, append setOutput(R)+term, run it, and
+// return the VM error plus R (read back via the output buffer). Crashing
+// programs never reach setOutput; callers then check only `.error`.
+struct RunR { uint64_t error; uint64_t r; };
+template <class Build>
+static RunR runR(Build&& build) {
+  CesVM vm;
+  auto host = makeNullHost();
+  VmProgram p;
+  build(p);
+  p.setOutput(Ref(CESVM_CELL_R), 8).term();
+  auto result = vm.execute(p.buildBytes(), host, 1'000'000);
+  uint64_t r = 0;
+  if (result.output.size() == 8) {
+    for (int i = 0; i < 8; ++i)
+      r |= static_cast<uint64_t>(result.output[i]) << (8 * i);
+  }
+  return {result.error, r};
+}
+
+BOOST_AUTO_TEST_CASE(SignedCompares) {
+  const uint64_t neg5 = static_cast<uint64_t>(int64_t{-5});
+
+  auto slt = runR([&](VmProgram& p) { p.slt(Imm(neg5), Imm(3)); });
+  BOOST_CHECK_EQUAL(slt.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(slt.r, 1u);
+
+  // Unsigned contrast: LT reads the sign bit as magnitude.
+  auto lt = runR([&](VmProgram& p) { p.lt(Imm(neg5), Imm(3)); });
+  BOOST_CHECK_EQUAL(lt.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(lt.r, 0u);
+
+  auto sgt = runR([&](VmProgram& p) { p.sgt(Imm(3), Imm(neg5)); });
+  BOOST_CHECK_EQUAL(sgt.r, 1u);
+  auto sge = runR([&](VmProgram& p) { p.sge(Imm(neg5), Imm(neg5)); });
+  BOOST_CHECK_EQUAL(sge.r, 1u);
+  auto sle = runR([&](VmProgram& p) { p.sle(Imm(3), Imm(neg5)); });
+  BOOST_CHECK_EQUAL(sle.r, 0u);
+}
+
+BOOST_AUTO_TEST_CASE(CheckedArithmeticOk) {
+  auto a = runR([](VmProgram& p) { p.addx(Imm(2), Imm(3)); });
+  BOOST_CHECK_EQUAL(a.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(a.r, 5u);
+  auto s = runR([](VmProgram& p) { p.subx(Imm(5), Imm(3)); });
+  BOOST_CHECK_EQUAL(s.r, 2u);
+  auto m = runR([](VmProgram& p) { p.mulx(Imm(6), Imm(7)); });
+  BOOST_CHECK_EQUAL(m.r, 42u);
+}
+
+BOOST_AUTO_TEST_CASE(CheckedArithmeticOverflowHalts) {
+  // The wrapping form succeeds mod 2^64; the checked form halts.
+  auto wrap = runR([](VmProgram& p) {
+    p.add(Imm(std::numeric_limits<uint64_t>::max()), Imm(1));
+  });
+  BOOST_CHECK_EQUAL(wrap.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(wrap.r, 0u);
+
+  auto ax = runR([](VmProgram& p) {
+    p.addx(Imm(std::numeric_limits<uint64_t>::max()), Imm(1));
+  });
+  BOOST_CHECK_EQUAL(ax.error, static_cast<uint64_t>(CESVM_OVERFLOW));
+
+  auto sx = runR([](VmProgram& p) { p.subx(Imm(3), Imm(5)); });
+  BOOST_CHECK_EQUAL(sx.error, static_cast<uint64_t>(CESVM_OVERFLOW));
+
+  auto mx = runR([](VmProgram& p) {
+    p.mulx(Imm(uint64_t{1} << 33), Imm(uint64_t{1} << 33));
+  });
+  BOOST_CHECK_EQUAL(mx.error, static_cast<uint64_t>(CESVM_OVERFLOW));
+}
+
+BOOST_AUTO_TEST_CASE(RequireAbortsOnFalsy) {
+  auto ok = runR([](VmProgram& p) { p.require(Imm(1)); });
+  BOOST_CHECK_EQUAL(ok.error, static_cast<uint64_t>(CESVM_OK));
+  auto bad = runR([](VmProgram& p) { p.require(Imm(0)); });
+  BOOST_CHECK_EQUAL(bad.error, static_cast<uint64_t>(CESVM_ABORT));
+}
+
+BOOST_AUTO_TEST_CASE(DupAndStackOps) {
+  // 7 DUP ADD|STACK -> 14.
+  auto v = runR([](VmProgram& p) {
+    p.push(Imm(7)).dup().stackOp(OP_ADD).pop(Imm(CESVM_CELL_R));
+  });
+  BOOST_CHECK_EQUAL(v.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(v.r, 14u);
+
+  auto empty = runR([](VmProgram& p) { p.dup(); });
+  BOOST_CHECK_EQUAL(empty.error, static_cast<uint64_t>(CESVM_UNDERFLOW));
+
+  auto ax = runR([](VmProgram& p) {
+    p.push(Imm(std::numeric_limits<uint64_t>::max())).push(Imm(1))
+     .stackOp(OP_ADDX);
+  });
+  BOOST_CHECK_EQUAL(ax.error, static_cast<uint64_t>(CESVM_OVERFLOW));
+
+  auto slt = runR([](VmProgram& p) {
+    p.push(Imm(static_cast<uint64_t>(int64_t{-5}))).push(Imm(3))
+     .stackOp(OP_SLT).pop(Imm(CESVM_CELL_R));
+  });
+  BOOST_CHECK_EQUAL(slt.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(slt.r, 1u);
+
+  auto assertFail = runR([](VmProgram& p) {
+    p.push(Imm(0)).stackOp(OP_ASSERT);
+  });
+  BOOST_CHECK_EQUAL(assertFail.error, static_cast<uint64_t>(CESVM_ABORT));
+}
+
+BOOST_AUTO_TEST_CASE(StackConditionalJumps) {
+  // jfStack: popped 0 takes the jump, skipping the abort.
+  auto a = runR([](VmProgram& p) {
+    auto ok = p.label();
+    p.push(Imm(0)).jfStack(ok).abort().place(ok)
+     .set(Imm(CESVM_CELL_R), Imm(9));
+  });
+  BOOST_CHECK_EQUAL(a.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(a.r, 9u);
+
+  // jtStack: popped 1 takes the jump.
+  auto b = runR([](VmProgram& p) {
+    auto ok = p.label();
+    p.push(Imm(1)).jtStack(ok).abort().place(ok)
+     .set(Imm(CESVM_CELL_R), Imm(8));
+  });
+  BOOST_CHECK_EQUAL(b.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(b.r, 8u);
+}
+
+// OP_RET reads its operand in the callee's register context, restores
+// the caller's 16 registers, then writes the value into R. R is the
+// return-value register; every other register is callee-saved. Any
+// other ordering either clobbers the return value with the caller's
+// stale R or returns the caller's register instead of the callee's.
+BOOST_AUTO_TEST_CASE(CallRetReturnValueSurvivesRegisterRestore) {
+  CesVM vm;
+  auto host = makeNullHost();
+  VmProgram p;
+  auto fn = p.label();
+  p.set(Imm(CESVM_CELL_GPR0), Imm(111));
+  p.set(Imm(CESVM_CELL_GPR1), Imm(222));
+  p.call(fn);
+  p.set(Imm(16), Ref(CESVM_CELL_R));
+  p.set(Imm(17), Ref(CESVM_CELL_GPR0));
+  p.set(Imm(18), Ref(CESVM_CELL_GPR1));
+  p.setOutputBytes(16, 3, 24);
+  p.term();
+  p.place(fn);
+  p.set(Imm(CESVM_CELL_GPR0), Imm(999));
+  p.set(Imm(CESVM_CELL_GPR1), Imm(888));
+  p.ret(Ref(CESVM_CELL_GPR0));
+
+  auto result = vm.execute(p.buildBytes(), host, 1'000'000);
+  BOOST_REQUIRE_EQUAL(result.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_REQUIRE_EQUAL(result.output.size(), 24u);
+  auto cell = [&](int c) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i)
+      v |= static_cast<uint64_t>(result.output[c * 8 + i]) << (8 * i);
+    return v;
+  };
+  BOOST_CHECK_EQUAL(cell(0), 999u);  // R: callee's GPR0, read pre-restore
+  BOOST_CHECK_EQUAL(cell(1), 111u);  // GPR0 restored to the caller's value
+  BOOST_CHECK_EQUAL(cell(2), 222u);  // GPR1 restored to the caller's value
+}
+
+// OP_ASSERT|STACK on an empty stack reports the pop's CESVM_UNDERFLOW;
+// it must not overwrite that with CESVM_ABORT.
+BOOST_AUTO_TEST_CASE(StackAssertOnEmptyStackReportsUnderflow) {
+  auto r = runR([](VmProgram& p) { p.stackOp(OP_ASSERT); });
+  BOOST_CHECK_EQUAL(r.error, static_cast<uint64_t>(CESVM_UNDERFLOW));
+}
+
+// OP_AND has a stack variant in the interpreter; keep it covered here
+// and in the stackOp() whitelist (it was absent from the stack-capable
+// opcode list in cesvm.h).
+BOOST_AUTO_TEST_CASE(StackAndVariantWorks) {
+  auto r = runR([](VmProgram& p) {
+    p.push(Imm(0xF0)).push(Imm(0x3C)).stackOp(OP_AND)
+     .pop(Imm(CESVM_CELL_R));
+  });
+  BOOST_CHECK_EQUAL(r.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(r.r, 0x30u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

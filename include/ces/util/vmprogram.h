@@ -165,11 +165,11 @@ struct Region {
 // The builder is register-style: every binary-op method takes two VmVal
 // operands and writes the result to R. CesVM's ISA also has stack-mode
 // variants (the opcode OR'd with the STACK bit 0x80, popping and pushing
-// the data stack), but the builder does not expose them for arithmetic.
-// The host C++ already does the operand scheduling that stack mode exists
-// to help a hand-coder with. push() and pop() remain exposed for parking
-// a value across a syscall that clobbers R; hand-write raw bytes if you
-// genuinely need stack-composed bytecode.
+// the data stack). For hand-written programs the register methods are
+// the intended surface; stack mode is exposed through stackOp() /
+// jfStack() / jtStack() / dup() for code generators, where stack-machine
+// evaluation of expression trees emits one operand-free byte per
+// interior node.
 
 class VmProgram {
 public:
@@ -209,10 +209,17 @@ public:
   VmProgram& jt(VmVal cond, VmLabel target);
   // Call `target`. Saves all 16 registers (128-byte frame); RET restores.
   VmProgram& call(VmLabel target);
-  // Return from a call, writing `retVal` into R before restoring regs.
-  // For top-level returns (no enclosing call), the program ends with
-  // CESVM_RET, which the VM treats as a crash.
+  // Return from a call. The VM reads `retVal` (in the callee's register
+  // context), restores the caller's 16 registers from the frame, then
+  // writes `retVal` into R — so R is the return-value register and every
+  // other register is callee-saved. For top-level returns (no enclosing
+  // call), the program ends with CESVM_RET, which the VM treats as a
+  // crash.
   VmProgram& ret(VmVal retVal);
+  // Abort (CESVM_ABORT) if `cond` is falsy. One opcode replacing the
+  // jt-over-abort guard idiom; the register-mode counterpart of the
+  // hostx contract.
+  VmProgram& require(VmVal cond);
 
   // Indirect jump and call: the target is a runtime value computed by
   // the program, not a compile-time label. Typical use: after
@@ -292,10 +299,42 @@ public:
   VmProgram& ge(VmVal a, VmVal b);
   VmProgram& le(VmVal a, VmVal b);
 
+  // Signed comparisons: operands compared as two's-complement int64.
+  // gt/lt/ge/le above are unsigned and read the sign bit as magnitude.
+  VmProgram& slt(VmVal a, VmVal b);
+  VmProgram& sgt(VmVal a, VmVal b);
+  VmProgram& sge(VmVal a, VmVal b);
+  VmProgram& sle(VmVal a, VmVal b);
+
+  // Checked unsigned arithmetic: like add/sub/mul but a wrap halts the
+  // VM with CESVM_OVERFLOW instead of producing a mod-2^64 result. The
+  // default choice for money math; the wrapping forms remain for
+  // intentional modular arithmetic.
+  VmProgram& addx(VmVal a, VmVal b);
+  VmProgram& subx(VmVal a, VmVal b);
+  VmProgram& mulx(VmVal a, VmVal b);
+
   // --- Stack ---
 
   VmProgram& push(VmVal v);
   VmProgram& pop(VmVal cell);
+
+  // Duplicate the top of the data stack (OP_DUP). Stack-only opcode.
+  VmProgram& dup();
+
+  // Emit the stack-mode variant (opcode | 0x80) of `op`: operands are
+  // popped from the data stack and the result pushed, one byte total.
+  // Accepts only opcodes whose stack form reads no inline operand bytes
+  // (arithmetic, logic, comparisons incl. signed and checked, ASSERT,
+  // NEG/NOT/LNOT, RND/TIME, LDB/STB, CALL); anything else throws
+  // VmProgramError. JF/JT stack forms carry a label and have dedicated
+  // emitters below.
+  VmProgram& stackOp(CesVMOpcode op);
+
+  // Stack-mode conditional jumps: the condition is popped from the data
+  // stack, the target is a label like jf()/jt().
+  VmProgram& jfStack(VmLabel target);
+  VmProgram& jtStack(VmLabel target);
 
   // --- Miscellaneous ---
 

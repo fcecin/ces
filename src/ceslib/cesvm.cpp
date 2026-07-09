@@ -425,6 +425,91 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
     case OP_LE | STACK:
       if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 <= op2); break;
+    case OP_SLT:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      R() = static_cast<int64_t>(op1) < static_cast<int64_t>(op2); break;
+    case OP_SLT | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      push(static_cast<int64_t>(op1) < static_cast<int64_t>(op2)); break;
+    case OP_SGT:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      R() = static_cast<int64_t>(op1) > static_cast<int64_t>(op2); break;
+    case OP_SGT | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      push(static_cast<int64_t>(op1) > static_cast<int64_t>(op2)); break;
+    case OP_SGE:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      R() = static_cast<int64_t>(op1) >= static_cast<int64_t>(op2); break;
+    case OP_SGE | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      push(static_cast<int64_t>(op1) >= static_cast<int64_t>(op2)); break;
+    case OP_SLE:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      R() = static_cast<int64_t>(op1) <= static_cast<int64_t>(op2); break;
+    case OP_SLE | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      push(static_cast<int64_t>(op1) <= static_cast<int64_t>(op2)); break;
+    case OP_ADDX:
+      // Checked unsigned add: a wrap halts with CESVM_OVERFLOW instead
+      // of producing a mod-2^64 result. Same shape for SUBX/MULX below.
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      if (op1 > UINT64_MAX - op2) { term_ = CESVM_OVERFLOW; break; }
+      R() = op1 + op2; break;
+    case OP_ADDX | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      if (op1 > UINT64_MAX - op2) { term_ = CESVM_OVERFLOW; break; }
+      push(op1 + op2); break;
+    case OP_SUBX:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      if (op2 > op1) { term_ = CESVM_OVERFLOW; break; }
+      R() = op1 - op2; break;
+    case OP_SUBX | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      if (op2 > op1) { term_ = CESVM_OVERFLOW; break; }
+      push(op1 - op2); break;
+    case OP_MULX:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read(); op2 = read();
+      if (op2 != 0 && op1 > UINT64_MAX / op2) { term_ = CESVM_OVERFLOW; break; }
+      R() = op1 * op2; break;
+    case OP_MULX | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op2 = pop(); op1 = pop();
+      if (op2 != 0 && op1 > UINT64_MAX / op2) { term_ = CESVM_OVERFLOW; break; }
+      push(op1 * op2); break;
+    case OP_ASSERT:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = read();
+      if (!op1) term_ = CESVM_ABORT;
+      break;
+    case OP_ASSERT | STACK:
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = pop();
+      // pop() on an empty stack already set CESVM_UNDERFLOW and
+      // returned 0; do not misreport that crash as an assert failure.
+      if (!op1 && !term_) term_ = CESVM_ABORT;
+      break;
+    case OP_DUP:
+      // pop-then-push-twice inherits the existing edge semantics: empty
+      // stack halts with CESVM_UNDERFLOW via pop(), a stack at cap
+      // halts with CESVM_SEGFAULT on the second push().
+      if (!bill(CESVM_COST_PER_OP)) break;
+      op1 = pop();
+      push(op1);
+      push(op1);
+      break;
     case OP_NEG:
       // Arithmetic two's-complement negate. Wraps at 0 (NEG of 0 is 0;
       // NEG of INT64_MIN is itself — that's the well-known x86 quirk

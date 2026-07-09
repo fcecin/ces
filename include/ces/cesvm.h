@@ -21,8 +21,9 @@
  * Architecture:
  *   - Harvard: code (read-only, up to 8KB) and data (io[], 8KB) are separate
  *   - Code starts as the 210-byte asset content, grows via SYS_LOAD_CODE
- *   - 50 opcodes (35 GVM core + RND, TIME, MOV, LDB, STB, CMP, FIL,
- *     HOSTX, ABORT, JMPR, CALLR, HOSTV, HOSTXV, SAR, LNOT)
+ *   - 59 opcodes (35 GVM core + RND, TIME, MOV, LDB, STB, CMP, FIL,
+ *     HOSTX, ABORT, JMPR, CALLR, HOSTV, HOSTXV, SAR, LNOT, SLT, SGT,
+ *     SGE, SLE, ADDX, SUBX, MULX, ASSERT, DUP)
  *   - 16 registers: PC, R, S, SYSCALL, ARG0-3, GPR0-7
  *   - CALL/RET save/restore all 16 registers (128-byte frame)
  *   - Write syscalls execute real mutations via host callbacks
@@ -120,8 +121,9 @@ enum CesVMError : uint64_t {
   CESVM_SYSCALL    = 10,  // invalid syscall number
   CESVM_AUTH       = 11,  // not authorized (e.g. write to non-owned asset)
   CESVM_CODEFULL   = 12,  // code space exhausted (SYS_LOAD_CODE)
-  CESVM_ABORT      = 13,  // program aborted (OP_HOSTX on S!=0, or OP_ABORT)
+  CESVM_ABORT      = 13,  // program aborted (OP_HOSTX on S!=0, OP_ABORT, or OP_ASSERT)
   CESVM_HOST       = 14,  // host callback or VM infrastructure threw
+  CESVM_OVERFLOW   = 15,  // checked arithmetic (ADDX/SUBX/MULX) wrapped
 };
 
 // Syscall numbers, dense range 0..22.
@@ -214,9 +216,10 @@ enum CesVMSyscall : uint64_t {
 //
 // The high bit (0x80) of an opcode byte is the STACK modifier: OR it
 // with any opcode that has a stack variant (ADD, SUB, MUL, DIV, MOD, OR,
-// ANDL, XOR, NOT, LNOT, SHL, SHR, SAR, EQ, NE, GT, LT, GE, LE, NEG, ORL,
-// JF, JT, LDB, STB, RND, TIME, CALL) to pop operands from the stack
-// instead of reading them from the instruction stream.
+// AND, ANDL, XOR, NOT, LNOT, SHL, SHR, SAR, EQ, NE, GT, LT, GE, LE, NEG,
+// ORL, JF, JT, LDB, STB, RND, TIME, CALL, SLT, SGT, SGE, SLE, ADDX,
+// SUBX, MULX, ASSERT) to pop operands from the stack instead of reading
+// them from the instruction stream.
 enum CesVMOpcode : uint8_t {
   OP_NOP   = 0,  OP_TERM  = 1,  OP_SET   = 2,  OP_JMP   = 3,
   OP_ADD   = 4,  OP_SUB   = 5,  OP_MUL   = 6,  OP_DIV   = 7,
@@ -247,6 +250,24 @@ enum CesVMOpcode : uint8_t {
   OP_SAR   = 48,
   // Logical NOT (!x). Distinct from OP_NOT (bitwise ~x) and OP_NEG (arithmetic).
   OP_LNOT  = 49,
+  // Signed comparisons: operands reinterpreted as two's-complement
+  // int64. The GT/LT/GE/LE family is unsigned and reads the sign bit
+  // as magnitude; these are correct for signed values such as account
+  // balances.
+  OP_SLT   = 50, OP_SGT   = 51, OP_SGE   = 52, OP_SLE   = 53,
+  // Checked unsigned arithmetic: identical to ADD/SUB/MUL except a
+  // wrap (add/mul overflow, sub borrow) halts with CESVM_OVERFLOW
+  // instead of producing a wrapped value. Intended as the default for
+  // money math; the wrapping forms remain for intentional mod-2^64 use.
+  OP_ADDX  = 54, OP_SUBX  = 55, OP_MULX  = 56,
+  // Abort (CESVM_ABORT) if the operand is falsy (0). One-opcode form
+  // of the jt-over-abort guard idiom; complements OP_HOSTX, which is
+  // the same contract for syscall status.
+  OP_ASSERT = 57,
+  // Duplicate the top of the data stack. Stack-only by nature (no
+  // register form); used when a stack-scheduled value feeds two
+  // consumers, since stack-mode ops pop their operands.
+  OP_DUP   = 58,
 };
 
 // Named cell indices for the 16 registers. Useful anywhere a cell

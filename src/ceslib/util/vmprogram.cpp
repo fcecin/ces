@@ -287,6 +287,19 @@ VmProgram& VmProgram::gt(VmVal a, VmVal b)   { emitOpcode(OP_GT);   emitVal(a); 
 VmProgram& VmProgram::lt(VmVal a, VmVal b)   { emitOpcode(OP_LT);   emitVal(a); emitVal(b); return *this; }
 VmProgram& VmProgram::ge(VmVal a, VmVal b)   { emitOpcode(OP_GE);   emitVal(a); emitVal(b); return *this; }
 VmProgram& VmProgram::le(VmVal a, VmVal b)   { emitOpcode(OP_LE);   emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::slt(VmVal a, VmVal b)  { emitOpcode(OP_SLT);  emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::sgt(VmVal a, VmVal b)  { emitOpcode(OP_SGT);  emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::sge(VmVal a, VmVal b)  { emitOpcode(OP_SGE);  emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::sle(VmVal a, VmVal b)  { emitOpcode(OP_SLE);  emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::addx(VmVal a, VmVal b) { emitOpcode(OP_ADDX); emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::subx(VmVal a, VmVal b) { emitOpcode(OP_SUBX); emitVal(a); emitVal(b); return *this; }
+VmProgram& VmProgram::mulx(VmVal a, VmVal b) { emitOpcode(OP_MULX); emitVal(a); emitVal(b); return *this; }
+
+VmProgram& VmProgram::require(VmVal cond) {
+  emitOpcode(OP_ASSERT);
+  emitVal(cond);
+  return *this;
+}
 
 // --- Stack ---
 
@@ -299,6 +312,45 @@ VmProgram& VmProgram::push(VmVal v) {
 VmProgram& VmProgram::pop(VmVal cell) {
   emitOpcode(OP_POP);
   emitVal(cell);
+  return *this;
+}
+
+VmProgram& VmProgram::dup() {
+  emitOpcode(OP_DUP);
+  return *this;
+}
+
+VmProgram& VmProgram::stackOp(CesVMOpcode op) {
+  // Only opcodes whose stack form reads no inline operand bytes. JF/JT
+  // stack forms carry a 2-byte label and go through jfStack()/jtStack().
+  switch (op) {
+    case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_MOD:
+    case OP_OR:  case OP_AND: case OP_ANDL: case OP_XOR: case OP_NOT:
+    case OP_LNOT: case OP_SHL: case OP_SHR: case OP_SAR: case OP_EQ:
+    case OP_NE:  case OP_GT:  case OP_LT:  case OP_GE:  case OP_LE:
+    case OP_NEG: case OP_ORL: case OP_RND: case OP_TIME: case OP_LDB:
+    case OP_STB: case OP_CALL:
+    case OP_SLT: case OP_SGT: case OP_SGE: case OP_SLE:
+    case OP_ADDX: case OP_SUBX: case OP_MULX: case OP_ASSERT:
+      break;
+    default:
+      throw VmProgramError(
+        "vmprogram: opcode " + std::to_string(op) +
+        " has no operand-free stack variant");
+  }
+  emitOpcode(static_cast<uint8_t>(op | CESVM_OP_STACK));
+  return *this;
+}
+
+VmProgram& VmProgram::jfStack(VmLabel target) {
+  emitOpcode(static_cast<uint8_t>(OP_JF | CESVM_OP_STACK));
+  emitLabelRef(target);
+  return *this;
+}
+
+VmProgram& VmProgram::jtStack(VmLabel target) {
+  emitOpcode(static_cast<uint8_t>(OP_JT | CESVM_OP_STACK));
+  emitLabelRef(target);
   return *this;
 }
 
