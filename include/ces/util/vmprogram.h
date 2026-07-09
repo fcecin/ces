@@ -645,6 +645,13 @@ public:
   using WithdrawArgs = DepositArgs;
   VmProgram& sysWithdraw(WithdrawArgs a);
 
+  // SYS_REFILL — grow this run's gas budget past the free grant, funded by the
+  // caller account (account hooks). amount = requested gas credits; the amount
+  // actually granted lands in R. Non-aborting (grants 0 if refill is off or
+  // the ceiling/balance is exhausted), so read R to see how much you got.
+  using RefillArgs = DepositArgs;
+  VmProgram& sysRefill(RefillArgs a);
+
   // SYS_READ_ASSET — read asset content and metadata. Three input
   // slots at io[4..6] (key, owner-out cell-index, content-out
   // cell-index); balance and price are written directly by the

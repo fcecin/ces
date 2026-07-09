@@ -468,6 +468,7 @@ public:
         udpSink_(setup.sendUdpFn),
         crossSink_(setup.crossTransferFn),
         scheduleSink_(setup.scheduleFn),
+        creditHookSink_(setup.creditHookFn),
         enableVerifySig_(setup.enableVerifySig) {
     this->allowance = setup.allowance;
     // Per-op fees mirror the protocol-side handlers (transfer/createAsset/...).
@@ -578,6 +579,23 @@ public:
     callerIt->second.setBalance(
       saturatingAddBalance(callerIt->second.getBalance(), amount));
     return CES_OK;
+  }
+
+  uint64_t refillGas(uint64_t requested) override {
+    if (this->refillCeiling == 0) return 0;
+    uint64_t room = this->refillCeiling > this->refilledTotal
+                      ? this->refillCeiling - this->refilledTotal : 0;
+    uint64_t granted = std::min(requested, room);
+    // Cap by what the caller can cover for the post-run charge: keep the
+    // granted total at or below the account balance, so the (<= granted-total)
+    // post-run debit in executeVmRun always clears. No debit here.
+    auto it = server_.accounts_->find(caller_);
+    int64_t bal = (it != server_.accounts_->end()) ? it->second.getBalance() : 0;
+    uint64_t avail = bal > static_cast<int64_t>(this->refilledTotal)
+                       ? static_cast<uint64_t>(bal) - this->refilledTotal : 0;
+    granted = std::min(granted, avail);
+    this->refilledTotal += granted;
+    return granted;
   }
 
   // ---- Asset writes -------------------------------------------------------
@@ -824,6 +842,7 @@ private:
                      const minx::Hash&)>                 crossSink_;
   std::function<uint8_t(const minx::Hash&, uint64_t, uint64_t,
                         const ces::Bytes&, uint64_t)>    scheduleSink_;
+  std::function<void(const minx::Hash&, uint64_t)>      creditHookSink_;
   bool enableVerifySig_;
 
   void maybeSaveAccount(const HashPrefix& id) {
@@ -858,6 +877,8 @@ private:
       Account newAcc(dest, amount, 0);
       server_.accounts_->getObjects().emplace(destPrefix, newAcc);
     }
+    // Record a deferred XFER_VM hook (fires as a watch after the run commits).
+    if (creditHookSink_) creditHookSink_(dest, amount);
   }
 
   // Debit programOwner's account directly. No allowance check — the owner
@@ -1806,6 +1827,35 @@ uint8_t CesServer::transfer(const minx::Hash& originKey,
   errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
   uint64_t totalDeduction = amount + txFee;
 
+  // GATE hooks, before any state change. Safe mode only: an incoming cross
+  // settlement (TransferMode::Open) and a payment-account settle
+  // (TransferMode::Payment) already committed on the origin / are a distinct
+  // mechanism, so a gate must never reject them (it would break vostro/reserve
+  // conservation). The origin's OUT gate (self-veto of its own send) fires
+  // first, then the dest's IN gate (a courtesy signal to the sender). A non-OK
+  // verdict rejects the whole transfer with nothing mutated. Read-only peeks
+  // inside the helper: no handle is held across the run, which may rehash maps.
+  if (mode == TransferMode::Safe) {
+    // Inbound dust floor: a deposit worth less than the cost of screening it
+    // fires no inbound hook. Outbound has no floor (your account, your
+    // footgun), so the OUT gate always runs.
+    uint64_t floor = hookFreeGrant();
+    bool ok = fireAccountHook(originKey, ALIAS_OP_HOOK_GATE,
+                              INVOKE_HOOK_XFER_OUT, destKey, amount) &&
+              (amount < floor ||
+               fireAccountHook(destKey, ALIAS_OP_HOOK_GATE,
+                               INVOKE_HOOK_XFER_IN, originKey, amount));
+    if (!ok) {
+      ActiveAccount o = accounts_.get(Account::getMapKey(originKey));
+      if (o.exists()) {
+        o.chargeError(errFee);
+        outOriginBalance = o.balance();
+      }
+      LOGDEBUG << "transfer: GATE rejected";
+      return CES_ERROR_HOOK_REJECTED;
+    }
+  }
+
   ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
   uint8_t rc = origin.validateSpend(amount, txFee, providedNonce, errFee);
   if (rc != CES_OK) {
@@ -1907,6 +1957,20 @@ uint8_t CesServer::transfer(const minx::Hash& originKey,
   outOriginBalance = origin.balance();
   accounts_.checkFlush(totalDeduction);
   checkAutoSnapshot();
+
+  // WATCH hooks: fire AFTER the transfer commits. Observe-only - the verdict is
+  // ignored, delivery already happened (fail-open). Safe mode only, same
+  // exemption as the gates above (settlement / payment legs never fire a hook).
+  // An account has one sidecar, so at most one of GATE (above) / WATCH fires per
+  // side. Dest's IN watch, then origin's OUT watch. The helper re-peeks fresh,
+  // so both see post-transfer balances.
+  if (mode == TransferMode::Safe) {
+    if (amount >= hookFreeGrant())   // inbound dust floor; outbound has none
+      fireAccountHook(destKey, ALIAS_OP_HOOK_WATCH, INVOKE_HOOK_XFER_IN,
+                      originKey, amount);
+    fireAccountHook(originKey, ALIAS_OP_HOOK_WATCH, INVOKE_HOOK_XFER_OUT,
+                    destKey, amount);
+  }
 
   LOGTRACE << "transfer ok" << VAR(amount) << VAR(outOriginBalance);
   return CES_OK;
@@ -2241,6 +2305,15 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
   }
 
   accounts_.checkFlush(totalDeduction);
+
+  // SETTLE_OUT watch: record this cross-send in the sender's history. Watch
+  // only (an outbound gate is a porous soft guardrail, not put on the
+  // settlement path) and fired only after the local debit + vostro credit
+  // stand. The origin/peerVostro handles above must not be reused after this
+  // (the run may rehash the maps); the settlement dispatch below uses captured
+  // values, so they are not.
+  fireAccountHook(originKey, ALIAS_OP_HOOK_WATCH, INVOKE_HOOK_SETTLE_OUT,
+                  destKey, amount);
 
   // 5. Dispatch remote transfer (settlementClient is non-null here). The
   // callback fires only on a TERMINAL failure: settlement retries until the
@@ -2659,6 +2732,24 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
   if (!origin.exists())
     return CES_ERROR_ORIGIN_NOT_FOUND;
 
+  // Hook sidecars point at a trigger program that runs with unbounded gas
+  // headroom relative to the account's own money; if the target could change
+  // after this check, a stranger could swap in draining bytecode. Require the
+  // trigger asset to be IMMUTABLE or owned by the setter, so the code the
+  // account committed to can never change under it. Checked once, here.
+  if (aliasOpIsHook(op)) {
+    minx::Hash triggerKey{};
+    std::memcpy(triggerKey.data(), content.data(), KEY_SIZE);
+    auto trigger = assets_.get(triggerKey);
+    bool ok = trigger.exists() &&
+              (isAssetImmutable(trigger.data().getBalance()) ||
+               trigger.data().getOwnerId() == origin.id);
+    if (!ok) {
+      LOGDEBUG << "setAlias: hook target not immutable or owned";
+      return CES_ERROR_HOOK_TARGET;
+    }
+  }
+
   uint8_t rc = origin.validateSpend(0, static_cast<uint64_t>(fee),
                                     providedNonce, errFee);
   if (rc != CES_OK)
@@ -2952,6 +3043,19 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           int64_t newBal = 0;
           uint8_t rc = transfer(req.originId, req.destKey, req.amount,
                                 TransferMode::Open, 0, effectiveNonce, newBal);
+          // SETTLE_IN watch: money landed on the dest via an open-transfer
+          // (the wire form of an incoming cross settlement). transfer() in Open
+          // mode is hook-exempt (a gate rejecting a committed cross would break
+          // vostro/reserve), so record it here instead - WATCH ONLY, after the
+          // credit commits, so there is no conservation risk. No settlement-vs-
+          // user-open discriminator: Open mode is overloaded and there is no
+          // reliable local signal (isConnected needs a probed peer; settlement
+          // can arrive from an unprobed one), so any Open landing on a hooked
+          // account is recorded. A rare local user open-transfer thus tags as
+          // SETTLE_IN; the event (a receipt) is real either way.
+          if (rc == CES_OK && req.amount >= hookFreeGrant())  // inbound floor
+            fireAccountHook(req.destKey, ALIAS_OP_HOOK_WATCH,
+                            INVOKE_HOOK_SETTLE_IN, req.originId, req.amount);
           // Record the dedup only once the transfer has committed: a NONCELESS
           // open-transfer that failed (e.g. insufficient balance) leaves no
           // event and must stay retryable so a later attempt can land.
@@ -3496,8 +3600,14 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
     std::string server;
     minx::Hash peerKey;
   };
+  struct DeferredHook {
+    minx::Hash dest;
+    minx::Hash counterparty;
+    uint64_t amount;
+  };
   std::vector<DeferredUdp> deferredUdp;
   std::vector<DeferredCrossXfer> deferredCrossXfers;
+  std::vector<DeferredHook> deferredHooks;
 
   auto saveAccount = [&](const HashPrefix& id) {
     auto it = accounts_->find(id);
@@ -3568,6 +3678,16 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
                                const minx::Hash& peerKey) {
     deferredCrossXfers.push_back({dest, amount, server, peerKey});
   };
+  // A program's SYS_TRANSFER to a hooked account: record it to fire the dest's
+  // WATCH after this run commits (XFER_VM). Skip while inside a hook (no
+  // cascades) and skip un-hooked dests cheaply (aliasId == 0). Counterparty is
+  // this run's caller (the account whose program moved the credit).
+  setup.creditHookFn = [&](const minx::Hash& dest, uint64_t amount) {
+    if (inHook_ || amount < hookFreeGrant()) return;   // inbound dust floor
+    auto it = accounts_->find(Account::getMapKey(dest));
+    if (it != accounts_->end() && it->second.getAliasId() != 0)
+      deferredHooks.push_back({dest, req.callerKey, amount});
+  };
   // SYS_SCHEDULE: enqueue synchronously (so the program sees the real
   // QUEUE_FULL/OK rc) but record the enqueue in the undo log, so a later VM
   // abort rolls it back. scheduledRuns_ is RAM-only, so commit needs no
@@ -3595,6 +3715,8 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
   vmHost.selfAssetKey = req.selfAssetKey;
   vmHost.programOwner = req.programOwnerPrefix;
   vmHost.input        = req.input;
+  vmHost.invokeKind   = req.invokeKind;
+  vmHost.refillCeiling = req.refillCeiling;
 
   // --- Execute VM ---
   CesVM vm;
@@ -3700,10 +3822,34 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
                        ? 0
                        : CESVM_CRASH_FEE;
   uint64_t spent = vmResult.budgetUsed + penalty;
-  if (spent < req.budget) {
+  // A free budget (the account-hook grant) was debited from no one, so there
+  // is nothing to refund; crediting the caller with the unused remainder would
+  // mint. Only refund a budget the caller actually pre-paid.
+  if (!req.freeBudget && spent < req.budget) {
     auto caller = accounts_.get(req.callerPrefix);
     if (caller.exists())
       caller.credit(req.budget - spent);
+  }
+
+  // Refill charge: the caller pays for gas consumed PAST the free grant (what
+  // SYS_REFILL made available). Applied here, after revert() and outside the
+  // undo log, so a crash still pays for the strand time it burned -- otherwise
+  // "refill, compute hard, crash" is free compute. Charge only the consumed
+  // portion (unused refill is free), bounded by what was granted and by the
+  // balance. `spent` includes the crash penalty; charge on budgetUsed alone so
+  // the refill charge is purely the gas the program actually burned.
+  if (vmHost.refilledTotal > 0 && vmResult.budgetUsed > req.budget) {
+    uint64_t consumed =
+        std::min(vmResult.budgetUsed - req.budget, vmHost.refilledTotal);
+    auto caller = accounts_.get(req.callerPrefix);
+    if (caller.exists() && consumed > 0) {
+      uint64_t pay = std::min<uint64_t>(
+          consumed, static_cast<uint64_t>(std::max<int64_t>(0, caller.balance())));
+      // A refill that consumes the whole balance deletes the account (debit's
+      // newBal<=0 branch) - the owner's footgun, bounded by the sidecar
+      // refill ceiling they chose.
+      if (pay > 0) caller.debit(pay);
+    }
   }
 
   // Flush the run's ledger events to the WAL. The gas refund just above and
@@ -3711,12 +3857,132 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
   // the pre-run gas debit already flushed — leaving a half-state on the WAL
   // that breaks conservation on crash-recovery. Flushing here makes the run
   // atomic with respect to durability.
-  if (!undoLog.empty() || spent < req.budget) {
+  if (!undoLog.empty() || spent < req.budget || vmHost.refilledTotal > 0) {
     accounts_->flush();
     assets_->flush();
   }
 
+  // Fire deferred XFER_VM watch hooks: a program's SYS_TRANSFER credited a
+  // hooked account. Only on commit (a reverted run never happened), and only as
+  // a WATCH (the credit is already committed; a program transfer cannot be
+  // gated). Each fires as a separate top-level run after this one is fully
+  // committed and flushed; fireAccountHook re-peeks and filters for a WATCH,
+  // and inHook_ (set during each) stops any cascade.
+  if (vmResult.error == CESVM_OK) {
+    for (const auto& h : deferredHooks) {
+      fireAccountHook(h.dest, ALIAS_OP_HOOK_WATCH, INVOKE_HOOK_XFER_VM,
+                      h.counterparty, h.amount);
+    }
+  }
+
   return out;
+}
+
+uint64_t CesServer::hookFreeGrant() {
+  uint64_t gasMult = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
+  if (gasMult == 0) gasMult = 1;
+  uint64_t fq = discountFee(FeeKind::Query, cfg_.feeQuery);
+  return CESVM_HOOK_GRANT_OPS * CESVM_COST_PER_OP * gasMult +
+         CESVM_HOOK_GRANT_READS * (CESVM_COST_PER_SYSCALL * gasMult + fq);
+}
+
+// ----------------------------------------------------------------------------
+// runAccountHook - account-hook (CESVM trigger) execution.
+// See the declaration in server.h for the identity/economics model and
+// local/account_hooks_design.md for the full design.
+// ----------------------------------------------------------------------------
+bool CesServer::runAccountHook(const minx::Hash& hookedKey,
+                               const minx::Hash& triggerAssetKey,
+                               uint64_t invokeKind,
+                               const minx::Hash& counterpartyKey,
+                               uint64_t amount, int64_t balance,
+                               uint64_t refillCeiling) {
+  // A hook never fires from inside a hook (no cascades, bounded nesting).
+  if (inHook_) return true;
+
+  auto asset = assets_.get(triggerAssetKey);
+  if (!asset.exists()) {
+    // Rotted/missing trigger (e.g. rent-starved): a GATE fails closed.
+    LOGDEBUG << "runAccountHook: trigger asset missing" << BVAR(triggerAssetKey);
+    return false;
+  }
+  AssetData content = asset.data().getContent();
+
+  uint64_t gasMult = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
+  if (gasMult == 0) gasMult = 1;
+  uint64_t grant = hookFreeGrant();
+
+  // Event descriptor into io[INPUT]:
+  //   [0..31]  counterparty pubkey
+  //   [32..39] amount (u64 LE)
+  //   [40..47] account balance at hook fire time (u64 LE): PRE-mutation for a
+  //            GATE (it runs before the credit/debit), POST-mutation for a
+  //            WATCH (it runs after). A gate computes the projected balance as
+  //            balance +/- amount; a watch already sees the settled balance.
+  ces::Bytes input(48, 0);
+  std::memcpy(input.data(), counterpartyKey.data(), KEY_SIZE);
+  ces::Buffer::pokeLE<uint64_t>(input.data() + 32, amount);
+  ces::Buffer::pokeLE<uint64_t>(input.data() + 40,
+                                static_cast<uint64_t>(balance));
+
+  VmRunRequest vreq;
+  vreq.callerPrefix       = Account::getMapKey(hookedKey);
+  vreq.callerKey          = hookedKey;
+  vreq.selfAssetKey       = triggerAssetKey;
+  vreq.programOwnerPrefix = HashPrefix{};   // empty: no consenting principal
+  vreq.code               = ces::Bytes(content.begin(), content.end());
+  vreq.input              = std::move(input);
+  vreq.budget             = grant;
+  vreq.allowance          = 0;              // read-only: no caller-account spend
+  vreq.gasMult            = gasMult;
+  vreq.invokeKind         = invokeKind;
+  vreq.freeBudget         = true;           // grant debited from no one
+  vreq.refillCeiling      = refillCeiling;  // SYS_REFILL cap (0 = off)
+
+  inHook_ = true;
+  VmRunResult vres;
+  try {
+    vres = executeVmRun(vreq);
+  } catch (...) {
+    vres.vmError = CESVM_HOST;
+  }
+  inHook_ = false;
+
+  // Verdict: clean TERM = accept; ABORT / fault / out-of-gas = reject.
+  return vres.vmError == CESVM_OK;
+}
+
+bool CesServer::fireAccountHook(const minx::Hash& accountKey, uint16_t wantOp,
+                                uint64_t invokeKind,
+                                const minx::Hash& counterpartyKey,
+                                uint64_t amount) {
+  ActiveAccount peek = accounts_.get(Account::getMapKey(accountKey));
+  if (!(peek.exists() && peek.balance() >= 0 &&
+        peek.data().getKey(peek.id) == accountKey &&
+        peek.data().getAliasId() != 0))
+    return true;  // no eligible account / no sidecar
+  auto al = aliases_.get(peek.data().getAliasId());
+  if (!(al.exists() && al.getOwner() == peek.id &&
+        al.data().getOp() == wantOp))
+    return true;  // no hook of the requested type
+  const AliasData& sc = al.data().getContent();
+  minx::Hash triggerKey{};
+  std::memcpy(triggerKey.data(), sc.data(), KEY_SIZE);
+  uint64_t ceiling = ces::Buffer::peekLE<uint64_t>(sc.data() + 32);
+  // A GATE runs as a PURE PREDICATE: no refill, so it has no money side effect.
+  // That keeps the composed sequence (OUT gate + IN gate + the transfer)
+  // atomic even though each hook run commits in its own executeVmRun and there
+  // is no journal enclosing the whole transfer: a later gate's reject cannot
+  // strand an earlier gate's charge, because gates never charge. Only WATCHES
+  // (which run AFTER the transfer commits, so there is nothing to be atomic
+  // with) may refill. A gate that needs more than the free grant is too
+  // expensive to run synchronously before every transfer anyway - that logic
+  // belongs in a watch.
+  if (wantOp == ALIAS_OP_HOOK_GATE) ceiling = 0;
+  int64_t bal = peek.balance();
+  // peek's iterator is invalid after this call; do not reuse it.
+  return runAccountHook(accountKey, triggerKey, invokeKind, counterpartyKey,
+                        amount, bal, ceiling);
 }
 
 // ----------------------------------------------------------------------------
@@ -6902,6 +7168,10 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
   vreq.budget             = run.budget;
   vreq.allowance          = run.allowance;
   vreq.gasMult            = cfg_.feeVmMult;
+  // Scheduled / autoexec / RPC-followup runs all fire through this path;
+  // they self-describe as SCHEDULED (autoexec, a boot-time scheduled run,
+  // shares it). A distinct AUTOEXEC kind would need a flag on the run record.
+  vreq.invokeKind         = INVOKE_SCHEDULED;
   vreq.enableVerifySig    = false;
   executeVmRun(vreq);
 

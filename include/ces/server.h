@@ -1371,6 +1371,12 @@ private:
                           uint64_t allowance, const ces::Bytes& input,
                           uint64_t time_us)> scheduleFn;
 
+    // Invoked by VmHost::creditDest when a program's SYS_TRANSFER credits an
+    // account: lets executeVmRun record a deferred XFER_VM hook to fire after
+    // the run commits (a program transfer cannot be gated; the hook is a
+    // watch). Empty = no hooks recorded.
+    std::function<void(const minx::Hash& dest, uint64_t amount)> creditHookFn;
+
     // true = real signature verification; false = always return false.
     bool enableVerifySig = false;
 
@@ -1455,6 +1461,17 @@ private:
     uint64_t   allowance = std::numeric_limits<uint64_t>::max();
     uint64_t   gasMult = 0;        // discounted (wire) or raw (cron)
     bool       enableVerifySig = false;
+    // Free gas that was NOT debited from anyone (the account-hook grant).
+    // executeVmRun must then NOT refund the unused remainder to the caller,
+    // which would mint. Undo-log rollback of the run's own effects is
+    // unaffected. See runAccountHook.
+    bool       freeBudget = false;
+    // Preloaded into io[CESVM_IO_INVOKE_KIND] (a CesVMInvoke value): which
+    // entry path started this run. Default INVOKE_DIRECT.
+    uint64_t   invokeKind = INVOKE_DIRECT;
+    // SYS_REFILL cap: max gas the run may draw from the caller account past
+    // `budget` (0 = refill disabled). Used by account hooks.
+    uint64_t   refillCeiling = 0;
   };
   struct VmRunResult {
     uint8_t    rcode = 0;
@@ -1464,6 +1481,36 @@ private:
     ces::Bytes output;
   };
   VmRunResult executeVmRun(const VmRunRequest& req);
+
+  // Run an account's CESVM trigger (account hook). v1: the inbound GATE on a
+  // wire transfer. Loads the trigger asset, runs it on the free grant (minimum
+  // compute, CESVM_HOOK_GRANT_*) with the hooked account as caller,
+  // programOwner empty (no consenting principal), allowance 0 (read-only), and
+  // an event descriptor in io[INPUT]. Returns true = accept (clean TERM),
+  // false = reject (abort/fault/out-of-gas, or a rotted/missing trigger asset:
+  // a gate fails closed). Must run on logicStrand_; callers must not hold an
+  // ActiveAccount/ActiveAsset handle across it (the run may rehash the maps).
+  bool runAccountHook(const minx::Hash& hookedKey,
+                      const minx::Hash& triggerAssetKey, uint64_t invokeKind,
+                      const minx::Hash& counterpartyKey, uint64_t amount,
+                      int64_t balance, uint64_t refillCeiling);
+  // Fire `accountKey`'s hook iff it exists, matches `wantOp` (GATE or WATCH),
+  // and the account is a real positive-balance match for the key. Returns true
+  // = accept / no hook (proceed), false = reject (GATE only; callers of a WATCH
+  // ignore the result). Read-only peek: holds no ActiveAccount/alias handle
+  // across the run. Extracts the trigger key + refill ceiling from the sidecar.
+  bool fireAccountHook(const minx::Hash& accountKey, uint16_t wantOp,
+                       uint64_t invokeKind, const minx::Hash& counterpartyKey,
+                       uint64_t amount);
+  // The account-hook free grant = MINIMUM COMPUTE at the live rates
+  // (CESVM_HOOK_GRANT_*). Doubles as the inbound dust floor: a transfer worth
+  // less than the cost of screening it fires no hook ("thanks for the money").
+  // One quantity, so the grant a screen gets and the floor it must clear are
+  // provably identical.
+  uint64_t hookFreeGrant();
+  // Re-entrancy guard: a hook never fires from inside a hook. logicStrand_-only,
+  // so a plain bool suffices.
+  bool inHook_ = false;
 
   CesConfig cfg_;
 

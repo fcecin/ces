@@ -12,7 +12,20 @@ using AliasData = std::array<uint8_t, 50>;
 // 16 bits (65536 codes); the vocabulary grows as features land.
 constexpr uint16_t ALIAS_OP_NONE   = 0x0000; // raw uninterpreted bytes (default); render as hex
 constexpr uint16_t ALIAS_OP_STRING = 0x0001; // UTF-8 text; render as text
+// Account hooks (CESVM triggers). The op selects when the trigger runs and its
+// failure mode; the content's first 32 bytes are the trigger program's asset
+// key (see local/account_hooks_design.md). Set-time: the server enforces the
+// target asset is IMMUTABLE or owned by the setter (CES_ERROR_HOOK_TARGET).
+constexpr uint16_t ALIAS_OP_HOOK_GATE  = 0x0010; // runs before the credit; may
+                                                 // reject (fail-closed). v1.
+constexpr uint16_t ALIAS_OP_HOOK_WATCH = 0x0011; // runs after the credit;
+                                                 // observe-only (fail-open). v2.
 constexpr uint16_t ALIAS_OP_SYSTEM = 0xFFFF; // reserved: the id-generator cell (id 0)
+
+// True if an alias op is any account-hook type.
+inline bool aliasOpIsHook(uint16_t op) {
+  return op == ALIAS_OP_HOOK_GATE || op == ALIAS_OP_HOOK_WATCH;
+}
 
 /**
  * Alias: a server-allocated, ID-keyed 64-byte sidecar bound to one account.

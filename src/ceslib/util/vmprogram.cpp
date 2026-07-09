@@ -492,6 +492,12 @@ VmProgram& VmProgram::sysWithdraw(WithdrawArgs a) {
   return hostxv(SYS_WITHDRAW, {a.amount});
 }
 
+VmProgram& VmProgram::sysRefill(RefillArgs a) {
+  // hostv, not hostxv: SYS_REFILL never fails (it grants 0 at worst), so a
+  // nonzero S must not abort. The program reads R for the granted amount.
+  return hostv(SYS_REFILL, {a.amount});
+}
+
 VmProgram& VmProgram::sysReadAsset(ReadAssetArgs a) {
   // Three contiguous inputs at io[4..6]: key cell-index, owner-out
   // cell-index, content-out cell-index. Balance and price are written

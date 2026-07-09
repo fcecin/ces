@@ -281,6 +281,56 @@ enum CesVMSyscall : uint64_t {
   // asset-owned chains). Bills feeTx, not feeAsset — matches the wire
   // CES_UPDATE_ASSET_META fee tier (cheaper than full content update).
   SYS_UPDATE_ASSET_META = 22,
+  // SYS_REFILL — top up this run's gas budget past the free grant, funded by
+  // the caller account (used by account hooks: the trigger spends its own
+  // account's money to do work bigger than the free grant, e.g. write
+  // history). io[4] = requested gas credits. Returns the amount actually
+  // granted in R (0 if refill is disabled or the sidecar ceiling / balance is
+  // exhausted); never aborts. The caller is charged post-run for gas consumed
+  // past the free grant, outside the undo log so a crash still pays for the
+  // strand time it used. No-op (grants 0) outside a run whose host set a
+  // refill ceiling. See local/account_hooks_design.md.
+  SYS_REFILL          = 23,
+};
+
+// Invocation kind — which entry path started this run. Preloaded into
+// io[CESVM_IO_INVOKE_KIND] from host.invokeKind so a program can dispatch on
+// how it was invoked. This is the universal VM invocation-context ABI: every
+// entry path stamps its value here; hooks are the first extension of it.
+//
+// APPEND-ONLY. Never renumber or reuse a value: a program built against an
+// older ABI treats an unrecognized kind as INVOKE_DIRECT semantics (read
+// io[INPUT] as opaque) or, for a gate, default-rejects. INVOKE_DIRECT = 0 so
+// zero-initialized io already means "direct call" with no migration.
+//
+// The hook subrange (16+) carries an event descriptor in io[INPUT] (which is
+// free on a hook, there being no user-supplied input): counterparty pubkey,
+// amount, resulting balance. Reserved values below are real fill-sites (a named
+// event, a fire-site, a descriptor), not placeholders: wiring one later is
+// "stamp the value + fill the descriptor", never an ABI break. Full model:
+// local/account_hooks_design.md.
+enum CesVMInvoke : uint64_t {
+  INVOKE_DIRECT        = 0,   // CES_RUN_ASSET (also the zero-init default).
+  INVOKE_SCHEDULED     = 1,   // SYS_SCHEDULE fire.
+  INVOKE_AUTOEXEC      = 2,   // boot autoexec.
+
+  // Account-hook subrange.
+  INVOKE_HOOK_XFER_IN  = 16,  // a local transfer credited this account.
+  INVOKE_HOOK_XFER_OUT = 17,  // this account sent a local transfer.
+  INVOKE_HOOK_XFER_VM  = 18,  // a program's SYS_TRANSFER credited this account
+                              // (deferred, never nested).
+
+  // Reserved: real events, not yet wired. See the design doc.
+  INVOKE_HOOK_MINT      = 32, // PoW mint credited this account.
+  INVOKE_HOOK_ASSET_BUY = 33, // CES_BUY_ASSET paid this account (asset owner).
+  // Cross-transfer settlement events, for complete transaction histories.
+  // Both WATCH-ONLY: a landed cross already committed on the origin so it
+  // cannot be gated (SETTLE_IN), and outbound gating is a porous soft
+  // guardrail not worth the settlement path (SETTLE_OUT). Fire points are on
+  // the settlement path (the dest credit / the crossTransfer origin debit),
+  // NOT the exempt transfer(Open) path.
+  INVOKE_HOOK_SETTLE_IN  = 34, // a cross transfer landed on this account.
+  INVOKE_HOOK_SETTLE_OUT = 35, // this account sent a cross transfer.
 };
 
 // Opcode numbers (one byte each). Exposed here as the single source of
@@ -476,8 +526,9 @@ static constexpr uint64_t CESVM_MAX_HOSTV_ARGS = 16;
 //
 // execute() writes only io[0..15] (registers) and the preloaded context in
 // io[752..1023]. The low scratch region io[16..63] belongs to the program.
-// New preloaded values go in the high region or the io[1022..1023] reserve,
-// never the low region, which would clobber programs relying on it as scratch.
+// New preloaded values go in the high region or the io[1023] reserve (io[1022]
+// is now the invocation kind), never the low region, which would clobber
+// programs relying on it as scratch.
 // ============================================================================
 static constexpr uint64_t CESVM_IO_INPUT_LEN  = 752;
 static constexpr uint64_t CESVM_IO_OUTPUT_LEN = 753;
@@ -495,6 +546,12 @@ static constexpr uint64_t CESVM_IO_ALLOWANCE  = 1020;
 // updated at op granularity instead of syscall granularity because
 // budget is consumed by every op, not just syscalls.
 static constexpr uint64_t CESVM_IO_BUDGET_REMAINING = 1021;
+// Invocation kind: which entry path started this run (a CesVMInvoke value).
+// execute() preloads it from host.invokeKind. Zero-init means INVOKE_DIRECT,
+// so a program that never reads this cell behaves exactly as before. Programs
+// that do read it dispatch on how they were invoked (direct call, scheduled,
+// autoexec, account hook). See CesVMInvoke.
+static constexpr uint64_t CESVM_IO_INVOKE_KIND = 1022;
 static constexpr uint64_t CESVM_MAX_INPUT     = 1024;
 static constexpr uint64_t CESVM_MAX_OUTPUT    = 1024;
 
@@ -526,6 +583,17 @@ static constexpr uint64_t CESVM_CRASH_FEE = 1000000;
 // Cost to schedule a delayed runAsset (base + per second of hosting)
 static constexpr uint64_t CESVM_SCHEDULE_BASE_COST = CESVM_COST_PER_OP * 100;  // 10000
 static constexpr uint64_t CESVM_SCHEDULE_PER_SEC = CESVM_COST_PER_OP;           // 100
+
+// Account-hook free grant = MINIMUM COMPUTE: the fixed gas budget every trigger
+// run starts with, sized as N instructions + M asset reads (not as a fraction
+// of any fee), converted to a credit budget at the live gasMult so a screen
+// always fits regardless of load. Too small to compute with (a screen, not a
+// program), so it is non-launderable via self-transfer no matter the nominal
+// credits. At stock fees this lands ~1.1x feeTx (screening an event costs about
+// a transaction). See local/account_hooks_design.md.
+//   grant = OPS*COST_PER_OP*gasMult + READS*(COST_PER_SYSCALL*gasMult + feeQuery)
+static constexpr uint64_t CESVM_HOOK_GRANT_OPS   = 50;
+static constexpr uint64_t CESVM_HOOK_GRANT_READS = 4;
 
 struct CesVMResult {
   uint64_t error = CESVM_OK;
@@ -577,6 +645,12 @@ public:
   // programOwner); bytecode-gated. See the programOwner field doc.
   // Backs SYS_WITHDRAW.
   virtual uint8_t  withdraw       (uint64_t)              { notImpl("withdraw"); }
+  // Grant up to `requested` gas credits, funded by the caller account, bounded
+  // by the refill ceiling and the account balance. Returns the amount granted;
+  // the VM adds it to its budget. Default 0 (refill disabled). Backs
+  // SYS_REFILL. The host tracks the running total in `refilledTotal` so
+  // executeVmRun can charge for gas consumed past the free grant.
+  virtual uint64_t refillGas      (uint64_t /*requested*/) { return 0; }
   virtual uint8_t  createAsset    (const minx::Hash&, const AssetData&, uint16_t)
   { notImpl("createAsset"); }
   // Caller pays, boot asset owns.
@@ -683,6 +757,19 @@ public:
   // who want to cap how much a gateway program can spend on their behalf.
   // Gas budget is *not* counted here; it has its own cap (`budget`).
   uint64_t allowance = std::numeric_limits<uint64_t>::max();
+
+  // Refill (SYS_REFILL). `refillCeiling` caps how much gas the run may draw
+  // from the caller account past the free grant (0 = refill disabled).
+  // `refilledTotal` is the running granted total, read by executeVmRun to
+  // charge the caller for gas consumed past the free grant.
+  uint64_t refillCeiling = 0;
+  uint64_t refilledTotal = 0;
+
+  // Which entry path started this run (a CesVMInvoke value). execute()
+  // preloads it into io[CESVM_IO_INVOKE_KIND]. Default INVOKE_DIRECT so the
+  // wire CES_RUN_ASSET path needs no change; scheduled/autoexec/hook paths set
+  // it explicitly.
+  uint64_t invokeKind = INVOKE_DIRECT;
 
   // Context
   minx::Hash callerKey;

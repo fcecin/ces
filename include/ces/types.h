@@ -174,7 +174,11 @@ enum error_code_t : uint8_t {
   CES_ERROR_BALANCE_OVERFLOW = 0x23,
   // Alias op referenced an id / account-selector that has no live alias.
   CES_ERROR_ALIAS_NOT_FOUND = 0x24,
-  CES_ERROR_LAST = CES_ERROR_ALIAS_NOT_FOUND
+  CES_ERROR_HOOK_REJECTED = 0x25,   // a destination account's GATE hook
+                                     // rejected the incoming transfer
+  CES_ERROR_HOOK_TARGET = 0x26,      // hook sidecar points at an asset that is
+                                     // not immutable and not owned by the setter
+  CES_ERROR_LAST = CES_ERROR_HOOK_TARGET
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -347,6 +351,8 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_BAD_INPUT:                        return "CES_ERROR_BAD_INPUT";
   case CES_ERROR_BALANCE_OVERFLOW:                 return "CES_ERROR_BALANCE_OVERFLOW";
   case CES_ERROR_ALIAS_NOT_FOUND:                  return "CES_ERROR_ALIAS_NOT_FOUND";
+  case CES_ERROR_HOOK_REJECTED:                    return "CES_ERROR_HOOK_REJECTED";
+  case CES_ERROR_HOOK_TARGET:                      return "CES_ERROR_HOOK_TARGET";
   default:                                         return "UNKNOWN_ERROR";
   }
 }

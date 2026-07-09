@@ -3407,6 +3407,50 @@ BOOST_AUTO_TEST_CASE(StackAndVariantWorks) {
   BOOST_CHECK_EQUAL(r.r, 0x30u);
 }
 
+// --- Invocation-kind ABI (io[CESVM_IO_INVOKE_KIND]) ---
+//
+// A program can read which entry path invoked it. Default is INVOKE_DIRECT
+// (0), so a program that never reads the cell is unaffected; execute()
+// preloads host.invokeKind for the paths that set it.
+BOOST_AUTO_TEST_CASE(InvocationKindPreloaded) {
+  auto host = makeNullHost();
+
+  // Program: copy io[INVOKE_KIND] into R, then TERM. R is observable via the
+  // result's register mirror is not exposed, so route it to the output window
+  // instead: output[0..7] = io[INVOKE_KIND], output_len = 8.
+  auto build = [](CesVMHost& h) {
+    VmProgram p;
+    // GPR0 = io[INVOKE_KIND]
+    p.set(Imm(CESVM_CELL_GPR0), Ref(CESVM_IO_INVOKE_KIND));
+    // output[0] cell = GPR0
+    p.set(Imm(CESVM_IO_OUTPUT), Ref(CESVM_CELL_GPR0));
+    p.set(Imm(CESVM_IO_OUTPUT_LEN), Imm(8));
+    p.term();
+    CesVM vm;
+    return vm.execute(p.buildBytes(), h, 1'000'000);
+  };
+
+  // Default: INVOKE_DIRECT (0).
+  {
+    auto r = build(host);
+    BOOST_REQUIRE_EQUAL(r.error, static_cast<uint64_t>(CESVM_OK));
+    BOOST_REQUIRE_EQUAL(r.output.size(), 8u);
+    uint64_t kind = 0;
+    std::memcpy(&kind, r.output.data(), 8);
+    BOOST_CHECK_EQUAL(kind, static_cast<uint64_t>(INVOKE_DIRECT));
+  }
+
+  // A hook-style invocation is visible to the program.
+  {
+    host.invokeKind = INVOKE_HOOK_XFER_IN;
+    auto r = build(host);
+    BOOST_REQUIRE_EQUAL(r.error, static_cast<uint64_t>(CESVM_OK));
+    uint64_t kind = 0;
+    std::memcpy(&kind, r.output.data(), 8);
+    BOOST_CHECK_EQUAL(kind, static_cast<uint64_t>(INVOKE_HOOK_XFER_IN));
+  }
+}
+
 // --- Fast core vs reference core differential ---
 //
 // The predecoded fast core (CESVM_OPT_PREDECODE) must be observably

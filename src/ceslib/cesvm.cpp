@@ -68,6 +68,7 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       std::chrono::system_clock::now().time_since_epoch()).count());
   io_[CESVM_IO_ALLOWANCE] = host.allowance;
   io_[CESVM_IO_BUDGET_REMAINING] = budget;
+  io_[CESVM_IO_INVOKE_KIND] = host.invokeKind;
   writeIoBytes(CESVM_IO_CALLER_KEY, host.callerKey.data(), KEY_SIZE);
   writeIoBytes(CESVM_IO_SELF_KEY, host.selfAssetKey.data(), KEY_SIZE);
   if (inputLen > 0)
@@ -1300,6 +1301,20 @@ void CesVM::hostCall(CesVMHost& host) {
     if (term_) return;
     if (!billCredits(host.feeTx)) return;
     S() = host.updateAssetMeta(key, newOwner, static_cast<uint32_t>(io_[6]));
+    break;
+  }
+
+  case SYS_REFILL: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    // Grow this run's budget by what the host grants (bounded host-side by the
+    // refill ceiling and the caller's balance). The caller is charged post-run
+    // for gas actually consumed past the free grant (executeVmRun), not for the
+    // grant itself, so unused refill costs nothing.
+    uint64_t granted = host.refillGas(io_[4]);
+    budget_ += granted;
+    io_[CESVM_IO_BUDGET_REMAINING] = budget_ - budgetUsed_;
+    R() = granted;
+    S() = CES_OK;
     break;
   }
 
