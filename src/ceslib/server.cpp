@@ -110,6 +110,12 @@ constexpr const char* ALIASES_DATA_SUBDIRECTORY = "aliases";
 // - Immutable assets: nobody may write.
 // - Asset-owned assets: only the executing boot asset itself can write.
 // - Account-owned assets: runner or program owner can write.
+// The `owner == programOwner` branch is a capability: it lets the run
+// rewrite programOwner's assets without programOwner signing. Sound only
+// while programOwner has consented to this bytecode (see the programOwner
+// field doc in cesvm.h). A run executing code its programOwner did not
+// consent to must pass programOwner empty, so only this branch's
+// caller-owned assets remain writable.
 // Returns CES_OK, CES_ERROR_IMMUTABLE, or CES_ERROR_NOT_OWNER.
 static inline uint8_t checkAssetWriteAuth(const Asset& asset,
                                            const HashPrefix& caller,
@@ -4579,7 +4585,14 @@ ces::AssetData buildDiceVmProgram() {
   p.set(ces::Imm(ces::CESVM_CELL_GPR0),
         ces::Ref(ces::CESVM_IO_ALLOWANCE));
 
-  // Caller deposits the bet to the owner (the house).
+  // Caller deposits the bet to the owner (the house). sysDeposit emits a
+  // hostx (abort-on-S!=0) op: this is THE GUARD. SYS_WITHDRAW below is an
+  // unbounded, allowance-exempt spend of the house (programOwner), so the
+  // payout must be unreachable unless the bet actually cleared. If the
+  // caller can't cover the bet, this aborts the run (undo-log rollback)
+  // before the flip -- an underfunded caller can never win house money.
+  // Do NOT weaken this to a non-aborting deposit. See the programOwner
+  // field doc in cesvm.h for the general model.
   p.sysDeposit({.amount = ces::Ref(ces::CESVM_CELL_GPR0)});
 
   // Coin flip.

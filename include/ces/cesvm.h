@@ -244,14 +244,16 @@ enum CesVMSyscall : uint64_t {
   // file auth / materialization checks otherwise.
   SYS_RPC             = 18,
   // SYS_OWNER_TRANSFER — same shape as SYS_TRANSFER (io[4]=dest cell ptr,
-  // io[5]=amount), but the source account is the program's owner
-  // (vmHost.programOwner), not the caller. The caller still pays the
-  // protocol fee (feeTx) because they invoked the syscall — only the
-  // value-bearing transfer is debited from the owner. No allowance check
-  // applies; the asset's owner deployed the bytecode and consented to
-  // whatever it does. Returns CES_ERROR_ORIGIN_NOT_FOUND if the program
-  // owner has no account (e.g. asset-owned chain), or
-  // CES_ERROR_INSUFFICIENT_BALANCE if the owner can't cover the amount.
+  // io[5]=amount), but the source account is programOwner, not the
+  // caller. The caller still pays the protocol fee (feeTx) because they
+  // invoked the syscall — only the value-bearing transfer is debited
+  // from programOwner. NO allowance check applies: this is an unbounded
+  // spend of programOwner, gated only by the bytecode reaching this
+  // instruction. See the programOwner field doc (this file) for the
+  // capability/security model and the /b/dice gating pattern. Returns
+  // CES_ERROR_ORIGIN_NOT_FOUND if programOwner has no account (e.g. an
+  // asset-owned chain, or a run with programOwner deliberately empty),
+  // or CES_ERROR_INSUFFICIENT_BALANCE if the owner can't cover it.
   SYS_OWNER_TRANSFER  = 19,
   // SYS_DEPOSIT — caller -> programOwner. Convenience for the common
   // "user funds the asset's owner" pattern (deposits, bets, payments
@@ -262,9 +264,15 @@ enum CesVMSyscall : uint64_t {
   SYS_DEPOSIT         = 20,
   // SYS_WITHDRAW — programOwner -> caller. Convenience for the
   // "asset pays its caller" pattern (refunds, payouts, faucets).
-  // io[4] = amount. NOT allowance-bound — the asset's owner consented
-  // to the bytecode by deploying it. Returns CES_ERROR_ORIGIN_NOT_FOUND
-  // or CES_ERROR_INSUFFICIENT_BALANCE per host.withdraw.
+  // io[4] = amount. NOT allowance-bound: an unbounded spend of
+  // programOwner, so the bytecode alone stands between it and a drain.
+  // The bytecode MUST reach this only on a path it authorized (in a
+  // faucet: only after the service was actually rendered / paid for).
+  // /b/dice pays 2*bet here but only after a hostx SYS_DEPOSIT proved
+  // the bet cleared; a plain (non-aborting) collect would let an
+  // underfunded caller win house money for free. See the programOwner
+  // field doc for the full model. Returns CES_ERROR_ORIGIN_NOT_FOUND or
+  // CES_ERROR_INSUFFICIENT_BALANCE per host.withdraw.
   SYS_WITHDRAW        = 21,
   // SYS_UPDATE_ASSET_META — set owner+price on an existing asset
   // without touching content. io[4] = key_ptr, io[5] = new_owner_ptr
@@ -558,13 +566,16 @@ public:
   // ---- Writes — return CES_OK on success, error code otherwise ------------
   virtual uint8_t  transfer       (const minx::Hash&, uint64_t)
   { notImpl("transfer"); }
-  // Same credit path as `transfer`, but the source is the program's
-  // owner (programOwner), not the caller. No allowance check.
+  // Same credit path as `transfer`, but the source is programOwner, not
+  // the caller. NO allowance check (unbounded spend of programOwner);
+  // bytecode-gated. See the programOwner field doc. Backs SYS_OWNER_TRANSFER.
   virtual uint8_t  ownerTransfer  (const minx::Hash&, uint64_t)
   { notImpl("ownerTransfer"); }
   // caller -> programOwner. Allowance-bound. Backs SYS_DEPOSIT.
   virtual uint8_t  deposit        (uint64_t)              { notImpl("deposit"); }
-  // programOwner -> caller. No allowance check. Backs SYS_WITHDRAW.
+  // programOwner -> caller. NO allowance check (unbounded spend of
+  // programOwner); bytecode-gated. See the programOwner field doc.
+  // Backs SYS_WITHDRAW.
   virtual uint8_t  withdraw       (uint64_t)              { notImpl("withdraw"); }
   virtual uint8_t  createAsset    (const minx::Hash&, const AssetData&, uint16_t)
   { notImpl("createAsset"); }
@@ -676,7 +687,29 @@ public:
   // Context
   minx::Hash callerKey;
   minx::Hash selfAssetKey;      // the asset being executed (boot cell)
-  HashPrefix programOwner{};    // owner of the boot cell (program author auth)
+  // The account this run may spend from WITHOUT an allowance check:
+  // SYS_OWNER_TRANSFER and SYS_WITHDRAW debit it, SYS_DEPOSIT credits
+  // it, and checkAssetWriteAuth lets the run rewrite its assets. It is a
+  // CAPABILITY (a consenting principal), not merely a provenance record,
+  // even though today it happens to equal the boot asset's current owner.
+  //
+  // SECURITY: this is a loaded gun. Any code path that reaches an
+  // allowance-exempt syscall spends this account, and the caller may be
+  // a stranger. The safety model is that the bytecode gates those
+  // syscalls itself; the field is only sound when the party it names has
+  // genuinely consented to this exact bytecode. In CES_RUN_ASSET that
+  // holds because deploying the asset IS the consent, and the deployer
+  // wrote the gate. /b/dice (buildDiceVmProgram in server.cpp) is the
+  // reference: it collects the bet with a hostx (abort-on-failure)
+  // SYS_DEPOSIT before it can ever reach the SYS_WITHDRAW payout, so an
+  // underfunded caller aborts the run instead of winning house money.
+  //
+  // A future caller that runs bytecode the named account did NOT consent
+  // to (e.g. an account-attached hook pointing at a stranger's program)
+  // MUST leave this empty; a zero prefix finds no account, so every
+  // allowance-exempt syscall no-ops and the run can only spend the
+  // caller via the allowance-bounded path.
+  HashPrefix programOwner{};
   ces::Bytes input;
 };
 
