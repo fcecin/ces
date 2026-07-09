@@ -185,13 +185,47 @@ cmake --build build/release --target cesvmbench --parallel
 # afterwards reset with -DCMAKE_CXX_FLAGS="" and rebuild via build.sh
 ```
 
-# Gas constant note
+# Gas calibration
 
-The gas cost comment in `cesvm.h` ("Baseline: ADD reg ~= 31 ns, 1 unit
-~= 0.31 ns") matches this rig's unthrottled before numbers. With the
-fast core an ADD-class op costs ~9 ns on wide operands and ~3-4 ns in
-short-val code, so CESVM_COST_PER_OP = 100 now overprices compute
-relative to wall time by roughly 3x. That is conservative (programs pay
-more gas per second of strand time than before), so no change is
-required; a future recalibration should re-run `cesvmbench ops` on a
-release build with the performance profile active.
+The `CESVM_COST_*` constants are anchored at 1 gas unit = 0.1 ns of
+logic-strand time, derived from the performance-profile tables above
+plus raw crypto measurements (`cesvmbench crypto`: ED25519 verify
+29.6 us, sign 21.7 us; SHA256 53.8 ns at 32 B rising ~0.46 ns/byte).
+Burning N units of gas always buys ~N/10 ns of strand time, uniformly
+across the opcode, syscall-dispatch, bulk-memory, hashing, and
+EC-verify lanes:
+
+| constant          | units  | implies      | measured               |
+|-------------------|--------|--------------|------------------------|
+| COST_PER_OP       | 100    | 10 ns        | 9.3 ns wide-op ADD (short-val runs faster, not discounted) |
+| COST_PER_SYSCALL  | 150    | 15 ns        | ~10-13 ns null dispatch |
+| COST_PER_MEMOP    | 500    | 50 ns        | ~54 ns SHA256 init     |
+| COST_PER_BYTE     | 5      | 0.5 ns/B     | 0.46 ns/B SHA256       |
+| COST_PER_CELL     | 3      | 0.3 ns/cell  | ~0.24 ns/cell MOV      |
+| COST_VERIFY_EC    | 300000 | 30 us        | 29.6 us ED25519 verify |
+
+Gas prices compute only; ledger-touching syscalls bill the same
+protocol fees as the wire ops (feeTx, feeQuery, feeAsset) on top, via
+billCredits.
+
+`feeVmMult` then converts gas units into credits as policy, anchored on
+the strand's opportunity cost: what the server earns settling instead.
+Measured with cesbench on this rig (100k-200k pre-signed transfers
+against the in-process server, ledger conservation verified):
+
+- ~80-82k TPS acked, 12.1-12.4 us per transfer (ed25519)
+- ~72k TPS, 13.8 us per transfer (secp256k1)
+- opportunity cost = feeTx x capacity = 32,000 x ~81k/s
+  ~= 2.6 credits per strand-ns
+
+A VM run at multiplier m burns ~10*m credits per strand-ns (100 units
+per ~10 ns op), so parity with settlement is m ~= 0.26: any m >= 1
+already out-earns the settlement lane. The default m = 5 prices VM
+compute at ~19x opportunity cost — deterrence enough that a
+strand-hogging program is a well-paying customer rather than a denial
+of service — while leaving the load discount (FeeKind::VMMult, floored
+at gasMult = 1) a real 5:1 busy/idle dynamic range. For scale, the L2
+compute lane charges feeComputeCpuSec = 5M credits per background
+core-second (0.005 credits/ns); the strand lane sits orders of
+magnitude above it because compute cores are fungible and the strand is
+the global lock.

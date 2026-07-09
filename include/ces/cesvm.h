@@ -490,21 +490,29 @@ static constexpr uint64_t CESVM_IO_BUDGET_REMAINING = 1021;
 static constexpr uint64_t CESVM_MAX_INPUT     = 1024;
 static constexpr uint64_t CESVM_MAX_OUTPUT    = 1024;
 
-// --- Gas cost constants (benchmarked on release build, 1M iterations) ---
-// Baseline: ADD reg ≈ 31 ns. 1 unit ≈ 0.31 ns.
+// --- Gas cost constants ---
+// Anchor: 1 gas unit = 0.1 ns of logic-strand time, measured on a release
+// build with cesvmbench (methodology and full tables: docs/cesvm-perf.md).
+// Every constant below is its measured wall cost expressed in that unit,
+// so gas is uniform across opcodes, syscall dispatch, bulk memory, hashing,
+// and EC verify: burning N units always buys ~N/10 ns of strand time.
+// Ledger mutations inside syscalls are NOT priced here; they bill the same
+// protocol fees as the wire ops (feeTx, feeQuery, ...) via billCredits.
 //
-// Cost per VM instruction in credits
+// Cost per VM instruction in gas units (~10 ns: wide-operand dispatch;
+// short-val code runs faster and is deliberately not discounted)
 static constexpr uint64_t CESVM_COST_PER_OP = 100;
-// Cost per syscall (dispatch + host callback, on top of per-op cost)
+// Cost per syscall (dispatch + host vtable, on top of per-op cost; ~15 ns)
 static constexpr uint64_t CESVM_COST_PER_SYSCALL = 150;
-// Cost for compute-only syscalls (HASH init, no ledger I/O)
-static constexpr uint64_t CESVM_COST_PER_MEMOP = 300;
-// Per-cell cost for variable-length memory opcodes (MOV, CMP, FIL)
-static constexpr uint64_t CESVM_COST_PER_CELL = 1;
-// Per-byte cost for variable-length data processing (HASH, VERIFY_SIG)
-static constexpr uint64_t CESVM_COST_PER_BYTE = 1;
-// EC signature verification cost (~1000x baseline op)
-static constexpr uint64_t CESVM_COST_VERIFY_EC = 100000;
+// Cost for compute-only syscalls (HASH init, no ledger I/O; ~50 ns)
+static constexpr uint64_t CESVM_COST_PER_MEMOP = 500;
+// Per-cell cost for variable-length memory opcodes (MOV, CMP, FIL; ~0.24 ns)
+static constexpr uint64_t CESVM_COST_PER_CELL = 3;
+// Per-byte cost for variable-length data processing (HASH, VERIFY_SIG;
+// SHA256 measures ~0.46 ns/byte)
+static constexpr uint64_t CESVM_COST_PER_BYTE = 5;
+// EC signature verification cost (ED25519 verify measures ~30 us)
+static constexpr uint64_t CESVM_COST_VERIFY_EC = 300000;
 // Fixed penalty on VM crash (deducted from refund, not from budget)
 static constexpr uint64_t CESVM_CRASH_FEE = 1000000;
 // Cost to schedule a delayed runAsset (base + per second of hosting)

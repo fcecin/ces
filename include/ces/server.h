@@ -47,7 +47,19 @@ constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 // separately (feeNetKiB*) and the bind contract removed the per-op
 // envelope verify, leaving this well below feeTx.
 constexpr uint64_t BASE_FEE_QUERY = 2'000;
-constexpr uint64_t BASE_FEE_VM_MULT = 50;
+// Gas-to-credits policy multiplier for CES_RUN_ASSET. The CESVM_COST_*
+// constants (cesvm.h) price VM work uniformly at 1 gas unit = 0.1 ns of
+// logic-strand time, so a run at multiplier m burns ~10*m credits per
+// strand-ns. The anchor is the strand's opportunity cost — what the
+// server earns settling instead: feeTx x measured transfer capacity
+// (cesbench: ~80k TPS, ~12 us/transfer) ≈ 2.6 credits per strand-ns.
+// m = 5 prices VM compute at ~19x that: enough margin that a
+// strand-hogging program is a well-paying customer rather than a denial
+// of service, while leaving the load discount (FeeKind::VMMult, which
+// scales gasMult toward 1 on an idle server) a real 5:1 dynamic range.
+// Ledger-touching syscalls bill their protocol fees separately
+// (billCredits); this multiplier prices pure compute only.
+constexpr uint64_t BASE_FEE_VM_MULT = 5;
 
 // ---------------------------------------------------------------------------
 // Default config values. Single source of truth: the CesConfig member
@@ -417,11 +429,13 @@ struct CesConfig {
   //                          "RAM is RAM" — same per-byte-day as the
   //                          full asset cell. 100K/byte-day at stock.
   //   feeComputeCpuSec     = 5_000_000, floor 1
-  //                          Full-core-second cost. 100× cheaper than
-  //                          a busy VM (feeVmMult=50 × ~10M ops/sec
-  //                          ≈ 500M/sec of wall-clock). At 10000 bp
-  //                          (full core) × 1 sec = 5M; at 500 bp
-  //                          (5% usage) × 1 sec = 250K.
+  //                          Full-core-second cost: 0.005 credits per
+  //                          ns of a background core. Deliberately far
+  //                          below the logic-strand VM lane (see
+  //                          BASE_FEE_VM_MULT): compute cores are
+  //                          fungible, the strand is the global lock.
+  //                          At 10000 bp (full core) × 1 sec = 5M; at
+  //                          500 bp (5% usage) × 1 sec = 250K.
   //
   // Orientation: a 1 MB idle service at stock fees pays roughly
   // ~72M (RAM) + ~18K (slot) per 60 s tick ≈ 104.9B/day

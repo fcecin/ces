@@ -231,14 +231,22 @@ int main(int argc, char* argv[]) {
     server->_brr(acc.key.getPublicKeyAsHash(), INITIAL_BALANCE);
   }
 
+  // The transfers run in Safe mode, which refuses to create the
+  // destination; the receiver account must exist up front.
+  KeyPair receiver(algo);
+  minx::Hash receiverPub = receiver.getPublicKeyAsHash();
+  server->_brr(receiverPub, 1);
+
   std::this_thread::sleep_for(std::chrono::milliseconds(5000));
 
   std::cout << "Pre-signing " << optTxCount << " transfer packets..." << std::endl;
   std::vector<minx::Bytes> packets;
   packets.reserve(optTxCount);
 
-  KeyPair receiver(algo);
-  minx::Hash receiverPub = receiver.getPublicKeyAsHash();
+  // Signed ops are bound to the destination server (anti-replay); derive
+  // the server's id from the same private key the config seeds.
+  HashPrefix serverId = Account::getMapKey(
+    KeyPair(cfg.serverPrivKey, algo).getPublicKeyAsHash());
 
   for (uint64_t i = 0; i < optTxCount; ++i) {
     size_t accIdx = i % optPoolSize;
@@ -247,6 +255,7 @@ int main(int argc, char* argv[]) {
 
     CesTransfer tx;
     tx.originId = sender.key.getPublicKeyAsHash();
+    tx.serverId = serverId;
     tx.destKey = receiverPub;
     tx.amount = 1;
     tx.reqNonce = sender.nonce;
@@ -376,11 +385,12 @@ int main(int argc, char* argv[]) {
   server->unsignedQueryAccount(Account::getMapKey(receiverPub), recvBal,
                                recvNonce, xd, xa, xt); }
 
-  bool recvOk = (recvBal == static_cast<int64_t>(totalVolumeExpected));
+  // +1: the receiver was seeded with 1 credit so the account exists.
+  bool recvOk = (recvBal == static_cast<int64_t>(totalVolumeExpected) + 1);
   std::cout << (recvOk ? " OK" : " FAIL") << std::endl;
   if (!recvOk) {
     std::cout << "  Receiver balance " << recvBal << " (expected "
-              << totalVolumeExpected << ")\n";
+              << (totalVolumeExpected + 1) << ")\n";
   }
 
   server->stop(false);
@@ -391,6 +401,12 @@ int main(int argc, char* argv[]) {
   std::cout << " Time        : " << seconds << " s\n";
   std::cout << " Throughput  : " << static_cast<uint64_t>(client.getSuccess() / seconds)
             << " TPS (acked)\n";
+  if (client.getSuccess() > 0)
+    std::cout << " Per transfer: "
+              << (seconds * 1e6 / static_cast<double>(client.getSuccess()))
+              << " us wall (sig verify parallel on task threads; when the"
+                 " logic strand is the bottleneck this approximates strand"
+                 " time per transfer)\n";
   std::cout << " Server Txs  : " << server->getTxCount() << "\n";
   std::cout << " Sent        : " << optTxCount << "\n";
   std::cout << " Verified    : " << totalVolumeExpected << "\n";
