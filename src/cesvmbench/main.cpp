@@ -1,11 +1,17 @@
 /**
- * CesVM opcode/syscall benchmark.
+ * CesVM interpreter benchmark.
  *
- * Runs each opcode and syscall in a tight loop, measures wall-clock time,
- * and reports nanoseconds per iteration and relative cost vs baseline (ADD).
+ * Four sections, selectable by argument (default: all):
+ *   prog    whole-program throughput (cesl workloads), ns/op and Mops/s —
+ *           the headline number for interpreter-core changes
+ *   ops     per-opcode ns/iter, relative cost vs baseline (ADD)
+ *   sys     per-syscall ns/iter against a null host
+ *   crypto  raw crypto costs outside the VM, for gas-constant context
  *
- * Build: cmake target "cesvmbench" (in tests/)
- * Run:   ./cesvmbench
+ * Build: cmake target "cesvmbench". Run on a RELEASE build; the gas
+ * constants in cesvm.h were calibrated against release numbers.
+ *
+ *   ./cesvmbench [prog|ops|sys|crypto]
  *
  * This is NOT a unit test — it produces human-readable benchmark output.
  */
@@ -14,6 +20,7 @@
 #include <ces/buffer.h>
 #include <ces/keys.h>
 #include <ces/types.h>
+#include <ces/lang/cesl.h>
 
 #include <cryptopp/sha.h>
 
@@ -164,11 +171,14 @@ static BenchResult runBench(const std::string& name, uint32_t iters,
   return {name, nsPerIter, result.opsExecuted, result.budgetUsed};
 }
 
-// Same as runBench but for syscalls — the body sets up syscall args + HOST
+// Same as runBench but for syscalls — the body sets up syscall args + HOST.
+// perIterCost covers syscalls with big fixed gas (VERIFY_EC) that the
+// default budget formula in runBench would exhaust mid-run.
 static BenchResult runSyscallBench(const std::string& name, uint32_t iters,
                                     uint8_t syscallNum,
                                     const ces::Bytes& argSetup,
-                                    CesVMHost& host) {
+                                    CesVMHost& host,
+                                    uint64_t perIterCost = 10000) {
   ces::Bytes body;
   // SET io[3] = syscallNum
   body.push_back(OP_SET);
@@ -178,21 +188,156 @@ static BenchResult runSyscallBench(const std::string& name, uint32_t iters,
   body.insert(body.end(), argSetup.begin(), argSetup.end());
   // HOST
   body.push_back(OP_HOST);
-  return runBench(name, iters, body, host);
+  return runBench(name, iters, body, host,
+                  static_cast<uint64_t>(iters) * perIterCost + 1000000);
 }
 
-int main() {
+// ----------------------------------------------------------------------------
+// Whole-program workloads (cesl source). Each stresses one interpreter
+// aspect; ns/op = wall time / result.opsExecuted is the core dispatch+
+// operand-decode cost the optimization work targets.
+// ----------------------------------------------------------------------------
+
+struct ProgSpec {
+  const char* name;
+  const char* what;
+  const char* src;
+};
+
+static const ProgSpec kPrograms[] = {
+  {"arith", "register arithmetic + loop branch", R"(
+    let i = 0;
+    let acc = 1;
+    while (i < 300000) {
+      acc = (acc *% 33) +% i;
+      i = i + 1;
+    }
+    output[0] = acc;
+    output_len = 8;
+  )"},
+  {"calls", "CALL/RET register frames", R"(
+    fn mix(a, b) {
+      return (a +% b) ^ (a << 1);
+    }
+    let i = 0;
+    let acc = 0;
+    while (i < 150000) {
+      acc = mix(acc, i);
+      i = i + 1;
+    }
+    output[0] = acc;
+    output_len = 8;
+  )"},
+  {"memory", "dynamic region indexing", R"(
+    let buf[256];
+    let pass = 0;
+    while (pass < 300) {
+      let j = 0;
+      while (j < 256) {
+        buf[j] = buf[j] +% (j ^ pass);
+        j = j + 1;
+      }
+      pass = pass + 1;
+    }
+    output[0] = buf[255];
+    output_len = 8;
+  )"},
+  {"stack", "deep expressions on the data stack", R"(
+    let i = 1;
+    let acc = 0;
+    while (i < 100000) {
+      acc = (acc +% ((i *% 3) +% 1) *% (i +% 2)) ^ (acc >> 3);
+      i = i + 1;
+    }
+    output[0] = acc;
+    output_len = 8;
+  )"},
+};
+
+// One timed run: warmup execute, then measured execute. Returns ns/op or
+// -1 on VM error. `legacy` selects the reference interpreter core (a no-op
+// when the build has CESVM_OPT_PREDECODE=0 — both columns then show the
+// reference core).
+static double progNsPerOp(const ces::Bytes& code, CesVMHost& host,
+                          bool legacy, uint64_t& opsOut) {
+  constexpr uint64_t budget = 2'000'000'000ULL;
+  CesVM vm;
+  vm._setLegacyCore(legacy);
+  auto r = vm.execute(code, host, budget);  // warmup
+  if (r.error != CESVM_OK) {
+    std::cerr << "VM error " << r.error << " after " << r.opsExecuted
+              << " ops\n";
+    return -1;
+  }
+  auto t0 = std::chrono::high_resolution_clock::now();
+  r = vm.execute(code, host, budget);
+  auto t1 = std::chrono::high_resolution_clock::now();
+  opsOut = r.opsExecuted;
+  return std::chrono::duration<double, std::nano>(t1 - t0).count() /
+         static_cast<double>(r.opsExecuted);
+}
+
+static void runPrograms(CesVMHost& host) {
+  std::cout << "PROGRAMS (cesl workloads), reference vs fast core:\n";
+  std::cout << std::left << std::setw(9) << "name"
+            << std::right << std::setw(11) << "ops"
+            << std::setw(10) << "ref ns"
+            << std::setw(10) << "fast ns"
+            << std::setw(9) << "Mops/s"
+            << std::setw(9) << "speedup"
+            << "  what\n";
+  std::cout << std::string(78, '-') << "\n";
+  for (const auto& p : kPrograms) {
+    ces::Bytes code;
+    try {
+      code = ceslCompile(p.src);
+    } catch (const std::exception& e) {
+      std::cerr << p.name << ": compile failed: " << e.what() << "\n";
+      continue;
+    }
+    uint64_t ops = 0;
+    double ref = progNsPerOp(code, host, true, ops);
+    double fast = progNsPerOp(code, host, false, ops);
+    if (ref < 0 || fast < 0) continue;
+    std::cout << std::left << std::setw(9) << p.name
+              << std::right << std::setw(11) << ops
+              << std::fixed << std::setprecision(2)
+              << std::setw(10) << ref
+              << std::setw(10) << fast
+              << std::setprecision(1)
+              << std::setw(9) << (1000.0 / fast)
+              << std::setw(8) << (ref / fast) << "x"
+              << "  " << p.what << "\n";
+  }
+  std::cout << "\n";
+}
+
+int main(int argc, char** argv) {
   blog::init();
   blog::set_level(blog::none);
   constexpr uint32_t N = 1'000'000;
+
+  std::string section = (argc > 1) ? argv[1] : "all";
+  bool all = (section == "all");
 
   auto host = makeNullHost();
 
   std::vector<BenchResult> results;
 
-  std::cout << "CesVM Benchmark — " << N << " iterations per test\n";
+  std::cout << "CesVM Benchmark\n";
   std::cout << std::string(72, '=') << "\n\n";
 
+  if (all || section == "prog")
+    runPrograms(host);
+
+  if (!all && section != "ops" && section != "sys" && section != "crypto")
+    return 0;
+
+  bool doOps = all || section == "ops";
+  bool doSys = all || section == "sys";
+  bool doCrypto = all || section == "crypto";
+
+  if (doOps) {
   // ---- OPCODES ----
   std::cout << "OPCODES:\n";
 
@@ -349,7 +494,9 @@ int main() {
 
   // FIL 32 cells
   results.push_back(runBench("FIL 32 cells", N, {OP_FIL, sv(16), sv(42), sv(32)}, host));
+  } // doOps
 
+  if (doSys) {
   // ---- SYSCALLS ----
   std::cout << "\nSYSCALLS:\n";
 
@@ -450,13 +597,13 @@ int main() {
     results.push_back(runBench("SYS_HASH 1024B", std::max(N / 10, 1u), body, host));
   }
 
-  // SYS_VERIFY_SIG (32 bytes data)
+  // SYS_VERIFY_SIG (32 bytes data) — carries CESVM_COST_VERIFY_EC per call
   results.push_back(runSyscallBench("SYS_VERIFY_SIG 32B", std::max(N / 100, 1u), SYS_VERIFY_SIG, {
     OP_SET, sv(4), sv(16),  // data ptr
     OP_SET, sv(5), sv(32),  // data len
     OP_SET, sv(6), sv(24),  // sig ptr
     OP_SET, sv(7), sv(36),  // pubkey ptr
-  }, host));
+  }, host, CESVM_COST_VERIFY_EC + 10000));
 
   // SYS_CROSS_TRANSFER
   results.push_back(runSyscallBench("SYS_CROSS_TRANSFER", N, SYS_CROSS_TRANSFER, {
@@ -476,7 +623,10 @@ int main() {
     OP_SET, sv(5), sv(48),  // content ptr
     OP_SET, sv(6), sv(10),  // days
   }, host));
+  } // doSys
 
+  double baseline = 0;
+  if (doOps || doSys) {
   // ---- REPORT ----
   std::cout << "\n" << std::string(72, '=') << "\n";
   std::cout << std::left << std::setw(25) << "Operation"
@@ -488,7 +638,6 @@ int main() {
   std::cout << std::string(72, '-') << "\n";
 
   // Find ADD reg as baseline
-  double baseline = 0;
   for (auto& r : results) {
     if (r.name == "ADD reg") {
       baseline = r.nsPerIter;
@@ -509,7 +658,10 @@ int main() {
 
   std::cout << "\nBaseline (ADD reg) = " << std::fixed << std::setprecision(1)
             << baseline << " ns/iter\n";
+  } // report
+  if (baseline <= 0) baseline = 1;
 
+  if (doCrypto) {
   // ---- RAW CRYPTO BENCHMARKS ----
   std::cout << "\n" << std::string(72, '=') << "\n";
   std::cout << "RAW CRYPTO (outside VM, direct API calls):\n";
@@ -605,6 +757,7 @@ int main() {
                 << std::setw(10) << (ns / baseline) << "x\n";
     }
   }
+  } // doCrypto
 
   return 0;
 }

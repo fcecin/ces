@@ -41,8 +41,8 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
                            uint64_t gasMult) {
   CesVMResult result;
   std::memset(io_, 0, sizeof(io_));
-  stack_.clear();
-  context_.clear();
+  stackClear();
+  ctxClear();
   term_ = CESVM_OK;
   budget_ = budget;
   budgetUsed_ = 0;
@@ -73,127 +73,140 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
   if (inputLen > 0)
     writeIoBytes(CESVM_IO_INPUT, host.input.data(), inputLen);
 
-  uint64_t op1, op2;
+  // Per-op gas precompute (see billOp): an overflowing COST_PER_OP*gasMult
+  // matches bill()'s overflow guard -- halt as budget-exhausted on the
+  // first op.
+  opCostOvf_ = CESVM_COST_PER_OP >
+               std::numeric_limits<uint64_t>::max() / gasMult_;
+  opCost_ = opCostOvf_ ? 0 : CESVM_COST_PER_OP * gasMult_;
+
+#if CESVM_OPT_PREDECODE
+  if (legacyCore_) runLegacy(host, result);
+  else             runFast(host, result);
+#else
+  runLegacy(host, result);
+#endif
+
+  result.error = term_;
+  result.budgetUsed = budgetUsed_;
+
+  // Read output from fixed io location
+  size_t outLen = std::min(io_[CESVM_IO_OUTPUT_LEN], uint64_t(CESVM_MAX_OUTPUT));
+  if (outLen > 0) {
+    result.output.resize(outLen);
+    readIoBytes(CESVM_IO_OUTPUT, result.output.data(), outLen);
+  }
+
+  return result;
+}
+
+// --- Reference interpreter core ---
+
+void CesVM::runLegacy(CesVMHost& host, CesVMResult& result) {
   while (!term_ && PC() < code_.size()) {
     result.opsExecuted++;
+    if (!billOp()) { PC()++; break; }
+    stepSlow(host);
+  }
+}
 
-    uint8_t opcode = code_[PC()++];
+// Execute exactly one instruction at PC. The base per-op cost has already
+// been billed by the caller (runLegacy or the fast core's dispatch);
+// variable extra costs (HOSTV's per-arg writes, MOV/CMP/FIL per-cell) are
+// billed here. This switch is the reference semantics: the fast core must
+// match it observably, and replays through it anything it does not
+// fast-path.
+void CesVM::stepSlow(CesVMHost& host) {
+  uint64_t op1, op2;
+  uint8_t opcode = code_[PC()++];
 
     switch (opcode) {
     case OP_NOP:
-      if (!bill(CESVM_COST_PER_OP)) break;
       break;
     case OP_TERM:
-      if (!bill(CESVM_COST_PER_OP)) break;
       PC() = UINT64_MAX;
       break;
     case OP_SET:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       op2 = read();
       get(op1) = op2;
       break;
     case OP_JMP:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(true);
       PC() = op1;
       break;
     case OP_ADD:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 + op2; break;
     case OP_ADD | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 + op2); break;
     case OP_SUB:
       // Two's-complement subtraction. Wraps silently on underflow
       // (consistent with ADD/MUL/NEG); programs that need to detect
       // "would go negative" branch on a CMP first.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       R() = op1 - op2;
       break;
     case OP_SUB | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       push(op1 - op2);
       break;
     case OP_MUL:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 * op2; break;
     case OP_MUL | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 * op2); break;
     case OP_DIV:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2) R() = op1 / op2; else term_ = CESVM_DIVZERO;
       break;
     case OP_DIV | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2) push(op1 / op2); else term_ = CESVM_DIVZERO;
       break;
     case OP_MOD:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2) R() = op1 % op2; else term_ = CESVM_DIVZERO;
       break;
     case OP_MOD | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2) push(op1 % op2); else term_ = CESVM_DIVZERO;
       break;
     case OP_OR:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 | op2; break;
     case OP_OR | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 | op2); break;
     case OP_ANDL:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 && op2; break;
     case OP_ANDL | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 && op2); break;
     case OP_XOR:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 ^ op2; break;
     case OP_XOR | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 ^ op2); break;
     case OP_NOT:
       // Bitwise complement (per x86/ARM/MIPS convention: NOT = ~x).
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); R() = ~op1; break;
     case OP_NOT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop(); push(~op1); break;
     case OP_LNOT:
       // Logical NOT: 0 → 1, anything else → 0.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); R() = !op1; break;
     case OP_LNOT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop(); push(!op1); break;
     case OP_SHL:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       // Shifting a uint64_t by >= 64 bits is UB per [expr.shift]/1.
       // Reject attacker bytecode that would trigger it.
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       R() = op1 << op2; break;
     case OP_SHL | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       push(op1 << op2); break;
     case OP_SHR:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       R() = op1 >> op2; break;
     case OP_SHR | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       push(op1 >> op2); break;
@@ -201,72 +214,52 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // Arithmetic shift right — preserves the sign bit. C++20 guarantees
       // signed `>>` is arithmetic (P0907R4); same UB rule for op2 >= 64
       // applies as in SHR/SHL.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       R() = static_cast<uint64_t>(static_cast<int64_t>(op1) >>
                                   static_cast<int>(op2)); break;
     case OP_SAR | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2 >= 64) { term_ = CESVM_SEGFAULT; break; }
       push(static_cast<uint64_t>(static_cast<int64_t>(op1) >>
                                  static_cast<int>(op2))); break;
     case OP_INC:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); ++get(op1); break;
     case OP_DEC:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); --get(op1); break;
     case OP_PUSH:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); push(op1); break;
     case OP_POP:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); get(op1) = pop(); break;
     case OP_AND:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 & op2; break;
     case OP_AND | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 & op2); break;
     case OP_HOST:
-      if (!bill(CESVM_COST_PER_OP)) break;
       hostCall(host);
       break;
     case OP_HOSTX:
-      if (!bill(CESVM_COST_PER_OP)) break;
       hostCall(host);
       if (!term_ && S() != 0) term_ = CESVM_ABORT;
       break;
     case OP_ABORT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       term_ = CESVM_ABORT;
       break;
     case OP_VPUSH:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       ++get(op1); get(get(op1)) = op2;
       break;
     case OP_VPOP:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       get(op2) = get(op1); --get(op1);
       break;
     case OP_CALL: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(true);
       // Hard cap on call depth to close a stack-recursion DoS vector
       // analogous to the data-stack cap in push(). 256 frames is plenty
       // for any realistic program; deeper recursion almost always
       // indicates a bug.
-      if (context_.size() >= CESVM_MAX_CALL_DEPTH) {
-        term_ = CESVM_SEGFAULT;
-        break;
-      }
-      std::array<uint64_t, CESVM_REG_SIZE> regs;
-      std::memcpy(regs.data(), &io_[0], sizeof(uint64_t) * CESVM_REG_SIZE);
-      context_.push_back(regs);
+      if (!ctxPush()) break;
       PC() = op1;
       break;
     }
@@ -275,15 +268,8 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // inline. Equivalent to OP_CALLR for a runtime-computed target,
       // but consumes the value off the stack rather than dereferencing
       // a cell. Same call-depth cap as OP_CALL.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
-      if (context_.size() >= CESVM_MAX_CALL_DEPTH) {
-        term_ = CESVM_SEGFAULT;
-        break;
-      }
-      std::array<uint64_t, CESVM_REG_SIZE> regs;
-      std::memcpy(regs.data(), &io_[0], sizeof(uint64_t) * CESVM_REG_SIZE);
-      context_.push_back(regs);
+      if (!ctxPush()) break;
       PC() = op1;
       break;
     }
@@ -291,22 +277,14 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // Indirect JMP: target comes from a regular operand, so it can
       // be dereferenced through a cell (e.g. R after SYS_LOAD_CODE
       // wrote the loaded block's offset there).
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       PC() = op1;
       break;
     case OP_CALLR: {
       // Indirect CALL: same shape as OP_CALL but the target is a
       // runtime value. See OP_JMPR.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
-      if (context_.size() >= CESVM_MAX_CALL_DEPTH) {
-        term_ = CESVM_SEGFAULT;
-        break;
-      }
-      std::array<uint64_t, CESVM_REG_SIZE> regs;
-      std::memcpy(regs.data(), &io_[0], sizeof(uint64_t) * CESVM_REG_SIZE);
-      context_.push_back(regs);
+      if (!ctxPush()) break;
       PC() = op1;
       break;
     }
@@ -322,7 +300,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // malformed arg stream (which would set term_ = CESVM_CODESIZE
       // mid-read) can't leave io half-populated in a state the
       // syscall would see as half-filled.
-      if (!bill(CESVM_COST_PER_OP)) break;
       uint64_t syscallNum = read();
       if (term_) break;
       uint64_t argCount = read();
@@ -356,146 +333,111 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_RET: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
-      if (context_.empty()) { term_ = CESVM_RET; break; }
-      std::memcpy(&io_[0], context_.back().data(),
-                  sizeof(uint64_t) * CESVM_REG_SIZE);
-      context_.pop_back();
+      if (ctxEmpty()) { term_ = CESVM_RET; break; }
+      ctxRestorePop();
       R() = op1;
       break;
     }
     case OP_JF:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       if (!op1) { PC() = read(true); }
       else { PC() += 2; }
       break;
     case OP_JF | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       if (!op1) { PC() = read(true); }
       else { PC() += 2; }
       break;
     case OP_JT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       if (op1) { PC() = read(true); }
       else { PC() += 2; }
       break;
     case OP_JT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       if (op1) { PC() = read(true); }
       else { PC() += 2; }
       break;
     case OP_EQ:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 == op2; break;
     case OP_EQ | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 == op2); break;
     case OP_NE:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 != op2; break;
     case OP_NE | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 != op2); break;
     case OP_GT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 > op2; break;
     case OP_GT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 > op2); break;
     case OP_LT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 < op2; break;
     case OP_LT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 < op2); break;
     case OP_GE:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 >= op2; break;
     case OP_GE | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 >= op2); break;
     case OP_LE:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 <= op2; break;
     case OP_LE | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 <= op2); break;
     case OP_SLT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       R() = static_cast<int64_t>(op1) < static_cast<int64_t>(op2); break;
     case OP_SLT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       push(static_cast<int64_t>(op1) < static_cast<int64_t>(op2)); break;
     case OP_SGT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       R() = static_cast<int64_t>(op1) > static_cast<int64_t>(op2); break;
     case OP_SGT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       push(static_cast<int64_t>(op1) > static_cast<int64_t>(op2)); break;
     case OP_SGE:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       R() = static_cast<int64_t>(op1) >= static_cast<int64_t>(op2); break;
     case OP_SGE | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       push(static_cast<int64_t>(op1) >= static_cast<int64_t>(op2)); break;
     case OP_SLE:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       R() = static_cast<int64_t>(op1) <= static_cast<int64_t>(op2); break;
     case OP_SLE | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       push(static_cast<int64_t>(op1) <= static_cast<int64_t>(op2)); break;
     case OP_ADDX:
       // Checked unsigned add: a wrap halts with CESVM_OVERFLOW instead
       // of producing a mod-2^64 result. Same shape for SUBX/MULX below.
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op1 > UINT64_MAX - op2) { term_ = CESVM_OVERFLOW; break; }
       R() = op1 + op2; break;
     case OP_ADDX | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op1 > UINT64_MAX - op2) { term_ = CESVM_OVERFLOW; break; }
       push(op1 + op2); break;
     case OP_SUBX:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2 > op1) { term_ = CESVM_OVERFLOW; break; }
       R() = op1 - op2; break;
     case OP_SUBX | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2 > op1) { term_ = CESVM_OVERFLOW; break; }
       push(op1 - op2); break;
     case OP_MULX:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read();
       if (op2 != 0 && op1 > UINT64_MAX / op2) { term_ = CESVM_OVERFLOW; break; }
       R() = op1 * op2; break;
     case OP_MULX | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop();
       if (op2 != 0 && op1 > UINT64_MAX / op2) { term_ = CESVM_OVERFLOW; break; }
       push(op1 * op2); break;
     case OP_ASSERT:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       if (!op1) term_ = CESVM_ABORT;
       break;
     case OP_ASSERT | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       // pop() on an empty stack already set CESVM_UNDERFLOW and
       // returned 0; do not misreport that crash as an assert failure.
@@ -505,7 +447,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // pop-then-push-twice inherits the existing edge semantics: empty
       // stack halts with CESVM_UNDERFLOW via pop(), a stack at cap
       // halts with CESVM_SEGFAULT on the second push().
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       push(op1);
       push(op1);
@@ -514,43 +455,34 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       // Arithmetic two's-complement negate. Wraps at 0 (NEG of 0 is 0;
       // NEG of INT64_MIN is itself — that's the well-known x86 quirk
       // and we replicate it: -x = 0 - x mod 2^64).
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read();
       R() = static_cast<uint64_t>(0) - op1;
       break;
     case OP_NEG | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       push(static_cast<uint64_t>(0) - op1);
       break;
     case OP_ORL:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = read(); op2 = read(); R() = op1 || op2; break;
     case OP_ORL | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); op1 = pop(); push(op1 || op2); break;
     case OP_RND:
-      if (!bill(CESVM_COST_PER_OP)) break;
       R() = rng_();
       break;
     case OP_RND | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       push(rng_());
       break;
     case OP_TIME:
-      if (!bill(CESVM_COST_PER_OP)) break;
       R() = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count());
       break;
     case OP_TIME | STACK:
-      if (!bill(CESVM_COST_PER_OP)) break;
       push(static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
           std::chrono::system_clock::now().time_since_epoch()).count()));
       break;
     case OP_MOV: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       // MOV dst, src, count — copy count cells from io[src] to io[dst]
       op1 = read(); // dst
       op2 = read(); // src
@@ -564,7 +496,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_LDB: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       // LDB — R = byte at byte_offset (read from io as byte array)
       op1 = read(); // byte offset
       auto* base = reinterpret_cast<uint8_t*>(io_);
@@ -575,7 +506,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_LDB | STACK: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       op1 = pop();
       auto* base = reinterpret_cast<uint8_t*>(io_);
       if (op1 >= CESVM_IO_SIZE * sizeof(uint64_t)) {
@@ -585,7 +515,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_STB: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       // STB — store low byte of value at byte_offset
       op1 = read(); // byte offset
       op2 = read(); // value (low byte used)
@@ -597,7 +526,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_STB | STACK: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       op2 = pop(); // value
       op1 = pop(); // byte offset
       auto* base = reinterpret_cast<uint8_t*>(io_);
@@ -608,7 +536,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_CMP: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       // CMP a, b, count → R = 1 if io[a..a+count-1] == io[b..b+count-1]
       op1 = read(); // a (cell offset)
       op2 = read(); // b (cell offset)
@@ -622,7 +549,6 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
       break;
     }
     case OP_FIL: {
-      if (!bill(CESVM_COST_PER_OP)) break;
       // FIL dst, val, count → fill io[dst..dst+count-1] with val
       op1 = read(); // dst (cell offset)
       op2 = read(); // value (uint64_t)
@@ -638,22 +564,487 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
     default:
       term_ = CESVM_OPCODE;
     }
-
-    if (term_) break;
-  }
-
-  result.error = term_;
-  result.budgetUsed = budgetUsed_;
-
-  // Read output from fixed io location
-  size_t outLen = std::min(io_[CESVM_IO_OUTPUT_LEN], uint64_t(CESVM_MAX_OUTPUT));
-  if (outLen > 0) {
-    result.output.resize(outLen);
-    readIoBytes(CESVM_IO_OUTPUT, result.output.data(), outLen);
-  }
-
-  return result;
 }
+
+#if CESVM_OPT_PREDECODE
+
+// ============================================================================
+// Fast interpreter core: memoized operand pre-decode plus (optionally)
+// computed-goto dispatch. See the CESVM_OPT_* block in cesvm.h for the
+// contract. stepSlow defines the semantics; instructions this core cannot
+// statically decode (variadic HOSTV/HOSTXV, operands dereferencing cell 0,
+// any encoding anomaly) keep h = H_SLOW and replay through stepSlow --
+// same bytes, same faults, same side effects.
+// ============================================================================
+
+// Dense fast-handler indices. The X-macro keeps the enum and the threaded
+// dispatch table in lockstep; H_SLOW must stay first (a zero-initialized
+// Decoded dispatches to it, and decodeAt leaves h = H_SLOW on any anomaly).
+#define CESVM_FAST_HANDLERS(X) \
+  X(SLOW) X(NOP) X(TERM) X(SET) X(JMP) X(INC) X(DEC) X(PUSH) X(POP) \
+  X(HOST) X(HOSTX) X(ABORT) X(VPUSH) X(VPOP) X(CALL) X(CALL_S) X(CALLR) \
+  X(JMPR) X(RET) X(JF) X(JF_S) X(JT) X(JT_S) X(DUP) X(RND) X(RND_S) \
+  X(TIME) X(TIME_S) X(MOV) X(CMP) X(FIL) X(LDB) X(LDB_S) X(STB) X(STB_S) \
+  X(ADD) X(ADD_S) X(SUB) X(SUB_S) X(MUL) X(MUL_S) X(DIV) X(DIV_S) \
+  X(MOD) X(MOD_S) X(OR) X(OR_S) X(AND) X(AND_S) X(XOR) X(XOR_S) \
+  X(ANDL) X(ANDL_S) X(ORL) X(ORL_S) X(NOT) X(NOT_S) X(LNOT) X(LNOT_S) \
+  X(NEG) X(NEG_S) X(SHL) X(SHL_S) X(SHR) X(SHR_S) X(SAR) X(SAR_S) \
+  X(EQ) X(EQ_S) X(NE) X(NE_S) X(GT) X(GT_S) X(LT) X(LT_S) X(GE) X(GE_S) \
+  X(LE) X(LE_S) X(SLT) X(SLT_S) X(SGT) X(SGT_S) X(SGE) X(SGE_S) \
+  X(SLE) X(SLE_S) X(ADDX) X(ADDX_S) X(SUBX) X(SUBX_S) X(MULX) X(MULX_S) \
+  X(ASSERT) X(ASSERT_S)
+
+enum : uint16_t {
+#define X(n) H_##n,
+  CESVM_FAST_HANDLERS(X)
+#undef X
+  H_COUNT
+};
+
+// Static per-opcode decode plan: fast handler, inline operand count, and
+// whether a 2-byte literal jump target follows the operands (the
+// read(true) form). H_SLOW rows never reach decodeAt's operand walk.
+struct FastOpInfo {
+  uint16_t h = H_SLOW;
+  uint8_t nops = 0;
+  bool jumpTail = false;
+};
+
+static constexpr std::array<FastOpInfo, 256> kFastOpInfo = [] {
+  std::array<FastOpInfo, 256> t{};
+  auto op = [&](uint8_t code, uint16_t h, uint8_t nops, bool tail = false) {
+    t[code] = {h, nops, tail};
+  };
+  op(OP_NOP,   H_NOP,   0);       op(OP_TERM,  H_TERM,  0);
+  op(OP_SET,   H_SET,   2);       op(OP_JMP,   H_JMP,   0, true);
+  op(OP_ADD,   H_ADD,   2);       op(OP_SUB,   H_SUB,   2);
+  op(OP_MUL,   H_MUL,   2);       op(OP_DIV,   H_DIV,   2);
+  op(OP_MOD,   H_MOD,   2);       op(OP_OR,    H_OR,    2);
+  op(OP_ANDL,  H_ANDL,  2);       op(OP_XOR,   H_XOR,   2);
+  op(OP_NOT,   H_NOT,   1);       op(OP_SHL,   H_SHL,   2);
+  op(OP_SHR,   H_SHR,   2);       op(OP_INC,   H_INC,   1);
+  op(OP_DEC,   H_DEC,   1);       op(OP_PUSH,  H_PUSH,  1);
+  op(OP_POP,   H_POP,   1);       op(OP_AND,   H_AND,   2);
+  op(OP_HOST,  H_HOST,  0);       op(OP_VPUSH, H_VPUSH, 2);
+  op(OP_VPOP,  H_VPOP,  2);       op(OP_CALL,  H_CALL,  0, true);
+  op(OP_RET,   H_RET,   1);       op(OP_JF,    H_JF,    1, true);
+  op(OP_JT,    H_JT,    1, true); op(OP_EQ,    H_EQ,    2);
+  op(OP_NE,    H_NE,    2);       op(OP_GT,    H_GT,    2);
+  op(OP_LT,    H_LT,    2);       op(OP_GE,    H_GE,    2);
+  op(OP_LE,    H_LE,    2);       op(OP_NEG,   H_NEG,   1);
+  op(OP_ORL,   H_ORL,   2);       op(OP_RND,   H_RND,   0);
+  op(OP_TIME,  H_TIME,  0);       op(OP_MOV,   H_MOV,   3);
+  op(OP_LDB,   H_LDB,   1);       op(OP_STB,   H_STB,   2);
+  op(OP_CMP,   H_CMP,   3);       op(OP_FIL,   H_FIL,   3);
+  op(OP_HOSTX, H_HOSTX, 0);       op(OP_ABORT, H_ABORT, 0);
+  op(OP_JMPR,  H_JMPR,  1);       op(OP_CALLR, H_CALLR, 1);
+  // OP_HOSTV / OP_HOSTXV stay H_SLOW: their operand count is a runtime
+  // value, so there is nothing static to pre-decode.
+  op(OP_SAR,   H_SAR,   2);       op(OP_LNOT,  H_LNOT,  1);
+  op(OP_SLT,   H_SLT,   2);       op(OP_SGT,   H_SGT,   2);
+  op(OP_SGE,   H_SGE,   2);       op(OP_SLE,   H_SLE,   2);
+  op(OP_ADDX,  H_ADDX,  2);       op(OP_SUBX,  H_SUBX,  2);
+  op(OP_MULX,  H_MULX,  2);       op(OP_ASSERT, H_ASSERT, 1);
+  op(OP_DUP,   H_DUP,   0);
+  // Stack variants: operands come off the data stack, so no inline
+  // operands; JF/JT keep their literal jump tail.
+  auto sop = [&](uint8_t code, uint16_t h, bool tail = false) {
+    t[code | STACK] = {h, 0, tail};
+  };
+  sop(OP_ADD, H_ADD_S);   sop(OP_SUB, H_SUB_S);   sop(OP_MUL, H_MUL_S);
+  sop(OP_DIV, H_DIV_S);   sop(OP_MOD, H_MOD_S);   sop(OP_OR, H_OR_S);
+  sop(OP_ANDL, H_ANDL_S); sop(OP_XOR, H_XOR_S);   sop(OP_NOT, H_NOT_S);
+  sop(OP_SHL, H_SHL_S);   sop(OP_SHR, H_SHR_S);   sop(OP_AND, H_AND_S);
+  sop(OP_CALL, H_CALL_S); sop(OP_JF, H_JF_S, true); sop(OP_JT, H_JT_S, true);
+  sop(OP_EQ, H_EQ_S);     sop(OP_NE, H_NE_S);     sop(OP_GT, H_GT_S);
+  sop(OP_LT, H_LT_S);     sop(OP_GE, H_GE_S);     sop(OP_LE, H_LE_S);
+  sop(OP_NEG, H_NEG_S);   sop(OP_ORL, H_ORL_S);   sop(OP_RND, H_RND_S);
+  sop(OP_TIME, H_TIME_S); sop(OP_LDB, H_LDB_S);   sop(OP_STB, H_STB_S);
+  sop(OP_SAR, H_SAR_S);   sop(OP_LNOT, H_LNOT_S); sop(OP_SLT, H_SLT_S);
+  sop(OP_SGT, H_SGT_S);   sop(OP_SGE, H_SGE_S);   sop(OP_SLE, H_SLE_S);
+  sop(OP_ADDX, H_ADDX_S); sop(OP_SUBX, H_SUBX_S); sop(OP_MULX, H_MULX_S);
+  sop(OP_ASSERT, H_ASSERT_S);
+  return t;
+}();
+
+// Decode the instruction at pc0 into d, mirroring read() byte for byte.
+// Any anomaly (truncation, oversized payload width, PC-dereferencing
+// operand) leaves h = H_SLOW so execution replays through stepSlow and
+// faults (or behaves) exactly as the reference core would.
+void CesVM::decodeAt(uint64_t pc0, Decoded& d) {
+  d.epoch = epoch_;
+  d.h = H_SLOW;
+  d.regptr = 0;
+  const FastOpInfo& info = kFastOpInfo[code_[pc0]];
+  if (info.h == H_SLOW) return;
+  const size_t size = code_.size();
+  uint64_t p = pc0 + 1;
+  for (uint8_t i = 0; i < info.nops; ++i) {
+    if (p >= size) return;
+    uint8_t control = code_[p++];
+    uint8_t v = control & MAX_SHORT_VAL;
+    uint64_t val;
+    if (control & SHORT_VAL) {
+      val = v;
+    } else {
+      if (v > sizeof(val)) return;
+      if (v > size || p > size - v) return;
+      val = 0;
+      std::memcpy(&val, &code_[p], v);
+      p += v;
+    }
+    if (control & REG_PTR) {
+      // A dereference of cell 0 observes the mid-instruction PC, which
+      // the fast core does not materialize per-operand.
+      if (val == 0) return;
+      d.regptr |= static_cast<uint8_t>(1u << i);
+    }
+    d.val[i] = val;
+  }
+  if (info.jumpTail) {
+    if (p + 2 > size) return;
+    d.target = static_cast<uint16_t>(code_[p] |
+                                     (static_cast<uint16_t>(code_[p + 1]) << 8));
+    p += 2;
+  }
+  d.nextPc = static_cast<uint16_t>(p);
+  d.nops = info.nops;
+  d.h = info.h;
+}
+
+void CesVM::runFast(CesVMHost& host, CesVMResult& result) {
+  if (++epoch_ == 0) {  // epoch wrap: hard-invalidate the whole table
+    dtab_.clear();
+    epoch_ = 1;
+  }
+  if (dtab_.size() < code_.size()) dtab_.resize(code_.size());
+
+  uint64_t pc = 0;
+  const Decoded* d = nullptr;
+  uint64_t a = 0, b = 0, c = 0;
+
+// Operand i: pre-decoded immediate, or a cell dereference through get()
+// (which bounds-checks and faults exactly like the reference core).
+#define VMOP(i) ((d->regptr & (1u << (i))) ? get(d->val[i]) : d->val[i])
+
+#if CESVM_OPT_THREADED
+  static const void* const kTbl[] = {
+#define X(n) &&VL_##n,
+    CESVM_FAST_HANDLERS(X)
+#undef X
+  };
+#define VM_TARGET(n) VL_##n:
+#define VM_NEXT      goto vm_dispatch
+
+vm_dispatch:
+  if (term_) return;
+  pc = io_[0];
+  if (pc >= code_.size()) return;
+  if (pc >= dtab_.size()) dtab_.resize(code_.size());  // SYS_LOAD_CODE grew
+  d = &dtab_[pc];
+  if (d->epoch != epoch_) decodeAt(pc, dtab_[pc]);
+  ++result.opsExecuted;
+  if (!billOp()) { io_[0] = pc + 1; return; }
+  io_[0] = d->nextPc;
+  goto *kTbl[d->h];
+#else
+#define VM_TARGET(n) case H_##n:
+#define VM_NEXT      continue
+
+  for (;;) {
+    if (term_) return;
+    pc = io_[0];
+    if (pc >= code_.size()) return;
+    if (pc >= dtab_.size()) dtab_.resize(code_.size());  // SYS_LOAD_CODE grew
+    d = &dtab_[pc];
+    if (d->epoch != epoch_) decodeAt(pc, dtab_[pc]);
+    ++result.opsExecuted;
+    if (!billOp()) { io_[0] = pc + 1; return; }
+    io_[0] = d->nextPc;
+    switch (d->h) {
+#endif
+
+  VM_TARGET(SLOW) {
+    // Replay through the reference interpreter: reset PC to the opcode
+    // byte (the base cost is already billed) and run one instruction.
+    io_[0] = pc;
+    stepSlow(host);
+  } VM_NEXT;
+
+  VM_TARGET(NOP) VM_NEXT;
+
+  VM_TARGET(TERM) { io_[0] = UINT64_MAX; } VM_NEXT;
+
+  VM_TARGET(SET) { a = VMOP(0); b = VMOP(1); get(a) = b; } VM_NEXT;
+
+  VM_TARGET(JMP) { io_[0] = d->target; } VM_NEXT;
+
+  VM_TARGET(INC) { a = VMOP(0); ++get(a); } VM_NEXT;
+
+  VM_TARGET(DEC) { a = VMOP(0); --get(a); } VM_NEXT;
+
+  VM_TARGET(PUSH) { a = VMOP(0); push(a); } VM_NEXT;
+
+  VM_TARGET(POP) { a = VMOP(0); get(a) = pop(); } VM_NEXT;
+
+  VM_TARGET(HOST) { hostCall(host); } VM_NEXT;
+
+  VM_TARGET(HOSTX) {
+    hostCall(host);
+    if (!term_ && S() != 0) term_ = CESVM_ABORT;
+  } VM_NEXT;
+
+  VM_TARGET(ABORT) { term_ = CESVM_ABORT; } VM_NEXT;
+
+  VM_TARGET(VPUSH) {
+    a = VMOP(0); b = VMOP(1);
+    ++get(a); get(get(a)) = b;
+  } VM_NEXT;
+
+  VM_TARGET(VPOP) {
+    a = VMOP(0); b = VMOP(1);
+    get(b) = get(a); --get(a);
+  } VM_NEXT;
+
+  // ctxPush snapshots the registers with PC = nextPc (the return
+  // address); on depth-cap failure it sets CESVM_SEGFAULT and the
+  // dispatch check exits.
+  VM_TARGET(CALL) { if (ctxPush()) io_[0] = d->target; } VM_NEXT;
+
+  VM_TARGET(CALL_S) { a = pop(); if (ctxPush()) io_[0] = a; } VM_NEXT;
+
+  VM_TARGET(CALLR) { a = VMOP(0); if (ctxPush()) io_[0] = a; } VM_NEXT;
+
+  VM_TARGET(JMPR) { a = VMOP(0); io_[0] = a; } VM_NEXT;
+
+  VM_TARGET(RET) {
+    a = VMOP(0);
+    if (ctxEmpty()) { term_ = CESVM_RET; }
+    else { ctxRestorePop(); R() = a; }
+  } VM_NEXT;
+
+  VM_TARGET(JF)   { a = VMOP(0); if (!a) io_[0] = d->target; } VM_NEXT;
+  VM_TARGET(JF_S) { a = pop();   if (!a) io_[0] = d->target; } VM_NEXT;
+  VM_TARGET(JT)   { a = VMOP(0); if (a)  io_[0] = d->target; } VM_NEXT;
+  VM_TARGET(JT_S) { a = pop();   if (a)  io_[0] = d->target; } VM_NEXT;
+
+  VM_TARGET(DUP) { a = pop(); push(a); push(a); } VM_NEXT;
+
+  VM_TARGET(RND)   { R() = rng_(); } VM_NEXT;
+  VM_TARGET(RND_S) { push(rng_()); } VM_NEXT;
+
+  VM_TARGET(TIME) {
+    R() = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+  } VM_NEXT;
+
+  VM_TARGET(TIME_S) {
+    push(static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count()));
+  } VM_NEXT;
+
+  VM_TARGET(MOV) {
+    a = VMOP(0); b = VMOP(1); c = VMOP(2);
+    if (c > CESVM_IO_SIZE ||
+        a > CESVM_IO_SIZE - c || b > CESVM_IO_SIZE - c) {
+      term_ = CESVM_SEGFAULT;
+    } else if (billMul(c, CESVM_COST_PER_CELL)) {
+      std::memmove(&io_[a], &io_[b], c * sizeof(uint64_t));
+    }
+  } VM_NEXT;
+
+  VM_TARGET(CMP) {
+    a = VMOP(0); b = VMOP(1); c = VMOP(2);
+    if (c > CESVM_IO_SIZE ||
+        a > CESVM_IO_SIZE - c || b > CESVM_IO_SIZE - c) {
+      term_ = CESVM_SEGFAULT;
+    } else if (billMul(c, CESVM_COST_PER_CELL)) {
+      R() = (std::memcmp(&io_[a], &io_[b], c * sizeof(uint64_t)) == 0) ? 1 : 0;
+    }
+  } VM_NEXT;
+
+  VM_TARGET(FIL) {
+    a = VMOP(0); b = VMOP(1); c = VMOP(2);
+    if (c > CESVM_IO_SIZE || a > CESVM_IO_SIZE - c) {
+      term_ = CESVM_SEGFAULT;
+    } else if (billMul(c, CESVM_COST_PER_CELL)) {
+      for (uint64_t i = 0; i < c; ++i)
+        io_[a + i] = b;
+    }
+  } VM_NEXT;
+
+  VM_TARGET(LDB) {
+    a = VMOP(0);
+    if (a >= CESVM_IO_SIZE * sizeof(uint64_t)) term_ = CESVM_SEGFAULT;
+    else R() = reinterpret_cast<uint8_t*>(io_)[a];
+  } VM_NEXT;
+
+  VM_TARGET(LDB_S) {
+    a = pop();
+    if (a >= CESVM_IO_SIZE * sizeof(uint64_t)) term_ = CESVM_SEGFAULT;
+    else push(reinterpret_cast<uint8_t*>(io_)[a]);
+  } VM_NEXT;
+
+  VM_TARGET(STB) {
+    a = VMOP(0); b = VMOP(1);
+    if (a >= CESVM_IO_SIZE * sizeof(uint64_t)) term_ = CESVM_SEGFAULT;
+    else reinterpret_cast<uint8_t*>(io_)[a] = static_cast<uint8_t>(b & 0xFF);
+  } VM_NEXT;
+
+  VM_TARGET(STB_S) {
+    b = pop(); a = pop();  // value first, offset second (matches stepSlow)
+    if (a >= CESVM_IO_SIZE * sizeof(uint64_t)) term_ = CESVM_SEGFAULT;
+    else reinterpret_cast<uint8_t*>(io_)[a] = static_cast<uint8_t>(b & 0xFF);
+  } VM_NEXT;
+
+// Two-operand ops with register and stack forms and no extra checks.
+#define VM_BIN(NAME, EXPR) \
+  VM_TARGET(NAME)      { a = VMOP(0); b = VMOP(1); R() = (EXPR); } VM_NEXT; \
+  VM_TARGET(NAME##_S)  { b = pop(); a = pop(); push(EXPR); } VM_NEXT;
+
+  VM_BIN(ADD, a + b)
+  VM_BIN(SUB, a - b)
+  VM_BIN(MUL, a * b)
+  VM_BIN(OR,  a | b)
+  VM_BIN(AND, a & b)
+  VM_BIN(XOR, a ^ b)
+  VM_BIN(ANDL, a && b)
+  VM_BIN(ORL,  a || b)
+  VM_BIN(EQ, a == b)
+  VM_BIN(NE, a != b)
+  VM_BIN(GT, a > b)
+  VM_BIN(LT, a < b)
+  VM_BIN(GE, a >= b)
+  VM_BIN(LE, a <= b)
+  VM_BIN(SLT, static_cast<int64_t>(a) <  static_cast<int64_t>(b))
+  VM_BIN(SGT, static_cast<int64_t>(a) >  static_cast<int64_t>(b))
+  VM_BIN(SGE, static_cast<int64_t>(a) >= static_cast<int64_t>(b))
+  VM_BIN(SLE, static_cast<int64_t>(a) <= static_cast<int64_t>(b))
+#undef VM_BIN
+
+  VM_TARGET(DIV) {
+    a = VMOP(0); b = VMOP(1);
+    if (b) R() = a / b; else term_ = CESVM_DIVZERO;
+  } VM_NEXT;
+
+  VM_TARGET(DIV_S) {
+    b = pop(); a = pop();
+    if (b) push(a / b); else term_ = CESVM_DIVZERO;
+  } VM_NEXT;
+
+  VM_TARGET(MOD) {
+    a = VMOP(0); b = VMOP(1);
+    if (b) R() = a % b; else term_ = CESVM_DIVZERO;
+  } VM_NEXT;
+
+  VM_TARGET(MOD_S) {
+    b = pop(); a = pop();
+    if (b) push(a % b); else term_ = CESVM_DIVZERO;
+  } VM_NEXT;
+
+  VM_TARGET(SHL) {
+    a = VMOP(0); b = VMOP(1);
+    if (b >= 64) term_ = CESVM_SEGFAULT; else R() = a << b;
+  } VM_NEXT;
+
+  VM_TARGET(SHL_S) {
+    b = pop(); a = pop();
+    if (b >= 64) term_ = CESVM_SEGFAULT; else push(a << b);
+  } VM_NEXT;
+
+  VM_TARGET(SHR) {
+    a = VMOP(0); b = VMOP(1);
+    if (b >= 64) term_ = CESVM_SEGFAULT; else R() = a >> b;
+  } VM_NEXT;
+
+  VM_TARGET(SHR_S) {
+    b = pop(); a = pop();
+    if (b >= 64) term_ = CESVM_SEGFAULT; else push(a >> b);
+  } VM_NEXT;
+
+  VM_TARGET(SAR) {
+    a = VMOP(0); b = VMOP(1);
+    if (b >= 64) term_ = CESVM_SEGFAULT;
+    else R() = static_cast<uint64_t>(static_cast<int64_t>(a) >>
+                                     static_cast<int>(b));
+  } VM_NEXT;
+
+  VM_TARGET(SAR_S) {
+    b = pop(); a = pop();
+    if (b >= 64) term_ = CESVM_SEGFAULT;
+    else push(static_cast<uint64_t>(static_cast<int64_t>(a) >>
+                                    static_cast<int>(b)));
+  } VM_NEXT;
+
+  VM_TARGET(NOT)    { a = VMOP(0); R() = ~a; } VM_NEXT;
+  VM_TARGET(NOT_S)  { a = pop(); push(~a); } VM_NEXT;
+  VM_TARGET(LNOT)   { a = VMOP(0); R() = !a; } VM_NEXT;
+  VM_TARGET(LNOT_S) { a = pop(); push(!a); } VM_NEXT;
+  VM_TARGET(NEG)    { a = VMOP(0); R() = static_cast<uint64_t>(0) - a; } VM_NEXT;
+  VM_TARGET(NEG_S)  { a = pop(); push(static_cast<uint64_t>(0) - a); } VM_NEXT;
+
+  VM_TARGET(ADDX) {
+    a = VMOP(0); b = VMOP(1);
+    if (a > UINT64_MAX - b) term_ = CESVM_OVERFLOW; else R() = a + b;
+  } VM_NEXT;
+
+  VM_TARGET(ADDX_S) {
+    b = pop(); a = pop();
+    if (a > UINT64_MAX - b) term_ = CESVM_OVERFLOW; else push(a + b);
+  } VM_NEXT;
+
+  VM_TARGET(SUBX) {
+    a = VMOP(0); b = VMOP(1);
+    if (b > a) term_ = CESVM_OVERFLOW; else R() = a - b;
+  } VM_NEXT;
+
+  VM_TARGET(SUBX_S) {
+    b = pop(); a = pop();
+    if (b > a) term_ = CESVM_OVERFLOW; else push(a - b);
+  } VM_NEXT;
+
+  VM_TARGET(MULX) {
+    a = VMOP(0); b = VMOP(1);
+    if (b != 0 && a > UINT64_MAX / b) term_ = CESVM_OVERFLOW;
+    else R() = a * b;
+  } VM_NEXT;
+
+  VM_TARGET(MULX_S) {
+    b = pop(); a = pop();
+    if (b != 0 && a > UINT64_MAX / b) term_ = CESVM_OVERFLOW;
+    else push(a * b);
+  } VM_NEXT;
+
+  VM_TARGET(ASSERT) {
+    a = VMOP(0);
+    if (!a) term_ = CESVM_ABORT;
+  } VM_NEXT;
+
+  VM_TARGET(ASSERT_S) {
+    a = pop();
+    // pop() on an empty stack already set CESVM_UNDERFLOW; do not
+    // misreport that crash as an assert failure.
+    if (!a && !term_) term_ = CESVM_ABORT;
+  } VM_NEXT;
+
+#if !CESVM_OPT_THREADED
+    default:
+      // Unreachable: decodeAt only emits indices with handlers. A loud
+      // halt beats a silent no-op if table and handlers ever diverge.
+      term_ = CESVM_HOST;
+      VM_NEXT;
+    }
+  }
+#endif
+
+#undef VM_TARGET
+#undef VM_NEXT
+#undef VMOP
+}
+
+#endif  // CESVM_OPT_PREDECODE
 
 // --- GVM operand decoding ---
 
@@ -693,36 +1084,6 @@ uint64_t CesVM::read(bool jumpSkipControl) {
   if (regptr)
     val = get(val);
   return val;
-}
-
-uint64_t& CesVM::get(uint64_t index) {
-  if (index < CESVM_IO_SIZE) {
-    return io_[index];
-  }
-  term_ = CESVM_SEGFAULT;
-  return R();
-}
-
-void CesVM::push(uint64_t v) {
-  // Hard cap on the data stack to close the "push in a tight loop and
-  // burn server memory faster than the gas budget can stop it" DoS
-  // vector. Overflow is promoted to CESVM_SEGFAULT, which the server's
-  // undo log rolls back the same as any other VM crash.
-  if (stack_.size() >= CESVM_MAX_STACK_DEPTH) {
-    term_ = CESVM_SEGFAULT;
-    return;
-  }
-  stack_.push_back(v);
-}
-
-uint64_t CesVM::pop() {
-  if (stack_.empty()) {
-    term_ = CESVM_UNDERFLOW;
-    return 0;
-  }
-  uint64_t v = stack_.back();
-  stack_.pop_back();
-  return v;
 }
 
 bool CesVM::bill(uint64_t cost) {

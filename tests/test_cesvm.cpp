@@ -6,6 +6,7 @@
 #include <ces/autoexec.h>
 #include <ces/buffer.h>
 #include <ces/cesvm.h>
+#include <ces/lang/cesl.h>
 #include <ces/util/vmprogram.h>
 #include <cryptopp/sha.h>
 #include <future>
@@ -3404,6 +3405,140 @@ BOOST_AUTO_TEST_CASE(StackAndVariantWorks) {
   });
   BOOST_CHECK_EQUAL(r.error, static_cast<uint64_t>(CESVM_OK));
   BOOST_CHECK_EQUAL(r.r, 0x30u);
+}
+
+// --- Fast core vs reference core differential ---
+//
+// The predecoded fast core (CESVM_OPT_PREDECODE) must be observably
+// identical to the reference interpreter (stepSlow): same error, same
+// op count, same gas, same output — including mid-run budget
+// exhaustion, faults, overlapping decodes from odd-offset jumps, and
+// the instructions the fast core replays through stepSlow.
+static void diffCores(const std::string& label, const ces::Bytes& code,
+                      uint64_t budget, uint64_t gasMult = 1,
+                      const ces::Bytes& input = {}) {
+  CesVM fast, ref;
+  ref._setLegacyCore(true);
+  auto hostA = makeNullHost();
+  auto hostB = makeNullHost();
+  hostA.input = input;
+  hostB.input = input;
+  auto a = fast.execute(code, hostA, budget, gasMult);
+  auto b = ref.execute(code, hostB, budget, gasMult);
+  BOOST_CHECK_MESSAGE(a.error == b.error,
+                      label << ": error " << a.error << " != " << b.error);
+  BOOST_CHECK_MESSAGE(a.opsExecuted == b.opsExecuted,
+                      label << ": ops " << a.opsExecuted << " != "
+                            << b.opsExecuted);
+  BOOST_CHECK_MESSAGE(a.budgetUsed == b.budgetUsed,
+                      label << ": budget " << a.budgetUsed << " != "
+                            << b.budgetUsed);
+  BOOST_CHECK_MESSAGE(a.output == b.output, label << ": output differs");
+}
+
+BOOST_AUTO_TEST_CASE(DifferentialFastVsReferenceCore) {
+  // Raw-byte edge cases the compiler never emits.
+  diffCores("empty", {}, 100000);
+  diffCores("truncated operand", {OP_ADD, sv(1)}, 100000);
+  diffCores("invalid opcode", {200}, 100000);
+  diffCores("bad operand width", {OP_PUSH, 0x09}, 100000);
+  diffCores("deref PC operand", {OP_ADD, rp(0), sv(5), OP_TERM}, 100000);
+  diffCores("stack underflow", {static_cast<uint8_t>(OP_ADD | STACK)}, 100000);
+  diffCores("jump past end", {OP_JMP, 100, 0}, 100000);
+  // JF with the cond such that the branch is taken but the 2-byte target
+  // is missing (CODESIZE), and untaken so PC walks off the end (clean OK).
+  diffCores("jf taken no target",
+            {OP_SET, sv(16), sv(0), OP_JF, rp(16)}, 100000);
+  diffCores("jf untaken no target",
+            {OP_SET, sv(16), sv(1), OP_JF, rp(16)}, 100000);
+  // SET into cell 0 is a computed jump back to offset 0: burns budget in
+  // a tight loop, so both cores must exhaust at the same op.
+  diffCores("pc write loop", {OP_SET, sv(0), sv(0)}, 5150);
+  diffCores("pc write loop gasmult", {OP_SET, sv(0), sv(0)}, 51500, 7);
+  // gasMult so large that COST_PER_OP * gasMult overflows: budget halt
+  // on the first op (the bill()/billOp() overflow guard).
+  diffCores("gasmult overflow", {OP_NOP, OP_TERM}, 100000,
+            std::numeric_limits<uint64_t>::max());
+  // Data-stack overflow via a push loop, and call-depth cap via CALL 0.
+  diffCores("stack overflow", {OP_PUSH, sv(1), OP_JMP, 0, 0}, 100000000);
+  diffCores("call depth", {OP_CALL, 0, 0}, 100000000);
+  // Jump into the middle of an instruction: the bytes re-decode
+  // differently at the odd offset and both cores must agree.
+  diffCores("overlapping decode",
+            {OP_JMP, 4, 0, OP_SET, sv(16), sv(42), OP_TERM}, 100000);
+  // Variadic syscalls take the replay path in the fast core.
+  diffCores("hostv", {OP_HOSTV, sv(SYS_NOP), sv(2), sv(7), sv(8), OP_TERM},
+            100000);
+  diffCores("hostv truncated", {OP_HOSTV, sv(0)}, 100000);
+  // Byte overlay + variable-length memory ops, with results landing in
+  // the output window so the output comparison covers them.
+  {
+    ces::Bytes p;
+    p.push_back(OP_STB); push2(p, 764 * 8); push2(p, 0xAB);  // output byte 0
+    p.push_back(OP_FIL); push2(p, 770); p.push_back(sv(7)); p.push_back(sv(4));
+    p.push_back(OP_MOV); push2(p, 765); push2(p, 770); p.push_back(sv(2));
+    p.push_back(OP_CMP); push2(p, 770); push2(p, 771); p.push_back(sv(1));
+    p.push_back(OP_SET); push2(p, 767); p.push_back(rp(1));  // save CMP's R
+    p.push_back(OP_LDB); push2(p, 764 * 8);
+    p.push_back(OP_SET); push2(p, 768); p.push_back(rp(1));  // save LDB's R
+    p.push_back(OP_SET); push2(p, CESVM_IO_OUTPUT_LEN); p.push_back(sv(63));
+    p.push_back(OP_TERM);
+    diffCores("ldb stb mov fil cmp", p, 1000000);
+  }
+  {
+    ces::Bytes p;
+    p.push_back(OP_FIL); push2(p, 1020); p.push_back(sv(1)); p.push_back(sv(10));
+    diffCores("fil bounds", p, 100000);
+  }
+
+  // Compiler-emitted workloads: checked/wrapping arithmetic, short
+  // circuit, calls, dynamic region indexing, deep expressions, faults.
+  auto csl = [](const char* src) { return ceslCompile(src); };
+  diffCores("cesl arith", csl(R"(
+    let i = 0; let acc = 1;
+    while (i < 2000) { acc = (acc *% 33) +% i; i = i + 1; }
+    output[0] = acc; output_len = 8;
+  )"), 20000000);
+  diffCores("cesl calls", csl(R"(
+    fn mix(a, b) { return (a +% b) ^ (a << 1); }
+    let i = 0; let acc = 0;
+    while (i < 1000) { acc = mix(acc, i); i = i + 1; }
+    output[0] = acc; output_len = 8;
+  )"), 20000000);
+  diffCores("cesl memory", csl(R"(
+    let buf[64];
+    let j = 0;
+    while (j < 64) { buf[j] = buf[j] +% (j ^ 21); j = j + 1; }
+    output[0] = buf[63]; output_len = 8;
+  )"), 20000000);
+  diffCores("cesl stack expr", csl(R"(
+    let i = 1; let acc = 0;
+    while (i < 500) {
+      acc = (acc +% ((i *% 3) +% 1) *% (i +% 2)) ^ (acc >> 3);
+      i = i + 1;
+    }
+    output[0] = acc; output_len = 8;
+  )"), 20000000);
+  diffCores("cesl overflow fault", csl(R"(
+    let x = 18446744073709551615;
+    x = x + 1;
+  )"), 100000);
+  diffCores("cesl divzero fault", csl(R"(
+    let z = 0;
+    output[0] = 10 / z;
+  )"), 100000);
+  diffCores("cesl require fault", csl("require(0);"), 100000);
+  // Mid-run budget exhaustion inside a compiler-emitted loop, at an
+  // odd gas multiplier.
+  diffCores("cesl budget exhaustion", csl(R"(
+    let i = 0;
+    while (i < 100000) { i = i + 1; }
+  )"), 123457, 3);
+  // Input-consuming program.
+  diffCores("cesl input", csl(R"(
+    output[0] = input[0] +% input_len;
+    output_len = 8;
+  )"), 1000000, 1, ces::Bytes{1, 2, 3, 4, 5, 6, 7, 8, 9});
 }
 
 BOOST_AUTO_TEST_SUITE_END()

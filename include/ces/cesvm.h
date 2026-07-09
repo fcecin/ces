@@ -94,13 +94,80 @@
 
 #include <minx/types.h>
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+// ============================================================================
+// Interpreter optimization switches
+// ============================================================================
+// Each is independently toggleable at compile time (-DCESVM_OPT_X=0) and must
+// be set identically for every TU in a build (they change the CesVM class
+// layout). Defaults: everything on; THREADED auto-detects GNU C.
+//
+//   CESVM_OPT_PREDECODE    Memoized operand pre-decode (the fast core). Each
+//                          byte offset's instruction is decoded once and
+//                          cached in a side table (epoch-validated per
+//                          execute(), extended on SYS_LOAD_CODE growth).
+//                          Anything the fast core cannot statically decode —
+//                          HOSTV/HOSTXV variable arg lists, operands that
+//                          dereference cell 0 (the mid-instruction PC),
+//                          truncated or invalid encodings — replays through
+//                          the reference interpreter (stepSlow), so
+//                          observable semantics are identical by
+//                          construction. 0 = always run the reference core.
+//   CESVM_OPT_THREADED     Computed-goto dispatch for the fast core (GNU C
+//                          label-address extension; GCC/Clang only,
+//                          auto-off elsewhere). No effect when
+//                          CESVM_OPT_PREDECODE=0.
+//   CESVM_OPT_BILL_HOIST   Precompute COST_PER_OP * gasMult once per
+//                          execute() instead of overflow-guarding the
+//                          multiply on every op. Pure C++.
+//   CESVM_OPT_FIXED_STACKS Data stack and CALL frame stack as fixed member
+//                          arrays (their depth caps are hard constants)
+//                          instead of std::vectors. Pure C++.
+//
+// The runtime hook CesVM::_setLegacyCore(true) forces the reference core on
+// one instance (used by the differential test and by cesvmbench to measure
+// the fast core against the reference in a single binary).
+
+#ifndef CESVM_OPT_PREDECODE
+#define CESVM_OPT_PREDECODE 1
+#endif
+
+#ifndef CESVM_OPT_THREADED
+#if defined(__GNUC__) || defined(__clang__)
+#define CESVM_OPT_THREADED 1
+#else
+#define CESVM_OPT_THREADED 0
+#endif
+#endif
+#if CESVM_OPT_THREADED && !(defined(__GNUC__) || defined(__clang__))
+#undef CESVM_OPT_THREADED
+#define CESVM_OPT_THREADED 0
+#endif
+
+#ifndef CESVM_OPT_BILL_HOIST
+#define CESVM_OPT_BILL_HOIST 1
+#endif
+
+// The one switch whose "off" position has a real use case rather than
+// being a fallback. On: the data stack and CALL frame stack live inline
+// in the object, growing sizeof(CesVM) by ~40 KB (8 KB stack + 32 KB
+// frames) on top of the 8 KB io_ array that is inline in every
+// configuration; worth ~10-20% on arith/memory workloads. Fine for the
+// current usage (one stack-local CesVM per run on logicStrand_). Off:
+// both revert to vectors and the object is ~8.5 KB again -- flip this
+// for any embedding that holds many CesVM objects alive at once.
+#ifndef CESVM_OPT_FIXED_STACKS
+#define CESVM_OPT_FIXED_STACKS 1
+#endif
 
 namespace ces {
 
@@ -615,11 +682,28 @@ public:
                       CesVMHost& host, uint64_t budget,
                       uint64_t gasMult = 1);
 
+  // Test/bench hook: force the reference (non-predecoded) interpreter core
+  // on this instance. The reference core defines the semantics; the fast
+  // core must match it observably. No effect when CESVM_OPT_PREDECODE=0
+  // (the reference core is all there is).
+  void _setLegacyCore(bool legacy) { legacyCore_ = legacy; }
+
 private:
   // GVM core
   uint64_t io_[CESVM_IO_SIZE];
+
+#if CESVM_OPT_FIXED_STACKS
+  // Both stacks have hard depth caps, so fixed member arrays beat vectors
+  // (no capacity checks or heap traffic on the hot push/pop path). Contents
+  // above the length watermark are never read.
+  uint64_t stackBuf_[CESVM_MAX_STACK_DEPTH];
+  uint32_t stackLen_ = 0;
+  std::array<uint64_t, CESVM_REG_SIZE> ctxBuf_[CESVM_MAX_CALL_DEPTH];
+  uint32_t ctxLen_ = 0;
+#else
   std::vector<uint64_t> stack_;
   std::vector<std::array<uint64_t, CESVM_REG_SIZE>> context_;
+#endif
 
   // Named register refs
   uint64_t& PC() { return io_[0]; }
@@ -628,12 +712,137 @@ private:
 
   // Operand decoding (from GVM)
   uint64_t read(bool jumpSkipControl = false);
-  uint64_t& get(uint64_t index);
-  void push(uint64_t v);
-  uint64_t pop();
+
+  uint64_t& get(uint64_t index) {
+    if (index < CESVM_IO_SIZE) {
+      return io_[index];
+    }
+    term_ = CESVM_SEGFAULT;
+    return R();
+  }
+
+  // Hard cap on the data stack to close the "push in a tight loop and
+  // burn server memory faster than the gas budget can stop it" DoS
+  // vector. Overflow is promoted to CESVM_SEGFAULT, which the server's
+  // undo log rolls back the same as any other VM crash.
+  void push(uint64_t v) {
+#if CESVM_OPT_FIXED_STACKS
+    if (stackLen_ >= CESVM_MAX_STACK_DEPTH) {
+      term_ = CESVM_SEGFAULT;
+      return;
+    }
+    stackBuf_[stackLen_++] = v;
+#else
+    if (stack_.size() >= CESVM_MAX_STACK_DEPTH) {
+      term_ = CESVM_SEGFAULT;
+      return;
+    }
+    stack_.push_back(v);
+#endif
+  }
+
+  uint64_t pop() {
+#if CESVM_OPT_FIXED_STACKS
+    if (stackLen_ == 0) {
+      term_ = CESVM_UNDERFLOW;
+      return 0;
+    }
+    return stackBuf_[--stackLen_];
+#else
+    if (stack_.empty()) {
+      term_ = CESVM_UNDERFLOW;
+      return 0;
+    }
+    uint64_t v = stack_.back();
+    stack_.pop_back();
+    return v;
+#endif
+  }
+
+  void stackClear() {
+#if CESVM_OPT_FIXED_STACKS
+    stackLen_ = 0;
+#else
+    stack_.clear();
+#endif
+  }
+
+  // CALL frame stack. ctxPush snapshots the 16 registers (including the
+  // already-advanced PC = return address); false means the call-depth cap
+  // was hit and CESVM_SEGFAULT is set. ctxRestorePop restores the caller's
+  // registers and drops the frame.
+  bool ctxPush() {
+#if CESVM_OPT_FIXED_STACKS
+    if (ctxLen_ >= CESVM_MAX_CALL_DEPTH) {
+      term_ = CESVM_SEGFAULT;
+      return false;
+    }
+    std::memcpy(ctxBuf_[ctxLen_++].data(), &io_[0],
+                sizeof(uint64_t) * CESVM_REG_SIZE);
+#else
+    if (context_.size() >= CESVM_MAX_CALL_DEPTH) {
+      term_ = CESVM_SEGFAULT;
+      return false;
+    }
+    std::array<uint64_t, CESVM_REG_SIZE> regs;
+    std::memcpy(regs.data(), &io_[0], sizeof(uint64_t) * CESVM_REG_SIZE);
+    context_.push_back(regs);
+#endif
+    return true;
+  }
+
+  bool ctxEmpty() const {
+#if CESVM_OPT_FIXED_STACKS
+    return ctxLen_ == 0;
+#else
+    return context_.empty();
+#endif
+  }
+
+  void ctxRestorePop() {
+#if CESVM_OPT_FIXED_STACKS
+    std::memcpy(&io_[0], ctxBuf_[--ctxLen_].data(),
+                sizeof(uint64_t) * CESVM_REG_SIZE);
+#else
+    std::memcpy(&io_[0], context_.back().data(),
+                sizeof(uint64_t) * CESVM_REG_SIZE);
+    context_.pop_back();
+#endif
+  }
+
+  void ctxClear() {
+#if CESVM_OPT_FIXED_STACKS
+    ctxLen_ = 0;
+#else
+    context_.clear();
+#endif
+  }
 
   // CES syscall dispatch
   void hostCall(CesVMHost& host);
+
+  // Interpreter cores. stepSlow executes exactly one instruction at PC
+  // (base per-op cost already billed by the caller) and is the reference
+  // semantics; runLegacy loops it. runFast is the predecoded core, which
+  // dispatches anything it can't fast-path back through stepSlow.
+  void stepSlow(CesVMHost& host);
+  void runLegacy(CesVMHost& host, CesVMResult& result);
+#if CESVM_OPT_PREDECODE
+  struct Decoded {
+    uint32_t epoch = 0;   // valid iff == epoch_
+    uint16_t h = 0;       // fast-handler index (0 = replay via stepSlow)
+    uint8_t  regptr = 0;  // bit i: operand i is a cell dereference
+    uint8_t  nops = 0;
+    uint16_t nextPc = 0;  // byte offset after the full instruction
+    uint16_t target = 0;  // JMP/CALL/JF/JT literal jump target
+    uint64_t val[3] = {}; // operand immediates / static cell indices
+  };
+  void decodeAt(uint64_t pc, Decoded& d);
+  void runFast(CesVMHost& host, CesVMResult& result);
+  std::vector<Decoded> dtab_; // indexed by byte offset; lazily decoded
+  uint32_t epoch_ = 0;        // bumped per execute(); validates dtab_ entries
+#endif
+  bool legacyCore_ = false;
 
   // Billing: deduct cost from budget, set CESVM_BUDGET on insufficient funds.
   // Returns true if budget was sufficient, false if execution should stop.
@@ -645,6 +854,25 @@ private:
   // credits already, not in gas units. Same halt semantics as bill().
   bool billCredits(uint64_t raw);
 
+  // The per-op base cost, billed once per instruction by both cores.
+  // With CESVM_OPT_BILL_HOIST the COST_PER_OP * gasMult product (and its
+  // overflow guard, which halts as budget-exhausted, matching bill()) is
+  // computed once per execute() instead of per op.
+  bool billOp() {
+#if CESVM_OPT_BILL_HOIST
+    if (opCostOvf_ || opCost_ > budget_ - budgetUsed_) {
+      term_ = CESVM_BUDGET;
+      io_[CESVM_IO_BUDGET_REMAINING] = 0;
+      return false;
+    }
+    budgetUsed_ += opCost_;
+    io_[CESVM_IO_BUDGET_REMAINING] = budget_ - budgetUsed_;
+    return true;
+#else
+    return bill(CESVM_COST_PER_OP);
+#endif
+  }
+
   // Helper: read bytes from io memory at offset into a buffer
   void readIoBytes(uint64_t ioOffset, uint8_t* out, size_t len);
   // Helper: write bytes to io memory at offset
@@ -654,6 +882,8 @@ private:
   uint64_t budget_ = 0;
   uint64_t budgetUsed_ = 0;
   uint64_t gasMult_ = 1;
+  uint64_t opCost_ = CESVM_COST_PER_OP;
+  bool opCostOvf_ = false;
   ces::Bytes code_;  // mutable code buffer (grows via SYS_LOAD_CODE)
   std::mt19937_64 rng_;
 };

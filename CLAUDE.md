@@ -73,6 +73,7 @@ src/cesluajitd/     compute child runtime (LuaJIT-hosted, default)
 src/cescompmockd/   no-Lua mock child (regression-test plumbing only)
 src/cesproxy/       TCP/UDP proxy with wire-level validation
 src/cesbench/       in-process benchmark
+src/cesvmbench/     CesVM interpreter benchmark (prog/ops/sys/crypto)
 src/cesqt/          Qt6 GUI: 11 tabs + JSON-RPC server (rpcserver.cpp)
 lang/               CesVM language playground: example .casm/.cesl
                     programs (simplest first) plus devnet.sh (one-command
@@ -138,7 +139,7 @@ Nonce modes: `0` skip (internal); `CES_NONCELESS` (UINT32_MAX) server assigns (s
 
 ## CesVM (`cesvm.h`, `cesvm.cpp`)
 
-Harvard architecture; runs on `logicStrand_`; mutations atomic with an undo log.
+Harvard architecture; runs on `logicStrand_`; mutations atomic with an undo log. The interpreter is a memoized-predecode fast core (epoch-validated side table, computed-goto dispatch on GCC/Clang) with a byte-identical reference core it replays odd cases through; compile-time switches `CESVM_OPT_*` in cesvm.h, pinned by CesVMTests/DifferentialFastVsReferenceCore, measured in docs/cesvm-perf.md via cesvmbench.
 
 `io[]` (1024 cells x 8 bytes) is the data plane only: registers, program scratch, context, preloaded caller/self keys, and fixed input/output windows. Bytecode lives in a separate `code_` buffer indexed by PC. `vmprogram.h`'s bump allocator (`pgm.allocContent()`) hands out typed scratch `Region`s so build code never types raw cell numbers.
 
@@ -362,6 +363,8 @@ cesqt: Qt6 GUI wrapping cesh verbs. 11 tabs (Wallet/Account/Transfer/Mining/Crea
 cesproxy: TCP/UDP proxy for non-UDP clients. `CesProxy` is a `MinxProxy` subclass plus wire-level validation.
 
 cesbench: in-process benchmark. Server and client in one binary. Tunes `threads`, `flush_value`.
+
+cesvmbench: CesVM interpreter benchmark (sections: prog/ops/sys/crypto; compares fast vs reference core). Run on release builds; numbers in docs/cesvm-perf.md.
 
 cesweb: HTTP gateway (Node) serving a server's L2 files to browsers, plus a `/dev` terminal into L2 programs; shells out to `cesh`. Lives in `cesweb/` with its own CLAUDE.md. Distinct from the in-server `webadmin` dashboard: cesweb is an external Node proxy to the L2 file store; webadmin is the embedded loopback operator UI.
 

@@ -190,6 +190,12 @@ target_link_libraries(cesbench PRIVATE ceslib CLI11::CLI11)
 target_link_options(cesbench PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesbench PROPERTIES OUTPUT_NAME "cesbench")
 
+file(GLOB CESVMBENCH_CPP "src/cesvmbench/*.cpp")
+add_executable(cesvmbench ${CESVMBENCH_CPP})
+target_link_libraries(cesvmbench PRIVATE ceslib)
+target_link_options(cesvmbench PRIVATE "-Wl,-z,noexecstack")
+set_target_properties(cesvmbench PROPERTIES OUTPUT_NAME "cesvmbench")
+
 add_executable(cesproxy src/cesproxy/main.cpp)
 target_link_libraries(cesproxy PRIVATE ceslib CLI11::CLI11)
 target_link_options(cesproxy PRIVATE "-Wl,-z,noexecstack")

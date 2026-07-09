@@ -1,8 +1,7 @@
 find_package(Boost 1.83.0 REQUIRED COMPONENTS unit_test_framework filesystem)
 
-# All tests in one binary (glob everything except benchmarks)
+# All tests in one binary
 file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "*.cpp")
-list(FILTER TEST_SOURCES EXCLUDE REGEX "bench_.*\\.cpp$")
 
 add_executable(cestests ${TEST_SOURCES})
 
@@ -26,7 +25,3 @@ if(Qt6_FOUND)
 endif()
 
 add_test(NAME CesTests COMMAND cestests)
-
-# CesVM benchmark (standalone, not part of any test suite)
-add_executable(cesvmbench bench_cesvm.cpp)
-target_link_libraries(cesvmbench PRIVATE ceslib)
