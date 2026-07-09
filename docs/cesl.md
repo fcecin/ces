@@ -251,6 +251,7 @@ value-typed parameters take any expression.
 | `send_client(id, ptr, len)` | push to a connected client |
 | `schedule(key, budget, allowance, in_ptr, in_len, time_us)` | future run |
 | `rpc(host, hostlen, port, filehead, followup, budget, tag)` | |
+| `refill(n)` | account hooks: draw up to `n` more gas from the account (sidecar-capped); yields the amount granted |
 
 Each builtin dispatches with abort-on-error semantics: a failing
 syscall halts the run (`CESVM_ABORT`) and rolls back. Each also has a
@@ -281,6 +282,34 @@ owner's account, who consented by deploying the code.
 | `r`, `s` | read-only | VM result / status registers |
 | `arg0..arg3` | read-only | syscall argument/result cells |
 | `PRICE_UNIT` | const | 100000000 (8-decimal credit unit) |
+| `invoke_kind` | read-only | which event invoked this run (see below) |
+| `INVOKE_DIRECT`, `INVOKE_SCHEDULED` | const | direct `CES_RUN_ASSET` / scheduled run |
+| `INVOKE_XFER_IN`, `INVOKE_XFER_OUT`, `INVOKE_XFER_VM` | const | account-hook transfer events |
+| `INVOKE_SETTLE_IN`, `INVOKE_SETTLE_OUT` | const | account-hook cross-transfer events |
+
+## 10a. Account hooks
+
+An account can attach a program that runs when a ledger event touches it: set
+the account's alias to a hook type pointing at the trigger asset's key. A
+**gate** (`ALIAS_OP_HOOK_GATE`) runs before an incoming transfer commits and
+accepts (clean return) or rejects (`require` fails / `abort`) - a courtesy
+signal to the sender; it must be immutable-or-self-owned and runs on the free
+grant only (no `refill`). A **watch** (`ALIAS_OP_HOOK_WATCH`) runs after the
+transfer commits, purely to observe/record, and may `refill` to spend past the
+grant, capped by the sidecar's refill ceiling.
+
+Read `invoke_kind` to see which event fired, and the event descriptor from the
+`input` region:
+
+| cell | meaning |
+|---|---|
+| `input[0..3]` | counterparty pubkey (the other account) |
+| `input[4]` | amount |
+| `input[5]` | this account's balance at fire time (pre for a gate, post for a watch) |
+
+A run that is not a hook reads `invoke_kind == INVOKE_DIRECT`. An inbound
+transfer worth less than the cost of screening it fires no hook at all (the
+dust floor). Examples: `lang/examples/hook_gate.cesl`, `hook_watch.cesl`.
 
 `gas_left` lets a program bail out gracefully (`require(gas_left >
 50000);`) before a hard out-of-gas abort. `arg1`/`arg3` expose

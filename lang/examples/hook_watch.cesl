@@ -1,0 +1,28 @@
+// An account hook (CESVM trigger), WATCH flavor. A WATCH runs AFTER a transfer
+// commits: it observes and records, and its result is ignored (it can never
+// block delivery). Unlike a gate, a watch may spend past the free grant by
+// calling refill(n), which draws from the account, capped by the sidecar
+// refill ceiling. That is what lets a watch afford a persistent write.
+//
+// SCREEN BEFORE YOU SPEND: refill only when the event is worth recording, so
+// dust cannot make you pay. Here we only refill for inbound events whose
+// amount clears a threshold; a well-screened watch cannot be griefed.
+//
+// The event descriptor and invoke_kind match hook_gate.cesl:
+//   input[0..3] counterparty, input[4] amount, input[5] balance, invoke_kind.
+//
+// Deploy like hook_gate.cesl but with op = ALIAS_OP_HOOK_WATCH, and set a
+// nonzero refill ceiling in the sidecar so refill() can grant.
+
+if (invoke_kind == INVOKE_XFER_IN) {
+  let amount = input[4];
+  if (amount >= 10 * PRICE_UNIT) {          // worth recording
+    let got = refill(1 * PRICE_UNIT);        // draw gas to afford a write
+    if (got > 0) {
+      // ... persist a record here (e.g. update_asset on your own log asset).
+      // Left out to keep the example self-contained; the point is that the
+      // gas to do it came from refill(), paid by this account, screened above.
+    }
+  }
+}
+return 0;

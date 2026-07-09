@@ -10,6 +10,8 @@
 #include <ces/lang/casm.h>
 
 #include <cstdint>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 using namespace ces;
@@ -168,6 +170,25 @@ BOOST_AUTO_TEST_CASE(ErrorsCarryLineNumbers) {
   BOOST_CHECK_THROW(casmAssemble("set g0, bogus\n"), CasmError);
   // duplicate label
   BOOST_CHECK_THROW(casmAssemble("a:\na:\nterm\n"), CasmError);
+}
+
+// Every shipped lang/examples/*.casm assembles - pins the demos against
+// mnemonic/encoding drift. Add a line here when you add an example.
+BOOST_AUTO_TEST_CASE(ShippedCasmExamplesAssemble) {
+  const std::string dir = std::string(CES_SOURCE_DIR) + "/lang/examples/";
+  const char* files[] = {"answer.casm", "countdown.casm", "greet.casm"};
+  for (const char* f : files) {
+    std::ifstream in(dir + f);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string src = ss.str();
+    BOOST_REQUIRE_MESSAGE(!src.empty(), std::string("missing example: ") + f);
+    try {
+      casmAssemble(src);
+    } catch (const std::exception& e) {
+      BOOST_ERROR(std::string(f) + " failed to assemble: " + e.what());
+    }
+  }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

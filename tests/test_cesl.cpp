@@ -11,6 +11,8 @@
 #include <ces/lang/cesl.h>
 
 #include <cstdint>
+#include <fstream>
+#include <sstream>
 #include <string>
 
 using namespace ces;
@@ -322,6 +324,82 @@ BOOST_AUTO_TEST_CASE(CompileErrors) {
   BOOST_CHECK_THROW(ceslCompile("let a = 1; let a = 2;"), CeslError);
   BOOST_CHECK_THROW(ceslCompile("fn f(a) {} return f();"), CeslError);
   BOOST_CHECK_THROW(ceslCompile("if (1) { fn g() {} }"), CeslError);
+}
+
+// Every syscall in the table compiles at its declared arity (catches a wrong
+// SYS_num / argc typo), and wrong arity is rejected. Compile-only: no host.
+BOOST_AUTO_TEST_CASE(AllSyscallsCompile) {
+  const char* calls[] = {
+      "read_account(0)", "transfer(0,0)", "read_asset(0,0,0)",
+      "create_asset_random(0,0,0)", "update_asset(0,0)", "fund_asset(0,0)",
+      "buy_asset(0,0)", "give_asset(0,0)", "hash(0,0,0)", "verify_sig(0,0,0,0)",
+      "cross_transfer(0,0,0)", "load_code(0)", "create_asset(0,0,0)",
+      "send_client(0,0,0)", "schedule(0,0,0,0,0,0)", "create_asset_managed(0,0,0)",
+      "rpc(0,0,0,0,0,0,0)", "owner_transfer(0,0)", "deposit(0)", "withdraw(0)",
+      "update_asset_meta(0,0,0)", "refill(0)",
+  };
+  for (const char* c : calls) {
+    std::string src = std::string(c) + "; return 0;";
+    BOOST_CHECK_NO_THROW(ceslCompile(src));               // plain form
+    BOOST_CHECK_NO_THROW(ceslCompile("try_" + src));      // try_ form
+  }
+  // Wrong arity is a compile error.
+  BOOST_CHECK_THROW(ceslCompile("refill(0,0); return 0;"), CeslError);
+  BOOST_CHECK_THROW(ceslCompile("transfer(0); return 0;"), CeslError);
+}
+
+// The refill syscall grows the run's gas budget and yields the granted amount.
+BOOST_AUTO_TEST_CASE(RefillSyscallGrantsBudget) {
+  struct RefillHost : CesVMHost {
+    uint64_t refillGas(uint64_t requested) override { return requested / 2; }
+  } host;
+  // The host halves the request; the plain form yields R = the granted amount.
+  auto r = runSrc("return refill(1000);", host);
+  BOOST_CHECK_EQUAL(r.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(r.outU64(), 500u);
+}
+
+// A cesl gate reads its invocation kind and event descriptor: accept only an
+// inbound transfer of at least 50, reading the amount from input[4].
+BOOST_AUTO_TEST_CASE(HookInvocationContext) {
+  CesVMHost host;
+  host.invokeKind = INVOKE_HOOK_XFER_IN;
+  host.input.assign(48, 0);
+  host.input[32] = 100;   // amount = input[4] = 100 (LE byte 0 of the cell)
+
+  auto accept = runSrc(
+      "require(invoke_kind == INVOKE_XFER_IN);\n"
+      "require(input[4] >= 50);\n"
+      "return input[4];\n", host);
+  BOOST_CHECK_EQUAL(accept.error, static_cast<uint64_t>(CESVM_OK));
+  BOOST_CHECK_EQUAL(accept.outU64(), 100u);
+
+  // Wrong kind rejects (require aborts).
+  host.invokeKind = INVOKE_HOOK_XFER_OUT;
+  auto reject = runSrc("require(invoke_kind == INVOKE_XFER_IN); return 1;", host);
+  BOOST_CHECK_EQUAL(reject.error, static_cast<uint64_t>(CESVM_ABORT));
+}
+
+// Every shipped lang/examples/*.cesl compiles - pins the demos (incl. the hook
+// examples) against language drift. Add a line here when you add an example.
+BOOST_AUTO_TEST_CASE(ShippedExamplesCompile) {
+  const std::string dir = std::string(CES_SOURCE_DIR) + "/lang/examples/";
+  const char* files[] = {
+      "add.cesl", "fib.cesl", "vault.cesl", "cruncher.cesl",
+      "hook_gate.cesl", "hook_watch.cesl",
+  };
+  for (const char* f : files) {
+    std::ifstream in(dir + f);
+    std::stringstream ss;
+    ss << in.rdbuf();
+    std::string src = ss.str();
+    BOOST_REQUIRE_MESSAGE(!src.empty(), std::string("missing example: ") + f);
+    try {
+      ceslCompile(src);
+    } catch (const std::exception& e) {
+      BOOST_ERROR(std::string(f) + " failed to compile: " + e.what());
+    }
+  }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

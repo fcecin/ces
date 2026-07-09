@@ -57,6 +57,7 @@ const std::unordered_map<std::string, SysCall>& sysTable() {
     {"deposit",              {SYS_DEPOSIT, 1}},
     {"withdraw",             {SYS_WITHDRAW, 1}},
     {"update_asset_meta",    {SYS_UPDATE_ASSET_META, 3}},
+    {"refill",               {SYS_REFILL, 1}},
   };
   return t;
 }
@@ -330,6 +331,18 @@ private:
     g["gas_left"]       = {Sym::RoVar, CESVM_IO_BUDGET_REMAINING, 0, 0};
     g["output_len"]     = {Sym::RwVar, CESVM_IO_OUTPUT_LEN, 0, 0};
     g["PRICE_UNIT"]     = {Sym::Const, 0, 0, 100000000};
+    // Account-hook context: which event invoked this run, and the named event
+    // kinds a trigger branches on. For a hook the event descriptor is in the
+    // `input` region: input[0..3]=counterparty key, input[4]=amount,
+    // input[5]=account balance at fire time.
+    g["invoke_kind"]      = {Sym::RoVar, CESVM_IO_INVOKE_KIND, 0, 0};
+    g["INVOKE_DIRECT"]     = {Sym::Const, 0, 0, INVOKE_DIRECT};
+    g["INVOKE_SCHEDULED"]  = {Sym::Const, 0, 0, INVOKE_SCHEDULED};
+    g["INVOKE_XFER_IN"]    = {Sym::Const, 0, 0, INVOKE_HOOK_XFER_IN};
+    g["INVOKE_XFER_OUT"]   = {Sym::Const, 0, 0, INVOKE_HOOK_XFER_OUT};
+    g["INVOKE_XFER_VM"]    = {Sym::Const, 0, 0, INVOKE_HOOK_XFER_VM};
+    g["INVOKE_SETTLE_IN"]  = {Sym::Const, 0, 0, INVOKE_HOOK_SETTLE_IN};
+    g["INVOKE_SETTLE_OUT"] = {Sym::Const, 0, 0, INVOKE_HOOK_SETTLE_OUT};
   }
 
   Sym* find(const std::string& name) {

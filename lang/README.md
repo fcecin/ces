@@ -24,6 +24,8 @@ Examples, simplest first:
 | `examples/fib.cesl` | variables, while, checked arithmetic |
 | `examples/vault.cesl` | input, require, a paid syscall + allowance |
 | `examples/cruncher.cesl` | subroutines, dynamic region indexing, multi-cell output, bundle deployment (>210 bytes) |
+| `examples/hook_gate.cesl` | account hook (gate): `invoke_kind`, event descriptor, accept/reject |
+| `examples/hook_watch.cesl` | account hook (watch): screen-then-`refill` to record |
 
 Full manual: `docs/cesl.md`. Short references:
 `include/ces/lang/casm.h` and `include/ces/lang/cesl.h`.

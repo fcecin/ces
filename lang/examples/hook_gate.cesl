@@ -1,0 +1,24 @@
+// An account hook (CESVM trigger). A GATE runs BEFORE an incoming transfer
+// commits and decides accept (clean return) or reject (require fails / abort).
+// A reject fails the transfer as a courtesy signal to the sender.
+//
+// The event descriptor is in the `input` region:
+//   input[0..3] = counterparty pubkey (the sender)
+//   input[4]    = amount
+//   input[5]    = this account's balance at fire time
+// and `invoke_kind` says which event fired (INVOKE_XFER_IN for an inbound
+// wire transfer). See docs/cesl.md, section "Account hooks".
+//
+// This gate accepts inbound transfers of at least 1 whole credit and rejects
+// everything smaller - a minimum-deposit policy. It only screens inbound
+// transfers; any other invocation just accepts.
+//
+// Deploy: compile, create an IMMUTABLE asset with the bytecode, then point
+// your account's alias at it as a GATE (op = ALIAS_OP_HOOK_GATE, content =
+// the asset key). Gates run on the free grant only (no refill), so keep them
+// cheap. Amounts below the dust floor never fire a hook at all.
+
+if (invoke_kind == INVOKE_XFER_IN) {
+  require(input[4] >= PRICE_UNIT);   // at least 1.0 credit, else reject
+}
+return 0;
