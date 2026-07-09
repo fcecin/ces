@@ -1,0 +1,64 @@
+// the big one: subroutines, a region as an array with dynamic
+// indexing, nested loops, and enough code that it cannot fit a single
+// 210-byte asset -- run.sh deploys it as a bundle (boot loader + code
+// chunk assets + key table) and runs it via CES_RUN_ASSET.
+
+const N = 64;
+let sieve[64];              // sieve[i] = 1 once i is known composite
+
+fn gcd(a, b) {
+  while (b != 0) {
+    let t = a % b;
+    a = b;
+    b = t;
+  }
+  return a;
+}
+
+fn collatz_steps(n) {
+  let steps = 0;
+  while (n != 1) {
+    if ((n & 1) == 0) { n = n / 2; }
+    else { n = 3 * n + 1; }
+    steps = steps + 1;
+  }
+  return steps;
+}
+
+fn mark_multiples(p) {      // sieve out p*p, p*p+p, ...
+  let i = p * p;
+  while (i < N) {
+    sieve[i] = 1;
+    i = i + p;
+  }
+  return 0;
+}
+
+// pass 1: sieve of eratosthenes, count the primes below N
+let p = 2;
+while (p * p < N) {
+  if (sieve[p] == 0) { mark_multiples(p); }
+  p = p + 1;
+}
+let primes = 0;
+let i = 2;
+while (i < N) {
+  if (sieve[i] == 0) { primes = primes + 1; }
+  i = i + 1;
+}
+
+// pass 2: hardest collatz start below 30 (spoiler: 27, 111 steps)
+let best_n = 1;
+let best_steps = 0;
+let n = 2;
+while (n < 30) {
+  let s = collatz_steps(n);
+  if (s > best_steps) { best_steps = s; best_n = n; }
+  n = n + 1;
+}
+
+// three results in three output cells
+output[0] = primes;                       // 18 primes below 64
+output[1] = best_n * 1000 + best_steps;   // 27111
+output[2] = gcd(462, 84);                 // 42
+output_len = 24;

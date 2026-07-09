@@ -171,6 +171,8 @@ BOOST_AUTO_TEST_CASE(ConstFolding) {
 
   BOOST_CHECK_THROW(ceslCompile("const X = 1 - 2;"), CeslError);
   BOOST_CHECK_THROW(ceslCompile("let v = 1; const X = v + 1;"), CeslError);
+  // Runtime shifts >= 64 fault the VM; the fold must reject, not yield 0.
+  BOOST_CHECK_THROW(ceslCompile("const X = 1 << 64;"), CeslError);
 }
 
 BOOST_AUTO_TEST_CASE(MemoryBuiltins) {

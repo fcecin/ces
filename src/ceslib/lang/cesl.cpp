@@ -1104,8 +1104,12 @@ private:
       case OP_OR:  return a | b;
       case OP_XOR: return a ^ b;
       case OP_AND: return a & b;
-      case OP_SHL: return b >= 64 ? 0 : a << b;
-      case OP_SHR: return b >= 64 ? 0 : a >> b;
+      // The VM faults (CESVM_SEGFAULT) on shift counts >= 64; keep the
+      // fold consistent with runtime semantics by rejecting them.
+      case OP_SHL:
+      case OP_SHR:
+        if (b >= 64) err("shift count >= 64 in constant expression");
+        return op == OP_SHL ? a << b : a >> b;
       case OP_EQ:  return a == b;
       case OP_NE:  return a != b;
       case OP_LT:  return a < b;
