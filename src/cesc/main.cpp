@@ -119,6 +119,8 @@ int main(int argc, char** argv) {
                   std::to_string(b.tables.size()) + " tables)\n";
       manifest += "# create every chunk and table asset at its key "
                   "(CES_CREATE_ASSET), then the boot asset (any key) last\n";
+      manifest += "# one-command deploy: "
+                  "cesh asset deploy-bundle <name> <this dir> --days N\n";
       char name[32];
       for (size_t i = 0; i < b.chunks.size(); ++i) {
         std::snprintf(name, sizeof(name), "chunk_%02zu.bin", i);

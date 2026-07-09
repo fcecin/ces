@@ -320,10 +320,19 @@ contiguously at run time; chunk keys live in a chain of key-table
 assets; a boot-loader asset holds one root key, loads everything, and
 jumps into the body. `cesc --bundle` computes the whole set offline
 with deterministic keys (sha256 of a tag, `--salt`, index, and body)
-and writes the blocks plus a `manifest.txt`: create every chunk and
-table asset at its listed key, then the boot asset (any key) last.
-`lang/run.sh` automates exactly this. Each run of a bundled program
-pays a query fee per table read and per chunk load on top of gas.
+and writes the blocks plus a `manifest.txt`; then one command deploys
+it all:
+
+```bash
+cesh asset deploy-bundle NAME out/ --days N
+```
+
+creates every chunk and table asset at its manifest key and the boot
+loader last, under NAME. Chunk and table keys are content-derived, so
+re-deploying the same bundle reuses the blocks already on the ledger
+(only a fresh boot asset is created). `lang/run.sh` automates compile
+plus deploy. Each run of a bundled program pays a query fee per table
+read and per chunk load on top of gas.
 
 ## 13. casm - the assembler
 

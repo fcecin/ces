@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <iostream>
 #include <iomanip>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -375,6 +376,19 @@ int main(int argc, char* argv[]) {
                     "/b/dice uses it as the bet amount.");
   cmd_ar->add_option("--input", asset_run_input_arg, "Input data (hex string)");
   cmd_ar->add_flag("--nonceless", asset_run_nonceless, "Use auto-nonce (no sequential nonce)");
+
+  std::string bundle_dir_arg;
+  auto* cmd_adb = cmd_asset->add_subcommand(
+    "deploy-bundle",
+    "Deploy a cesc --bundle directory: create every chunk and key-table "
+    "asset at its manifest key, then the boot loader under <id>. "
+    "Chunk/table keys are content-derived, so a re-deploy of the same "
+    "bundle reuses the assets already on the ledger.");
+  cmd_adb->add_option("id", asset_id_arg, "Boot asset ID or name")->required();
+  cmd_adb->add_option("dir", bundle_dir_arg,
+                      "Bundle directory (contains manifest.txt)")->required();
+  cmd_adb->add_option("--days", asset_days_arg,
+                      "Days to fund each created asset")->required();
 
   auto* cmd_aq = cmd_asset->add_subcommand("query", "Unsigned asset query");
   cmd_aq->add_option("id", asset_id_arg, "Asset ID or name")->required();
@@ -1324,6 +1338,82 @@ int main(int argc, char* argv[]) {
         print_field("Budget Used", std::to_string(budgetUsed));
         print_field("Allowance Used", std::to_string(allowanceUsed));
         return 1;
+      }
+
+    } else if (cmd_adb->parsed()) {
+      // Deploy a cesc --bundle directory. manifest.txt lines are
+      // "chunk <64-hex-key> <file>", "table <64-hex-key> <file> [root]"
+      // and one "boot - boot.bin"; comments start with '#'. Chunks and
+      // tables are created at their manifest keys first, the boot loader
+      // last under the user-chosen id. Chunk/table keys are derived from
+      // their content, so CES_ERROR_ASSET_EXISTS means the identical
+      // block is already on the ledger: count it as reused and move on.
+      std::filesystem::path dir(bundle_dir_arg);
+      std::ifstream mf(dir / "manifest.txt");
+      if (!mf) {
+        std::cerr << "Deploy Failed: cannot read "
+                  << (dir / "manifest.txt").string() << "\n";
+        return 1;
+      }
+      auto readBlock = [&](const std::string& file) -> AssetData {
+        std::ifstream f(dir / file, std::ios::binary);
+        AssetData d{};
+        if (!f.read(reinterpret_cast<char*>(d.data()),
+                    static_cast<std::streamsize>(d.size())) ||
+            f.peek() != std::ifstream::traits_type::eof())
+          throw std::runtime_error("bundle block " + file + " is not exactly " +
+                                   std::to_string(d.size()) + " bytes");
+        return d;
+      };
+      uint64_t created = 0, reused = 0;
+      std::string line, bootFile;
+      while (std::getline(mf, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream ls(line);
+        std::string kind, keyHex, file;
+        ls >> kind >> keyHex >> file;
+        if (kind == "boot") {
+          bootFile = file;
+          continue;
+        }
+        if ((kind != "chunk" && kind != "table") || file.empty()) {
+          std::cerr << "Deploy Failed: bad manifest line: " << line << "\n";
+          return 1;
+        }
+        uint8_t rc = cc.createAsset(parseAssetKey(keyHex), readBlock(file),
+                                    asset_days_arg);
+        if (rc == CES_OK) {
+          ++created;
+        } else if (rc == CES_ERROR_ASSET_EXISTS) {
+          ++reused;
+        } else {
+          std::cerr << "Deploy Failed: " << kind << " " << file << " ("
+                    << keyHex << "): " << errorString(rc) << "\n";
+          return 1;
+        }
+      }
+      if (bootFile.empty()) {
+        std::cerr << "Deploy Failed: manifest has no boot line\n";
+        return 1;
+      }
+      uint8_t rc = cc.createAsset(parseAssetKey(asset_id_arg),
+                                  readBlock(bootFile), asset_days_arg);
+      if (rc != CES_OK) {
+        std::cerr << "Deploy Failed: boot asset '" << asset_id_arg
+                  << "': " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (g_quiet) {
+        std::cout << "{\"boot\":\"" << jesc(asset_id_arg)
+                  << "\",\"blocksCreated\":" << created
+                  << ",\"blocksReused\":" << reused << "}\n";
+      } else {
+        print_header("Bundle Deployed");
+        print_field("Boot Asset", asset_id_arg);
+        print_field("Blocks Created", created);
+        print_field("Blocks Reused", reused);
+        print_field("Days", asset_days_arg);
+        std::cout << "Success.\n";
       }
 
     } else if (cmd_asq->parsed()) {

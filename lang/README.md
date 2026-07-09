@@ -27,10 +27,11 @@ Examples, simplest first:
 
 Full manual: `docs/cesl.md`. Short references:
 `include/ces/lang/casm.h` and `include/ces/lang/cesl.h`.
-Programs past 210 bytes deploy as bundles
-(`cesc --bundle`, see `include/ces/lang/bundle.h`); run.sh does this
-automatically, creating the chunk and key-table assets at their
-manifest keys and the boot loader last.
+Programs past 210 bytes deploy as bundles: `cesc --bundle` writes the
+chunk, key-table, and boot blocks plus a manifest (see
+`include/ces/lang/bundle.h`), and `cesh asset deploy-bundle NAME DIR
+--days N` creates every asset in one command. run.sh does both
+automatically.
 
 Everything generated (compiled binaries, the devnet workspace, keys,
 ledger) lands in `lang/build/`, which is gitignored. The devnet wallet

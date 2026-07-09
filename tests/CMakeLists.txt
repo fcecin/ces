@@ -20,7 +20,7 @@ target_compile_definitions(cestests PRIVATE CES_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
 
 # E2E tests need the binaries they shell out to, plus the compute
 # child stub (the handler fork+execs cescompmockd).
-add_dependencies(cestests cesh cesproxy cescompmockd cesluajitd)
+add_dependencies(cestests cesh cesc cesproxy cescompmockd cesluajitd)
 if(Qt6_FOUND)
   add_dependencies(cestests cesqt)
 endif()
