@@ -1,0 +1,5 @@
+; the smallest CesVM program: write 42 to the output and stop.
+; run it:   ./run.sh answer.casm     (after ./devnet.sh up)
+    set output_len, 8      ; output is 8 bytes...
+    set output, 42         ; ...holding 42 (little-endian u64)
+    term

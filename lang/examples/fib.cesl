@@ -1,0 +1,11 @@
+// iterative fibonacci: variables, while, checked arithmetic.
+let n = 20;
+let a = 0;
+let b = 1;
+while (n > 0) {
+  let t = a + b;
+  a = b;
+  b = t;
+  n = n - 1;
+}
+return a;   // fib(20) = 6765

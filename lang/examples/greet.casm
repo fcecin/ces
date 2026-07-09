@@ -1,0 +1,6 @@
+; pack a string into cells with .string and return it as the output.
+.alloc msg 2               ; 2 scratch cells = 16 bytes
+.string msg, "hello, ces"
+    mov output, msg, 2     ; copy both cells into the output buffer
+    set output_len, 10     ; "hello, ces" is 10 bytes
+    term

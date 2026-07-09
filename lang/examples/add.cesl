@@ -1,0 +1,3 @@
+// the smallest cesl program: arithmetic and a top-level return.
+// + - * are checked (a wrap halts the VM); +% -% *% wrap on purpose.
+return 2 + 3 * 4;

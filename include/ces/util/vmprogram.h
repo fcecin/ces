@@ -336,6 +336,15 @@ public:
   VmProgram& jfStack(VmLabel target);
   VmProgram& jtStack(VmLabel target);
 
+  // Generic emitter for table-driven code generators (the casm
+  // assembler): emit `op` followed by `operands`, each in shortest
+  // form. Performs no per-opcode operand-count validation; the caller's
+  // table owns that. Rejects opcodes whose wire shape is not
+  // opcode-then-plain-operands: label-target jumps/calls (2-byte raw
+  // target, use jmp/call/jf/jt) and the variadic host dispatchers
+  // (inline count byte, use hostv/hostxv).
+  VmProgram& rawOp(CesVMOpcode op, std::initializer_list<VmVal> operands);
+
   // --- Miscellaneous ---
 
   // Write a 64-bit random number to R.
@@ -817,6 +826,15 @@ public:
   // Build-out
   // =========================================================================
 
+  // Code-base offset for label resolution. A program destined to run at
+  // a nonzero base address (a bundle body entered at 210 behind the boot
+  // loader; see lang/bundle.h) sets this before build-out: every label
+  // target resolves to (offset + base) so jumps land correctly at run
+  // time. The emitted bytes do not move, only the resolved targets.
+  // Computed jmpr/callr addresses are the program's own responsibility.
+  // buildBootBlock() rejects a nonzero base (a boot block runs at 0).
+  void setBaseOffset(uint64_t base) { baseOffset_ = base; }
+
   // Current code size in bytes. Grows as opcodes are appended.
   size_t size() const { return code_.size(); }
 
@@ -863,6 +881,9 @@ private:
   // first cell past the named registers; advances by alloc() each
   // time a region is requested. allocAt() does not move it.
   uint64_t scratchTop_ = CESVM_REG_SIZE;
+
+  // Added to every resolved label target at build-out. See setBaseOffset.
+  uint64_t baseOffset_ = 0;
 
   // --- Internal emit helpers ---
 

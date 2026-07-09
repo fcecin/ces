@@ -1,0 +1,12 @@
+; sum 10+9+...+1 with a countdown loop: registers, labels, jt.
+; [x] reads the contents of cell x; a bare symbol is the value itself.
+    set g0, 10             ; counter
+    set g1, 0              ; accumulator
+loop:
+    add [g1], [g0]         ; R = g1 + g0
+    set g1, [r]            ; g1 = R
+    dec g0
+    jt [g0], loop          ; loop while g0 != 0
+    set output_len, 8
+    set output, [g1]       ; 55
+    term

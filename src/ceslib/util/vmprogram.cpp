@@ -134,12 +134,12 @@ void VmProgram::resolveLabelsOrThrow() {
     if (r.labelId >= labels_.size()) {
       throw VmProgramError("vmprogram: reloc against unknown label");
     }
-    const uint64_t target = labels_[r.labelId];
-    if (target == std::numeric_limits<uint64_t>::max()) {
+    if (labels_[r.labelId] == std::numeric_limits<uint64_t>::max()) {
       throw VmProgramError(
         "vmprogram: label referenced but never placed (id=" +
         std::to_string(r.labelId) + ")");
     }
+    const uint64_t target = labels_[r.labelId] + baseOffset_;
     if (target > 0xFFFFu) {
       throw VmProgramError(
         "vmprogram: label offset exceeds 16-bit range (offset=" +
@@ -351,6 +351,22 @@ VmProgram& VmProgram::jfStack(VmLabel target) {
 VmProgram& VmProgram::jtStack(VmLabel target) {
   emitOpcode(static_cast<uint8_t>(OP_JT | CESVM_OP_STACK));
   emitLabelRef(target);
+  return *this;
+}
+
+VmProgram& VmProgram::rawOp(CesVMOpcode op,
+                             std::initializer_list<VmVal> operands) {
+  switch (op) {
+    case OP_JMP: case OP_CALL: case OP_JF: case OP_JT:
+    case OP_HOSTV: case OP_HOSTXV:
+      throw VmProgramError(
+        "vmprogram: rawOp cannot emit opcode " + std::to_string(op) +
+        "; its wire shape is not opcode-then-plain-operands");
+    default:
+      break;
+  }
+  emitOpcode(op);
+  for (const auto& v : operands) emitVal(v);
   return *this;
 }
 
@@ -604,6 +620,11 @@ VmProgram& VmProgram::hostxv(uint64_t syscallNum,
 // ===========================================================================
 
 AssetData VmProgram::buildBootBlock() {
+  if (baseOffset_ != 0) {
+    throw VmProgramError(
+      "vmprogram: buildBootBlock with nonzero base offset (a boot block "
+      "runs at address 0; base-offset code belongs in a bundle body)");
+  }
   resolveLabelsOrThrow();
   AssetData out{};
   if (code_.size() > out.size()) {

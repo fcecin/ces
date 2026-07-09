@@ -195,6 +195,11 @@ target_link_libraries(cesproxy PRIVATE ceslib CLI11::CLI11)
 target_link_options(cesproxy PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesproxy PROPERTIES OUTPUT_NAME "cesproxy")
 
+add_executable(cesc src/cesc/main.cpp)
+target_link_libraries(cesc PRIVATE ceslib CLI11::CLI11)
+target_link_options(cesc PRIVATE "-Wl,-z,noexecstack")
+set_target_properties(cesc PROPERTIES OUTPUT_NAME "cesc")
+
 add_executable(cescompmockd src/cescompmockd/main.cpp)
 target_link_options(cescompmockd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cescompmockd PROPERTIES OUTPUT_NAME "cescompmockd")

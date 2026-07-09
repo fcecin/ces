@@ -57,17 +57,28 @@ include/ces/util/   shared helpers: ctrlc, fileperm, hash, hex, log,
                     metrics, resolver, vmprogram, wallet.
                     Each include/ces/<group>/<x>.h has a matching
                     src/ceslib/<group>/<x>.cpp.
+include/ces/lang/   CesVM toolchain: casm (textual assembler) and cesl
+                    (transaction-script language). Both emit bytecode
+                    through util/vmprogram; language references live in
+                    the headers.
 src/ceslib/         static lib mirroring the include tree: top-level
                     server.cpp (incl. SYS_RPC outbound engine), cesvm.cpp,
                     ramfilestore.cpp, accounts/assets/client/clientasync/
                     cesco; subdirs cesplex/, l2/, util/
 src/ces/main.cpp    server CLI: config, key gen, ces credit/debit/snapshot
+src/cesc/           cesc CLI: compiles .cesl / assembles .casm into CesVM
+                    bytecode (-o out.bin, --hex, --boot pads to 210)
 src/cesh/           shell client (main.cpp + dial.cpp/h)
 src/cesluajitd/     compute child runtime (LuaJIT-hosted, default)
 src/cescompmockd/   no-Lua mock child (regression-test plumbing only)
 src/cesproxy/       TCP/UDP proxy with wire-level validation
 src/cesbench/       in-process benchmark
 src/cesqt/          Qt6 GUI: 11 tabs + JSON-RPC server (rpcserver.cpp)
+lang/               CesVM language playground: example .casm/.cesl
+                    programs (simplest first) plus devnet.sh (one-command
+                    local no-PoW server + funded wallet), run.sh (compile,
+                    deploy as asset, CES_RUN_ASSET), build.sh. Artifacts
+                    land in lang/build/ (gitignored).
 extensions/         committed catalog of operator-deployable /s/ Lua
                     extensions (dice.lua + dice.md, discovery.lua +
                     discovery.md); the default extensions_dir. Install
@@ -134,6 +145,10 @@ Harvard architecture; runs on `logicStrand_`; mutations atomic with an undo log.
 Syscalls (`cesvm.h`) cover account/asset read and mutate, transfers (local and cross), hashing, sig-verify, code load, scheduling, deposit/withdraw, send-to-client, and outbound `SYS_RPC`. `SYS_SEND_UDP` is tombstoned (returns DISABLED).
 
 VmProgram (`vmprogram.h`): C++ fluent API, one method per opcode, label support; emits an asset cell or a byte vector.
+
+Toolchain (`include/ces/lang/`, CLI `cesc`): `casm` is the 1:1 textual assembler; `cesl` is the transaction-script language (single u64 type, checked arithmetic by default with `+% -% *%` wrapping forms, static cell allocation, non-reentrant fns with recursion rejected at compile time, syscall builtins mirroring the CesVM ABI). Both compile through VmProgram. `cesc file.cesl|file.casm` emits bytecode; `--boot` enforces/pads the 210-byte boot block. References in the two headers.
+
+Bundler (`lang/bundle.h`, `cesc --bundle <dir> [--salt s]`): packages a program larger than one boot block into deployable assets. The body is compiled with codeBase 210 (VmProgram label relocation; byte length is base-independent) and split into 210-byte chunk assets that SYS_LOAD_CODE reassembles contiguously at 210, 420, ...; instructions may straddle chunk boundaries and all jump targets are link-time constants. Chunk keys live in a chain of key-table assets (5 chunk keys + next-table key each), so one root key in the boot loader covers the full 8 KB. Keys are deterministic (sha256 of tag+salt+index+body); deploy chunks and tables at their listed keys, boot last. Each run pays feeQuery per table read and chunk load.
 
 Cron / `SYS_SCHEDULE`: enqueues a one-shot VM run at absolute wall time; missed deadlines fire ASAP. Recurrence is a scheduled VM re-calling `SYS_SCHEDULE`. Schedule state persisted as ledger entries.
 

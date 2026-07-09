@@ -1,0 +1,9 @@
+// input, require, and a real syscall: deposit credits with the
+// program's owner. The 8-byte input is the amount (little-endian);
+// deposits spend the caller's credits, so the run needs an allowance:
+//   ./run.sh vault.cesl --input 0500000000000000 --allowance 500
+require(input_len == 8);
+let amt = input[0];
+require(amt > 0);
+deposit(amt);
+return amt;
