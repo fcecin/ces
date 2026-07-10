@@ -621,6 +621,26 @@ uint8_t CesClient::createAsset(const Hash& assetId, const AssetData& content,
   });
 }
 
+uint8_t CesClient::createAssetRange(const Hash& firstKey, uint32_t count,
+                                    uint16_t days) {
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesCreateAssetRange req;
+  req.ownerId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.firstKey = firstKey;
+  req.count = count;
+  req.days = days;
+  return sendSigned(req, createAssetRangeGen_, createAssetRangeResultCode_, [&] {
+    return createAssetRangeResultNonce_ == reqNonce &&
+           createAssetRangeResultOriginId_ == myId;
+  });
+}
+
 uint8_t CesClient::setAlias(uint16_t op, const AliasData& content,
                             uint32_t& outAliasId) {
   outAliasId = 0;
@@ -1270,6 +1290,15 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         createAssetResultOriginId_ = r.ownerId;
         createAssetResultNonce_ = r.reqNonce;
         createAssetResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_CREATE_ASSET_RANGE_RESULT:
+      handleSigned(CesCreateAssetRangeResult{}, "create asset range",
+                   createAssetRangeGen_, [&](auto& r) {
+        createAssetRangeResultOriginId_ = r.ownerId;
+        createAssetRangeResultNonce_ = r.reqNonce;
+        createAssetRangeResultCode_ = r.rcode;
       });
       break;
 

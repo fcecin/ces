@@ -667,6 +667,13 @@ public:
                       uint16_t balance, uint32_t providedNonce,
                       int64_t rentFee = -1, int64_t errFee = -1);
 
+  // Atomically create `count` account-owned cells at firstKey||0..count-1
+  // (firstKey is prefix||0). Rejects the whole batch if any key exists.
+  uint8_t createAssetRange(const minx::Hash& originKey, const HashPrefix& ownerId,
+                           const minx::Hash& firstKey, uint32_t count,
+                           uint16_t days, uint32_t providedNonce,
+                           int64_t rentFee = -1, int64_t errFee = -1);
+
   uint8_t updateAsset(const minx::Hash& originKey, const minx::Hash& assetId,
                       const HashPrefix& newOwnerId, const AssetData& content,
                       uint32_t price, uint32_t providedNonce,

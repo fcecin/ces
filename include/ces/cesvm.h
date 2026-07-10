@@ -293,10 +293,10 @@ enum CesVMSyscall : uint64_t {
   SYS_REFILL          = 23,
   // SYS_CREATE_ASSET_RANGE — atomically create N account-owned assets at a
   // fresh random 24-byte prefix, keyed prefix||0 .. prefix||(N-1) (last 8 bytes
-  // an LE index). Cell 0's content carries uint32_t N at bytes 0..3; all cells
-  // are otherwise zero. The prefix is opaque entropy, no type tag, and the
-  // whole batch is collision-checked: any pre-existing target key abandons the
-  // batch (creating nothing) and retries a fresh prefix. io[4]=N, io[5]=days,
+  // a native index). Cell 0's content carries uint32_t N at bytes 0..3; all
+  // cells are otherwise zero. The prefix is opaque entropy, no type tag, and
+  // the whole batch is collision-checked: any pre-existing target key abandons
+  // the batch (creating nothing) and retries a fresh prefix. io[4]=N, io[5]=days,
   // io[6]=cell index where the 32-byte handle (cell-0 key) is written. Bills N
   // asset creations. This is the bare array primitive; sequence membership is
   // metadata held by the owner (all cells share one owner), not read from keys.

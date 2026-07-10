@@ -912,4 +912,52 @@ BOOST_FIXTURE_TEST_CASE(OwnerPaysDrainsOverDaysThenFlipOffKillsAssetNotAccount,
   BOOST_CHECK_EQUAL(bal(b.getPublicKeyAsHash()), afterFlip);     // not charged
 }
 
+// CES_CREATE_ASSET_RANGE: the client picks a prefix and creates N account-owned
+// cells atomically. All exist and share the client's ownership; cell 0 carries
+// N; cell N does not exist (bounded). Re-claiming the prefix collides; count 0
+// is rejected. Small indices keep the native LE index in the low byte.
+BOOST_FIXTURE_TEST_CASE(CreateAssetRange, CesFixture) {
+  const uint32_t N = 4;
+  minx::Hash firstKey{};
+  for (int i = 0; i < 24; ++i) firstKey[i] = static_cast<uint8_t>(0x40 + i);
+
+  BOOST_REQUIRE_EQUAL(client->createAssetRange(firstKey, N, 30), CES_OK);
+
+  HashPrefix me = getMyId();
+  for (uint32_t i = 0; i < N; ++i) {
+    minx::Hash key = firstKey;
+    key[24] = static_cast<uint8_t>(i);   // i < 256, so the low index byte
+    HashPrefix owner{};
+    AssetData content{};
+    uint16_t bal = 0;
+    uint32_t price = 0;
+    BOOST_REQUIRE_EQUAL(client->queryAsset(key, owner, content, bal, price),
+                        CES_OK);
+    BOOST_CHECK(owner == me);
+    if (i == 0) BOOST_CHECK_EQUAL(content[0], static_cast<uint8_t>(N));
+  }
+
+  // cell N was never created: the range is exactly N wide.
+  {
+    minx::Hash key = firstKey;
+    key[24] = static_cast<uint8_t>(N);
+    HashPrefix owner{};
+    AssetData content{};
+    uint16_t bal = 0;
+    uint32_t price = 0;
+    client->queryAsset(key, owner, content, bal, price);
+    BOOST_CHECK(!(owner == me));
+  }
+
+  // Re-claiming the same prefix collides.
+  BOOST_CHECK_EQUAL(client->createAssetRange(firstKey, N, 30),
+                    static_cast<uint8_t>(CES_ERROR_ASSET_EXISTS));
+
+  // Count 0 is rejected.
+  minx::Hash fk2{};
+  for (int i = 0; i < 24; ++i) fk2[i] = static_cast<uint8_t>(0x90 + i);
+  BOOST_CHECK_EQUAL(client->createAssetRange(fk2, 0, 30),
+                    static_cast<uint8_t>(CES_ERROR_BAD_INPUT));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

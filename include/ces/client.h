@@ -139,6 +139,9 @@ public:
   uint8_t createAsset(const Hash& assetId, const AssetData& content,
                       uint16_t days, bool private_ = false,
                       bool immutable = false, bool ownerPays = false);
+  // Atomically create `count` account-owned cells at firstKey||0..count-1
+  // (firstKey is prefix||0). Success means all cells exist.
+  uint8_t createAssetRange(const Hash& firstKey, uint32_t count, uint16_t days);
   uint8_t setAssetOwnerPays(const Hash& assetId, bool ownerPays);
 
   uint8_t updateAsset(const Hash& assetId, const HashPrefix& newOwner,
@@ -390,6 +393,11 @@ private:
   uint32_t createAssetResultNonce_ = 0;
   uint8_t createAssetResultCode_ = 0;
   std::atomic<uint64_t> createAssetGen_ = 0;
+
+  HashPrefix createAssetRangeResultOriginId_;
+  uint32_t createAssetRangeResultNonce_ = 0;
+  uint8_t createAssetRangeResultCode_ = 0;
+  std::atomic<uint64_t> createAssetRangeGen_ = 0;
 
   HashPrefix updateAssetResultOwnerId_;
   uint32_t updateAssetResultNonce_ = 0;

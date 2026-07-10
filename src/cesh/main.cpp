@@ -309,6 +309,8 @@ int main(int argc, char* argv[]) {
 
   std::string asset_id_arg, asset_content_arg, asset_hexcontent_arg, asset_target_arg;
   uint16_t asset_days_arg = 0;
+  uint32_t asset_range_count_arg = 0;
+  std::string asset_range_prefix_arg;
   uint64_t asset_price_arg = 0;
   uint64_t asset_buy_amount_arg = 0;
 
@@ -323,6 +325,11 @@ int main(int argc, char* argv[]) {
   cmd_ac->add_flag("--private", asset_private_arg, "Make asset private (content hidden from non-owner)");
   cmd_ac->add_flag("--immutable", asset_immutable_arg, "Seal content forever (cannot be updated; owner/price/funding still mutable)");
   cmd_ac->add_flag("--owner-pays", asset_owner_pays_arg, "Auto-fund daily rent from the owner account once prepaid days run out");
+
+  auto* cmd_arg = cmd_asset->add_subcommand("range", "Atomically create N account-owned cells at a prefix");
+  cmd_arg->add_option("count", asset_range_count_arg, "Number of cells")->required();
+  cmd_arg->add_option("--days", asset_days_arg, "Days to fund")->required();
+  cmd_arg->add_option("--prefix", asset_range_prefix_arg, "24-byte prefix hex (default: random)");
 
   auto* cmd_au = cmd_asset->add_subcommand("update", "Full asset update");
   cmd_au->add_option("id", asset_id_arg, "Asset ID or name")->required();
@@ -1186,6 +1193,31 @@ int main(int argc, char* argv[]) {
         std::cout << "Success.\n";
       } else {
         std::cerr << "Create Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+
+    } else if (cmd_arg->parsed()) {
+      minx::Hash firstKey{};
+      if (asset_range_prefix_arg.empty()) {
+        minx::Hash r = KeyPair().getPublicKeyAsHash();   // fresh random entropy
+        for (int i = 0; i < 24; ++i) firstKey[i] = r[i];
+      } else {
+        auto pb = ces::parseHex(asset_range_prefix_arg);
+        if (pb.size() < 24) {
+          std::cerr << "prefix must be at least 24 bytes of hex\n";
+          return 1;
+        }
+        for (int i = 0; i < 24; ++i) firstKey[i] = pb[i];
+      }
+      uint8_t rc = cc.createAssetRange(firstKey, asset_range_count_arg,
+                                       asset_days_arg);
+      if (rc == CES_OK) {
+        print_header("Asset Range Created");
+        print_field("Cells", asset_range_count_arg);
+        print_field("Handle", minx::hashToString(firstKey));
+        std::cout << "Success.\n";
+      } else {
+        std::cerr << "Create Range Failed: " << errorString(rc) << "\n";
         return 1;
       }
 

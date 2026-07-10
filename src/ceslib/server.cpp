@@ -106,6 +106,17 @@ constexpr const char* ACCOUNTS_DATA_SUBDIRECTORY = "accounts";
 constexpr const char* ASSETS_DATA_SUBDIRECTORY = "assets";
 constexpr const char* ALIASES_DATA_SUBDIRECTORY = "aliases";
 
+// Asset-range cell conventions, shared by the VM syscall host and the
+// CES_CREATE_ASSET_RANGE handler: cell i's key is prefix||i with a native index
+// in the last 8 bytes; cell 0's content carries the range length as a native
+// uint32 at bytes 0..3.
+static void rangeSetCellIndex(minx::Hash& key, uint64_t index) {
+  std::memcpy(key.data() + 24, &index, sizeof(index));
+}
+static void rangeSetLength(AssetData& content, uint32_t count) {
+  std::memcpy(content.data(), &count, sizeof(count));
+}
+
 // Shared write-auth check for VM host callbacks.
 // - Immutable assets: nobody may write.
 // - Asset-owned assets: only the executing boot asset itself can write.
@@ -644,8 +655,7 @@ public:
                            uint16_t days) override {
     minx::Hash key = firstKey;
     for (uint32_t i = 0; i < n; ++i) {
-      uint64_t idx = i;
-      std::memcpy(key.data() + 24, &idx, sizeof(idx));
+      rangeSetCellIndex(key, i);
       if (server_.assets_->find(key) != server_.assets_->end())
         return CES_ERROR_ASSET_EXISTS;
     }
@@ -656,11 +666,10 @@ public:
     auto bal = assetBalance(static_cast<uint16_t>(storeDays), priv,
                             /*aowned=*/false, immut, isAssetOwnerPays(days));
     for (uint32_t i = 0; i < n; ++i) {
-      uint64_t idx = i;
-      std::memcpy(key.data() + 24, &idx, sizeof(idx));
+      rangeSetCellIndex(key, i);
       maybeSaveAsset(key);
       AssetData content{};
-      if (i == 0) std::memcpy(content.data(), &n, sizeof(n));
+      if (i == 0) rangeSetLength(content, n);
       server_.assets_->getObjects().emplace(key, Asset(caller_, content, bal, 0));
     }
     return CES_OK;
@@ -2419,6 +2428,68 @@ uint8_t CesServer::createAsset(const minx::Hash& originKey,
   return CES_OK;
 }
 
+uint8_t CesServer::createAssetRange(const minx::Hash& originKey,
+                                    const HashPrefix& ownerId,
+                                    const minx::Hash& firstKey, uint32_t count,
+                                    uint16_t days, uint32_t providedNonce,
+                                    int64_t rentFee, int64_t errFee) {
+  rentFee = resolveFee(rentFee, cfg_.feeAsset);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  if (count == 0 || count > CESVM_MAX_ASSET_RANGE)
+    return CES_ERROR_BAD_INPUT;
+
+  uint64_t perCell = attenuatedFundCost(
+    FeeKind::AssetRent, rentFee,
+    2u + static_cast<uint32_t>(assetDays(days)), 0);
+  uint64_t totalCost = perCell * count;
+
+  uint8_t rc = origin.validateSpend(0, totalCost, providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  if (assets_->getObjects().size() + count > cfg_.maxAsset) {
+    origin.chargeError(errFee);
+    LOGDEBUG << "createAssetRange: max assets reached";
+    return CES_ERROR_INTERNAL;
+  }
+
+  // Atomic: reject the whole batch if any target key already exists.
+  minx::Hash key = firstKey;
+  for (uint32_t i = 0; i < count; ++i) {
+    rangeSetCellIndex(key, i);
+    if (assets_.get(key).exists()) {
+      origin.chargeError(errFee);
+      return CES_ERROR_ASSET_EXISTS;
+    }
+  }
+
+  origin.debit(totalCost);
+  accounts_.checkFlush(totalCost);
+
+  bool priv = isAssetPrivate(days);
+  bool immut = isAssetImmutable(days);
+  uint32_t storeDays = 1u + assetDays(days);
+  if (storeDays > 0x0FFF) storeDays = 0x0FFF;
+  auto bal = assetBalance(static_cast<uint16_t>(storeDays), priv,
+                          /*aowned=*/false, immut, isAssetOwnerPays(days));
+  Asset::SerModeGuard guard(Asset::SerMode::Full);
+  for (uint32_t i = 0; i < count; ++i) {
+    rangeSetCellIndex(key, i);
+    AssetData content{};
+    if (i == 0) rangeSetLength(content, count);
+    assets_->update(key, Asset(ownerId, content, bal, 0));
+  }
+  assets_.checkFlush(totalCost);
+  checkAutoSnapshot();
+  LOGTRACE << "createAssetRange ok" << VAR(count) << VAR(days);
+  return CES_OK;
+}
+
 uint8_t CesServer::updateAsset(const minx::Hash& originKey,
                                const minx::Hash& assetId,
                                const HashPrefix& newOwnerId,
@@ -3191,6 +3262,27 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           res.assetId = req.assetId;
           res.amount = req.amount;
           res.price = req.price;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_CREATE_ASSET_RANGE: {
+      CesCreateAssetRange req;
+      req.fromBytes(msg.data);
+      Hash key = req.ownerId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesCreateAssetRange& req, const HashPrefix& ownerPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint8_t rc = createAssetRange(req.ownerId,
+                                        Account::getMapKey(req.ownerId),
+                                        req.firstKey, req.count, req.days,
+                                        req.reqNonce);
+          CesCreateAssetRangeResult res;
+          res.ownerId = ownerPrefix;
+          res.reqNonce = req.reqNonce;
+          res.firstKey = req.firstKey;
           res.rcode = rc;
           sendSignedReply(addr, msg, std::move(res));
         });

@@ -641,6 +641,31 @@ struct CesCreateAssetResult {
   CES_INJECT_SIGNED_METHODS(CES_CREATE_ASSET_RESULT)
 };
 
+// Atomic multi-cell allocation: create `count` account-owned cells at a
+// caller-chosen prefix, keyed firstKey||0 .. firstKey||(count-1) (firstKey is
+// prefix||0). Success means all cells exist; the caller already knows the
+// handle (it picked the prefix), so nothing is echoed but a status.
+#define CES_CREATE_ASSET_RANGE_FIELDS(X)                                       \
+  X(Hash, ownerId) X(HashPrefix, serverId)                                     \
+  X(uint32_t, reqNonce) X(Hash, firstKey) X(uint32_t, count)                   \
+    X(uint16_t, days)
+struct CesCreateAssetRange {
+  CES_DECLARE_FIELDS(CES_CREATE_ASSET_RANGE_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_CREATE_ASSET_RANGE_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_CREATE_ASSET_RANGE)
+};
+
+#define CES_CREATE_ASSET_RANGE_RESULT_FIELDS(X)                                \
+  X(HashPrefix, ownerId)                                                       \
+  X(uint32_t, reqNonce) X(Hash, firstKey) X(uint8_t, rcode)
+struct CesCreateAssetRangeResult {
+  CES_DECLARE_FIELDS(CES_CREATE_ASSET_RANGE_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_CREATE_ASSET_RANGE_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_CREATE_ASSET_RANGE_RESULT)
+};
+
 #define CES_UPDATE_ASSET_FIELDS(X)                                             \
   X(Hash, ownerId) X(HashPrefix, serverId)                                     \
   X(uint32_t, reqNonce) X(Hash, assetId) X(HashPrefix, newOwnerId)             \
