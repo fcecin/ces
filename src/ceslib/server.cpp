@@ -2827,7 +2827,7 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
                             const AliasData& content, uint32_t providedNonce,
                             uint32_t& outAliasId, int64_t fee,
                             int64_t errFee) {
-  fee = discountedFlatFee(fee, cfg_.feeAccount, FeeKind::AccountRent);
+  fee = discountedFlatFee(fee, cfg_.feeAlias, FeeKind::AccountRent);
   errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
   outAliasId = 0;
 
@@ -4782,14 +4782,15 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
       });
       accounts_.adjustTotalCredits(astCreditsDelta);
     }
-    // Alias rent: each alias costs its owner one day (feeAccount rate), charged
-    // in RAM like account/asset rent (the snapshot below captures it). Owner
-    // gone or unable to pay -> erase the alias and clear its aliasId. The
-    // id-generator cell (id 0) is never billed.
+    // Alias rent: sized by the alias's byte footprint (feeAlias =
+    // ALIAS_BYTES x MEMORY_PRICE), charged to the owner in RAM like account/
+    // asset rent (the snapshot below captures it). Owner gone or unable to pay
+    // -> erase the alias and clear its aliasId. The id-generator cell (id 0) is
+    // never billed.
     size_t aliasBefore = 0, aliasReclaimed = 0;
     {
       uint64_t dailyAliasFee =
-        discountFee(FeeKind::AccountRent, cfg_.feeAccount);
+        discountFee(FeeKind::AccountRent, cfg_.feeAlias);
       auto& map = aliases_->getObjects();
       aliasBefore = map.size();
       int64_t aliasCreditsDelta = 0;

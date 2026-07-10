@@ -480,9 +480,10 @@ BOOST_FIXTURE_TEST_CASE(EvictsAfterChannelDies, NetBillFixture) {
 BOOST_FIXTURE_TEST_CASE(EvictsOnInsufficientFunds, NetBillFixture) {
   // Use a fresh key (NOT testKey, which the fixture funds heavily).
   ces::KeyPair brokeKey;
-  // Fund 100 raw, far below the tick debit. Throughput is metered per KiB, so a
-  // multi-KiB round-trip makes the byte debit clearly exceed the funding.
-  server->_brr(brokeKey.getPublicKeyAsHash(), 100);
+  // Fund 10 raw, far below the tick debit. Throughput is metered per KiB
+  // (~50 raw/KiB at stock), so a multi-KiB round-trip debits hundreds of raw,
+  // well above the funding.
+  server->_brr(brokeKey.getPublicKeyAsHash(), 10);
 
   NbTestPeer peer;
   BOOST_REQUIRE(peer.start() != 0);

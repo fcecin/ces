@@ -29,6 +29,7 @@ struct AliasFixtureBase {
     CesConfig cfg =
       makeTestConfig(tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
     cfg.feeAccount = feeAccount;
+    cfg.feeAlias = feeAccount;
     cfg.feeQuery = feeQuery;
     cfg.feeTx = 0;
     cfg.feeAsset = 0;
@@ -248,7 +249,7 @@ BOOST_FIXTURE_TEST_CASE(SetChargesOneDay, AliasRentFixture) {
   int64_t before = bal(a.getPublicKeyAsHash());
   uint32_t id = 0;
   CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, str("x"), id));
-  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 1000);   // one day = feeAccount
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 1000);   // one day = feeAlias
 }
 
 BOOST_FIXTURE_TEST_CASE(DailyRentChargesOwner, AliasRentFixture) {

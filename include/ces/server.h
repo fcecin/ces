@@ -38,10 +38,23 @@ namespace ces {
 // a unique_ptr to one; the full type is only needed in server.cpp.
 class CesPlex;
 
-constexpr uint64_t BASE_FEE_ACCOUNT = 6'400'000;
-// Asset rent tracks the RAM size ratio: Account is 64 B, Asset is
-// 256 B, so feeAsset = 4x feeAccount.
-constexpr uint64_t BASE_FEE_ASSET = 25'600'000;
+// L1 RAM is one uniform good: every ledger row's daily rent is its byte
+// footprint times this one price. Fixed, not load-discounted -- rent tracks
+// occupancy, which the throughput gauge can't see. Disk, compute RSS, and
+// net-mem all derive from feeAsset, so they scale with it.
+constexpr uint64_t MEMORY_PRICE = 10'000;   // raw credits per byte-day of RAM
+
+// Row footprint (value + key + overhead), in bytes. Account 64 : Asset 256
+// holds the 4x ratio. Alias is the resizable memory area; 128 today, grows to
+// 16 KiB once its read/write moves onto chunked RUDP (a fixed UDP op can't
+// carry it).
+constexpr uint64_t ACCOUNT_BYTES = 64;
+constexpr uint64_t ASSET_BYTES   = 256;
+constexpr uint64_t ALIAS_BYTES   = 128;
+
+constexpr uint64_t BASE_FEE_ACCOUNT = ACCOUNT_BYTES * MEMORY_PRICE;   // 640,000
+constexpr uint64_t BASE_FEE_ASSET   = ASSET_BYTES   * MEMORY_PRICE;   // 2,560,000
+constexpr uint64_t BASE_FEE_ALIAS   = ALIAS_BYTES   * MEMORY_PRICE;   // 1,280,000
 constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 // Query fee covers dedup + state write. The network share is billed
 // separately (feeNetKiB*) and the bind contract removed the per-op
@@ -154,6 +167,7 @@ struct CesConfig {
 
   uint64_t feeAccount = BASE_FEE_ACCOUNT;
   uint64_t feeAsset = BASE_FEE_ASSET;
+  uint64_t feeAlias = BASE_FEE_ALIAS;   // sized rent: ALIAS_BYTES x MEMORY_PRICE
   uint64_t feeTx = BASE_FEE_TRANSACTION;
   uint64_t feeQuery = BASE_FEE_QUERY;
   uint64_t feeVmMult = BASE_FEE_VM_MULT;
@@ -707,11 +721,11 @@ public:
                    uint64_t priceLimit, uint32_t providedNonce,
                    int64_t buyFee = -1, int64_t errFee = -1);
 
-  // Alias ops: a dependable, account-owned 64-byte sidecar (local/aliases.md).
+  // Alias ops: a dependable, account-owned 128-byte sidecar (local/aliases.md).
   // setAlias binds/edits the origin account's single alias: with no live alias
   // it allocates a fresh id, otherwise it overwrites the existing one in place
   // (the id is stable across edits; delete to drop or rotate it). Charges one
-  // day at the feeAccount rate. deleteAlias erases it and clears the account
+  // day at the feeAlias rate. deleteAlias erases it and clears the account
   // link; queryAlias is a public read. All run on logicStrand_.
   uint8_t setAlias(const minx::Hash& originKey, uint16_t op,
                    const AliasData& content, uint32_t providedNonce,
