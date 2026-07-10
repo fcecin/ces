@@ -6,7 +6,7 @@
 
 namespace ces {
 
-using AliasData = std::array<uint8_t, 50>;
+using AliasData = std::array<uint8_t, 128>;
 
 // Alias op enum: the uint16 in the value, a hardcoded system operation code.
 // 16 bits (65536 codes); the vocabulary grows as features land.
@@ -28,14 +28,15 @@ inline bool aliasOpIsHook(uint16_t op) {
 }
 
 /**
- * Alias: a server-allocated, ID-keyed 64-byte sidecar bound to one account.
+ * Alias: a server-allocated, ID-keyed sidecar bound to one account.
  * The boost flat-map entry is pair<const uint32_t, Alias>: a 4-byte id key and
- * this 60-byte value, 64 bytes total, one cache line. Fields are ordered for
- * zero padding; the layout is pinned in tests/test_alias_layout.cpp.
+ * a 138-byte value, 144 bytes total (2 bytes trailing pad from the key's 4-byte
+ * alignment). The value itself is zero-padded; the layout is pinned in
+ * tests/test_alias_layout.cpp.
  *
  * - owner: HashPrefix, the owning account (server-set at create, not forgeable).
- * - op: uint16_t, the system operation enum (hardcoded; see local/aliases.md).
- * - content: 50 bytes of payload whose meaning is defined by op.
+ * - op: uint16_t, the system operation enum (hardcoded).
+ * - content: 128 bytes of payload whose meaning is defined by op.
  *
  * No per-cell balance: an alias is funded by its owner account (daily rent at
  * the feeAccount rate). One alias per account; the account holds its id in

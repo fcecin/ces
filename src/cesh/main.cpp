@@ -1131,7 +1131,8 @@ int main(int argc, char* argv[]) {
       else if (!alias_content_arg.empty())
         bytes.assign(alias_content_arg.begin(), alias_content_arg.end());
       if (bytes.size() > d.size())
-        throw std::runtime_error("alias content exceeds 50 bytes");
+        throw std::runtime_error("alias content exceeds " +
+                                 std::to_string(d.size()) + " bytes");
       for (size_t i = 0; i < bytes.size(); ++i) d[i] = bytes[i];
       return d;
     };
