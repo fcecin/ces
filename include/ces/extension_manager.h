@@ -55,6 +55,22 @@ bool extensionCommand(CesServer* server, const std::string& name,
                       const std::string& id, const std::string& arg,
                       std::string& out);
 
+// The mene admin panel of a running extension (kComputeExtCapPanel).
+// `frame` = a complete wire frame JSON: {"type":"render","tree":...} or a
+// {"type":"toast",...} carrying a panel-side Lua error. false if not enabled /
+// no panel registered / IPC timeout.
+bool extensionPanel(CesServer* server, const std::string& name,
+                    std::string& frame);
+// Dispatch a browser event ({"on":...,"value":...} JSON) to the panel's
+// update(); `frame` = the post-update render (or toast), as above.
+bool extensionPanelEvent(CesServer* server, const std::string& name,
+                         const std::string& eventJson, std::string& frame);
+
+// Tell the extension whether any dashboard client is watching its panel
+// (drives the child's change-detect push tick). One-way, idempotent —
+// re-send periodically so a relaunched child re-arms.
+void extensionPanelWatch(CesServer* server, const std::string& name, bool on);
+
 // /s/<name>.conf text ("" if none).
 std::string extensionConfigGet(CesServer* server, const std::string& name);
 // Persist text to /s/<name>.conf and push it live to the running instance.

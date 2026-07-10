@@ -36,6 +36,15 @@ local cfg = {}
 local running = false
 local heartbeat_armed = false
 
+-- Height history for the panel's sparkline; the block heartbeat appends one
+-- point per committed block (bounded ring, numbers only).
+local height_spark = {}
+local SPARK_MAX = 60
+local function spark_push(h)
+  height_spark[#height_spark + 1] = h
+  while #height_spark > SPARK_MAX do table.remove(height_spark, 1) end
+end
+
 -- Pubkeys arrive as raw 32-byte strings; hex them for display.
 local function hex(s)
   return (s:gsub(".", function(c) return string.format("%02x", c:byte()) end))
@@ -67,7 +76,12 @@ local function do_start()
   -- own quorum, so a tick proposes+precommits+commits synchronously and returns --
   -- it never blocks the cooperative VM.
   if not heartbeat_armed then
-    ces.every(pace, function() if running then ces.hyle.solo.tick() end end)
+    ces.every(pace, function()
+      if running then
+        ces.hyle.solo.tick()
+        spark_push(tonumber(ces.hyle.solo.height()) or 0)
+      end
+    end)
     heartbeat_armed = true
   end
   ces.log("hylesolo: started chain '" .. (cfg.chain_id or "hylesolo") .. "', one block every " .. pace .. "ms")
@@ -82,7 +96,106 @@ local function do_stop()
   return "stopped"
 end
 
-ces.extension_admin{
+-- The mene admin panel (webadmin Extensions tab): the chain's live meters plus
+-- the Start/Stop lifecycle, one declarative view. Registered only on hosts that
+-- install the mene library; the flat status map below stays for API consumers.
+local function build_panel()
+  return mene.app{
+    model = { last_msg = "" },
+    view = function(m)
+      local binding = has_binding()
+      local state = not binding and "no binding" or (running and "running" or "stopped")
+      local tone = running and "ok" or (binding and "warn" or "err")
+      local body = {}
+      if running then
+        body[#body + 1] = mene.grid({ cols = 4, gap = 12 },
+          mene.metric({ label = "height", value = meter(ces.hyle.solo.height),
+                        spark = height_spark, tone = "info" }),
+          mene.stat({ label = "validator balance", value = meter(ces.hyle.solo.balance) }),
+          mene.stat({ label = "txs", value = meter(ces.hyle.solo.txs) }),
+          mene.stat({ label = "queries", value = meter(ces.hyle.solo.queries) }))
+        body[#body + 1] = mene.kv({ rows = {
+          { "chain", ces.hyle.solo.chain_id() },
+          { "accounts", meter(ces.hyle.solo.accounts) },
+          { "entries", meter(ces.hyle.solo.entries) },
+          { "last block", meter(ces.hyle.solo.last_block_time) },
+          { "validators", "1 (self)" },
+        } })
+      elseif not binding then
+        body[#body + 1] = mene.alert({ tone = "err", title = "ces.hyle.solo absent" },
+          "build the node with --hyle to host a chain")
+      else
+        body[#body + 1] = mene.text({ tone = "muted" },
+          "configured chain: " .. (cfg.chain_id or "hylesolo") ..
+          " — edit Config below, then Start.")
+      end
+      body[#body + 1] = mene.stack({ gap = 4 },
+        mene.text({ tone = "muted" }, "validator pubkey (this program)"),
+        mene.text({ copy = true, tone = "code" },
+          ces.program_pubkey and hex(ces.program_pubkey()) or "?"))
+      body[#body + 1] = mene.row({ gap = 8 },
+        mene.button({ on = "start", kind = "primary",
+                      disabled = running or not binding }, "Start chain"),
+        mene.button({ on = "stop", kind = "danger", disabled = not running,
+                      confirm = "Stop the chain?" }, "Stop chain"))
+      -- One grid for ALL fields, chain_id included: a lone field beside a
+      -- 2-row grid bottom-aligns inside the form's wrapping flex row and reads
+      -- as an empty cell above it. The bare submit flows into the idle space
+      -- right of the grid's last row (the form is flex, align-items:flex-end).
+      -- cols=4: seven fields pack into two rows (4/3) and the submit takes the
+      -- free fourth cell's space; also matches the stat-tile grid above.
+      body[#body + 1] = mene.section({ title = "genesis / economy config (persists; chain runs on Start)" },
+        mene.form({ on = "cfg" },
+          mene.grid({ cols = 4, gap = 10 },
+            mene.field({ name = "chain_id", label = "chain id",
+                         value = cfg.chain_id or "hylesolo" }),
+            mene.field({ name = "block_pace_ms", kind = "number",
+                         label = "block pace ms", value = cfg.block_pace_ms or 1000 }),
+            mene.field({ name = "alloc", kind = "number",
+                         label = "genesis alloc", value = cfg.alloc or 1000000000 }),
+            mene.field({ name = "reward_base", kind = "number",
+                         label = "reward base", value = cfg.reward_base or 2 }),
+            mene.field({ name = "fee_transfer", kind = "number",
+                         label = "fee transfer", value = cfg.fee_transfer or 1 }),
+            mene.field({ name = "fee_entry", kind = "number",
+                         label = "fee entry", value = cfg.fee_entry or 1 }),
+            mene.field({ name = "fee_mint", kind = "number",
+                         label = "fee mint", value = cfg.fee_mint or 1 })),
+          mene.submit({ kind = "primary" }, "Apply + save")))
+      if m.last_msg ~= "" then
+        body[#body + 1] = mene.text({ tone = "muted" }, m.last_msg)
+      end
+      return mene.card({ title = "HyleSolo",
+                         subtitle = "single-node hyle chain" },
+        mene.row({ gap = 8 },
+          mene.badge({ tone = tone }, state)),
+        unpack(body))
+    end,
+    update = function(ev, m)
+      if ev.on == "start" then m.last_msg = do_start()
+      elseif ev.on == "stop" then m.last_msg = do_stop()
+      elseif ev.on == "cfg" and type(ev.value) == "table" then
+        local keys = { "chain_id", "block_pace_ms", "alloc", "fee_transfer",
+                       "fee_entry", "fee_mint", "reward_base" }
+        local c, lines = {}, {}
+        for _, k in ipairs(keys) do
+          c[k] = tostring(ev.value[k] or "")
+          lines[#lines + 1] = k .. " = " .. c[k]
+        end
+        cfg = c   -- same as on_config: stored; the chain reads it on Start
+        if ces.extension_admin.save_config then
+          ces.extension_admin.save_config(table.concat(lines, "\n") .. "\n")
+          m.last_msg = "config saved; takes effect on the next Start"
+        else
+          m.last_msg = "config stored for this run (host cannot persist)"
+        end
+      end
+      return m
+    end,
+  }
+end
+
+local spec = {
   status = function()
     if not running then
       return {
@@ -130,6 +243,8 @@ ces.extension_admin{
   }, "\n"),
   on_config = function(c) cfg = c end,   -- store only; the chain runs on Start, not on enable
 }
+if mene then spec.panel = build_panel() end
+ces.extension_admin(spec)
 
 ces.run()
 

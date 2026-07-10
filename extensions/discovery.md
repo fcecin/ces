@@ -102,8 +102,9 @@ keeps running.
 ## Configuration
 
 Optional. Drop `/s/discovery.conf` (a `key = value` file) to override
-defaults; absent keys keep the built-in defaults shown here. Re-enable
-the extension to apply a change (config is read at launch).
+defaults; absent keys keep the built-in defaults shown here. Config is
+read at launch, and edits through the dashboard (the panel's config form
+or the raw Config editor) retune the running agent live, no restart.
 
 ```
 seeds = ces.pubcom.org:53830   # comma-separated rendezvous; "seeds =" disables
@@ -134,8 +135,12 @@ someone adds it a peer.
 
 ## Observability
 
-The Extensions tab of the web dashboard shows discovery's live status
-(registry size, alive/verified/heard/dark counts, current pull gap).
+The Extensions tab of the web dashboard renders discovery's mene panel: stat
+tiles (registry size, alive count, outbound peers, pull gap), a composition bar
+of the registry by liveness state, a sortable/paged table of known servers, and
+the dump action, plus a typed config form that applies live and persists
+/s/discovery.conf. The flat status map (registry size, alive/verified/heard/dark
+counts, current pull gap) stays registered for API consumers.
 
 You can also dial the instance directly for a console:
 

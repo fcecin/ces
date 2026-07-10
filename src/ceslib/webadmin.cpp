@@ -18,8 +18,12 @@
 #include <ces/server.h>
 #include <ces/util/hex.h>
 
+#include <mene/assets.h>
+
 #include <minx/blog.h>
 #include <minx/minx.h>
+#include <cryptopp/base64.h>
+#include <cryptopp/sha.h>
 
 #include <boost/asio/ip/address.hpp>
 #include <boost/asio/ip/udp.hpp>
@@ -762,10 +766,7 @@ std::string buildFileStat(CesServer& s, const std::string& path) {
   return o.str();
 }
 
-std::string buildLogs(const std::string& query) {
-  auto q = parseKV(query);
-  uint64_t sinceSeq = 0;
-  parseU64(getParam(q, "since"), sinceSeq);
+std::string buildLogsSince(uint64_t sinceSeq, uint64_t* hiOut = nullptr) {
   uint64_t hi = 0;
   auto lines = LogRing::instance().since(sinceSeq, hi);
   std::ostringstream o;
@@ -778,7 +779,15 @@ std::string buildLogs(const std::string& query) {
       << ",\"text\":" << jstr(lines[i].text) << "}";
   }
   o << "]}";
+  if (hiOut) *hiOut = hi;
   return o.str();
+}
+
+std::string buildLogs(const std::string& query) {
+  auto q = parseKV(query);
+  uint64_t sinceSeq = 0;
+  parseU64(getParam(q, "since"), sinceSeq);
+  return buildLogsSince(sinceSeq);
 }
 
 std::string buildInspect(CesServer& s, const std::string& address, bool paid) {
@@ -827,7 +836,64 @@ std::string buildHello(CesServer& s) {
   return o.str();
 }
 
+// The panel frame is already wire JSON ({"type":"render",...} or a toast);
+// pass it through. A JSON object with no "type" means unavailable.
+std::string buildExtensionPanel(CesServer& s, const std::string& name) {
+  std::string frame;
+  if (!extensionPanel(&s, name, frame) || frame.empty())
+    return "{\"ok\":false,\"error\":\"panel unavailable\"}";
+  return frame;
+}
+
+// Case-insensitive header value from a raw HTTP header block.
+std::string headerValue(const std::string& head, const std::string& nameLower) {
+  std::string lower = head;
+  for (auto& ch : lower) ch = static_cast<char>(::tolower(ch));
+  auto pos = lower.find("\r\n" + nameLower + ":");
+  if (pos == std::string::npos) return "";
+  size_t v = pos + 2 + nameLower.size() + 1;
+  size_t e = head.find("\r\n", v);
+  if (e == std::string::npos) e = head.size();
+  std::string out = head.substr(v, e - v);
+  while (!out.empty() && (out.front() == ' ' || out.front() == '\t'))
+    out.erase(out.begin());
+  while (!out.empty() && (out.back() == ' ' || out.back() == '\r'))
+    out.pop_back();
+  return out;
+}
+
+// Is a Host-header value (optionally :port) a loopback name? The dashboard is
+// a loopback-only, no-auth server reached through an SSH tunnel; a browser
+// carrying any other Host was steered here by a hostile page (DNS rebinding).
+bool isLocalHostValue(std::string host) {
+  // strip :port ("[::1]:8080" keeps the brackets)
+  auto colon = host.rfind(':');
+  if (colon != std::string::npos && host.find(']', colon) == std::string::npos)
+    host = host.substr(0, colon);
+  for (auto& ch : host) ch = static_cast<char>(::tolower(ch));
+  return host == "127.0.0.1" || host == "localhost" || host == "[::1]" ||
+         host == "::1";
+}
+
+// Is an Origin header value a local page? Browsers attach Origin to
+// cross-site POSTs and every WebSocket upgrade; non-browser clients (cesh
+// scripts, curl, tests) send none, which is allowed.
+bool isLocalOrigin(const std::string& origin) {
+  auto sep = origin.find("://");
+  if (sep == std::string::npos) return false;
+  return isLocalHostValue(origin.substr(sep + 3));
+}
+
 extern const char* kDashboardHtml;  // defined at the bottom of this file
+
+// The mene browser renderer (linked from mene::assets), served at /mene.js
+// and /mene.css for the Extensions tab's panel lane. The stylesheet's design
+// tokens are re-homed from :root to .menehost so they cannot collide with the
+// dashboard's own :root variables; every panel mounts inside a .menehost.
+const std::string& meneCssScoped() {
+  static const std::string css = mene::rendererCssScoped(".menehost");
+  return css;
+}
 
 }  // namespace
 
@@ -835,8 +901,9 @@ extern const char* kDashboardHtml;  // defined at the bottom of this file
 // WebAdminSession
 // =============================================================================
 
-WebAdminSession::WebAdminSession(Socket socket, CesServer& server)
-  : socket_(std::move(socket)), server_(server) {}
+WebAdminSession::WebAdminSession(Socket socket, CesServer& server,
+                                 WebAdmin& admin)
+  : socket_(std::move(socket)), server_(server), admin_(admin) {}
 
 void WebAdminSession::start() { doRead(); }
 
@@ -895,6 +962,28 @@ void WebAdminSession::handleRequest() {
     path = target.substr(0, qm);
     query = target.substr(qm + 1);
   }
+
+  // Browser-boundary guards for a no-auth loopback server:
+  //   * Host must be a loopback name — a public name resolving here means a
+  //     hostile page steered the browser via DNS rebinding.
+  //   * Origin, when a browser attaches one (cross-site POSTs, every WS
+  //     upgrade), must be a local page — rejects CSRF and cross-origin
+  //     sockets. Non-browser clients send no Origin and are unaffected.
+  {
+    std::string head = request_.substr(0, headerEnd_);
+    std::string host = headerValue(head, "host");
+    if (!host.empty() && !isLocalHostValue(host)) {
+      respond(403, "text/plain", "forbidden: non-local Host");
+      return;
+    }
+    std::string origin = headerValue(head, "origin");
+    if (!origin.empty() && !isLocalOrigin(origin) &&
+        (method == "POST" || path == "/ws")) {
+      respond(403, "text/plain", "forbidden: cross-origin request");
+      return;
+    }
+  }
+
   std::string body = request_.substr(headerEnd_, contentLength_);
   try {
     route(method, path, query, body);
@@ -905,6 +994,12 @@ void WebAdminSession::handleRequest() {
 
 void WebAdminSession::route(const std::string& method, const std::string& path,
                           const std::string& query, const std::string& body) {
+  // ---- WebSocket upgrade (the push lane; see wsUpgrade) ----
+  if (method == "GET" && path == "/ws") {
+    wsUpgrade();
+    return;
+  }
+
   // ---- UI ----
   if (method == "GET" && (path == "/" || path == "/index.html")) {
     respond(200, "text/html; charset=utf-8", kDashboardHtml);
@@ -912,6 +1007,14 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
   }
   if (method == "GET" && path == "/favicon.ico") {
     respond(204, "image/x-icon", "");
+    return;
+  }
+  if (method == "GET" && path == "/mene.js") {
+    respond(200, "application/javascript; charset=utf-8", mene::rendererJs());
+    return;
+  }
+  if (method == "GET" && path == "/mene.css") {
+    respond(200, "text/css; charset=utf-8", meneCssScoped());
     return;
   }
 
@@ -931,6 +1034,10 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
     }
     if (path == "/api/extension_config") {
       respondJson(buildExtensionConfig(server_, getParam(parseKV(query), "name")));
+      return;
+    }
+    if (path == "/api/extension_panel") {
+      respondJson(buildExtensionPanel(server_, getParam(parseKV(query), "name")));
       return;
     }
     if (path == "/api/logs")    { respondJson(buildLogs(query)); return; }
@@ -1136,6 +1243,15 @@ void WebAdminSession::route(const std::string& method, const std::string& path,
                      : "{\"ok\":false,\"error\":\"command failed\"}");
       return;
     }
+    if (path == "/api/extension_panel_event") {
+      std::string frame;
+      bool ok = extensionPanelEvent(&server_, getParam(form, "name"),
+                                    getParam(form, "event"), frame);
+      respondJson(ok && !frame.empty()
+                    ? frame
+                    : std::string("{\"ok\":false,\"error\":\"panel event failed\"}"));
+      return;
+    }
     if (path == "/api/extension_config_set") {
       bool ok = extensionConfigSet(&server_, getParam(form, "name"),
                                    getParam(form, "text"));
@@ -1250,6 +1366,327 @@ void WebAdminSession::runAsync(std::function<std::string()> work) {
   }));
 }
 
+// ---------------------------------------------------------------------------
+// WebSocket (RFC 6455) — the dashboard's push lane. After a GET /ws upgrade
+// the session leaves HTTP and speaks TEXT frames:
+//   browser -> server  {"type":"hello","ext":name}   watch a panel (idempotent;
+//                                                    replies with a fresh frame)
+//                      {"type":"bye","ext":name}     stop watching
+//                      {"type":"event","ext":name,"event":{...}}  widget event
+//   server -> browser  {"type":"panel","ext":name,"frame":<wire frame>}
+//                      {"type":"status","data":<api/status JSON>}  every 1s
+// Same security posture as the rest of webadmin: loopback bind, no auth.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// base64(SHA1(key + RFC6455 magic)) — the Sec-WebSocket-Accept value.
+std::string wsAcceptKey(const std::string& key) {
+  static const char* kMagic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+  std::string in = key + kMagic;
+  CryptoPP::SHA1 sha;
+  uint8_t digest[CryptoPP::SHA1::DIGESTSIZE];
+  sha.CalculateDigest(digest, reinterpret_cast<const uint8_t*>(in.data()),
+                      in.size());
+  std::string b64;
+  CryptoPP::Base64Encoder enc(new CryptoPP::StringSink(b64),
+                              false /* no line breaks */);
+  enc.Put(digest, sizeof(digest));
+  enc.MessageEnd();
+  return b64;
+}
+
+// Unmasked server->client frame: FIN+opcode, then 7/16/64-bit length.
+std::string wsBuildFrame(uint8_t op, const std::string& payload) {
+  std::string out;
+  out.push_back(static_cast<char>(0x80 | op));
+  size_t len = payload.size();
+  if (len < 126) {
+    out.push_back(static_cast<char>(len));
+  } else if (len <= 0xFFFF) {
+    out.push_back(static_cast<char>(126));
+    out.push_back(static_cast<char>((len >> 8) & 0xFF));
+    out.push_back(static_cast<char>(len & 0xFF));
+  } else {
+    out.push_back(static_cast<char>(127));
+    for (int i = 7; i >= 0; --i)
+      out.push_back(static_cast<char>((static_cast<uint64_t>(len) >> (i * 8)) & 0xFF));
+  }
+  out += payload;
+  return out;
+}
+
+// Pull one flat string field ("type"/"ext") out of a wire message. The
+// dashboard composes these messages itself and extension names are
+// [A-Za-z0-9._-], so a plain scan is exact (no escapes possible).
+std::string wireField(const std::string& text, const std::string& name) {
+  std::string needle = "\"" + name + "\":\"";
+  auto p = text.find(needle);
+  if (p == std::string::npos) return "";
+  size_t v = p + needle.size();
+  auto e = text.find('"', v);
+  if (e == std::string::npos) return "";
+  return text.substr(v, e - v);
+}
+
+// The raw JSON value of the "event" field: a string-aware balanced-brace scan
+// (no ordering constraint on the envelope). The extracted value is verified by
+// the child's full JSON parser before anything acts on it.
+std::string wireEvent(const std::string& text) {
+  auto p = text.find("\"event\":");
+  if (p == std::string::npos) return "";
+  size_t i = p + 8;
+  while (i < text.size() && (text[i] == ' ' || text[i] == '\t')) ++i;
+  if (i >= text.size() || text[i] != '{') return "";
+  int depth = 0;
+  bool inStr = false, escaped = false;
+  for (size_t j = i; j < text.size(); ++j) {
+    char c = text[j];
+    if (inStr) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '"') inStr = false;
+    } else if (c == '"') {
+      inStr = true;
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      if (--depth == 0) return text.substr(i, j - i + 1);
+    }
+  }
+  return "";
+}
+
+}  // namespace
+
+void WebAdminSession::wsUpgrade() {
+  std::string head = request_.substr(0, headerEnd_);
+  std::string key = headerValue(head, "sec-websocket-key");
+  std::string upgrade = headerValue(head, "upgrade");
+  for (auto& ch : upgrade) ch = static_cast<char>(::tolower(ch));
+  if (key.empty() || upgrade != "websocket") {
+    respond(400, "text/plain", "not a websocket upgrade");
+    return;
+  }
+  std::string resp =
+    "HTTP/1.1 101 Switching Protocols\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Accept: " + wsAcceptKey(key) + "\r\n\r\n";
+  ws_ = true;
+  responded_ = true;              // the HTTP phase is over for this session
+  // Bytes the client sent after the handshake are the start of the WS stream.
+  wsIn_ = request_.substr(headerEnd_ + contentLength_);
+  request_.clear();
+  auto self = shared_from_this();
+  auto out = std::make_shared<std::string>(std::move(resp));
+  boost::asio::async_write(socket_, boost::asio::buffer(*out),
+    [this, self, out](boost::system::error_code ec, size_t) {
+      if (ec) { wsClose(); return; }
+      // Register only now: a push queued before the 101 finished writing
+      // would interleave with the handshake bytes on the socket.
+      admin_.wsRegister(self);
+      if (!wsProcessBuffer()) { wsClose(); return; }
+      wsRead();
+    });
+}
+
+void WebAdminSession::wsRead() {
+  auto self = shared_from_this();
+  socket_.async_read_some(boost::asio::buffer(readChunk_),
+    [this, self](boost::system::error_code ec, size_t n) {
+      if (ec) { wsClose(); return; }
+      wsIn_.append(readChunk_.data(), n);
+      if (wsIn_.size() > 4 * 1024 * 1024) { wsClose(); return; }
+      if (!wsProcessBuffer()) { wsClose(); return; }
+      if (!wsClosed_) wsRead();
+    });
+}
+
+bool WebAdminSession::wsProcessBuffer() {
+  for (;;) {
+    if (wsIn_.size() < 2) return true;
+    const unsigned char* p =
+      reinterpret_cast<const unsigned char*>(wsIn_.data());
+    bool fin = (p[0] & 0x80) != 0;
+    uint8_t opcode = p[0] & 0x0F;
+    bool masked = (p[1] & 0x80) != 0;
+    uint64_t len = p[1] & 0x7F;
+    size_t off = 2;
+    if (len == 126) {
+      if (wsIn_.size() < off + 2) return true;
+      len = (uint64_t(p[off]) << 8) | p[off + 1];
+      off += 2;
+    } else if (len == 127) {
+      if (wsIn_.size() < off + 8) return true;
+      len = 0;
+      for (int i = 0; i < 8; ++i) len = (len << 8) | p[off + i];
+      off += 8;
+    }
+    if (!masked) return false;          // client frames MUST be masked
+    if (len > (1u << 20)) return false; // sanity cap
+    if (wsIn_.size() < off + 4 + len) return true;
+    unsigned char mask[4];
+    for (int i = 0; i < 4; ++i) mask[i] = p[off + i];
+    off += 4;
+    std::string payload;
+    payload.resize(len);
+    for (uint64_t i = 0; i < len; ++i)
+      payload[i] = static_cast<char>(p[off + i] ^ mask[i & 3]);
+    off += len;
+    wsIn_.erase(0, off);
+
+    switch (opcode) {
+      case 0x1:   // text
+      case 0x2:   // binary
+      case 0x0: { // continuation
+        if (opcode == 0x0) {
+          wsFrag_ += payload;
+        } else {
+          wsFrag_ = payload;
+          wsFragOp_ = opcode;
+        }
+        if (fin) {
+          std::string msg;
+          msg.swap(wsFrag_);
+          if (wsFragOp_ == 0x1) wsHandleMessage(msg);
+        }
+        break;
+      }
+      case 0x9:   // ping -> pong
+        wsOutQ_.push_back(wsBuildFrame(0xA, payload));
+        if (!wsWriting_) wsWriteNext();
+        break;
+      case 0xA:   // pong
+        break;
+      case 0x8:   // close: echo, flush, then close
+        wsOutQ_.push_back(wsBuildFrame(0x8, payload));
+        wsClosed_ = true;   // stop reading; wsWriteNext closes after the flush
+        if (!wsWriting_) wsWriteNext();
+        return true;
+      default:
+        return false;
+    }
+  }
+}
+
+void WebAdminSession::wsHandleMessage(const std::string& text) {
+  std::string type = wireField(text, "type");
+  std::string ext = wireField(text, "ext");
+  if (type == "hello" && !ext.empty()) {
+    admin_.wsSubscribe(this, ext);
+    // Fresh pull so the new watcher paints immediately; later updates arrive
+    // as unsolicited pushes from the child.
+    std::string frame;
+    if (extensionPanel(&server_, ext, frame) && !frame.empty()) {
+      wsSend("{\"type\":\"panel\",\"ext\":" + jstr(ext) +
+             ",\"frame\":" + frame + "}");
+    }
+    return;
+  }
+  if (type == "bye" && !ext.empty()) {
+    admin_.wsUnsubscribe(this, ext);
+    return;
+  }
+  if (type == "event" && !ext.empty()) {
+    std::string ev = wireEvent(text);
+    std::string frame;
+    if (!ev.empty() && extensionPanelEvent(&server_, ext, ev, frame) &&
+        !frame.empty()) {
+      // Reply to the actor; other watchers get the bridge's auto-push.
+      wsSend("{\"type\":\"panel\",\"ext\":" + jstr(ext) +
+             ",\"frame\":" + frame + "}");
+    }
+    return;
+  }
+  if (type == "logs-on") {
+    // Push new log lines each tick, starting after the client's last seq
+    // (so a reconnect doesn't replay what it already renders).
+    uint64_t since = 0;
+    parseU64(wireField(text, "since"), since);
+    wsLogsSub_ = true;
+    wsLogsSeq_ = since;
+    wsPushLogs();   // immediate catch-up
+    return;
+  }
+  if (type == "logs-off") {
+    wsLogsSub_ = false;
+    return;
+  }
+  if (type == "view-on") {
+    // Subscribe to a pushed tab view; the immediate push paints the tab, the
+    // tick's hash-gated pushes keep it live.
+    std::string v = wireField(text, "view");
+    std::string data = admin_.viewData(v);
+    if (!data.empty()) {
+      wsViews_.insert(v);
+      wsViewHash_.erase(v);
+      wsPushView(v, "{\"type\":\"view\",\"view\":\"" + v + "\",\"data\":" +
+                      data + "}",
+                 std::hash<std::string>{}(data));
+    }
+    return;
+  }
+  if (type == "view-off") {
+    wsViews_.erase(wireField(text, "view"));
+    return;
+  }
+}
+
+void WebAdminSession::wsPushView(const std::string& view,
+                                 const std::string& msg, size_t hash) {
+  auto it = wsViewHash_.find(view);
+  if (it != wsViewHash_.end() && it->second == hash) return;
+  wsViewHash_[view] = hash;
+  wsSend(msg);
+}
+
+void WebAdminSession::wsPushLogs() {
+  if (!wsLogsSub_ || wsClosed_) return;
+  uint64_t hi = wsLogsSeq_;
+  std::string data = buildLogsSince(wsLogsSeq_, &hi);
+  if (hi == wsLogsSeq_) return;   // nothing new
+  wsSend("{\"type\":\"logs\",\"data\":" + data + "}");
+  wsLogsSeq_ = hi;
+}
+
+void WebAdminSession::wsSend(const std::string& text) {
+  if (wsClosed_) return;
+  // Backpressure: a client that stopped reading (dead tunnel) must not
+  // accumulate frames without bound. Frames are periodic or change-driven,
+  // so a healthy client's queue stays near-empty; hitting the cap means the
+  // peer is gone — drop the connection (the browser auto-reconnects).
+  if (wsOutQ_.size() >= 1024) { wsClose(); return; }
+  wsOutQ_.push_back(wsBuildFrame(0x1, text));
+  if (!wsWriting_) wsWriteNext();
+}
+
+void WebAdminSession::wsWriteNext() {
+  if (wsOutQ_.empty()) {
+    wsWriting_ = false;
+    if (wsClosed_) wsClose();
+    return;
+  }
+  wsWriting_ = true;
+  auto out = std::make_shared<std::string>(std::move(wsOutQ_.front()));
+  wsOutQ_.pop_front();
+  auto self = shared_from_this();
+  boost::asio::async_write(socket_, boost::asio::buffer(*out),
+    [this, self, out](boost::system::error_code ec, size_t) {
+      if (ec) { wsClose(); return; }
+      wsWriteNext();
+    });
+}
+
+void WebAdminSession::wsClose() {
+  if (!ws_) return;
+  admin_.wsUnregister(this);
+  boost::system::error_code ic;
+  socket_.shutdown(boost::asio::ip::tcp::socket::shutdown_both, ic);
+  socket_.close(ic);
+  wsClosed_ = true;
+}
+
 void WebAdminSession::respondJson(const std::string& json) {
   respond(200, "application/json", json);
 }
@@ -1317,6 +1754,12 @@ bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
     g_webStartUnix = minx::getSecsSinceEpoch();
     installLogSink();
     logSinkInstalled_ = true;
+    // Receive unsolicited extension panel frames (mene push bridge /
+    // change-detect tick) and fan them out to watching WebSocket clients.
+    server_.setExtPanelPushHandler(
+      [this](const std::string& name, const std::string& frame) {
+        panelPush(name, frame);
+      });
     LOGINFO << "web dashboard listening (NO AUTH)"
             << SVAR(bindAddr) << VAR(port);
     doAccept();
@@ -1330,6 +1773,23 @@ bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
 }
 
 void WebAdmin::stop() {
+  // Unhook the push sink first: no new frames land while tearing down.
+  server_.setExtPanelPushHandler(nullptr);
+  // Close WS sessions + timer on the io thread (their owner). Synchronize:
+  // this runs off-io (main), so wait for the posted teardown.
+  std::promise<void> done;
+  boost::asio::post(io_, [this, &done]() {
+    stopping_ = true;
+    if (statusTimer_) statusTimer_->cancel();
+    auto sessions = wsSessions_;   // wsClose mutates the map
+    for (auto& [ptr, weak] : sessions) {
+      if (auto s = weak.lock()) s->wsClose();
+    }
+    done.set_value();
+  });
+  // Bounded wait: if the io thread is already gone (some tests stop it before
+  // the dashboard), don't hang shutdown.
+  done.get_future().wait_for(std::chrono::seconds(2));
   if (acceptor_) {
     boost::system::error_code ec;
     acceptor_->close(ec);
@@ -1344,6 +1804,131 @@ void WebAdmin::stop() {
   }
 }
 
+// ---- WebSocket registry / push fan-out (io thread) -------------------------
+
+void WebAdmin::wsRegister(const std::shared_ptr<WebAdminSession>& s) {
+  wsSessions_[s.get()] = s;
+  armStatusTimer();
+}
+
+void WebAdmin::wsUnregister(WebAdminSession* s) {
+  auto it = wsSessions_.find(s);
+  if (it == wsSessions_.end()) return;
+  // Release this client's panel watches.
+  for (const auto& ext : s->wsSubs()) {
+    auto w = wsWatch_.find(ext);
+    if (w != wsWatch_.end() && --w->second <= 0) {
+      wsWatch_.erase(w);
+      extensionPanelWatch(&server_, ext, false);
+    }
+  }
+  wsSessions_.erase(it);
+}
+
+void WebAdmin::wsSubscribe(WebAdminSession* s, const std::string& ext) {
+  auto it = wsSessions_.find(s);
+  if (it == wsSessions_.end()) return;
+  auto sp = it->second.lock();
+  if (!sp) return;
+  if (sp->wsSubs().insert(ext).second) {
+    if (++wsWatch_[ext] == 1) extensionPanelWatch(&server_, ext, true);
+  }
+}
+
+void WebAdmin::wsUnsubscribe(WebAdminSession* s, const std::string& ext) {
+  auto it = wsSessions_.find(s);
+  if (it == wsSessions_.end()) return;
+  auto sp = it->second.lock();
+  if (!sp) return;
+  if (sp->wsSubs().erase(ext) > 0) {
+    auto w = wsWatch_.find(ext);
+    if (w != wsWatch_.end() && --w->second <= 0) {
+      wsWatch_.erase(w);
+      extensionPanelWatch(&server_, ext, false);
+    }
+  }
+}
+
+void WebAdmin::panelPush(const std::string& name, const std::string& frame) {
+  boost::asio::post(io_, [this, name, frame]() {
+    if (stopping_ || wsSessions_.empty()) return;
+    std::string msg = "{\"type\":\"panel\",\"ext\":" + jstr(name) +
+                      ",\"frame\":" + frame + "}";
+    for (auto it = wsSessions_.begin(); it != wsSessions_.end();) {
+      auto sp = it->second.lock();
+      if (!sp) { it = wsSessions_.erase(it); continue; }
+      if (sp->wsSubs().count(name)) sp->wsSend(msg);
+      ++it;
+    }
+  });
+}
+
+void WebAdmin::armStatusTimer() {
+  if (stopping_ || statusTimer_) return;
+  statusTimer_ = std::make_unique<boost::asio::steady_timer>(io_);
+  statusTimer_->expires_after(std::chrono::seconds(1));
+  statusTimer_->async_wait([this](boost::system::error_code ec) {
+    statusTimer_.reset();
+    if (ec || stopping_) return;
+    statusTick();
+    if (!wsSessions_.empty()) armStatusTimer();
+  });
+}
+
+std::string WebAdmin::viewData(const std::string& view) {
+  if (view == "peers")   return buildPeers(server_);
+  if (view == "billing") return buildNetbill(server_);
+  if (view == "compute") {
+    // The compute tab renders live instances AND config-derived panels; ship
+    // both so the tab needs no side fetches. cfg changes rarely, so the
+    // combined payload's hash keeps pushes change-driven.
+    return "{\"cp\":" + buildCompute(server_) +
+           ",\"cfg\":" + buildConfig(server_) + "}";
+  }
+  return "";
+}
+
+void WebAdmin::viewsTick() {
+  static const char* kViews[] = {"peers", "billing", "compute"};
+  for (const char* v : kViews) {
+    bool watched = false;
+    for (auto& [ptr, weak] : wsSessions_) {
+      auto sp = weak.lock();
+      if (sp && sp->wsWatchesView(v)) { watched = true; break; }
+    }
+    if (!watched) continue;   // nobody looking = the view is never built
+    std::string data = viewData(v);
+    size_t h = std::hash<std::string>{}(data);
+    std::string msg = std::string("{\"type\":\"view\",\"view\":\"") + v +
+                      "\",\"data\":" + data + "}";
+    for (auto it = wsSessions_.begin(); it != wsSessions_.end();) {
+      auto sp = it->second.lock();
+      if (!sp) { it = wsSessions_.erase(it); continue; }
+      if (sp->wsWatchesView(v)) sp->wsPushView(v, msg, h);
+      ++it;
+    }
+  }
+}
+
+void WebAdmin::statusTick() {
+  if (wsSessions_.empty()) return;
+  // Status push replaces the browser's HTTP heartbeat while the socket is up.
+  std::string msg = "{\"type\":\"status\",\"data\":" + buildStatus(server_) + "}";
+  for (auto it = wsSessions_.begin(); it != wsSessions_.end();) {
+    auto sp = it->second.lock();
+    if (!sp) { it = wsSessions_.erase(it); continue; }
+    sp->wsSend(msg);
+    sp->wsPushLogs();   // change-driven: sends only when new lines exist
+    ++it;
+  }
+  viewsTick();          // change-driven tab tables for their subscribers
+  // Re-assert panel watches (idempotent): a relaunched extension child lost
+  // its watch flag; this heals it within a tick.
+  for (const auto& [ext, count] : wsWatch_) {
+    if (count > 0) extensionPanelWatch(&server_, ext, true);
+  }
+}
+
 void WebAdmin::doAccept() {
   acceptor_->async_accept(
     [this](boost::system::error_code ec,
@@ -1354,7 +1939,8 @@ void WebAdmin::doAccept() {
         }
         return;
       }
-      std::make_shared<WebAdminSession>(std::move(socket), server_)->start();
+      std::make_shared<WebAdminSession>(std::move(socket), server_, *this)
+        ->start();
       doAccept();
     });
 }
@@ -1368,6 +1954,8 @@ const char* kDashboardHtml = R"DASH(<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CES Server Dashboard</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpolygon points='12,1.5 21,6.75 21,17.25 12,22.5 3,17.25 3,6.75' fill='none' stroke='%2336d399' stroke-width='2'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/mene.css">
+<script src="/mene.js"></script>
 <style>
 :root{
   --bg:#0a0d14; --panel:#121826; --panel2:#0e1320; --bd:#222b3d; --bd2:#2d3850;
@@ -1483,6 +2071,9 @@ button.flash{animation:btnflash .22s ease-out}
 .extbody .kvtable td:first-child{width:38%}
 .extcfg textarea{width:100%;height:140px;margin:6px 0;font-family:var(--mono);font-size:12.5px;resize:vertical}
 .extcmdout{margin-top:7px;color:var(--muted);font-size:12px;min-height:1em}
+/* mene panel host (caps&16): the panel's design tokens are scoped here
+   (mene.css :root is re-homed to .menehost via mene::rendererCssScoped). */
+.menehost{margin-top:8px}
 
 /* tables */
 table.data{width:100%;border-collapse:collapse;font-size:13px}
@@ -1720,7 +2311,7 @@ table.data tr:hover td{background:rgba(86,168,255,.04)}
           <option value="0">all</option><option value="1">debug+</option>
           <option value="2">info+</option><option value="3">warn+</option><option value="4">error+</option>
         </select>
-        <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="logPause">pause</label>
+        <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="logPause" onchange="wsLogsSync()">pause</label>
         <label class="muted" style="display:flex;align-items:center;gap:6px"><input type="checkbox" id="logAuto" checked>autoscroll</label>
         <button class="ghost sm" onclick="clearLogs()">clear</button>
       </div>
@@ -1890,7 +2481,8 @@ function showTab(n){activeTab=n;try{history.replaceState(null,'','#'+n);}catch(e
   // Status is cheap; poll expanded extension rows fast. Only while this tab is
   // showing (timer torn down on switch) and only for expanded rows (extPollStatus
   // iterates extExpanded). A collapsed or unseen card is never polled.
-  if(n==='extensions')extStatusTimer=setInterval(extPollStatus,500);}
+  if(n==='extensions')extStatusTimer=setInterval(extPollStatus,500);
+  wsLogsSync();wsViewSync();}
 function loadTab(n){({overview:loadOverview,peers:loadPeers,wallet:loadWallet,lookup:loadLookup,billing:loadBilling,fees:loadFees,file:loadFile,compute:loadCompute,extensions:loadExtensions,logs:pollLogs,config:loadConfig}[n]||(()=>{}))();}
 $('#tabs').addEventListener('click',e=>{const t=e.target.closest('.tab');if(t)showTab(t.dataset.tab);});
 
@@ -1960,7 +2552,10 @@ function gaugeHtml(lbl,bp){bp=Number(bp)||0;const pct=(bp/100).toFixed(1);
 // Add-peer form up top (replacing whatever's there).
 function useAddr(key,addr){const k=$('#addKey'),a=$('#addAddr');if(k)k.value=key;if(a)a.value=addr;copy(addr);}
 async function loadPeers(){
+  if(wsOk)return;  // pushed as a view over the WebSocket; fetch only as fallback
   let d;try{d=await api('/api/peers');}catch(e){return;}
+  renderPeers(d);}
+function renderPeers(d){
   $('#curTarget').textContent=fmtCredits(d.target)+' cr';
   if(d.maxPeers!=null){$('#curMaxPeers').textContent=d.maxPeers+' ('+(d.maxPeers*3)+' in RAM)';
     if(!$('#maxPeers').value)$('#maxPeers').placeholder=String(d.maxPeers);}
@@ -2164,7 +2759,10 @@ async function lookupFile(){const p=$('#fileLookupPath').value.trim();if(!p){toa
   }catch(err){toast('lookup failed','err');}}
 
 /* billing */
-async function loadBilling(){let d;try{d=await api('/api/netbill');}catch(e){return;}
+async function loadBilling(){
+  if(!wsOk){let d;try{d=await api('/api/netbill');}catch(e){return;}renderBilling(d);}
+  if(!billReady){try{const cfg=await api('/api/config');$('#billFees').innerHTML=feeRows(FEES_NET);fillFees(cfg.knobs,FEES_NET);billReady=true;}catch(e){}}}
+function renderBilling(d){
   if(!d.active){$('#billTbl').innerHTML='';$('#billNote').textContent='Channel metering inactive — the rpc port (CesPlex) is disabled.';}
   else{
     $('#billNote').textContent=d.rows.length?'':'No bound channels right now.';
@@ -2173,15 +2771,33 @@ async function loadBilling(){let d;try{d=await api('/api/netbill');}catch(e){ret
         <td>${esc(r.tag)}</td><td class="mono" title="${esc(r.payer)}">${esc(r.payer.slice(0,12))}</td>
         <td class="num">${fmtNum(r.bytesSent)}</td><td class="num">${fmtNum(r.bytesReceived)}</td><td class="num">${fmtNum(r.memByteSec)}</td>
         <td class="num">${fmtNum(r.dSent)}</td><td class="num">${fmtNum(r.dRecv)}</td><td class="num">${r.dAge}s</td></tr>`).join('');
-  }
-  if(!billReady){try{const cfg=await api('/api/config');$('#billFees').innerHTML=feeRows(FEES_NET);fillFees(cfg.knobs,FEES_NET);billReady=true;}catch(e){}}}
+  }}
 
 /* logs */
 let logLines=[],logSince=0,srvLevel=-1;
-async function pollLogs(){if($('#logPause').checked)return;
-  try{const d=await api('/api/logs?since='+logSince);
-    if(d.level!==undefined&&d.level!==srvLevel){srvLevel=d.level;highlightSrvLevel();}
-    if(d.lines.length){logLines=logLines.concat(d.lines);if(logLines.length>3000)logLines=logLines.slice(-3000);logSince=d.hi;renderLogs();}}catch(e){}}
+function applyLogs(d){
+  if(d.level!==undefined&&d.level!==srvLevel){srvLevel=d.level;highlightSrvLevel();}
+  if(d.lines&&d.lines.length){logLines=logLines.concat(d.lines);if(logLines.length>3000)logLines=logLines.slice(-3000);logSince=d.hi;renderLogs();}}
+async function pollLogs(){
+  if($('#logPause').checked)return;
+  if(wsOk)return;  // lines are pushed over the WebSocket; poll only as fallback
+  try{applyLogs(await api('/api/logs?since='+logSince));}catch(e){}}
+// Keep the server's logs-on/logs-off subscription in sync with what the
+// operator is looking at (Logs tab active + not paused). Idempotent.
+function wsLogsSync(){
+  if(!wsOk)return;
+  if(activeTab==='logs'&&!$('#logPause').checked)
+    wsSend({type:'logs-on',since:String(logSince)});
+  else wsSend({type:'logs-off'});
+}
+// Same idea for the pushed tab views: subscribe the visible one, drop the
+// rest. The server builds a view only while someone watches it.
+const WS_VIEWS=['peers','billing','compute'];
+function wsViewSync(){
+  if(!wsOk)return;
+  for(const v of WS_VIEWS)
+    wsSend(activeTab===v?{type:'view-on',view:v}:{type:'view-off',view:v});
+}
 async function setSrvLevel(n){const r=await post('/api/loglevel',{level:String(n)}).catch(()=>null);
   if(r&&r.ok){srvLevel=r.level;highlightSrvLevel();toast('server now emits '+['TRACE','DEBUG','INFO','WARN','ERROR'][n]+'+','ok');}
   else toast('could not set log level','err');}
@@ -2264,7 +2880,11 @@ async function loadFile(){let fs,cfg;try{fs=await api('/api/filestore');cfg=awai
     else $('#fileCapEdit').innerHTML='<p class="hint">file handler not mounted — wire <span class="mono">/ces/file/1 = builtin:file</span> in <span class="mono">[cesplex_mounts]</span> and restart.</p>';
     fileReady=true;}
   $('#fileCap').innerHTML=[['store dir',esc(fs.dir||'—')]].map(r=>`<tr><td class="mono">${r[0]}</td><td class="num">${r[1]}</td></tr>`).join('');}
-async function loadCompute(){let cp,cfg;try{cp=await api('/api/compute');cfg=await api('/api/config');}catch(e){return;}
+async function loadCompute(){
+  if(wsOk)return;  // pushed as a view (live cp + cfg) over the WebSocket
+  let cp,cfg;try{cp=await api('/api/compute');cfg=await api('/api/config');}catch(e){return;}
+  renderCompute(cp,cfg);}
+function renderCompute(cp,cfg){
   if(cp.enabled){
     $('#computeStats').innerHTML=[['Running',fmtNum(cp.instances.length)],['Max',fmtNum(cp.maxInstances)],['Port range',cp.portCount>0?(cp.portBase+'–'+(cp.portBase+cp.portCount-1)):'none','wide']].map(c=>`<div class="card${c[2]?' '+c[2]:''}"><h3>${c[0]}</h3><div class="stat">${c[1]}</div></div>`).join('');
     $('#computeTbl').innerHTML='<tr><th>pid</th><th>source</th><th class="num">CPU</th><th class="num">RSS</th><th class="num">uptime</th><th class="num" title="outbound CES-client port / inbound /ces/luarpc/1 host port (0 = none)">ports (CES/rpc)</th></tr>'+(cp.instances.length?cp.instances.map(i=>`<tr><td class="mono">${i.pid}</td><td class="mono">${esc(i.source)}</td><td class="num">${(i.cpuBp/100).toFixed(0)}%</td><td class="num">${fmtBytes(i.rssBytes)}</td><td class="num">${fmtDur(i.uptimeSecs)}</td><td class="num">${i.clientPort||'-'} / ${i.rpcPort||'-'}</td></tr>`).join(''):'<tr><td colspan="6" class="muted">no running instances</td></tr>');
@@ -2322,11 +2942,19 @@ function extRow(it){
     body=`<div class="muted">Does not implement the extension contract — nothing to configure or command (N/A).</div>`;
   }else if(it.enabled){
     // Render only the sections this program actually registered (caps bits:
-    // 1=status 2=commands 4=config_defaults 8=on_config). No empty N/A sections.
+    // 1=status 2=commands 4=config_defaults 8=on_config 16=panel). A mene
+    // panel supersedes the whole legacy lane — status table, command buttons,
+    // AND the raw-textarea Config editor (a panel extension owns its config UX
+    // as a form that applies live and persists via save_config; the
+    // /api/extension_config* endpoints remain for scripts).
     body='';
-    if(it.caps&1) body+=`<h4>Status</h4><div id="extStatus-${id}"><span class="muted">…</span></div>`;
-    if(it.caps&2&&it.commands.length) body+=`<h4>Commands</h4><div class="row">${it.commands.map(c=>`<button class="sm" onclick="extCmd('${esc(it.name)}','${esc(c.id)}')">${esc(c.label||c.id)}</button>`).join('')}</div><div id="extCmdOut-${id}" class="extcmdout mono"></div>`;
-    if(it.caps&12) body+=`<h4>Config</h4><button class="green sm" onclick="extConfigToggle('${esc(it.name)}',${(it.caps&4)?1:0})">Edit</button><div class="extcfg" id="extCfg-${id}"></div>`;
+    if(it.caps&16){
+      body+=`<div class="menehost" id="extPanel-${id}"><span class="muted">loading panel…</span></div>`;
+    }else{
+      if(it.caps&1) body+=`<h4>Status</h4><div id="extStatus-${id}"><span class="muted">…</span></div>`;
+      if(it.caps&2&&it.commands.length) body+=`<h4>Commands</h4><div class="row">${it.commands.map(c=>`<button class="sm" onclick="extCmd('${esc(it.name)}','${esc(c.id)}')">${esc(c.label||c.id)}</button>`).join('')}</div><div id="extCmdOut-${id}" class="extcmdout mono"></div>`;
+      if(it.caps&12) body+=`<h4>Config</h4><button class="green sm" onclick="extConfigToggle('${esc(it.name)}',${(it.caps&4)?1:0})">Edit</button><div class="extcfg" id="extCfg-${id}"></div>`;
+    }
     if(!body) body=`<div class="muted">Running — implements no status, commands, or config.</div>`;
   }else{
     body=`<div class="muted">${it.installed?'Installed, not running — Enable to interact.':'Available — Install to use.'}</div>`;
@@ -2345,6 +2973,67 @@ function extFetchStatus(name){
     el.innerHTML=(s.ok&&s.kv.length)?`<table class="kvtable">${s.kv.map(p=>`<tr><td class="mono">${esc(p[0])}</td><td class="mono">${esc(p[1])}</td></tr>`).join('')}</table>`:'<span class="muted">no status</span>';
   }).catch(()=>{});
 }
+// ---- mene panel lane (caps&16). Transport is WebSocket-first: panels arrive
+// as pushed {"type":"panel","ext","frame"} messages (the extension pushes on
+// events and whenever its rendered frame actually changes — no polling at
+// all). When the socket is down, the code falls back to the HTTP poll path
+// below. Widget events ride the socket too; the response and all other
+// watchers get push frames. Mene.mountPanel reconciles in place
+// (focus/scroll survive).
+function extPaintPanel(name,f){
+  const el=$('#extPanel-'+cssid(name));if(!el)return;
+  if(f&&f.type==='render'&&f.tree){
+    if(!el.__menePainted){el.innerHTML='';el.__menePainted=true;}
+    try{Mene.mountPanel(el,f.tree,ev=>extPanelEvent(name,ev));}
+    catch(e){el.textContent='panel render error: '+e.message;}
+  }else if(f&&f.type==='toast'){
+    el.__menePainted=false;
+    el.innerHTML=`<div class="muted">panel error: ${esc(f.text||'')}</div>`;
+  }else{
+    el.__menePainted=false;
+    el.innerHTML=`<span class="muted">${esc((f&&f.error)||'panel unavailable')}</span>`;
+  }
+}
+function extFetchPanel(name){
+  if(wsOk){wsSend({type:'hello',ext:name});return;}
+  api('/api/extension_panel?name='+encodeURIComponent(name))
+    .then(f=>extPaintPanel(name,f)).catch(()=>{});
+}
+async function extPanelEvent(name,ev){
+  if(wsSend({type:'event',ext:name,event:ev}))return;  // reply arrives as a push
+  try{const f=await post('/api/extension_panel_event',{name,event:JSON.stringify(ev)});
+    extPaintPanel(name,f);}
+  catch(e){toast('server error','err');}
+}
+
+// ---- WebSocket push lane. Panels and the status heartbeat ride one socket;
+// everything falls back to the HTTP pollers whenever it is down.
+let ws=null,wsOk=false,wsLastStatus=0;
+function wsSend(o){
+  if(wsOk&&ws&&ws.readyState===1){ws.send(JSON.stringify(o));return true;}
+  return false;
+}
+function wsResubscribe(){
+  for(const name of extExpanded)
+    if($('#extPanel-'+cssid(name))) wsSend({type:'hello',ext:name});
+}
+function wsConnect(){
+  let s;
+  try{s=new WebSocket(`ws://${location.host}/ws`);}catch(e){setTimeout(wsConnect,3000);return;}
+  s.onopen=()=>{ws=s;wsOk=true;wsResubscribe();wsLogsSync();wsViewSync();};
+  s.onmessage=(m)=>{
+    let d;try{d=JSON.parse(m.data);}catch(e){return;}
+    if(d.type==='panel'&&d.ext)extPaintPanel(d.ext,d.frame);
+    else if(d.type==='status'&&d.data){wsLastStatus=Date.now();setLive(true);setHeader(d.data);}
+    else if(d.type==='logs'&&d.data){if(!$('#logPause').checked)applyLogs(d.data);}
+    else if(d.type==='view'&&d.view==='peers')renderPeers(d.data);
+    else if(d.type==='view'&&d.view==='billing')renderBilling(d.data);
+    else if(d.type==='view'&&d.view==='compute')renderCompute(d.data.cp,d.data.cfg);
+  };
+  s.onclose=()=>{if(ws===s){ws=null;wsOk=false;}setTimeout(wsConnect,2000);};
+  s.onerror=()=>{try{s.close();}catch(e){}};
+}
+wsConnect();
 // Global funding budget control (one knob, all extensions). Polls the rate + the
 // live remaining allowance; prefills the input once so the operator sees it.
 let fundPrefilled=false;
@@ -2396,14 +3085,22 @@ async function loadExtensions(){
   // rows rebuild. Only benign pid/caps jitter is suppressed while editing.
   const life=d.items.map(it=>[it.name,it.available,it.installed,it.enabled].join(':')).join('|');
   if(life!==extLife){extOpenConfig=null;extLife=life;}
-  if(sig!==extSig && !extOpenConfig){$('#extList').innerHTML=d.items.length?d.items.map(extRow).join(''):'<p class="muted">No extensions found.</p>';extSig=sig;}
+  if(sig!==extSig && !extOpenConfig){
+    $('#extList').innerHTML=d.items.length?d.items.map(extRow).join(''):'<p class="muted">No extensions found.</p>';
+    extSig=sig;
+    wsResubscribe();   // rebuilt panel hosts need a fresh pushed frame
+  }
   extPollStatus();
 }
 // Poll status for expanded rows only. The status div exists only for an enabled,
 // contract-implementing, status-capable row, so guarding on it means a collapsed
 // card (not in extExpanded) or a non-status row never issues a request.
 function extPollStatus(){
-  for(const name of extExpanded) if($('#extStatus-'+cssid(name))) extFetchStatus(name);
+  for(const name of extExpanded){
+    if($('#extStatus-'+cssid(name))) extFetchStatus(name);
+    // Panels: pushed over the WebSocket when it is up; poll only as fallback.
+    if(!wsOk&&$('#extPanel-'+cssid(name))) extFetchPanel(name);
+  }
 }
 function extToggle(name){
   const id=cssid(name), open=!extExpanded.has(name);
@@ -2411,7 +3108,8 @@ function extToggle(name){
   const body=$('#extBody-'+id); if(body) body.style.display=open?'':'none';
   const chev=$('#extChev-'+id); if(chev) chev.textContent=open?'▾':'▸';
   const row=body&&body.closest('.extrow'); if(row) row.classList.toggle('open',open);
-  if(open) extFetchStatus(name);
+  if(open){extFetchStatus(name);if($('#extPanel-'+id))extFetchPanel(name);}
+  else if($('#extPanel-'+id))wsSend({type:'bye',ext:name});
 }
 async function extAct(action,name){
   // Disable every lifecycle button immediately so a mash cannot fire overlapping
@@ -2460,6 +3158,9 @@ showTab(TABS.includes(initTab)?initTab:'overview');
 // and every 2s; drives the live dot and uptime, and flips to
 // "offline" on its own the moment the server stops answering.
 async function heartbeat(){
+  // While the WebSocket is delivering status pushes, skip the HTTP poll; the
+  // interval stays armed purely as a staleness watchdog + fallback.
+  if(wsOk&&Date.now()-wsLastStatus<6000)return;
   try{const s=await api('/api/status');setLive(true);setHeader(s);}
   catch(e){setLive(false);}
 }

@@ -51,10 +51,21 @@ local function arm()
 end
 arm()
 
+-- One apply path for both the host's on_config push and the panel's config
+-- form: retune the knobs and re-arm the tick when the interval changed.
+local function apply_cfg(c)
+  local prev = peerfunder.emit_ms
+  peerfunder:reconfigure(c)
+  if peerfunder.emit_ms ~= prev then arm() end
+end
+
 -- Dashboard contract: live stats, a force-emit command, the config the editor
--- seeds, and live retune of the numeric knobs.
+-- seeds, and live retune of the numeric knobs. On hosts with the mene library
+-- installed, a declarative panel (stats, candidate table, blacklist editor,
+-- config form) supersedes the flat status lane; the status map stays for API
+-- consumers.
 if ces.extension_admin then
-  ces.extension_admin{
+  local spec = {
     status = function()
       return {
         budget  = tostring(peerfunder:budget()),
@@ -76,12 +87,10 @@ if ces.extension_admin then
       "per_peer_cap = 0\n" ..
       "min_reserve = 0\n" ..
       "require_inbound = 1\n",
-    on_config = function(c)
-      local prev = peerfunder.emit_ms
-      peerfunder:reconfigure(c)
-      if peerfunder.emit_ms ~= prev then arm() end   -- re-arm on a new interval
-    end,
+    on_config = apply_cfg,
   }
+  if mene then spec.panel = peerfunder:panel_app(apply_cfg) end
+  ces.extension_admin(spec)
 end
 
 ces.log("peerfunder: up, emit_per_peer=" .. peerfunder.emit_per_peer ..
@@ -203,6 +212,145 @@ function Peerfunder:emit()
     "peerfunder: tick funded %d/%d peers, paid %d, budget %d",
     count, #cands, paid, budget))
   return count, paid, budget
+end
+
+-- Serialize the LIVE state (knobs + blacklist) as conf-file text, so every
+-- panel-side change persists exactly what is running. The blacklist csv makes
+-- panel blacklist edits durable across restarts.
+local function self_conf_text(pf)
+  local bl = {}
+  for k in pairs(pf.blacklist) do bl[#bl + 1] = hex(k) end
+  table.sort(bl)
+  return "emit_ms = " .. pf.emit_ms .. "\n" ..
+         "emit_per_peer = " .. pf.emit_per_peer .. "\n" ..
+         "per_peer_cap = " .. pf.per_peer_cap .. "\n" ..
+         "min_reserve = " .. pf.min_reserve .. "\n" ..
+         "require_inbound = " .. (pf.require_inbound and 1 or 0) .. "\n" ..
+         "blacklist = " .. table.concat(bl, ",") .. "\n"
+end
+
+-- Persist the live state if the host supports it; returns a status suffix.
+local function persist(pf)
+  if ces.extension_admin.save_config then
+    ces.extension_admin.save_config(self_conf_text(pf))
+    return " + saved"
+  end
+  return " (host cannot persist)"
+end
+
+-- The mene admin panel (webadmin Extensions tab): budget/emission stats, the
+-- candidate table with live balances, force-emit, blacklist management, and a
+-- typed config form that applies live and persists /s/peerfunder.conf.
+-- `apply_cfg` is main's on_config path (reconfigure + tick re-arm). Uses the
+-- host-installed global `mene`; only called when it exists.
+-- Deterministic blacklist ordering. view and update both derive it from the
+-- live set, so a row-click index resolves without the view having to stash a
+-- snapshot in the model (views stay pure: they only read).
+local function blacklist_keys(pf)
+  local bl = {}
+  for k in pairs(pf.blacklist) do bl[#bl + 1] = k end
+  table.sort(bl)
+  return bl
+end
+
+function Peerfunder:panel_app(apply_cfg)
+  local pf = self
+  -- Bound the per-render work: each candidate row costs a ledger read, and
+  -- the view runs on every host render tick while the panel is watched.
+  local MAX_ROWS = 50
+  return mene.app{
+    model = { last_msg = "" },
+    view = function(m)
+      local cands = pf:candidates()
+      local budget = pf:budget()
+      local rows = {}
+      for i, p in ipairs(cands) do
+        if i > MAX_ROWS then break end
+        local acc = ces.account_read(p.pubkey)
+        rows[#rows + 1] = { hex(p.pubkey):sub(1, 16),
+                            (acc and acc.balance) or 0,
+                            p.inbound and "in" or "out" }
+      end
+      local bl_rows = {}
+      for _, k in ipairs(blacklist_keys(pf)) do
+        bl_rows[#bl_rows + 1] = { hex(k) }
+      end
+      return mene.card({ title = "Peer Funder",
+                         subtitle = "seeds channel liquidity at peers" },
+        mene.grid({ cols = 4, gap = 12 },
+          mene.stat({ label = "budget", value = budget,
+                      tone = budget > pf.min_reserve and "ok" or "warn" }),
+          mene.stat({ label = "candidates", value = #cands }),
+          mene.stat({ label = "granted total", value = pf.granted_total }),
+          mene.stat({ label = "ticks / last emitted",
+                      value = pf.ticks .. " / " .. pf.last_emitted })),
+        mene.row({ align = "between" },
+          mene.text({ tone = "muted" }, m.last_msg),
+          mene.button({ on = "emit", kind = "primary" }, "Emit now")),
+        mene.section({ title = "candidate peers" },
+          #rows > 0
+            and mene.table({ sortable = true, page_size = 10,
+                             cols = { "peer", "balance with us", "dir" },
+                             rows = rows })
+            or mene.text({ tone = "muted" }, "no fundable peers right now"),
+          #cands > MAX_ROWS and mene.text({ tone = "muted" },
+            "showing " .. MAX_ROWS .. " of " .. #cands) or nil),
+        mene.section({ title = "blacklist" },
+          #bl_rows > 0
+            and mene.table({ on = "unbl", cols = { "pubkey (click to remove)" },
+                             rows = bl_rows })
+            or mene.text({ tone = "muted" }, "empty"),
+          mene.form({ on = "bl" },
+            mene.field({ name = "key", label = "pubkey (64 hex)",
+                         placeholder = "aabb..." }),
+            mene.submit({ kind = "danger" }, "Blacklist"))),
+        mene.section({ title = "config (applies live + persists)" },
+          mene.form({ on = "cfg" },
+            mene.grid({ cols = 4, gap = 10 },
+              mene.field({ name = "emit_ms", kind = "number",
+                           label = "emit interval ms", value = pf.emit_ms }),
+              mene.field({ name = "emit_per_peer", kind = "number",
+                           label = "per peer per tick (raw)", value = pf.emit_per_peer }),
+              mene.field({ name = "per_peer_cap", kind = "number",
+                           label = "per-peer cap (0 = none)", value = pf.per_peer_cap }),
+              mene.field({ name = "min_reserve", kind = "number",
+                           label = "min reserve", value = pf.min_reserve })),
+            mene.checkbox({ name = "require_inbound",
+                            label = "only fund inbound peers (sent us PoW)",
+                            checked = pf.require_inbound }),
+            mene.submit({ kind = "primary" }, "Apply + save"))))
+    end,
+    update = function(ev, m)
+      if ev.on == "emit" then
+        local count, paid = pf:emit()
+        m.last_msg = string.format("emitted to %d peers, %d paid", count, paid)
+      elseif ev.on == "cfg" and type(ev.value) == "table" then
+        local c = {}
+        for k, x in pairs(ev.value) do
+          if type(x) == "boolean" then x = x and "1" or "0" end
+          c[k] = tostring(x)
+        end
+        apply_cfg(c)
+        m.last_msg = "config applied" .. persist(pf)
+      elseif ev.on == "bl" then
+        local k = unhex((ev.value and ev.value.key or ""):gsub("%s", ""))
+        if k and #k == 32 then
+          pf.blacklist[k] = true
+          m.last_msg = "blacklisted" .. persist(pf)
+        else
+          m.last_msg = "bad key: need 64 hex chars"
+        end
+      elseif ev.on == "unbl" and ev.value and ev.value.row ~= nil then
+        -- Same deterministic ordering the view rendered from.
+        local k = blacklist_keys(pf)[ev.value.row + 1]   -- row index is 0-based
+        if k then
+          pf.blacklist[k] = nil
+          m.last_msg = "unblacklisted " .. hex(k):sub(1, 16) .. persist(pf)
+        end
+      end
+      return m
+    end,
+  }
 end
 
 -- Relay command channel (cesh dial): one-line text commands for ops and tests.

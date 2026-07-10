@@ -24,6 +24,15 @@ blacklist =               # comma-separated 64-hex peer pubkeys to never fund
 
 Amounts are raw units (PRICE_UNIT = 1e8 per credit).
 
+## Dashboard panel
+
+The Extensions tab of the web dashboard renders peerfunder's mene panel: stat
+tiles (budget, candidates, granted total, ticks/last emitted), a sortable table
+of candidate peers with their live balances, blacklist management (click a row
+to remove, a form to add), an Emit-now button, and a typed config form
+that applies live and persists /s/peerfunder.conf (blacklist edits persist too). The flat status map stays
+registered for API consumers.
+
 ## Relay commands (`cesh dial`)
 
 - `status` - budget, candidate count, totals, program pubkey

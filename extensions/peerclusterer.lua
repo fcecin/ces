@@ -244,9 +244,117 @@ arm()
 -- Observability console over the relay (cesh dial <pid>): status, view dump.
 admin.attach(stat, view, function() return me end)
 
+-- One apply path for both the host's on_config push and the panel's config
+-- form: rebuild opts and re-arm the tick when the interval changed.
+local function apply_cfg(c)
+  local prev = opts.tick_ms
+  opts = build_opts(c)
+  if opts.tick_ms ~= prev then arm() end
+end
+
+-- The mene admin panel: clustering stats, a live netgraph of the 2-hop
+-- neighborhood (the relay `view` verb, as a picture), and a typed config form
+-- that applies live and persists. Bounded so a huge view cannot bloat the
+-- frame. Built only on hosts with the mene library installed.
+local function build_panel()
+  local MAX_NODES = 60
+  return mene.app{
+    model = { last_msg = "" },
+    view = function(m)
+      local mypeers = {}
+      for _, p in ipairs(ces.peers() or {}) do
+        if p.pubkey then mypeers[p.pubkey] = true end
+      end
+      local function nid(k) return string.sub(
+        (k:gsub(".", function(c) return string.format("%02x", c:byte()) end)), 1, 12) end
+      local nodes, edges, seen, total = {}, {}, {}, 0
+      local function add_node(k, tone, size)
+        if seen[k] then return true end
+        total = total + 1
+        if #nodes >= MAX_NODES then return false end
+        seen[k] = true
+        nodes[#nodes + 1] = { id = nid(k), label = nid(k), tone = tone, size = size }
+        return true
+      end
+      if me then add_node(me, "ok", 16) end
+      for k in pairs(mypeers) do add_node(k, culled[k] and "err" or "info") end
+      for k in pairs(view) do
+        if k ~= me then add_node(k, mypeers[k] and "info" or "warn") end
+      end
+      local eseen = {}
+      local function add_edge(a, b)
+        if not (seen[a] and seen[b]) or a == b then return end
+        local ka, kb = nid(a), nid(b)
+        local ek = ka < kb and (ka .. kb) or (kb .. ka)
+        if eseen[ek] then return end
+        eseen[ek] = true
+        edges[#edges + 1] = { ka, kb }
+      end
+      if me then for k in pairs(mypeers) do add_edge(me, k) end end
+      for k, list in pairs(view) do
+        for _, q in ipairs(list) do add_edge(k, q) end
+      end
+      return mene.card({ title = "Peer Clusterer",
+                         subtitle = "closes a clique around this host" },
+        mene.grid({ cols = 4, gap = 12 },
+          mene.stat({ label = "peers", value = stat.peers }),
+          mene.stat({ label = "core clique", value = stat.core,
+                      tone = stat.core >= opts.group_size and "ok" or "warn" }),
+          mene.stat({ label = "adds / culls",
+                      value = stat.adds .. " / " .. stat.culls }),
+          mene.stat({ label = "ticks", value = stat.ticks })),
+        mene.row({ gap = 8 },
+          mene.text({ tone = "muted" }, "last action:"),
+          mene.badge({ tone = "info" }, stat.last or "idle")),
+        mene.section({ title = "2-hop neighborhood" },
+          mene.netgraph({ id = "topo", layout = "radial", height = 300,
+                          nodes = nodes, edges = edges }),
+          total > MAX_NODES and mene.text({ tone = "muted" },
+            "showing " .. MAX_NODES .. " of " .. total .. " nodes") or nil),
+        mene.section({ title = "config (applies live + persists)" },
+          mene.form({ on = "cfg" },
+            mene.grid({ cols = 3, gap = 10 },
+              mene.field({ name = "group_size", kind = "number",
+                           label = "group size", value = opts.group_size }),
+              mene.field({ name = "max_peers", kind = "number",
+                           label = "max peers", value = opts.max_peers }),
+              mene.field({ name = "tick_ms", kind = "number",
+                           label = "tick ms", value = opts.tick_ms }),
+              mene.field({ name = "gossip_cap", kind = "number",
+                           label = "gossip cap", value = opts.gossip_cap }),
+              mene.field({ name = "peer_credit_target", kind = "number",
+                           label = "peer credit target", value = opts.peer_credit_target }),
+              mene.field({ name = "dud_timeout_ms", kind = "number",
+                           label = "dud timeout ms", value = opts.dud_timeout_ms })),
+            mene.row({ align = "end" },
+              mene.submit({ kind = "primary" }, "Apply + save"))),
+          m.last_msg ~= "" and mene.text({ tone = "muted" }, m.last_msg) or nil))
+    end,
+    update = function(ev, m)
+      if ev.on == "cfg" and type(ev.value) == "table" then
+        local keys = { "group_size", "max_peers", "tick_ms", "gossip_cap",
+                       "peer_credit_target", "dud_timeout_ms" }
+        local c, lines = {}, {}
+        for _, k in ipairs(keys) do
+          c[k] = tostring(ev.value[k] or "")
+          lines[#lines + 1] = k .. " = " .. c[k]
+        end
+        apply_cfg(c)
+        if ces.extension_admin.save_config then
+          ces.extension_admin.save_config(table.concat(lines, "\n") .. "\n")
+          m.last_msg = "config applied live + saved"
+        else
+          m.last_msg = "config applied live (host cannot persist)"
+        end
+      end
+      return m
+    end,
+  }
+end
+
 -- Dashboard contract: live stats, the config the editor seeds, live retune.
 if ces.extension_admin then
-  ces.extension_admin{
+  local spec = {
     status = function()
       return {
         peers      = tostring(stat.peers),
@@ -265,12 +373,10 @@ if ces.extension_admin then
       "gossip_cap = 64\n" ..   -- peers advertised per gossip frame
       "peer_credit_target = 500000000\n" ..  -- 5 full credits lifetime PoW to count
       "dud_timeout_ms = 86400000\n",         -- 24h settle before reclaiming own duds
-    on_config = function(c)
-      local prev = opts.tick_ms
-      opts = build_opts(c)
-      if opts.tick_ms ~= prev then arm() end
-    end,
+    on_config = apply_cfg,
   }
+  if mene then spec.panel = build_panel() end
+  ces.extension_admin(spec)
 end
 
 ces.log("peerclusterer: up, group_size=" .. opts.group_size ..

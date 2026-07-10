@@ -71,6 +71,15 @@ network as an emergent consequence of every node nudging toward its own clique.
 the peer miner maintains on each peer): a peer can only reciprocate as much PoW
 as the network mines. Both default to 5 credits.
 
+## Dashboard panel
+
+The Extensions tab of the web dashboard renders peerclusterer's mene panel:
+stat tiles (peers, core clique vs target, adds/culls, ticks), the last action,
+and the 2-hop neighborhood as a live pannable graph (self highlighted, own
+peers blue, heard-only yellow, culled red; bounded to 60 nodes), plus a typed config form that applies live and
+persists /s/peerclusterer.conf. The flat
+status map stays registered for API consumers.
+
 ## Relay commands (`cesh dial <pid>`)
 
 - `status` - peers, core size, total adds, total culls, ticks, last action

@@ -88,6 +88,19 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(tomlplusplus)
 
+# mene: the admin-panel UI library. Its build exports mene::assets, a
+# dependency-free static lib carrying the embedded Lua library and browser
+# renderer (see <mene/assets.h>), so the Lua encoder and the JS renderer in
+# one server binary cannot skew. Bump GIT_TAG to take a new mene. Local mene
+# checkout for development: cmake -DFETCHCONTENT_SOURCE_DIR_MENE=/path/to/mene
+FetchContent_Declare(
+    mene
+    GIT_REPOSITORY https://github.com/fcecin/mene.git
+    GIT_TAG        1ad758ddd51587602fe145653a45c9d76d36b11a
+    SOURCE_SUBDIR  cpp
+)
+FetchContent_MakeAvailable(mene)
+
 # -----------------------------------------------------------------------------
 # 4. EXTERNAL PROJECT DEPENDENCIES
 # -----------------------------------------------------------------------------
@@ -145,6 +158,7 @@ PUBLIC
   cryptopp::cryptopp
   secp256k1
   minxlib
+  mene::assets
   Threads::Threads
   libbacktrace
   ${CMAKE_DL_LIBS}

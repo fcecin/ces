@@ -135,7 +135,12 @@ itself) each block, so its balance climbs as the chain advances.
 
 ## Observability
 
-The Extensions tab of the web dashboard shows hylesolo's live status:
+The Extensions tab of the web dashboard renders hylesolo's mene panel: a state
+badge, live metric tiles (height with a per-block sparkline, validator balance,
+txs, queries), the chain detail rows, a copyable validator pubkey, the
+Start/Stop chain buttons (Stop asks for confirmation), and a genesis/economy
+config form that persists /s/hylesolo.conf (takes effect on the next Start). The flat status map
+below stays registered for API consumers:
 
 - `state` -- `stopped` (loaded, no chain) or `running`.
 - `chain` -- the running chain id.

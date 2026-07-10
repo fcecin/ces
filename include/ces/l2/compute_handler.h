@@ -71,8 +71,11 @@ constexpr uint8_t kComputeExtCapStatus         = 0x01;
 constexpr uint8_t kComputeExtCapCommands       = 0x02;
 constexpr uint8_t kComputeExtCapConfigDefaults = 0x04;
 constexpr uint8_t kComputeExtCapOnConfig       = 0x08;
-constexpr uint8_t kComputeExtReqStatus  = 0x00;
-constexpr uint8_t kComputeExtReqCommand = 0x01;
+constexpr uint8_t kComputeExtCapPanel          = 0x10;  // mene UI panel registered
+constexpr uint8_t kComputeExtReqStatus      = 0x00;
+constexpr uint8_t kComputeExtReqCommand     = 0x01;
+constexpr uint8_t kComputeExtReqPanelRender = 0x02;  // reply = render/toast frame JSON
+constexpr uint8_t kComputeExtReqPanelEvent  = 0x03;  // body = event JSON; reply as RENDER
 
 struct ComputeExtInfo {
   // Identity, reported live via ces.manifest{} (may be set even with no contract).
@@ -149,6 +152,9 @@ public:
 
   // Push a config blob (text) to a running extension's on_config. Best-effort.
   void extConfig(uint64_t pid, const std::string& cfg);
+  // Panel watch on/off (drives the child's change-detect push tick). One-way,
+  // idempotent; the caller re-sends periodically to survive child relaunches.
+  void extPanelWatch(uint64_t pid, bool on);
 
   // Kill every running instance of `sourceName` (e.g. "/s/discovery.lua").
   // Async (hops onto the CesPlex strand). The ExtensionManager's Disable.

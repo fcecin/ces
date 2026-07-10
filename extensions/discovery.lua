@@ -30,6 +30,7 @@ __mods["main"] = function()
 local registry = require("registry")
 local Agent    = require("agent")
 local admin    = require("admin")
+local panel    = require("panel")
 local conf     = require("conf")
 
 -- Operator-deployed config; defaults apply if the file is absent. Production
@@ -109,11 +110,22 @@ ces.every(opts.announce_ms, announce)
 
 admin.attach(reg)   -- observability over the relay (cesh dial); inbound-only, not a mesh
 
+-- One apply path for both the host's on_config push and the panel's config
+-- form: rebuild opts (so the form re-renders current values) and retune the
+-- running agent.
+local function apply_cfg(c)
+  opts = build_opts(c)
+  agent:reconfigure(opts)
+end
+
 -- Extension contract: live registry stats on the dashboard, a dump command, the
 -- config defaults the editor seeds, and on_config for LIVE retuning — an edit in
 -- the dashboard reconfigures the running agent (re-arms cadences, updates knobs,
--- folds in new seeds) with no restart.
-ces.extension_admin{
+-- folds in new seeds) with no restart. On hosts that install the mene library,
+-- a declarative panel (registry composition + server table + config form)
+-- supersedes the flat status lane in the dashboard; the status map stays for
+-- API consumers.
+local spec = {
   status = function()
     local s = reg:stats()
     return {
@@ -150,8 +162,13 @@ ces.extension_admin{
     "peer_min_credit = 100000000\n",   -- floor credits to keep funded at each peer (1.0)
   -- Live reconfigure: the host pushes the edited config map here (no restart).
   -- We rebuild the same opts the launch path uses and hand them to the agent.
-  on_config = function(c) agent:reconfigure(build_opts(c)) end,
+  -- The panel's config form applies through the same function.
+  on_config = apply_cfg,
 }
+if mene then
+  spec.panel = panel.build(reg, agent, apply_cfg, function() return opts end)
+end
+ces.extension_admin(spec)
 
 ces.run()
 
@@ -942,6 +959,140 @@ function M.attach(reg)
     on_close = function(conn) a:on_close(conn) end,
   })
   return a
+end
+
+return M
+
+end
+
+__mods["panel"] = function()
+-- panel - the mene admin panel (webadmin Extensions tab): live registry
+-- composition, a sortable/paged table of known servers, the dump action, and a
+-- typed config form that applies live AND persists /s/discovery.conf (via
+-- ces.extension_admin.save_config). Uses the host-installed global `mene`;
+-- build() is only called when the host provides it (see main.lua), so the
+-- bundle still runs on mene-less hosts.
+
+local M = {}
+
+-- Bound the per-frame table so a huge registry cannot bloat the render frame;
+-- the table pages client-side and a truncation note keeps the cap visible.
+local MAX_ROWS = 200
+
+-- The config keys the form round-trips, in file order. Matches build_opts /
+-- config_defaults in main.lua.
+local CFG_KEYS = {
+  "seeds", "announce", "active_target", "crawl_ms", "maint_ms", "save_ms",
+  "pull_floor_ms", "pull_ceil_ms", "sample_k", "probe_ms", "dead_after",
+  "peer_min_credit", "announce_ms", "announce_budget",
+}
+
+-- Form value map (strings/bools) -> conf-file text, fixed key order.
+local function conf_text(v)
+  local out = {}
+  for _, k in ipairs(CFG_KEYS) do
+    local x = v[k]
+    if type(x) == "boolean" then x = x and "1" or "0" end
+    out[#out + 1] = k .. " = " .. tostring(x or "")
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+
+-- build(reg, agent, apply_cfg, get_opts):
+--   apply_cfg(c) applies a conf string-map live (main's on_config path);
+--   get_opts()   returns the CURRENT typed opts (form initial values).
+function M.build(reg, agent, apply_cfg, get_opts)
+  local function num_field(name, label, value)
+    return mene.field({ name = name, kind = "number", label = label,
+                        value = value })
+  end
+  return mene.app{
+    model = { last_msg = "" },
+    view = function(m)
+      local s = reg:stats()
+      local o = get_opts()
+      local outbound = 0
+      for _, p in ipairs(ces.peers() or {}) do
+        if p.outbound then outbound = outbound + 1 end
+      end
+      local rows, total = {}, 0
+      for _, addr in ipairs(reg:addrs()) do
+        total = total + 1
+        if #rows < MAX_ROWS then
+          local r = reg:get(addr)
+          rows[#rows + 1] = {
+            addr,
+            tostring(r and r.state or "?"),
+            (r and (r.rpc_port or 0) > 0) and tostring(r.rpc_port) or "-",
+          }
+        end
+      end
+      return mene.card({ title = "Discovery", subtitle = "network registry / crawler" },
+        mene.grid({ cols = 4, gap = 12 },
+          mene.stat({ label = "registry", value = s.total }),
+          mene.stat({ label = "alive", value = s.alive,
+                      tone = s.alive > 0 and "ok" or "warn" }),
+          mene.stat({ label = "outbound peers", value = outbound }),
+          mene.stat({ label = "pull gap",
+                      value = tostring(math.floor((agent.pull_interval or 0) / 1000)) .. "s" })),
+        mene.breakdown({ label = "registry by liveness state", parts = {
+          { "alive",    s.alive,    "ok"   },
+          { "verified", s.verified, "info" },
+          { "heard",    s.heard,    "warn" },
+          { "dark",     s.dark,     "err"  },
+        } }),
+        mene.section({ title = "known servers" },
+          mene.table({ sortable = true, page_size = 10,
+                       cols = { "address", "state", "rpc" }, rows = rows }),
+          total > MAX_ROWS and mene.text({ tone = "muted" },
+            "showing " .. MAX_ROWS .. " of " .. total) or nil),
+        mene.row({ align = "end" },
+          mene.button({ on = "dump" }, "Log registry summary")),
+        mene.section({ title = "config (applies live + persists)" },
+          mene.form({ on = "cfg" },
+            mene.field({ name = "seeds", label = "seeds (host:port, comma-separated)",
+                         value = table.concat(o.seeds or {}, ",") }),
+            mene.field({ name = "announce",
+                         label = "announce (our public address; empty = off)",
+                         value = o.announce or "" }),
+            mene.grid({ cols = 4, gap = 10 },
+              num_field("active_target", "active target", o.active_target),
+              num_field("crawl_ms", "crawl ms", o.crawl_ms),
+              num_field("maint_ms", "maint ms", o.maint_ms),
+              num_field("save_ms", "save ms", o.save_ms),
+              num_field("pull_floor_ms", "pull floor ms", o.pull_floor_ms),
+              num_field("pull_ceil_ms", "pull ceil ms", o.pull_ceil_ms),
+              num_field("sample_k", "sample k", o.sample_k),
+              num_field("probe_ms", "probe ms", o.probe_ms),
+              num_field("dead_after", "dead after", o.dead_after),
+              num_field("peer_min_credit", "peer min credit", o.peer_min_credit),
+              num_field("announce_ms", "announce ms", o.announce_ms),
+              num_field("announce_budget", "announce budget", o.announce_budget)),
+            mene.row({ align = "end" },
+              mene.submit({ kind = "primary" }, "Apply + save"))),
+          m.last_msg ~= "" and mene.text({ tone = "muted" }, m.last_msg) or nil))
+    end,
+    update = function(ev, m)
+      if ev.on == "dump" then
+        ces.log("discovery: " .. agent:summary())
+        m.last_msg = ""
+      elseif ev.on == "cfg" and type(ev.value) == "table" then
+        local c = {}
+        for k, x in pairs(ev.value) do
+          if type(x) == "boolean" then x = x and "1" or "0" end
+          c[k] = tostring(x)
+        end
+        apply_cfg(c)
+        if ces.extension_admin.save_config then
+          ces.extension_admin.save_config(conf_text(c))
+          m.last_msg = "config applied live + saved to /s/discovery.conf"
+        else
+          m.last_msg = "config applied live (host cannot persist; edit Config below to save)"
+        end
+      end
+      return m
+    end,
+  }
 end
 
 return M

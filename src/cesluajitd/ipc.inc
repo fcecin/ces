@@ -27,6 +27,9 @@ constexpr uint8_t  TAG_EXT_REP          = 0x0f;  // child → server (reply)
 constexpr uint8_t  TAG_EXT_CONFIG       = 0x10;  // server → child (on_config, one-way)
 constexpr uint8_t  TAG_EXT_DISABLE_SELF = 0x11;  // child → server
 constexpr uint8_t  TAG_EXT_MANIFEST     = 0x12;  // child → server (ces.manifest, one-way)
+constexpr uint8_t  TAG_EXT_SAVE_CONFIG  = 0x19;  // child → server (persist /s/<name>.conf, one-way)
+constexpr uint8_t  TAG_EXT_UI_PUSH      = 0x1a;  // child → server (panel render frame, one-way)
+constexpr uint8_t  TAG_EXT_UI_WATCH     = 0x1b;  // server → child ([u8 on]; drives the change-detect tick)
 
 constexpr uint8_t  TAG_GOSSIP_IN        = 0x13;  // server → child (a flooded message)
 constexpr uint8_t  TAG_GOSSIP_OUT       = 0x14;  // child → server (ces.gossip.send)
@@ -37,13 +40,16 @@ constexpr uint8_t  TAG_PEER_MSG_IN      = 0x16;  // server → child (mesh messa
 constexpr uint8_t  TAG_PEER_MSG_OUT     = 0x17;  // child → server (ces.peer.send)
 constexpr uint8_t  TAG_PEER_LISTEN      = 0x18;  // child → server (ces.peer.listen)
 
-constexpr uint8_t  EXT_REQ_STATUS  = 0x00;
-constexpr uint8_t  EXT_REQ_COMMAND = 0x01;
+constexpr uint8_t  EXT_REQ_STATUS       = 0x00;
+constexpr uint8_t  EXT_REQ_COMMAND      = 0x01;
+constexpr uint8_t  EXT_REQ_PANEL_RENDER = 0x02;  // reply = [status][render/toast frame JSON]
+constexpr uint8_t  EXT_REQ_PANEL_EVENT  = 0x03;  // body = event JSON; reply as RENDER
 
 constexpr uint8_t  EXT_CAP_STATUS          = 0x01;
 constexpr uint8_t  EXT_CAP_COMMANDS        = 0x02;
 constexpr uint8_t  EXT_CAP_CONFIG_DEFAULTS = 0x04;
 constexpr uint8_t  EXT_CAP_ON_CONFIG       = 0x08;
+constexpr uint8_t  EXT_CAP_PANEL           = 0x10;  // mene UI panel registered
 
 constexpr uint16_t METHOD_CLIENT_SEND      = 0x0001;
 constexpr uint16_t METHOD_FILE_CREATE      = 0x0100;

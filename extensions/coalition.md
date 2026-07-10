@@ -147,8 +147,12 @@ reciprocated PoW, so a network using a nonzero target runs the engine.
 
 ## Observability
 
-The Extensions tab of the web dashboard reports state, fingerprint, member count,
-and attempt counters. The instance can also be dialed directly:
+The Extensions tab of the web dashboard renders coalition's mene panel: state
+and maturity badges, attempt-outcome composition (commits/faults/retractions),
+and — once formed — the fingerprint/age rows, a copyable coalition id, the
+member table, and the clique as a ring graph, plus a typed config form that
+applies live and persists /s/coalition.conf. The flat status map stays
+registered for API consumers. The instance can also be dialed directly:
 
 ```bash
 cesh --server $SRV --rpc-port $RPC compute instances /s/coalition.lua   # -> pid

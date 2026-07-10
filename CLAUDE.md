@@ -6,7 +6,7 @@ CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind 
 
 ## Coding practices
 
-- Always use `build.sh` to build and run tests. Do not invoke `cmake --build` or `cestests` directly; go through `./build.sh debug --test` (or `--teste2e`).
+- Always use `build.sh` to build and run tests. Do not invoke `cmake --build` or `cestests` directly; go through `./build.sh debug --test`. The full run includes the E2E suites (CeshE2E, CesnetBotE2E, ...); filter by suite name to skip them.
 - Always redirect `build.sh` output to a file, then grep/tail it. Do not tail the live pipe: direct pipes lose buffered stdio output, and reading live output races the test harness for ephemeral ports.
 
   ```bash
@@ -26,7 +26,6 @@ CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind 
 ./build.sh release                  # optimized
 ./build.sh debug --test             # build + unit tests
 ./build.sh debug --test <filter>    # run matching tests only
-./build.sh debug --teste2e          # build + E2E tests
 ./build.sh debug --asan             # AddressSanitizer
 ./build.sh rm                       # delete all build dirs
 ```
@@ -226,7 +225,7 @@ Per-instance ports: each instance gets a CES client on a statically-allocated UD
 
 cesluajitd: one sandboxed LuaJIT VM per process, with no `os`/`io`/`debug`/`require`/`loadstring`/`ffi`. The supervisor frames IPC over the UDS and hands the child a bootstrap frame with its identity (owner key + program keypair), its reserved ports, and the source. The Lua API surfaces client messaging, the file store (owner-authority, billed to the source's `file_balance`), `ces.transfer` / `account_read` / `random_bytes`, identity and time helpers, capacity-billed `bucket`s, and the unified `ces.conn` raw byte-stream API.
 
-`[extension]` auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is operator-deployed, not embedded in the binary: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source logs a WRN and is skipped. The repeatable flag is the generic `--extension <name>`. Shipped: `dice` (fair-coin double-or-nothing whose house bankroll is the file's program account, `ces.program_pubkey()`); and `discovery` (a built cesdk bundle that keeps the host's peer table populated and gossips known servers via paid sample exchange).
+`[extension]` auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is operator-deployed, not embedded in the binary: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source logs a WRN and is skipped. The repeatable flag is the generic `--extension <name>`. Shipped in extensions/: `dice` (fair-coin double-or-nothing whose house bankroll is the file's program account, `ces.program_pubkey()`), `discovery` (cesdk bundle; keeps the host's peer table populated and gossips known servers via paid sample exchange), `hylesolo` (cesdk bundle; single-node hyle chain, needs a `--hyle` build), `peerfunder`, `peerclusterer`, and `coalition` (cesdk bundles; peer-liquidity seeding, clique clustering, coalition formation). All six register `ces.extension_admin` with a mene admin panel (see Web admin dashboard).
 
 ## L2 lua: `builtin:lua` (channel routing)
 
@@ -344,6 +343,10 @@ The in-server operator dashboard (class `WebAdmin`), distinct from `cesweb` (the
 
 GET endpoints emit hand-rolled JSON; POST actions take form-urlencoded bodies. Ledger reads hop onto `logicStrand_` via a `std::future`; remote inspect/mine run on worker threads joined at `stop()`, never the io thread. The live log tail is a bounded in-memory `LogRing` fed by a Boost.Log sink. Tests: `tests/test_webadmin.cpp` (suite `WebAdminTests`) drives every endpoint over raw TCP against an in-process server.
 
+WebSocket push lane (`GET /ws`, RFC 6455 in-tree, accept key via CryptoPP SHA1): the dashboard's live data rides one socket instead of polling. Frames: browser sends `{type:hello|bye,ext}` (subscribe to an extension panel) and `{type:"event",ext,event}` (widget event; the server extracts the event value with a string-aware balanced scan and the child's full JSON parser validates it); server pushes `{type:"panel",ext,frame}`, `{type:"status",data}` every 1s while any client is connected, `{type:"logs",data}` deltas after a `{type:"logs-on",since}` subscription (Logs tab active, unpaused) and only when new lines exist, and `{type:"view",view,data}` for the peers/billing/compute tab tables after a `{type:"view-on",view}` subscription — built only while someone watches the tab, hash-gated so identical tables are never re-sent. The browser subscribes exactly its visible tab (`wsViewSync`/`wsLogsSync` on tab switch); the HTTP loaders remain as the socket-down fallback. Extension side: a registered panel installs mene's `__mene_host_push` bridge (dispatches auto-push; `panel:push()` for immediacy) and, while watched (`TAG_EXT_UI_WATCH`, re-asserted every 2s so a relaunched child re-arms), the child renders every 500ms and pushes over `TAG_EXT_UI_PUSH` ONLY when the frame's hash changed — so wire traffic is change-driven end to end. Relay: compute_handler -> `CesServer::notifyExtPanelPush` -> `WebAdmin::panelPush` (weak_ptr session registry on the web io thread). The browser is WS-first with auto-reconnect; the HTTP pollers (500ms panel, 2s heartbeat) remain solely as the fallback while the socket is down. Watch counts gate the child tick: nobody watching = zero render work. Tested in `ExtPanelTests/WebSocketPanelPush` (handshake, hello, spontaneous change push, event over socket, status heartbeat).
+
+Extension admin panels (mene): an extension may pass `panel = mene.app{model, view, update}` to `ces.extension_admin{}` (caps bit 0x10). `mene` is the declarative UI library (github.com/fcecin/mene), fetched by CMake at a pinned commit (bump the mene GIT_TAG in CMakeLists.txt to update; local checkout via -DFETCHCONTENT_SOURCE_DIR_MENE) and consumed as its `mene::assets` link target (`<mene/assets.h>`, dependency-free): `::mene::luaModules()` is the Lua declaration library, installed as the global `mene` in every program VM by `install_mene_lib` (api_mene.inc; the header is included at file scope by main.cpp since the .inc lives inside namespace cesluajitd), and `::mene::rendererJs()` / `rendererCssScoped(".menehost")` are the browser renderer, served by webadmin at `/mene.js` + `/mene.css`. The panel rides the existing blocking extension IPC as two request kinds: `EXT_REQ_PANEL_RENDER` returns the current `{"type":"render","tree":...}` frame and `EXT_REQ_PANEL_EVENT` dispatches a browser event (`{"on":...,"value":...}`) through the app's `update` then re-renders; a Lua error inside view/update travels as a `{"type":"toast",...}` frame, never a transport failure. Server side: `extensionPanel`/`extensionPanelEvent` (extension_manager) behind `GET /api/extension_panel` and `POST /api/extension_panel_event`. The Extensions tab mounts the frame with `Mene.mountPanel` (in-place reconciliation; focus/scroll survive), polls it on the 500ms expanded-row cadence, and paints event responses immediately; when the panel cap is present it supersedes the flat status table and command buttons. Config editing is panel-native too: `ces.extension_admin.save_config(text)` (one-way `TAG_EXT_SAVE_CONFIG`, path derived from the instance's own source so an extension can only write its own conf, no on_config echo) lets a panel config `form` apply live and persist `/s/<name>.conf` in one update. The panel supersedes the whole legacy lane in the UI — status table, command buttons, and the raw-textarea Config editor (rendered only for panel-less extensions); the `/api/extension_config*` endpoints stay for scripts. Both mene halves ship in one server binary, so the Lua encoder and JS renderer cannot skew. All six shipped extensions register panels, guarded with `if mene then` so bundles still run on mene-less hosts. Tests: `tests/test_ext_panel.cpp` (suite `ExtPanelTests`).
+
 Hello banner: `<data_dir>/hello.txt` is a UTF-8 string capped at 160 bytes (trimmed on a codepoint boundary), seeded at boot and served in `CES_QUERY_SERVER_INFO` as the `hello` field. The dashboard's Config tab is the only other writer.
 
 ## `ces credit` / `ces debit` / `ces snapshot`
@@ -391,7 +394,7 @@ CesFixture (`tests/test_common.h`): in-process server plus CesClient plus temp d
 
 ```bash
 ./build.sh debug --test AccountTests
-./build.sh debug --teste2e            # E2E (shells out to cesh + cesnet/cesnetbot)
+./build.sh debug --test CeshE2E       # E2E only (shells out to cesh + cesnet/cesnetbot)
 ```
 
 Network simulator:

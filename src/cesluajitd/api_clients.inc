@@ -810,10 +810,14 @@ void install_ces_api(lua_State* L) {
 
   // ces.extension_admin — a callable table: ces.extension_admin{...} registers
   // the admin contract (via __call); ces.extension_admin.disable_self() turns
-  // this instance off.
+  // this instance off; ces.extension_admin.save_config(text) persists the
+  // extension's /s/<name>.conf (panel config forms apply live + save through
+  // one update).
   lua_newtable(L);
   lua_pushcfunction(L, guarded<lua_ces_extension_admin_disable_self>);
   lua_setfield(L, -2, "disable_self");
+  lua_pushcfunction(L, guarded<lua_ces_extension_admin_save_config>);
+  lua_setfield(L, -2, "save_config");
   lua_newtable(L);                                  // metatable
   lua_pushcfunction(L, guarded<lua_ces_extension_admin>);
   lua_setfield(L, -2, "__call");

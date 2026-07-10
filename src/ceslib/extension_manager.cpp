@@ -285,6 +285,40 @@ bool extensionCommand(CesServer* server, const std::string& name,
   return true;
 }
 
+bool extensionPanel(CesServer* server, const std::string& name,
+                    std::string& frame) {
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return false;
+  uint64_t pid = runningPid(server, name);
+  if (!pid) return false;
+  ces::Bytes out;
+  if (!h->extRequest(pid, kComputeExtReqPanelRender, ces::Bytes{}, out, 2000))
+    return false;
+  frame.assign(reinterpret_cast<const char*>(out.data()), out.size());
+  return true;
+}
+
+bool extensionPanelEvent(CesServer* server, const std::string& name,
+                         const std::string& eventJson, std::string& frame) {
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return false;
+  uint64_t pid = runningPid(server, name);
+  if (!pid) return false;
+  ces::Bytes in(eventJson.begin(), eventJson.end());
+  ces::Bytes out;
+  if (!h->extRequest(pid, kComputeExtReqPanelEvent, in, out, 5000))
+    return false;
+  frame.assign(reinterpret_cast<const char*>(out.data()), out.size());
+  return true;
+}
+
+void extensionPanelWatch(CesServer* server, const std::string& name, bool on) {
+  ComputeHandler* h = server->computeHandler();
+  if (!h) return;
+  uint64_t pid = runningPid(server, name);
+  if (pid) h->extPanelWatch(pid, on);
+}
+
 std::string extensionConfigGet(CesServer* server, const std::string& name) {
   if (!validName(name)) return "";
   return fhReadServerFile(server, "/s/" + name + ".conf");

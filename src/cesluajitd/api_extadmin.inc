@@ -9,6 +9,7 @@
 int  g_ext_status_ref  = LUA_NOREF;
 int  g_ext_command_ref = LUA_NOREF;
 int  g_ext_config_ref  = LUA_NOREF;
+int  g_ext_panel_ref   = LUA_NOREF;   // mene.app registered via `panel`
 bool g_ext_registered  = false;
 
 std::string ext_str_field(lua_State* L, int tbl, const char* key) {
@@ -159,6 +160,33 @@ int lua_ces_extension_admin(lua_State* L) {
     caps |= EXT_CAP_ON_CONFIG;
   } else lua_pop(L, 1);
 
+  // panel = a mene.app (table with `view` and `update` functions). The host
+  // drives it via EXT_REQ_PANEL_RENDER / EXT_REQ_PANEL_EVENT; webadmin renders
+  // the frames with the embedded mene renderer. A present-but-malformed panel
+  // is a loud error, not a silent skip.
+  lua_getfield(L, 2, "panel");
+  if (!lua_isnil(L, -1)) {
+    if (!lua_istable(L, -1))
+      return luaL_error(L, "ces.extension_admin: panel must be a mene.app table");
+    lua_getfield(L, -1, "view");
+    bool hasView = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+    lua_getfield(L, -1, "update");
+    bool hasUpdate = lua_isfunction(L, -1);
+    lua_pop(L, 1);
+    if (!hasView || !hasUpdate)
+      return luaL_error(L,
+        "ces.extension_admin: panel must have view and update functions (a mene.app)");
+    if (g_ext_panel_ref != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, g_ext_panel_ref);
+    g_ext_panel_ref = luaL_ref(L, LUA_REGISTRYINDEX);   // pops the panel table
+    caps |= EXT_CAP_PANEL;
+    // Arm the mene push bridge: App:dispatch auto-pushes through this global,
+    // and the program may call panel:push() for spontaneous immediacy. The
+    // host relays pushes to watching webadmin WebSocket clients.
+    lua_pushcfunction(L, lua_mene_host_push);
+    lua_setglobal(L, "__mene_host_push");
+  } else lua_pop(L, 1);
+
   body[0] = caps;
   write_frame(TAG_EXT_REGISTER, 0, body.data(), body.size());
   g_ext_registered = true;
@@ -173,10 +201,34 @@ int lua_ces_extension_admin_disable_self(lua_State* L) {
   return 0;
 }
 
+// ces.extension_admin.save_config(text) — persist `text` as this extension's
+// /s/<name>.conf on the host. One-way, no on_config echo: the caller has
+// already applied the values it is saving (a panel config form does apply +
+// save in one update). Same 64 KB cap as config_defaults.
+int lua_ces_extension_admin_save_config(lua_State* L) {
+  size_t n = 0;
+  const char* p = luaL_checklstring(L, 1, &n);
+  if (n > 65535) n = 65535;
+  write_frame(TAG_EXT_SAVE_CONFIG, 0,
+              reinterpret_cast<const uint8_t*>(p), n);
+  return 0;
+}
+
 // Host -> program: EXT_CONFIG (one-way on_config) or EXT_REQ (status/command,
 // answered with EXT_REP echoing the corr_id). Returns false on a fatal socket
 // write error so the run loop can exit.
 bool dispatch_ext_frame(lua_State* L, Frame f) {
+  if (f.tag == TAG_EXT_UI_WATCH) {
+    // Host says whether any webadmin client is watching the panel. Watch-on
+    // resets the change-detect state so the next tick pushes a fresh frame.
+    bool on = !f.body.empty() && f.body[0] != 0;
+    if (on && !g_ext_ui_watch) {
+      g_ext_ui_last_hash = 0;
+      g_ext_ui_next_check_us = 0;
+    }
+    g_ext_ui_watch = on;
+    return true;
+  }
   if (f.tag == TAG_EXT_CONFIG) {
     if (g_ext_config_ref == LUA_NOREF) return true;
     lua_rawgeti(L, LUA_REGISTRYINDEX, g_ext_config_ref);
@@ -238,6 +290,19 @@ bool dispatch_ext_frame(lua_State* L, Frame f) {
           }
         }
       }
+    }
+  } else if (kind == EXT_REQ_PANEL_RENDER || kind == EXT_REQ_PANEL_EVENT) {
+    // Panel frames. A Lua error inside view/update travels as a toast FRAME
+    // with STATUS_OK (the browser shows it); STATUS_INTERNAL means only "no
+    // panel registered" so the host can tell capability from failure.
+    if (g_ext_panel_ref == LUA_NOREF) {
+      rep.push_back(STATUS_INTERNAL);
+    } else {
+      std::string frame = (kind == EXT_REQ_PANEL_RENDER)
+        ? mene_panel_render(L, g_ext_panel_ref)
+        : mene_panel_event(L, g_ext_panel_ref, f.body.data() + 1, f.body.size() - 1);
+      rep.push_back(STATUS_OK);
+      put_bytes(rep, frame.data(), frame.size());
     }
   } else {
     rep.push_back(STATUS_INTERNAL);
@@ -473,6 +538,8 @@ int lua_ces_run(lua_State* L) {
     drain_gossip(L);
     drain_peer(L);
     drain_ready(L);
+    // Watched panel: render-and-push if the frame changed (500ms budget inside).
+    mene_ui_tick(L, g_ext_panel_ref);
 
     // Block until the next event on either source, or the next timer deadline.
     // Don't block if a coroutine became ready in the meantime.
@@ -489,7 +556,14 @@ int lua_ces_run(lua_State* L) {
     }
     bool workPending = !g_ready.empty() || !g_conn_advance.empty() ||
                        !g_luarpc_advance.empty();
-    int pr = ::poll(pfds, nfds, workPending ? 0 : next_timer_timeout_ms());
+    int pollMs = workPending ? 0 : next_timer_timeout_ms();
+    if (!workPending && g_ext_ui_watch && g_ext_panel_ref != LUA_NOREF) {
+      // The change-detect tick needs the loop to wake at its cadence even when
+      // the program has no timers of its own (next_timer_timeout_ms may be -1).
+      constexpr int kUiMs = static_cast<int>(kExtUiCheckIntervalUs / 1000);
+      if (pollMs < 0 || pollMs > kUiMs) pollMs = kUiMs;
+    }
+    int pr = ::poll(pfds, nfds, pollMs);
     if (pr < 0) {
       if (errno == EINTR) continue;
       return 0;
@@ -509,7 +583,8 @@ int lua_ces_run(lua_State* L) {
       if (f.tag == TAG_CONN_OPENED || f.tag == TAG_CONN_DATA_IN ||
           f.tag == TAG_CONN_CLOSED) {
         if (!dispatch_conn_frame(L, std::move(f))) return 0;
-      } else if (f.tag == TAG_EXT_REQ || f.tag == TAG_EXT_CONFIG) {
+      } else if (f.tag == TAG_EXT_REQ || f.tag == TAG_EXT_CONFIG ||
+                 f.tag == TAG_EXT_UI_WATCH) {
         if (!dispatch_ext_frame(L, std::move(f))) return 0;
       } else {
         route_to_queue(std::move(f));   // DELIVER → g_inbox, API_REPLY → reply_q

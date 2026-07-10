@@ -160,6 +160,9 @@ constexpr uint8_t kIpcTagExtRep         = 0x0f;  // child → server (reply)
 constexpr uint8_t kIpcTagExtConfig      = 0x10;  // server → child (on_config)
 constexpr uint8_t kIpcTagExtDisableSelf = 0x11;  // child → server
 constexpr uint8_t kIpcTagExtManifest    = 0x12;  // child → server (ces.manifest)
+constexpr uint8_t kIpcTagExtSaveConfig  = 0x19;  // child → server (persist conf)
+constexpr uint8_t kIpcTagExtUiPush      = 0x1a;  // child → server (panel frame)
+constexpr uint8_t kIpcTagExtUiWatch     = 0x1b;  // server → child ([u8 on])
 
 constexpr uint8_t kIpcTagGossipIn       = 0x13;  // server → child (flooded message)
 constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip.send)
@@ -1309,6 +1312,47 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   }
   if (tag == kIpcTagExtDisableSelf) {
     killByPid(*inst->owner, inst->pid);
+    return;
+  }
+  if (tag == kIpcTagExtUiPush) {
+    // Unsolicited panel render/toast frame (the mene push bridge or the
+    // child's change-detect tick). Relay to the host's registered sink
+    // (webadmin broadcasts it to watching WebSocket clients). Drop silently
+    // when no sink is registered.
+    if (!isServerZone(inst->sourceName) || !inst->isExtension) return;
+    const std::string& src = inst->sourceName;   // "/s/<name>.lua"
+    auto dot = src.rfind(".lua");
+    if (dot == std::string::npos || dot <= 3) return;
+    std::string name = src.substr(3, dot - 3);
+    std::string frame(reinterpret_cast<const char*>(body.data()) + kIpcHdr,
+                      body.size() - kIpcHdr);
+    if (!frame.empty()) {
+      CesServer* server = inst->owner->server_;
+      if (server) server->notifyExtPanelPush(name, frame);
+    }
+    return;
+  }
+  if (tag == kIpcTagExtSaveConfig) {
+    // ces.extension_admin.save_config(text): persist the instance's OWN
+    // /s/<name>.conf. /s/ extensions only; the path is derived from the
+    // instance's source, never from the frame, so an extension can only ever
+    // write its own conf. One-way, no on_config echo — the caller already
+    // applied the values it is saving. writeServerFile is direct file-handler
+    // I/O (no strand hop), safe on rpcTaskIO.
+    if (!isServerZone(inst->sourceName) || !inst->isExtension) return;
+    const std::string& src = inst->sourceName;
+    auto dot = src.rfind(".lua");
+    if (dot == std::string::npos) return;
+    std::string conf = src.substr(0, dot) + ".conf";
+    std::string text(reinterpret_cast<const char*>(body.data()) + kIpcHdr,
+                     body.size() - kIpcHdr);
+    if (text.size() > 65535) text.resize(65535);
+    CesServer* server = inst->owner->server_;
+    FileHandler* fh = server ? server->fileHandler() : nullptr;
+    if (!fh || !fh->writeServerFile(conf, text)) {
+      LOGDEBUG << "extension save_config failed"
+               << VAR(inst->pid) << SVAR(conf);
+    }
     return;
   }
   if (tag != kIpcTagApiCall) {
@@ -3102,6 +3146,23 @@ bool ComputeHandler::extRequest(uint64_t pid, uint8_t kind, const ces::Bytes& in
     });
   }
   return ok;
+}
+
+// Tell a running extension whether any webadmin client is watching its panel
+// (drives the child's change-detect push tick). One-way, best-effort,
+// idempotent — webadmin re-sends it periodically so a relaunched child
+// re-arms on its own.
+void ComputeHandler::extPanelWatch(uint64_t pid, bool on) {
+  CesServer* server = server_;
+  if (!server) return;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return;
+  boost::asio::post(ex, [this, pid, on]() {
+    auto it = instances_.find(pid);
+    if (it == instances_.end() || !it->second->isExtension) return;
+    uint8_t b = on ? 1 : 0;
+    enqueueOutbound(it->second, makeFrame(kIpcTagExtUiWatch, 0, &b, 1));
+  });
 }
 
 // Push a config blob to a running extension (one-way on_config). Best-effort.

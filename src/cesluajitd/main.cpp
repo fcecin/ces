@@ -83,6 +83,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include <mene/assets.h>
+
 extern "C" {
 #include <lauxlib.h>
 #include <lua.h>
@@ -133,6 +135,7 @@ namespace cesluajitd {
 #include "api_conn.inc"
 #include "timers.inc"
 #include "api_chan.inc"
+#include "api_mene.inc"
 #include "api_extadmin.inc"
 #include "conn_direct.inc"
 #ifdef CES_HYLE
@@ -242,6 +245,7 @@ int main(int argc, char** argv) {
   }
   load_safe_libs(L);
   install_ces_api(L);
+  install_mene_lib(L);
 
   // The /ces/luarpc/1 endpoint opens LAZILY — on the program's first
   // ces.luarpc.set_listener() or .connect() (see luarpc_ensure_endpoint). A

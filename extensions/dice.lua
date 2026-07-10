@@ -33,9 +33,7 @@
 -- Identity — a static global table (a hand-written /s/ program declares this
 -- directly; cesdk-built ones get it generated from project.lua). The host reads
 -- it at run-loop entry, and `cesluajitd --manifest` harvests it without running.
--- dice declares a manifest but no ces.extension_admin contract, so it shows
--- name/version but its admin cells read N/A.
-CES_MANIFEST = { name = "Double-or-Nothing Dice", version = "1.0",
+CES_MANIFEST = { name = "Double-or-Nothing Dice", version = "1.1",
                  description = "Fair-coin double-or-nothing wager game (house bankroll = program account)." }
 
 local HOUSE_PUBKEY = ces.program_pubkey()
@@ -170,6 +168,22 @@ local function pending_bet(conn)
   return n, nil, t
 end
 
+-- Operator-facing counters for the admin panel. In-RAM, reset on relaunch
+-- (like every instance counter); the ledger stays the source of truth for
+-- balances.
+local stats = {
+  plays = 0, heads = 0, tails = 0,
+  wagered = 0, paid = 0,
+  recent = {},               -- ring of recent play lines (newest last)
+}
+local RECENT_MAX = 30
+
+local function stat_note(line)
+  local r = stats.recent
+  r[#r + 1] = line
+  while #r > RECENT_MAX do table.remove(r, 1) end
+end
+
 local function handle_play(conn)
   local n, why, xfer_time = pending_bet(conn)
   if n == 0 then send_line(conn, why); return end
@@ -198,15 +212,25 @@ local function handle_play(conn)
     return
   end
 
+  stats.plays = stats.plays + 1
+  stats.wagered = stats.wagered + n
+  local who = hex(conn.pubkey):sub(1, 12)
+
   if flip() then
     local ok, terr = ces.transfer(conn.pubkey, payout)
     if not ok then
       send_line(conn,
         "won " .. payout .. " but payout failed: " .. tostring(terr))
+      stat_note(who .. " bet " .. n .. " -> heads, PAYOUT FAILED: " .. tostring(terr))
       return
     end
+    stats.heads = stats.heads + 1
+    stats.paid = stats.paid + payout
+    stat_note(who .. " bet " .. n .. " -> heads, paid " .. payout)
     send_line(conn, "heads. you won " .. payout .. " (+" .. n .. ", paid to your account)")
   else
+    stats.tails = stats.tails + 1
+    stat_note(who .. " bet " .. n .. " -> tails, house keeps " .. n)
     send_line(conn, "tails. house keeps " .. n)
   end
 end
@@ -290,5 +314,51 @@ ces.conn.set_listener({
   on_data  = on_data,
   on_close = on_close,
 })
+
+-- Admin panel (webadmin Extensions tab). Guarded: on a host without the mene
+-- library or the extension contract, dice still runs as a plain dial game.
+if ces.extension_admin and mene then
+  local panel = mene.app{
+    model = stats,   -- the live counters above; play handlers mutate them
+    view = function(m)
+      local house = ces.account_read(HOUSE_PUBKEY)
+      return mene.card({ title = "Dice house", subtitle = "fair-coin double-or-nothing" },
+        mene.grid({ cols = 4, gap = 12 },
+          mene.stat({ label = "house balance",
+                      value = house and house.balance or "?",
+                      tone = (house and house.balance or 0) > 0 and "ok" or "err" }),
+          mene.stat({ label = "plays", value = m.plays }),
+          mene.stat({ label = "wagered", value = m.wagered }),
+          mene.stat({ label = "paid out", value = m.paid })),
+        mene.breakdown({ label = "outcomes (fairness monitor)", parts = {
+          { "heads (player wins)", m.heads, "ok" },
+          { "tails (house keeps)", m.tails, "info" },
+        } }),
+        mene.row({ align = "between" },
+          mene.stack({ gap = 4 },
+            mene.text({ tone = "muted" }, "house pubkey (players transfer bets here)"),
+            mene.text({ copy = true, tone = "code" }, hex(HOUSE_PUBKEY))),
+          mene.button({ on = "reset", kind = "danger",
+                        confirm = "Reset the play counters?" }, "Reset counters")),
+        #m.recent > 0 and mene.section({ title = "recent plays" },
+          mene.log({ lines = m.recent, height = 160, follow = true })) or nil)
+    end,
+    update = function(ev, m)
+      if ev.on == "reset" then
+        m.plays, m.heads, m.tails, m.wagered, m.paid = 0, 0, 0, 0, 0
+        m.recent = {}
+      end
+      return m
+    end,
+  }
+  ces.extension_admin{
+    status = function()
+      return { plays = tostring(stats.plays), heads = tostring(stats.heads),
+               tails = tostring(stats.tails), wagered = tostring(stats.wagered),
+               paid = tostring(stats.paid) }
+    end,
+    panel = panel,
+  }
+end
 
 ces.conn.run()

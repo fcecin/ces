@@ -62,6 +62,11 @@ If `/s/dice.lua` is missing, you'll see
 `WRN extension: launch failed dice /s/dice.lua` and the server
 keeps running.
 
+The Extensions tab of the web dashboard renders dice's mene panel: house
+balance and play counters, a heads/tails composition bar (fairness monitor),
+the copyable house pubkey, a live log of recent plays, and a confirmed
+counter-reset button. Counters are in-RAM and reset on relaunch.
+
 ---
 
 ## Player: betting from cesh

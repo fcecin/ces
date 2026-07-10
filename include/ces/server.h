@@ -1283,6 +1283,24 @@ public:
     extLocalBudget_.store(v, std::memory_order_relaxed);
   }
 
+  // Extension panel push sink (webadmin's WebSocket lane). The compute handler
+  // calls notifyExtPanelPush from rpcTaskIO with an unsolicited mene frame from
+  // a /s/ extension; the registered handler must be thread-safe (webadmin posts
+  // onto its own io_context). Unregistered = pushes dropped (pull still works).
+  void setExtPanelPushHandler(
+      std::function<void(const std::string& name, const std::string& frame)> h) {
+    std::lock_guard<std::mutex> lk(extPanelPushMu_);
+    extPanelPush_ = std::move(h);
+  }
+  void notifyExtPanelPush(const std::string& name, const std::string& frame) {
+    std::function<void(const std::string&, const std::string&)> h;
+    {
+      std::lock_guard<std::mutex> lk(extPanelPushMu_);
+      h = extPanelPush_;
+    }
+    if (h) h(name, frame);
+  }
+
   // CesConfig accessor — the file handler needs the resolved
   // feeFile / fileMaxBytes / cesplexFileDir after start() has
   // defaulted them.
@@ -1646,6 +1664,10 @@ private:
   // mutable so the const extFundingPerDay() accessor can lock.
   std::atomic<uint64_t> extLocalBudget_{0};   // seeded from cfg_.extLocalBudget at boot
   mutable std::mutex extFundingMu_;
+
+  // Extension panel push sink (see setExtPanelPushHandler).
+  std::mutex extPanelPushMu_;
+  std::function<void(const std::string&, const std::string&)> extPanelPush_;
   uint64_t           extFundingRatePerDay_ = 0;
   double             extFundingAllowance_ = 0.0;
   int64_t            extFundingLastUs_ = 0;

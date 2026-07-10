@@ -862,8 +862,123 @@ arm()
 
 admin.attach(stat, function() return state end, function() return coal end)
 
+-- One apply path for both the host's on_config push and the panel's config
+-- form: rebuild opts and re-arm the tick when the interval changed.
+local function apply_cfg(c)
+  local prev = opts.tick_ms
+  opts = build_opts(c)
+  if opts.tick_ms ~= prev then arm() end
+end
+
+-- The mene admin panel: formation state, outcome composition, (when formed)
+-- the member clique as identity rows + a ring graph, and a typed config form
+-- that applies live and persists. Formation itself is autonomous. Built only
+-- on hosts with the mene library installed.
+local function build_panel()
+  return mene.app{
+    model = { last_msg = "" },
+    view = function(m)
+      local formed = (state == "formed")
+      local body = {}
+      body[#body + 1] = mene.grid({ cols = 4, gap = 12 },
+        mene.stat({ label = "members",
+                    value = (formed and #coal.members or 0) .. " / " .. opts.group_size,
+                    tone = formed and "ok" or "default" }),
+        mene.stat({ label = "attempts", value = stat.attempts }),
+        mene.stat({ label = "commits", value = stat.commits }),
+        mene.stat({ label = "ticks", value = stat.ticks }))
+      body[#body + 1] = mene.breakdown({ label = "attempt outcomes", parts = {
+        { "commits", stat.commits, "ok" },
+        { "faults", stat.faults, "err" },
+        { "retractions", stat.retractions, "warn" },
+      } })
+      if formed then
+        local age_s = math.floor((now_ms() - coal.formed_at) / 1000)
+        body[#body + 1] = mene.kv({ rows = {
+          { "fingerprint", hex(coal.fp):sub(1, 16) },
+          { "age", tostring(age_s) .. "s" },
+          { "mature", coal_mature() and "yes" or "not yet" },
+        } })
+        body[#body + 1] = mene.stack({ gap = 4 },
+          mene.text({ tone = "muted" }, "coalition id"),
+          mene.text({ copy = true, tone = "code" }, hex(coal.id)))
+        local rows, nodes, edges = {}, {}, {}
+        for _, m in ipairs(coal.members) do
+          local h = hex(m)
+          rows[#rows + 1] = { h }
+          nodes[#nodes + 1] = { id = h:sub(1, 12), label = h:sub(1, 12),
+                                tone = "ok" }
+        end
+        for i = 1, #nodes do
+          for j = i + 1, #nodes do
+            edges[#edges + 1] = { nodes[i].id, nodes[j].id }
+          end
+        end
+        body[#body + 1] = mene.section({ title = "members (all-to-all clique)" },
+          mene.table({ cols = { "member pubkey" }, rows = rows, page_size = 10 }),
+          #nodes > 1 and mene.netgraph({ id = "clique", layout = "ring",
+                                         height = 220, nodes = nodes,
+                                         edges = edges }) or nil)
+      end
+      body[#body + 1] = mene.row({ gap = 8 },
+        mene.text({ tone = "muted" }, "last:"),
+        mene.badge({ tone = "info" }, stat.last or "idle"))
+      body[#body + 1] = mene.section({ title = "config (applies live + persists)" },
+        mene.form({ on = "cfg" },
+          mene.grid({ cols = 3, gap = 10 },
+            mene.field({ name = "group_size", kind = "number",
+                         label = "group size", value = opts.group_size }),
+            mene.field({ name = "group_pow_target", kind = "number",
+                         label = "group pow target", value = opts.group_pow_target }),
+            mene.field({ name = "tick_ms", kind = "number",
+                         label = "tick ms", value = opts.tick_ms }),
+            mene.field({ name = "gossip_cap", kind = "number",
+                         label = "gossip cap", value = opts.gossip_cap }),
+            mene.field({ name = "stable_ticks", kind = "number",
+                         label = "stable ticks", value = opts.stable_ticks }),
+            mene.field({ name = "attempt_timeout_ms", kind = "number",
+                         label = "attempt timeout ms", value = opts.attempt_timeout_ms }),
+            mene.field({ name = "cooldown_ms", kind = "number",
+                         label = "cooldown ms", value = opts.cooldown_ms }),
+            mene.field({ name = "member_stale_ms", kind = "number",
+                         label = "member stale ms", value = opts.member_stale_ms }),
+            mene.field({ name = "maturity_ms", kind = "number",
+                         label = "maturity ms", value = opts.maturity_ms })),
+          mene.row({ align = "end" },
+            mene.submit({ kind = "primary" }, "Apply + save"))),
+        m.last_msg ~= "" and mene.text({ tone = "muted" }, m.last_msg) or nil)
+      return mene.card({ title = "Coalition",
+                         subtitle = "two-round all-to-all formation" },
+        mene.row({ gap = 8 },
+          mene.badge({ tone = formed and "ok" or "warn" }, state),
+          formed and coal_mature() and mene.badge({ tone = "ok" }, "mature") or nil),
+        unpack(body))
+    end,
+    update = function(ev, m)
+      if ev.on == "cfg" and type(ev.value) == "table" then
+        local keys = { "group_size", "group_pow_target", "tick_ms", "gossip_cap",
+                       "stable_ticks", "attempt_timeout_ms", "cooldown_ms",
+                       "member_stale_ms", "maturity_ms" }
+        local c, lines = {}, {}
+        for _, k in ipairs(keys) do
+          c[k] = tostring(ev.value[k] or "")
+          lines[#lines + 1] = k .. " = " .. c[k]
+        end
+        apply_cfg(c)
+        if ces.extension_admin.save_config then
+          ces.extension_admin.save_config(table.concat(lines, "\n") .. "\n")
+          m.last_msg = "config applied live + saved"
+        else
+          m.last_msg = "config applied live (host cannot persist)"
+        end
+      end
+      return m
+    end,
+  }
+end
+
 if ces.extension_admin then
-  ces.extension_admin{
+  local spec = {
     status = function()
       local mlist = ""
       if state == "formed" then
@@ -912,12 +1027,10 @@ if ces.extension_admin then
       "cooldown_ms = 600000\n" ..
       "member_stale_ms = 7200000\n" ..
       "maturity_ms = 604800000\n",
-    on_config = function(c)
-      local prev = opts.tick_ms
-      opts = build_opts(c)
-      if opts.tick_ms ~= prev then arm() end
-    end,
+    on_config = apply_cfg,
   }
+  if mene then spec.panel = build_panel() end
+  ces.extension_admin(spec)
 end
 
 ces.log("coalition: up, N=" .. opts.group_size ..
