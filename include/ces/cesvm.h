@@ -291,6 +291,16 @@ enum CesVMSyscall : uint64_t {
   // strand time it used. No-op (grants 0) outside a run whose host set a
   // refill ceiling. See local/account_hooks_design.md.
   SYS_REFILL          = 23,
+  // SYS_CREATE_ASSET_RANGE — atomically create N account-owned assets at a
+  // fresh random 24-byte prefix, keyed prefix||0 .. prefix||(N-1) (last 8 bytes
+  // an LE index). Cell 0's content carries uint32_t N at bytes 0..3; all cells
+  // are otherwise zero. The prefix is opaque entropy, no type tag, and the
+  // whole batch is collision-checked: any pre-existing target key abandons the
+  // batch (creating nothing) and retries a fresh prefix. io[4]=N, io[5]=days,
+  // io[6]=cell index where the 32-byte handle (cell-0 key) is written. Bills N
+  // asset creations. This is the bare array primitive; sequence membership is
+  // metadata held by the owner (all cells share one owner), not read from keys.
+  SYS_CREATE_ASSET_RANGE = 24,
 };
 
 // Invocation kind — which entry path started this run. Preloaded into
@@ -555,6 +565,12 @@ static constexpr uint64_t CESVM_IO_INVOKE_KIND = 1022;
 static constexpr uint64_t CESVM_MAX_INPUT     = 1024;
 static constexpr uint64_t CESVM_MAX_OUTPUT    = 1024;
 
+// SYS_CREATE_ASSET_RANGE: max cells per atomic range, and collision retries.
+// The 24-byte prefix carries 2^192 entropy, so one attempt effectively always
+// wins; retries only guard the astronomically rare collision.
+static constexpr uint64_t CESVM_MAX_ASSET_RANGE     = 256;
+static constexpr uint64_t CESVM_ASSET_RANGE_RETRIES = 4;
+
 // --- Gas cost constants ---
 // Anchor: 1 gas unit = 0.1 ns of logic-strand time, measured on a release
 // build with cesvmbench (methodology and full tables: docs/cesvm-perf.md).
@@ -656,6 +672,12 @@ public:
   // Caller pays, boot asset owns.
   virtual uint8_t  createAssetManaged(const minx::Hash&, const AssetData&, uint16_t)
   { notImpl("createAssetManaged"); }
+  // Atomically create `n` account-owned assets keyed by the given first key
+  // with its last 8 bytes overwritten 0..n-1 (LE). Returns CES_ERROR_ASSET_EXISTS
+  // creating nothing if any target key exists (caller retries a fresh prefix);
+  // CES_OK on success. Cell 0's content carries uint32_t n at bytes 0..3.
+  virtual uint8_t  createAssetRange(const minx::Hash&, uint32_t, uint16_t)
+  { notImpl("createAssetRange"); }
   virtual uint8_t  updateAsset    (const minx::Hash&, const AssetData&)
   { notImpl("updateAsset"); }
   // Owner+price-only update; content untouched. Backs SYS_UPDATE_ASSET_META.

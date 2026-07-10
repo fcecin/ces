@@ -1276,6 +1276,35 @@ void CesVM::hostCall(CesVMHost& host) {
     break;
   }
 
+  case SYS_CREATE_ASSET_RANGE: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    uint64_t n = io_[4];
+    if (n == 0 || n > CESVM_MAX_ASSET_RANGE) {
+      S() = CES_ERROR_BAD_INPUT;
+      break;
+    }
+    // Gas scales with the cells created: this base plus one per extra cell.
+    if (n > 1 && !bill(CESVM_COST_PER_SYSCALL * (n - 1))) return;
+    uint16_t days = static_cast<uint16_t>(io_[5]);
+    uint64_t per = computePrepayCost(host.feeAssetRaw, host.assetRentMultBp,
+                                     2u + assetDays(days), 0);
+    if (!billCredits(per * n)) return;
+    // Fresh 24-byte entropy prefix, index suffix zeroed (cell 0). Retry a new
+    // prefix on the astronomically rare collision; the host creates nothing on
+    // collision so the retry is clean.
+    minx::Hash firstKey{};
+    uint8_t rc = CES_ERROR_ASSET_EXISTS;
+    for (uint64_t attempt = 0; attempt < CESVM_ASSET_RANGE_RETRIES; ++attempt) {
+      for (int i = 0; i < 24; ++i) firstKey[i] = static_cast<uint8_t>(rng_());
+      for (int i = 24; i < 32; ++i) firstKey[i] = 0;
+      rc = host.createAssetRange(firstKey, static_cast<uint32_t>(n), days);
+      if (rc != CES_ERROR_ASSET_EXISTS) break;
+    }
+    S() = rc;
+    if (rc == CES_OK) writeIoBytes(io_[6], firstKey.data(), firstKey.size());
+    break;
+  }
+
   case SYS_UPDATE_ASSET: {
     if (!bill(CESVM_COST_PER_SYSCALL)) return;
     minx::Hash key;

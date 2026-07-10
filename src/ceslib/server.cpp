@@ -634,6 +634,38 @@ public:
     return CES_OK;
   }
 
+  // Atomically create n account-owned cells keyed firstKey with its last 8
+  // bytes = 0..n-1 written in native order (matching CesVM readIoBytes/
+  // writeIoBytes, so a program's counter cell drops straight into the key).
+  // Collision-checked: any existing target key abandons the batch untouched so
+  // the caller can retry a fresh prefix. Cell 0 carries uint32_t n at
+  // content[0..3], native.
+  uint8_t createAssetRange(const minx::Hash& firstKey, uint32_t n,
+                           uint16_t days) override {
+    minx::Hash key = firstKey;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint64_t idx = i;
+      std::memcpy(key.data() + 24, &idx, sizeof(idx));
+      if (server_.assets_->find(key) != server_.assets_->end())
+        return CES_ERROR_ASSET_EXISTS;
+    }
+    bool priv = isAssetPrivate(days);
+    bool immut = isAssetImmutable(days);
+    uint32_t storeDays = 1u + assetDays(days);
+    if (storeDays > 0x0FFF) storeDays = 0x0FFF;
+    auto bal = assetBalance(static_cast<uint16_t>(storeDays), priv,
+                            /*aowned=*/false, immut, isAssetOwnerPays(days));
+    for (uint32_t i = 0; i < n; ++i) {
+      uint64_t idx = i;
+      std::memcpy(key.data() + 24, &idx, sizeof(idx));
+      maybeSaveAsset(key);
+      AssetData content{};
+      if (i == 0) std::memcpy(content.data(), &n, sizeof(n));
+      server_.assets_->getObjects().emplace(key, Asset(caller_, content, bal, 0));
+    }
+    return CES_OK;
+  }
+
   uint8_t updateAsset(const minx::Hash& key, const AssetData& content) override {
     auto it = server_.assets_->find(key);
     if (it == server_.assets_->end()) return CES_ERROR_ASSET_NOT_FOUND;

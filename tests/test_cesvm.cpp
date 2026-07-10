@@ -1847,6 +1847,95 @@ BOOST_FIXTURE_TEST_CASE(RunAssetTransferProgram, CesFixture) {
   BOOST_CHECK_EQUAL(destBalAfter, destBalBefore + 50);
 }
 
+BOOST_FIXTURE_TEST_CASE(RunAssetCreateAssetRange, CesFixture) {
+  // A program allocates a range of N cells and outputs the 32-byte handle
+  // (cell-0 key). We then derive each cell key from the handle, confirm all N
+  // exist and share the runner's ownership, and that cell 0 carries N.
+  const uint64_t N = 5;
+  VmProgram pgm;
+  Region handle = pgm.allocHash();  // 4 cells = the 32-byte cell-0 key
+  pgm.sysCreateAssetRange({.count = Imm(N), .days = Imm(30),
+                           .keyOutPtr = handle});
+  pgm.setOutputBytes(handle.cell, /*count=*/4, /*byteLen=*/32);
+  pgm.term();
+  AssetData code = pgm.buildBootBlock();
+
+  minx::Hash assetId;
+  assetId.fill(0x52);
+  BOOST_REQUIRE_EQUAL(client->createAsset(assetId, code, 30), CES_OK);
+
+  ces::Bytes input, output;
+  uint64_t vmError = 0, budgetUsed = 0;
+  // Budget must cover N asset-rent prepays (feeAsset per cell) plus gas.
+  uint8_t rc = client->runAsset(assetId, 6'000'000'000, input, vmError,
+                                budgetUsed, output);
+  BOOST_REQUIRE_EQUAL(rc, CES_OK);
+  BOOST_REQUIRE_EQUAL(vmError, CESVM_OK);
+  BOOST_REQUIRE_EQUAL(output.size(), 32u);
+
+  minx::Hash cell0{};
+  std::copy(output.begin(), output.end(), cell0.begin());
+  // The handle IS prefix||0: its index suffix (last 8 bytes) is zero.
+  for (int b = 24; b < 32; ++b) BOOST_CHECK_EQUAL(cell0[b], 0u);
+
+  HashPrefix me = getMyId();
+  for (uint64_t i = 0; i < N; ++i) {
+    minx::Hash key = cell0;
+    uint64_t idx = i;
+    std::memcpy(key.data() + 24, &idx, sizeof(idx));  // native, as the VM lays it
+    HashPrefix owner{};
+    AssetData content{};
+    uint16_t bal = 0;
+    uint32_t price = 0;
+    BOOST_REQUIRE_EQUAL(client->queryAsset(key, owner, content, bal, price),
+                        CES_OK);
+    BOOST_CHECK(owner == me);  // exists, and all cells share the runner's owner
+    if (i == 0) {
+      uint32_t len = 0;
+      std::memcpy(&len, content.data(), sizeof(len));
+      BOOST_CHECK_EQUAL(len, static_cast<uint32_t>(N));
+    }
+  }
+
+  // The cell one past the range (prefix||N) was never created: its owner is not
+  // the runner, so the range is bounded to exactly N.
+  minx::Hash past = cell0;
+  uint64_t pastIdx = N;
+  std::memcpy(past.data() + 24, &pastIdx, sizeof(pastIdx));
+  HashPrefix pastOwner{};
+  AssetData pastContent{};
+  uint16_t pastBal = 0;
+  uint32_t pastPrice = 0;
+  client->queryAsset(past, pastOwner, pastContent, pastBal, pastPrice);
+  BOOST_CHECK(!(pastOwner == me));
+}
+
+BOOST_FIXTURE_TEST_CASE(RunAssetCreateAssetRangeRejectsBadCount, CesFixture) {
+  // Count 0 and count past the cap make the syscall return CES_ERROR_BAD_INPUT,
+  // which OP_HOSTX surfaces as a VM abort (CESVM_ABORT). A valid count runs
+  // clean (CESVM_OK).
+  auto vmErrorFor = [&](uint64_t count) -> uint64_t {
+    VmProgram pgm;
+    Region handle = pgm.allocHash();
+    pgm.sysCreateAssetRange({.count = Imm(count), .days = Imm(30),
+                             .keyOutPtr = handle});
+    pgm.term();
+    AssetData code = pgm.buildBootBlock();
+    minx::Hash assetId;
+    assetId.fill(0x61);  // non-zero prefix; disambiguate by count off the prefix
+    std::memcpy(assetId.data() + 8, &count, sizeof(count));
+    BOOST_REQUIRE_EQUAL(client->createAsset(assetId, code, 30), CES_OK);
+    ces::Bytes input, output;
+    uint64_t vmError = 0, budgetUsed = 0;
+    client->runAsset(assetId, 6'000'000'000, input, vmError, budgetUsed, output);
+    return vmError;
+  };
+  BOOST_CHECK_EQUAL(vmErrorFor(0), static_cast<uint64_t>(CESVM_ABORT));
+  BOOST_CHECK_EQUAL(vmErrorFor(CESVM_MAX_ASSET_RANGE + 1),
+                    static_cast<uint64_t>(CESVM_ABORT));
+  BOOST_CHECK_EQUAL(vmErrorFor(1), static_cast<uint64_t>(CESVM_OK));
+}
+
 BOOST_FIXTURE_TEST_CASE(RunAssetOwnerTransferProgram, CesFixture) {
   // Program owned by `client` (account A) does SYS_OWNER_TRANSFER 50
   // credits to a third account (destKey). A second client (account B)

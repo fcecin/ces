@@ -509,6 +509,10 @@ VmProgram& VmProgram::sysCreateAssetRandom(CreateAssetRandomArgs a) {
   return hostxv(SYS_CREATE_ASSET_RANDOM, {a.contentPtr, a.days, a.keyOutPtr});
 }
 
+VmProgram& VmProgram::sysCreateAssetRange(CreateAssetRangeArgs a) {
+  return hostxv(SYS_CREATE_ASSET_RANGE, {a.count, a.days, a.keyOutPtr});
+}
+
 VmProgram& VmProgram::sysCreateAsset(CreateAssetArgs a) {
   return hostxv(SYS_CREATE_ASSET, {a.keyPtr, a.contentPtr, a.days});
 }

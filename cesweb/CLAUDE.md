@@ -130,6 +130,19 @@ port is only a trailing `-<digits>`. **The host must be a DNS name — IP litera
 the CES zone namespace IS the URL namespace. Zones: `/h/ /f/ /p/ /s/` (only `/s/`
 lists its contents). A trailing `/` ⇒ `index.html`.
 
+**Directory URLs `301` to the trailing slash**, as on any web server — the
+redirect (not an internal rewrite) is what makes the index page's relative links
+resolve *under* it. CES stores no directories, so `/s/blog` is one iff
+`/s/blog/index.html` STATs ok: the engine probes that on a `notfound` whose last
+segment has no dot, and reports `errKind: 'isdir'` for the responder to redirect
+on. A dotted last segment is never probed, so an ordinary 404 costs no extra
+query. A bare zone (`/s`) redirects to its root with no CES call at all.
+
+A **known failure is always reported**, even past `failTtlMs`; expiring the entry
+only arms the retry for the *next* request. Restarting the job inside the request
+that expires it would answer a sitrep reload with another sitrep — the error page
+is already in hand, and the extra round costs a STAT fee.
+
 With `CESWEB_DEFAULT_HOST` set, a host-less path (`/p/site/index.html`) resolves
 to that host — the clean single-server form.
 

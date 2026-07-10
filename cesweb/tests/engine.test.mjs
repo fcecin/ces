@@ -47,6 +47,34 @@ test('missing file -> FAILED notfound', async () => {
   finally { engine.stop(); }
 });
 
+test('an expired failure is still reported, then retried on the NEXT request', async () => {
+  // The failure entry outliving its TTL must not answer this request with a
+  // fresh job: a client refreshing near the TTL boundary would get another
+  // sitrep page instead of the error that is already known.
+  const { engine } = setup({ files: { '/p/gone.txt': { statError: 'FILE_NOT_FOUND' } } }, { failTtlMs: 30 });
+  try {
+    assert.equal((await waitState(engine, H, P, '/p/gone.txt', State.FAILED)).errKind, 'notfound');
+    await sleep(60);
+    assert.equal(engine.requestContent(H, P, '/p/gone.txt').state, State.FAILED, 'expired failure still reported');
+    assert.equal(engine.requestContent(H, P, '/p/gone.txt').state, State.RESOLVING, 'next request retries');
+  } finally { engine.stop(); }
+});
+
+test('a path whose index.html exists -> FAILED isdir (the redirect signal)', async () => {
+  const { engine } = setup({ files: { '/s/blog/index.html': { bytes: 'hi', modifiedUs: 1 } } });
+  try {
+    assert.equal((await waitState(engine, H, P, '/s/blog', State.FAILED)).errKind, 'isdir');
+    assert.equal((await waitState(engine, H, P, '/s/nodir', State.FAILED)).errKind, 'notfound');
+    assert.equal((await waitState(engine, H, P, '/s/blog/index.html', State.READY)).size, 2);
+  } finally { engine.stop(); }
+});
+
+test('a dotted last segment is never probed for an index', async () => {
+  const { engine } = setup({ files: { '/p/gone.txt/index.html': { bytes: 'x', modifiedUs: 1 } } });
+  try { assert.equal((await waitState(engine, H, P, '/p/gone.txt', State.FAILED)).errKind, 'notfound'); }
+  finally { engine.stop(); }
+});
+
 test('payment failure on read -> FAILED poor', async () => {
   const { engine } = setup({ files: { '/p/x.bin': { size: 50, getError: 'INSUFFICIENT_BALANCE' } } });
   try { assert.equal((await waitState(engine, H, P, '/p/x.bin', State.FAILED)).errKind, 'poor'); }

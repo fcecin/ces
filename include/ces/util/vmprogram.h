@@ -686,6 +686,15 @@ public:
   using CreateAssetManagedArgs = CreateAssetArgs;
   VmProgram& sysCreateAssetManaged(CreateAssetManagedArgs a);
 
+  // SYS_CREATE_ASSET_RANGE — atomically allocate `count` account-owned cells at
+  // a fresh random prefix; cell 0's content holds uint32_t count.
+  struct CreateAssetRangeArgs {
+    VmVal count;      // io[4] — number of cells
+    VmVal days;       // io[5] — lifetime in days
+    VmVal keyOutPtr;  // io[6] — cell index where the handle (cell-0 key) lands
+  };
+  VmProgram& sysCreateAssetRange(CreateAssetRangeArgs a);
+
   // SYS_UPDATE_ASSET — overwrite the content of an existing asset.
   struct UpdateAssetArgs {
     VmVal keyPtr;     // io[4]

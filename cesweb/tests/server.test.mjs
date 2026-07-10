@@ -20,6 +20,8 @@ before(async () => {
       '/p/a.txt': { bytes: 'hello world', modifiedUs: 100 },
       '/p/gone.txt': { statError: 'FILE_NOT_FOUND' },
       '/p/poor.bin': { size: 50, getError: 'INSUFFICIENT_BALANCE' },
+      '/s/index.html': { bytes: 'catalog', modifiedUs: 1 },
+      '/s/blog/index.html': { bytes: '<h1>blog</h1>', modifiedUs: 1 },
     },
   });
   child = spawn('node', [SERVER], {
@@ -34,6 +36,7 @@ before(async () => {
       CESWEB_DEFAULT_CES_PORT: '53830',
       CESWEB_ALLOW_HOSTS: 'localhost',
       CESWEB_ALLOW_PRIVATE_HOSTS: '1',   // the harness talks to localhost
+      CESWEB_FAIL_TTL_MS: '30',          // failures expire between polls: the error must still show
     },
   });
   const port = await new Promise((resolve, reject) => {
@@ -50,20 +53,21 @@ before(async () => {
 
 after(() => { if (child) child.kill('SIGKILL'); });
 
-async function get(p, headers) {
-  const r = await fetch(base + p, { headers });
+async function get(p, headers, init = {}) {
+  const r = await fetch(base + p, { headers, ...init });
   return {
     status: r.status,
     ct: r.headers.get('content-type') || '',
     cr: r.headers.get('content-range'),
     ar: r.headers.get('accept-ranges'),
+    loc: r.headers.get('location'),
     body: await r.text(),
   };
 }
-async function poll(p, until, { timeout = 8000, interval = 50 } = {}) {
+async function poll(p, until, { timeout = 8000, interval = 50, ...init } = {}) {
   const t0 = Date.now();
   for (;;) {
-    const r = await get(p);
+    const r = await get(p, undefined, init);
     if (until(r)) return r;
     if (Date.now() - t0 > timeout) throw new Error('poll timeout: ' + JSON.stringify(r).slice(0, 200));
     await sleep(interval);
@@ -105,6 +109,37 @@ test('status endpoint reports engine state as JSON (at /status)', async () => {
 test('missing file → 404', async () => {
   const r = await poll('/p/gone.txt', (x) => x.status === 404);
   assert.equal(r.status, 404);
+});
+
+// A directory URL must land on its index.html, and via a REDIRECT: serving it
+// under the slashless URL would resolve the page's relative links one level up.
+test('a directory → 301 to the trailing slash → index.html', async () => {
+  const r = await poll('/s/blog', (x) => x.status !== 200, { redirect: 'manual' });
+  assert.equal(r.status, 301);
+  assert.equal(r.loc, '/s/blog/');
+  const idx = await poll('/s/blog/', (x) => x.body === '<h1>blog</h1>');   // the sitrep page is text/html too
+  assert.equal(idx.ct, 'text/html; charset=utf-8');
+  const q = await poll('/s/blog?x=1', (x) => x.status === 301, { redirect: 'manual' });  // the query survives
+  assert.equal(q.loc, '/s/blog/?x=1');
+});
+
+test('a bare zone → 301 to the zone root', async () => {
+  const r = await get('/s', undefined, { redirect: 'manual' });
+  assert.equal(r.status, 301);
+  assert.equal(r.loc, '/s/');
+  const idx = await poll('/s/', (x) => x.body === 'catalog');
+  assert.equal(idx.body, 'catalog');
+});
+
+// The sitrep page reloads on a fixed countdown; a failure must be reported when
+// that reload lands, whatever the fail-TTL is. Regression: an expired entry used
+// to restart the job, so the reload got another sitrep instead of the error.
+test('a slashless path with no index → 404, never a stale sitrep', async () => {
+  for (let i = 0; i < 3; i++) {
+    const r = await poll('/s/nothinghere', (x) => x.status !== 200, { redirect: 'manual' });
+    assert.equal(r.status, 404);
+    await sleep(60);                       // outlive the fail TTL, then ask again
+  }
 });
 
 test('out-of-credits → 402', async () => {

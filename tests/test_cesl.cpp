@@ -331,7 +331,8 @@ BOOST_AUTO_TEST_CASE(CompileErrors) {
 BOOST_AUTO_TEST_CASE(AllSyscallsCompile) {
   const char* calls[] = {
       "read_account(0)", "transfer(0,0)", "read_asset(0,0,0)",
-      "create_asset_random(0,0,0)", "update_asset(0,0)", "fund_asset(0,0)",
+      "create_asset_random(0,0,0)", "create_asset_range(0,0,0)",
+      "update_asset(0,0)", "fund_asset(0,0)",
       "buy_asset(0,0)", "give_asset(0,0)", "hash(0,0,0)", "verify_sig(0,0,0,0)",
       "cross_transfer(0,0,0)", "load_code(0)", "create_asset(0,0,0)",
       "send_client(0,0,0)", "schedule(0,0,0,0,0,0)", "create_asset_managed(0,0,0)",

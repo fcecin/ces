@@ -40,6 +40,7 @@ const std::unordered_map<std::string, SysCall>& sysTable() {
     {"transfer",             {SYS_TRANSFER, 2}},
     {"read_asset",           {SYS_READ_ASSET, 3}},
     {"create_asset_random",  {SYS_CREATE_ASSET_RANDOM, 3}},
+    {"create_asset_range",   {SYS_CREATE_ASSET_RANGE, 3}},
     {"update_asset",         {SYS_UPDATE_ASSET, 2}},
     {"fund_asset",           {SYS_FUND_ASSET, 2}},
     {"buy_asset",            {SYS_BUY_ASSET, 2}},

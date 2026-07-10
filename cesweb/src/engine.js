@@ -95,8 +95,14 @@ export class Engine {
     const key = `${host}:${cesPort}\0${cesPath}`;
     const job = this.jobs.get(key);
     if (job) {
-      if (job.state === State.FAILED && Date.now() - job.failedMs > this.failTtlMs) this.jobs.delete(key);
-      else return this._jobSnap(job);
+      if (job.state !== State.FAILED) return this._jobSnap(job);
+      // A known failure is always reported. Expiring it only arms the retry for
+      // the NEXT request: restarting the job here answers the reload with a
+      // fresh sitrep instead, so a client refreshing near failTtlMs waits another
+      // full round (and pays for another STAT) to see an error already in hand.
+      const snap = this._jobSnap(job);
+      if (Date.now() - job.failedMs > this.failTtlMs) this.jobs.delete(key);
+      return snap;
     }
 
     let st = null;
@@ -140,7 +146,10 @@ export class Engine {
 
       j.state = State.STATTING;
       const st = await ceshStat(this.cesh, j.target, info.rpcPort, j.cesPath, info.serverKey, this.walletOpts);
-      if (!st.ok) return this._failJob(j, st.errKind);
+      if (!st.ok) {
+        if (st.errKind === 'notfound' && await this._hasIndex(j, info)) return this._failJob(j, 'isdir');
+        return this._failJob(j, st.errKind);
+      }
       if (st.size > this.maxFileBytes) return this._failJob(j, 'toobig');
 
       let cur; try { cur = fs.statSync(j.fsPath); } catch {}
@@ -182,6 +191,18 @@ export class Engine {
   _failJob(j, kind) {
     j.state = State.FAILED; j.errKind = kind || 'error'; j.failedMs = Date.now();
     j.gotBytes = 0; j.wantSize = 0;
+  }
+
+  // CES stores no directories, so the only way to know that /s/blog names one is
+  // to ask whether /s/blog/index.html exists. Answered as errKind 'isdir', which
+  // the responder turns into the trailing-slash redirect. Only a dotless last
+  // segment is probed, so an ordinary 404 costs no extra query.
+  async _hasIndex(j, info) {
+    const last = j.cesPath.slice(j.cesPath.lastIndexOf('/') + 1);
+    if (!last || last.includes('.')) return false;
+    const st = await ceshStat(this.cesh, j.target, info.rpcPort,
+                              `${j.cesPath}/index.html`, info.serverKey, this.walletOpts);
+    return st.ok;
   }
 
   // ---- background revalidation of a READY file ---------------------------

@@ -238,6 +238,7 @@ value-typed parameters take any expression.
 | `read_asset(key, owner_out, content_out)` | balance/price land in `arg3`/io[8] |
 | `create_asset(key, content, days)` | |
 | `create_asset_random(content, days, key_out)` | |
+| `create_asset_range(count, days, key_out)` | atomic N account-owned cells at a random prefix; cell 0 holds `count` |
 | `create_asset_managed(key, content, days)` | caller pays, program owns |
 | `update_asset(key, content)` | |
 | `update_asset_meta(key, owner, price)` | |

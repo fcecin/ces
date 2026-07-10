@@ -130,6 +130,13 @@ function sendHtml(res, status, body, extra = {}) {
   res.end(buf);
 }
 
+// A path that names a directory gets the trailing slash a browser needs for the
+// relative links inside its index.html to resolve under it, not beside it.
+function redirectSlash(res, u) {
+  res.writeHead(301, { location: `${u.pathname}/${u.search || ''}`, 'content-length': 0 });
+  res.end();
+}
+
 function sendJson(res, status, obj) {
   const buf = Buffer.from(JSON.stringify(obj, null, 2), 'utf8');
   res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', 'content-length': buf.length });
@@ -489,6 +496,9 @@ const httpd = http.createServer((req, res) => {
       return sendHtml(res, 200, termPage(parseDialPath(u.pathname, DEFAULT_CES_PORT, DEFAULT_HOST)));
     }
 
+    // A bare zone letter is the zone root: /s -> /s/ -> /s/index.html.
+    if (DEFAULT_HOST && /^\/(h|f|p|s)$/.test(u.pathname)) return redirectSlash(res, u);
+
     const parsed = parseRequestPath(u.pathname, DEFAULT_CES_PORT, DEFAULT_HOST);
     if (parsed.kind === 'favicon') { res.writeHead(204); return res.end(); }
     if (parsed.kind === 'root') return sendHtml(res, 200, landing());
@@ -510,6 +520,7 @@ const httpd = http.createServer((req, res) => {
       return serveLocal(req, res, snap.file, contentTypeFor(cesPath), snap.size || null);
     }
     if (snap.state === State.FAILED) {
+      if (snap.errKind === 'isdir') return redirectSlash(res, u);
       return errPage(res, snap.errKind, target, cesPath);
     }
     // resolving / statting / queued / downloading → live sitrep, auto-refresh.

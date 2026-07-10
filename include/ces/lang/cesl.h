@@ -58,7 +58,8 @@
  *   read_account(pfx) transfer(dest, amt) deposit(amt) withdraw(amt)
  *   owner_transfer(dest, amt) read_asset(key, owner_out, content_out)
  *   create_asset(key, content, days) create_asset_random(content, days,
- *   key_out) create_asset_managed(key, content, days)
+ *   key_out) create_asset_range(count, days, key_out)
+ *   create_asset_managed(key, content, days)
  *   update_asset(key, content) update_asset_meta(key, owner, price)
  *   fund_asset(key, days) buy_asset(key, max_price)
  *   give_asset(key, owner) hash(ptr, len, out)

@@ -745,6 +745,12 @@ BOOST_AUTO_TEST_CASE(TypedSyscallWrappersStructuralCheck) {
   }
   {
     VmProgram p;
+    p.sysCreateAssetRange({.count = Imm(5), .days = Imm(30),
+                            .keyOutPtr = Imm(16)});
+    check(std::move(p), SYS_CREATE_ASSET_RANGE, 3);
+  }
+  {
+    VmProgram p;
     p.sysCreateAsset({.keyPtr = Imm(16), .contentPtr = Imm(32),
                        .days = Imm(30)});
     check(std::move(p), SYS_CREATE_ASSET, 3);
