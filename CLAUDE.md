@@ -41,7 +41,7 @@ include/ces/        CES core (L1): types, account/asset, keys, protocol,
                     autoexec, cesco, cesproxy, feemult, buffer, persisted
 include/ces/cesplex/  CesPlex, the L1 connection multiplexer:
                       mux     bus core: bind handshake, channel routing,
-                              object mount(), CesPlexHost seam
+                              object mount(), CesPlexHost interface
                       wire    bind contract + per-op envelope wire format
                       session per-op serve loop + CesPlexClient (the L2
                               verb SDK file/compute ride; lua bypasses it)

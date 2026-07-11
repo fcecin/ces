@@ -2,8 +2,8 @@
 //
 // CesPlex is a Layer-1, general-purpose mechanism: it latches onto a MINX
 // engine that speaks CES and multiplexes it. It knows the CES protocol and
-// nothing about who hosts it (see CesPlexHost — the only seam: sign +
-// rate disclosure + a sink for measured resource usage). CesServer uses
+// nothing about who hosts it (see CesPlexHost — the only host interface:
+// sign + rate disclosure + a sink for measured resource usage). CesServer uses
 // one on its secondary port; a ledgerless host (the cesluajitd compute
 // child) can use one too. The L2 protocols
 // (file / compute / lua) are handlers that ride this bus — users of it,
@@ -71,7 +71,7 @@ struct CesPlexUsage {
 };
 
 // -----------------------------------------------------------------------
-// CesPlexHost — the host seam
+// CesPlexHost — the host interface
 // -----------------------------------------------------------------------
 //
 // CesPlex is a general-purpose connection controller / multiplexer that

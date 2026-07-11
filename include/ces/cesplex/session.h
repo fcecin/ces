@@ -78,7 +78,7 @@ struct CesPlexProtocol {
 // ReqCtx structs they replace, so dispatchers need no edits.
 struct CesPlexRequest : std::enable_shared_from_this<CesPlexRequest> {
   std::shared_ptr<minx::RudpStream> stream;
-  CesPlexHost* host = nullptr;        // signs responses; the host seam
+  CesPlexHost* host = nullptr;        // signs responses
   BoundChannelContext bound;
   uint8_t verb = 0;
   std::array<uint8_t, CES_PLEX_SIG_SIZE> sig{};

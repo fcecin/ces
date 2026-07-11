@@ -26,7 +26,7 @@
 
 #include <ces/keys.h>
 #include <ces/types.h>
-#include <ces/cesplex/mux.h>   // CesPlexHost (the host seam)
+#include <ces/cesplex/mux.h>   // CesPlexHost (the host interface)
 #include <minx/rudp/rudp.h>
 
 #include <boost/asio/io_context.hpp>

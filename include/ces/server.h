@@ -1049,7 +1049,7 @@ public:
   // private key never leaves C++.
   Signature serverSign(const uint8_t* data, size_t len);
 
-  // Test seams: drive the inbound-PoW peer-table path (inboundCredit > 0) and set
+  // Test hooks: drive the inbound-PoW peer-table path (inboundCredit > 0) and set
   // the verified flag, so the address-claim policy (a verified address is sticky
   // against an unsigned inbound claim; unverified entries are freely overwritten)
   // can be unit-tested without real PoW + a live signed server-info exchange.

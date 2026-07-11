@@ -12,7 +12,7 @@ implements none of the contract, so its management cells read N/A.
 
 Legend: [ ] todo  [~] in progress  [x] done
 
-- [x] P1  ces.extension_admin Lua contract + host<->program IPC seam
+- [x] P1  ces.extension_admin Lua contract + host<->program IPC
         (cesluajitd register/dispatch + disable_self; compute_handler IPC tags +
         REGISTER store, EXT_REQ/REP correlation, EXT_CONFIG push, DISABLE_SELF;
         public computeHandlerExtInfo/ExtRequest/ExtConfig). Builds clean.
@@ -178,8 +178,9 @@ enabled extensions). Live state vs exported boot config stay separate.
   child, each dispatched to the matching `ces.extension_admin` callback and answered;
   `disable_self()` flows program->host.
 
-The cesluajitd IPC loop already pumps frames (conn data, api replies); the seam
-adds these request/reply tags and a dispatch into the registered callbacks.
+The cesluajitd IPC loop already pumps frames (conn data, api replies);
+extension_admin adds these request/reply tags and a dispatch into the registered
+callbacks.
 
 ## Webadmin Extensions page
 
