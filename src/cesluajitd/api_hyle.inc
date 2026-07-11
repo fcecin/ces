@@ -1,38 +1,47 @@
 // ---------------------------------------------------------------------------
-// ces.hyle.solo - a SINGLE-NODE (transportless) hyle-services blockchain hosted
-// IN this cesluajitd process. Extension-only: registered solely for privileged
-// (/s/) programs.
+// ces.hyle - a hyle blockchain hosted IN this cesluajitd process.
+// Extension-only: registered solely for privileged (/s/) programs.
 //
-// "solo" is a deliberate sub-namespace: these primitives are hardcoded to the
-// one-validator, no-transport case (Runtime with transport == nullptr, genesis
-// validator set == {self}), which is why they are hand-driven -- tick() means
-// "synchronously produce exactly one block." A future transport-enabled multi-node
-// API (validators across servers, meshed over dedicated CesPlex channels) would
-// live under a different ces.hyle.* name and be event-driven, not ticked; the root
-// ces.hyle namespace is reserved for it.
+// `ces.hyle.*` is the CHAIN INTERFACE: submit, sudo, govern, read, and the op builders. It
+// says nothing about how many nodes are behind it. `ces.hyle.solo.*` is the LIFECYCLE of one
+// implementation: a single-validator, transportless chain a program drives by hand, one block
+// per tick. A transport-enabled multi-node implementation adds its own lifecycle (ces.hyle.net)
+// and leaves the interface alone, so a program written against ces.hyle.* moves from the devnet
+// to a real chain unchanged.
 //
-// Only present when the node was built with --hyle (CES_HYLE): hyle_services is
-// statically linked, so these calls drive a hyle::morphe::Runtime DIRECTLY -- no
-// host IPC. Solo means the program's own key is the sole validator and proposer,
-// so a tick reaches its own 1-of-1 quorum and proposes+precommits+commits
-// synchronously, then returns -- it never blocks the cooperative Lua VM. In-RAM
-// only: stop() (or the process dying on disable) drops the chain; a later start()
-// boots a fresh one from the current config.
+// Sudo is here in full. A sudo act runs with its guards waived, so it needs a supermajority's
+// approval, collected ON CHAIN: propose() opens the proposal with the program's own vote,
+// approve() adds more, and the vote reaching quorum executes it. On a one-validator chain that
+// single vote is the supermajority, so propose() executes at once; raise the validator count
+// and the same path waits for the other members to approve() first.
 //
-// Surface (see apps/hylesolo in cesdk for the extension that drives it):
-//   ces.hyle.solo.start{ chain_id=, block_pace_ms=, alloc=, fee_transfer=,
-//                        fee_entry=, fee_mint=, reward_base= }  -> true, or nil,err
-//   ces.hyle.solo.tick()     -- advance exactly one height (one block); -> new height
-//   ces.hyle.solo.height()   -- committed height (number)
-//   ces.hyle.solo.chain_id() -- string
-//   ces.hyle.solo.balance()  -- the sole validator's own minted balance (number)
-//   ces.hyle.solo.accounts() -- current account (a) cell count in the RAM state
-//   ces.hyle.solo.entries()  -- current entry (e) cell count in the RAM state
-//   ces.hyle.solo.last_block_time() -- PBTS wall-time (unix seconds) of the last block
-//   ces.hyle.solo.txs()      -- lifetime ops committed into blocks (RAM, reset on start)
-//   ces.hyle.solo.queries()  -- lifetime chain-read binding calls (RAM, reset on start)
-//   ces.hyle.solo.running()  -- bool
-//   ces.hyle.solo.stop()     -- destroy the node
+// Only present when the node was built with --hyle (CES_HYLE): hyle_services is statically
+// linked, so these calls drive a hyle::services::Runtime DIRECTLY, no host IPC. In-RAM only:
+// stop() (or the process dying) drops the chain.
+//
+// IDENTITY. The chain's sole validator is derived from this program's own 32-byte secret,
+// and both CES and hyle derive ed25519 the same way, so ces.hyle.self() == ces.program_pubkey():
+// one key, two ledgers. The program's CES account and its chain account are the same 32 bytes,
+// and so are any user's. That is what lets a payment on one side authorize a mint on the other
+// with no mapping table.
+//
+// Surface (drives extensions/hylesolo.lua; see apps/hylesolo in cesdk for the source):
+//   solo lifecycle
+//     ces.hyle.solo.start{ chain_id=, block_pace_ms=, alloc=, fee_transfer=, fee_entry=,
+//                          fee_mint=, fee_sudo=, reward_base=, rent_rate=, rip_bounty=,
+//                          sudo_ttl_secs= } -> true | nil,err
+//     ces.hyle.solo.tick()   -- advance exactly one height; -> new height
+//     ces.hyle.solo.stop()   -- destroy the node
+//   chain
+//     ces.hyle.running() / height() / chain_id() / self() / mint_key()
+//     ces.hyle.info()    -- one table: everything live
+//     ces.hyle.config()  -- the genesis economy
+//     ces.hyle.account(pubkey) / entry(name) / tx_result(txid) / validators()
+//     ces.hyle.submit(bytes)          -- admit signed ops; -> {txid,..} | nil,reason
+//     ces.hyle.op.*                   -- build ops signed AS THIS PROGRAM
+//     ces.hyle.sudo.op.*              -- build a sudo act's inner bytes
+//     ces.hyle.sudo.propose(inner) / approve(proposer,inner) / pending(proposer) / quorum()
+//     ces.hyle.vote_add(pk) / vote_remove(pk)
 // ---------------------------------------------------------------------------
 #ifdef CES_HYLE
 
@@ -40,13 +49,22 @@
 // this .inc is textually inside `namespace cesluajitd`, and library/std headers
 // must not be included inside a namespace.
 
-static std::unique_ptr<hyle::morphe::Runtime> g_hyle_node;
+static std::unique_ptr<hyle::services::Runtime> g_hyle_node;
 static std::unique_ptr<hyle::KeyPair> g_hyle_key;  // the sole validator (== the program key)
 static std::string g_hyle_chain;
 
-// Lifetime meters (RAM, reset on start): txs summed from the commit event, queries bumped by the getters.
+// Lifetime meters (RAM, reset on start): txs summed from the commit event, queries bumped by the readers.
 static uint64_t g_hyle_txs = 0;
 static uint64_t g_hyle_queries = 0;
+
+static hyle::wire::View hyle_chain_view() {
+  return hyle::wire::View(reinterpret_cast<const uint8_t*>(g_hyle_chain.data()),
+                          g_hyle_chain.size());
+}
+
+static hyle::wire::View hyle_view(const hyle::wire::Bytes& b) {
+  return hyle::wire::View(b.data(), b.size());
+}
 
 // Read a uint64 field from the config table at stack index 1 (default if absent/non-numeric).
 static uint64_t hyle_cfg_u64(lua_State* L, const char* key, uint64_t def) {
@@ -56,28 +74,136 @@ static uint64_t hyle_cfg_u64(lua_State* L, const char* key, uint64_t def) {
   return v;
 }
 
+// Field readers for the op builders: every builder takes one table argument.
+static uint64_t hyle_fld_u64(lua_State* L, const char* key, uint64_t def) {
+  return hyle_cfg_u64(L, key, def);
+}
+
+static hyle::wire::Bytes hyle_fld_bytes(lua_State* L, const char* key) {
+  lua_getfield(L, 1, key);
+  size_t n = 0;
+  const char* s = lua_isstring(L, -1) ? lua_tolstring(L, -1, &n) : nullptr;
+  hyle::wire::Bytes out;
+  if (s != nullptr) out.assign(s, s + n);
+  lua_pop(L, 1);
+  return out;
+}
+
+// A 32-byte key field. Absent or wrong-sized yields the zero key, which every op path
+// treats as "not given" (and which sudo refuses to leave owning anything).
+static hyle::PubKey hyle_fld_key(lua_State* L, const char* key) {
+  hyle::PubKey k{};
+  lua_getfield(L, 1, key);
+  size_t n = 0;
+  const char* s = lua_isstring(L, -1) ? lua_tolstring(L, -1, &n) : nullptr;
+  if (s != nullptr && n == 32) std::memcpy(k.data(), s, 32);
+  lua_pop(L, 1);
+  return k;
+}
+
+// A key field that must be there. Absent or wrong-sized is an error, not a zero key:
+// the zero key is the mint sentinel, and quietly resolving `to` to it would turn a
+// mistyped transfer into a burn.
+static hyle::PubKey hyle_fld_key_req(lua_State* L, const char* key) {
+  lua_getfield(L, 1, key);
+  size_t n = 0;
+  const char* s = lua_isstring(L, -1) ? lua_tolstring(L, -1, &n) : nullptr;
+  if (s == nullptr || n != 32)
+    luaL_error(L, "field '%s' must be a 32-byte pubkey", key);
+  hyle::PubKey k{};
+  std::memcpy(k.data(), s, 32);
+  lua_pop(L, 1);
+  return k;
+}
+
+static hyle::PubKey hyle_arg_key(lua_State* L, int idx) {
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, idx, &n);
+  if (n != 32) luaL_error(L, "expected a 32-byte pubkey, got %d bytes", static_cast<int>(n));
+  hyle::PubKey k{};
+  std::memcpy(k.data(), s, 32);
+  return k;
+}
+
+static void hyle_push_bytes(lua_State* L, const hyle::wire::Bytes& b) {
+  lua_pushlstring(L, reinterpret_cast<const char*>(b.data()), b.size());
+}
+
+static void hyle_set_u64(lua_State* L, const char* key, uint64_t v) {
+  lua_pushnumber(L, static_cast<lua_Number>(v));
+  lua_setfield(L, -2, key);
+}
+
+static void hyle_set_bytes(lua_State* L, const char* key, const uint8_t* p, size_t n) {
+  lua_pushlstring(L, reinterpret_cast<const char*>(p), n);
+  lua_setfield(L, -2, key);
+}
+
+// The program's own hyle identity. Same 32 bytes as ces.program_pubkey(); see IDENTITY above.
+static hyle::KeyPair hyle_program_key() {
+  hyle::PrivKey secret{};
+  std::memcpy(secret.data(), g_program_privkey, 32);
+  return hyle::KeyPair::from_secret(secret);
+}
+
+// Every interface call needs a chain. Returns false having pushed (nil, reason).
+static bool hyle_need_node(lua_State* L) {
+  if (g_hyle_node) return true;
+  lua_pushnil(L);
+  lua_pushstring(L, "no chain running");
+  return false;
+}
+
+// 'a' + pubkey, or 'e' + name: hyle's two transfer destinations.
+static hyle::wire::Bytes hyle_account_dest(const hyle::PubKey& pk) {
+  hyle::wire::Bytes b;
+  b.push_back(hyle::services::ACCOUNT_PREFIX);
+  b.insert(b.end(), pk.begin(), pk.end());
+  return b;
+}
+
+static hyle::wire::Bytes hyle_entry_dest(const hyle::wire::Bytes& name) {
+  hyle::wire::Bytes b;
+  b.push_back(hyle::services::ENTRY_PREFIX);
+  b.insert(b.end(), name.begin(), name.end());
+  return b;
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle (solo)
+// ---------------------------------------------------------------------------
+
 int lua_ces_hyle_start(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (g_hyle_node) { lua_pushboolean(L, 1); return 1; }  // idempotent: already running
 
   lua_getfield(L, 1, "chain_id");
-  g_hyle_chain = lua_isstring(L, -1) ? lua_tostring(L, -1) : "hyle-hello";
+  g_hyle_chain = lua_isstring(L, -1) ? lua_tostring(L, -1) : "hylesolo";
   lua_pop(L, 1);
 
-  // The sole validator is derived deterministically from this program's own secret, so the 1-node
+  // The sole validator is derived deterministically from this program's own secret, so the
   // chain's identity is stable across restarts and tied to the program.
-  hyle::PrivKey secret{};
-  std::memcpy(secret.data(), g_program_privkey, 32);
-  g_hyle_key = std::make_unique<hyle::KeyPair>(hyle::KeyPair::from_secret(secret));
+  g_hyle_key = std::make_unique<hyle::KeyPair>(hyle_program_key());
 
-  hyle::morphe::Genesis g;
+  hyle::services::Genesis g;
   g.chain_id = g_hyle_chain;
   g.validators = { g_hyle_key->pub };
   g.allocations = { { g_hyle_key->pub, hyle_cfg_u64(L, "alloc", 1000000000ull) } };
-  g.config.fee_transfer = hyle_cfg_u64(L, "fee_transfer", 1);
-  g.config.fee_entry    = hyle_cfg_u64(L, "fee_entry", 1);
+  // Defaults must satisfy the genesis economy, which hyle checks: reward_base > fee_mint,
+  // and with rent on, rip_bounty <= min(fee_transfer, fee_entry) -- a bounty worth more
+  // than the fee to create a rippable entry is a pump that mints money out of the cull.
+  g.config.fee_transfer = hyle_cfg_u64(L, "fee_transfer", 10);
+  g.config.fee_entry    = hyle_cfg_u64(L, "fee_entry", 10);
   g.config.fee_mint     = hyle_cfg_u64(L, "fee_mint", 1);
+  g.config.fee_sudo     = hyle_cfg_u64(L, "fee_sudo", 1);
   g.config.reward_base  = hyle_cfg_u64(L, "reward_base", 2);
+  // At rate 0 an entry is immortal: its balance buys nothing and nothing can cull it.
+  g.config.rent_rate    = hyle_cfg_u64(L, "rent_rate", 1);
+  g.config.rip_bounty   = hyle_cfg_u64(L, "rip_bounty", 10);
+  // A pending sudo proposal past this age cannot execute and is cleared. 0 = never expires.
+  g.config.sudo_ttl_secs = hyle_cfg_u64(L, "sudo_ttl_secs", 0);
+  // The proof-of-work epoch key. Seeded from the chain id so two chains do not share one.
+  g.config.mint_genesis_key = hyle::sha256(hyle_chain_view());
 
   std::string err;
   if (!g.validate(err)) {
@@ -88,13 +214,12 @@ int lua_ces_hyle_start(lua_State* L) {
   }
 
   const uint64_t pace = hyle_cfg_u64(L, "block_pace_ms", 1000);  // Lua drives the ticks; pace is advisory
-  g_hyle_node = std::make_unique<hyle::morphe::Runtime>(g, *g_hyle_key, pace, nullptr);
+  g_hyle_node = std::make_unique<hyle::services::Runtime>(g, *g_hyle_key, pace, nullptr);
 
-  // reset meters and count committed ops per block
   g_hyle_txs = 0;
   g_hyle_queries = 0;
   g_hyle_node->app().add_on_commit(
-    [](const hyle::morphe::CommitEvent& ev) { g_hyle_txs += ev.txs.size(); });
+      [](const hyle::services::CommitEvent& ev) { g_hyle_txs += ev.txs.size(); });
 
   lua_pushboolean(L, 1);
   return 1;
@@ -104,69 +229,6 @@ int lua_ces_hyle_tick(lua_State* L) {
   if (!g_hyle_node) { lua_pushnil(L); return 1; }
   g_hyle_node->run_to(g_hyle_node->height() + 1);  // solo self-quorum: synchronous, non-blocking
   lua_pushnumber(L, static_cast<lua_Number>(g_hyle_node->height()));
-  return 1;
-}
-
-int lua_ces_hyle_height(lua_State* L) {
-  ++g_hyle_queries;
-  lua_pushnumber(L, g_hyle_node ? static_cast<lua_Number>(g_hyle_node->height()) : 0);
-  return 1;
-}
-
-int lua_ces_hyle_chain_id(lua_State* L) {
-  lua_pushlstring(L, g_hyle_chain.data(), g_hyle_chain.size());
-  return 1;
-}
-
-// balance of the sole validator's own account (minted reward_base per committed block)
-int lua_ces_hyle_balance(lua_State* L) {
-  ++g_hyle_queries;
-  if (!g_hyle_node || !g_hyle_key) { lua_pushnil(L); return 1; }
-  lua_pushnumber(L, static_cast<lua_Number>(g_hyle_node->app().balance(g_hyle_key->pub)));
-  return 1;
-}
-
-int lua_ces_hyle_running(lua_State* L) {
-  lua_pushboolean(L, g_hyle_node ? 1 : 0);
-  return 1;
-}
-
-// State exposes size()/canonical() but no iteration, so count a/e cells over the canonical KV dump.
-// The walk lives in ceslib (countCanonicalKvKeyPrefix), unit-tested there.
-static uint64_t hyle_canon_count(uint8_t prefix) {
-  if (!g_hyle_node) return 0;
-  auto canon = g_hyle_node->app().store().canonical();
-  return ces::countCanonicalKvKeyPrefix(std::span<const uint8_t>(canon.data(), canon.size()), prefix);
-}
-
-int lua_ces_hyle_accounts(lua_State* L) {
-  ++g_hyle_queries;
-  lua_pushnumber(L, static_cast<lua_Number>(hyle_canon_count(hyle::morphe::ACCOUNT_PREFIX)));
-  return 1;
-}
-
-int lua_ces_hyle_entries(lua_State* L) {
-  ++g_hyle_queries;
-  lua_pushnumber(L, static_cast<lua_Number>(hyle_canon_count(hyle::morphe::ENTRY_PREFIX)));
-  return 1;
-}
-
-// PBTS wall-time (unix seconds) of the last committed block; 0 before the first
-int lua_ces_hyle_last_block_time(lua_State* L) {
-  ++g_hyle_queries;
-  lua_pushnumber(L, g_hyle_node ? static_cast<lua_Number>(g_hyle_node->app().last_timestamp()) : 0);
-  return 1;
-}
-
-// lifetime ops committed into blocks (from the commit event); reset on start
-int lua_ces_hyle_txs(lua_State* L) {
-  lua_pushnumber(L, static_cast<lua_Number>(g_hyle_txs));
-  return 1;
-}
-
-// lifetime chain-read binding calls (height/balance/accounts/entries/last_block_time); reset on start
-int lua_ces_hyle_queries(lua_State* L) {
-  lua_pushnumber(L, static_cast<lua_Number>(g_hyle_queries));
   return 1;
 }
 
@@ -180,24 +242,545 @@ int lua_ces_hyle_stop(lua_State* L) {
   return 1;
 }
 
-// Install the ces.hyle.solo subtable. Call with the ces table on top of the stack.
+int lua_ces_hyle_running(lua_State* L) {
+  lua_pushboolean(L, g_hyle_node ? 1 : 0);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// Reads
+// ---------------------------------------------------------------------------
+
+int lua_ces_hyle_height(lua_State* L) {
+  ++g_hyle_queries;
+  lua_pushnumber(L, g_hyle_node ? static_cast<lua_Number>(g_hyle_node->height()) : 0);
+  return 1;
+}
+
+int lua_ces_hyle_chain_id(lua_State* L) {
+  lua_pushlstring(L, g_hyle_chain.data(), g_hyle_chain.size());
+  return 1;
+}
+
+int lua_ces_hyle_self(lua_State* L) {
+  const hyle::KeyPair kp = hyle_program_key();
+  lua_pushlstring(L, reinterpret_cast<const char*>(kp.pub.data()), kp.pub.size());
+  return 1;
+}
+
+int lua_ces_hyle_mint_key(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  const hyle::Hash& k = g_hyle_node->app().mint_key();
+  lua_pushlstring(L, reinterpret_cast<const char*>(k.data()), k.size());
+  return 1;
+}
+
+// State exposes size()/canonical() but no iteration, so count a/e cells over the canonical KV dump.
+// The walk lives in ceslib (countCanonicalKvKeyPrefix), unit-tested there.
+static uint64_t hyle_canon_count(uint8_t prefix) {
+  if (!g_hyle_node) return 0;
+  auto canon = g_hyle_node->app().store().canonical();
+  return ces::countCanonicalKvKeyPrefix(std::span<const uint8_t>(canon.data(), canon.size()), prefix);
+}
+
+int lua_ces_hyle_info(lua_State* L) {
+  ++g_hyle_queries;
+  if (!g_hyle_node) { lua_pushnil(L); return 1; }
+  const hyle::services::App& app = g_hyle_node->app();
+
+  lua_newtable(L);
+  lua_pushlstring(L, g_hyle_chain.data(), g_hyle_chain.size());
+  lua_setfield(L, -2, "chain_id");
+  hyle_set_u64(L, "height", g_hyle_node->height());
+  hyle_set_u64(L, "last_block_time", app.last_timestamp());
+  hyle_set_u64(L, "accounts", hyle_canon_count(hyle::services::ACCOUNT_PREFIX));
+  hyle_set_u64(L, "entries", hyle_canon_count(hyle::services::ENTRY_PREFIX));
+  hyle_set_u64(L, "txs", g_hyle_txs);
+  hyle_set_u64(L, "queries", g_hyle_queries);
+  hyle_set_u64(L, "mempool", app.mempool().size());
+  hyle_set_u64(L, "sudo_minted", app.sudo_minted());
+  hyle_set_u64(L, "sudo_pending", hyle_canon_count(hyle::services::PENDING_PREFIX));
+  const uint64_t nmembers = g_hyle_node->node().member_count();
+  hyle_set_u64(L, "validators", nmembers);
+  hyle_set_u64(L, "quorum", (2 * nmembers) / 3 + 1);
+  hyle_set_u64(L, "balance", app.balance(g_hyle_key->pub));
+
+  const hyle::Hash h = g_hyle_node->node().composite_hash();
+  hyle_set_bytes(L, "app_hash", h.data(), h.size());
+  hyle_set_bytes(L, "self", g_hyle_key->pub.data(), g_hyle_key->pub.size());
+  return 1;
+}
+
+int lua_ces_hyle_config(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  const hyle::services::Config& c = g_hyle_node->app().config();
+  lua_newtable(L);
+  hyle_set_u64(L, "fee_mint", c.fee_mint);
+  hyle_set_u64(L, "fee_transfer", c.fee_transfer);
+  hyle_set_u64(L, "fee_entry", c.fee_entry);
+  hyle_set_u64(L, "fee_sudo", c.fee_sudo);
+  hyle_set_u64(L, "rent_rate", c.rent_rate);
+  hyle_set_u64(L, "rip_bounty", c.rip_bounty);
+  hyle_set_u64(L, "sudo_ttl_secs", c.sudo_ttl_secs);
+  hyle_set_u64(L, "reward_base", c.reward_base);
+  hyle_set_u64(L, "reward_max_diff", c.reward_max_diff);
+  hyle_set_u64(L, "mint_capacity", c.mint_capacity);
+  hyle_set_u64(L, "pbts_window_secs", c.pbts_window_secs);
+  return 1;
+}
+
+int lua_ces_hyle_account(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  const hyle::PubKey pk = hyle_arg_key(L, 1);
+  const hyle::services::App& app = g_hyle_node->app();
+  lua_newtable(L);
+  hyle_set_u64(L, "balance", app.balance(pk));
+  hyle_set_u64(L, "sequence", app.sequence(pk));
+  lua_pushboolean(L, app.account_exists(pk) ? 1 : 0);
+  lua_setfield(L, -2, "exists");
+  return 1;
+}
+
+int lua_ces_hyle_entry(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  const hyle::wire::View name(reinterpret_cast<const uint8_t*>(s), n);
+
+  hyle::services::Entry e;
+  if (!g_hyle_node->app().entry_info(name, e)) { lua_pushnil(L); return 1; }
+
+  lua_newtable(L);
+  hyle_set_bytes(L, "owner", e.owner.data(), e.owner.size());
+  hyle_set_u64(L, "balance", e.balance);
+  hyle_set_u64(L, "created", e.created);
+  hyle_set_u64(L, "last_modified", e.last_modified);
+  hyle_set_u64(L, "last_rent", e.last_rent);
+  hyle_set_bytes(L, "payload", e.payload.data(), e.payload.size());
+  return 1;
+}
+
+int lua_ces_hyle_tx_result(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  if (n != 32) luaL_error(L, "expected a 32-byte tx id, got %d bytes", static_cast<int>(n));
+  hyle::Hash id{};
+  std::memcpy(id.data(), s, 32);
+
+  hyle::services::TxResult r;
+  if (!g_hyle_node->app().tx_result(id, r)) { lua_pushnil(L); return 1; }
+  lua_newtable(L);
+  hyle_set_u64(L, "height", r.height);
+  lua_pushboolean(L, r.applied ? 1 : 0);
+  lua_setfield(L, -2, "applied");
+  return 1;
+}
+
+int lua_ces_hyle_validators(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  ++g_hyle_queries;
+  const auto set = g_hyle_node->node().validators_for(g_hyle_node->height() + 1);
+  lua_newtable(L);
+  int i = 1;
+  for (const auto& v : set) {
+    lua_pushlstring(L, reinterpret_cast<const char*>(v.public_key.data()), v.public_key.size());
+    lua_rawseti(L, -2, i++);
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// submit: admit already-signed ops. CES does not interpret them; each carries its own signature.
+// ---------------------------------------------------------------------------
+
+int lua_ces_hyle_submit(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+
+  hyle::services::Decoded d;
+  try {
+    d = hyle::services::decode_ops(hyle::wire::View(reinterpret_cast<const uint8_t*>(s), n));
+  } catch (const hyle::wire::Error&) {
+    lua_pushnil(L);
+    lua_pushstring(L, "malformed op batch");
+    return 2;
+  }
+
+  // Admit each op and hand back its tx id, so the caller can poll tx_result. An op that
+  // fails admission stops the batch; the ones already admitted stay admitted.
+  const hyle::wire::View cv = hyle_chain_view();
+  std::vector<hyle::Hash> ids;
+  const char* fail = nullptr;
+
+  for (const auto& o : d.mints) {
+    const hyle::services::Admit a = g_hyle_node->submit(o);
+    if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
+    ids.push_back(hyle::services::tx_id(cv, o));
+  }
+  if (fail == nullptr)
+    for (const auto& o : d.transfers) {
+      const hyle::services::Admit a = g_hyle_node->submit(o);
+      if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
+      ids.push_back(hyle::services::tx_id(cv, o));
+    }
+  if (fail == nullptr)
+    for (const auto& o : d.entries) {
+      const hyle::services::Admit a = g_hyle_node->submit(o);
+      if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
+      ids.push_back(hyle::services::tx_id(cv, o));
+    }
+
+  if (fail != nullptr) {
+    lua_pushnil(L);
+    lua_pushstring(L, fail);
+    return 2;
+  }
+  if (ids.empty()) {
+    lua_pushnil(L);
+    lua_pushstring(L, "no ops");
+    return 2;
+  }
+
+  lua_newtable(L);
+  int i = 1;
+  for (const auto& id : ids) {
+    lua_pushlstring(L, reinterpret_cast<const char*>(id.data()), id.size());
+    lua_rawseti(L, -2, i++);
+  }
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
+// op builders: the program signing AS ITSELF. Its CES program key IS its chain account,
+// so these need no key argument. A user's op is signed by the user's own client and
+// arrives here as opaque bytes for submit(); the program never holds a user's key.
+// ---------------------------------------------------------------------------
+
+// Default seq is the committed sequence. Pipelining several ops before the first commits
+// needs explicit, consecutive seq values.
+static uint64_t hyle_self_seq(lua_State* L, const hyle::PubKey& self) {
+  lua_getfield(L, 1, "seq");
+  const bool given = lua_isnumber(L, -1) != 0;
+  const uint64_t v = given ? static_cast<uint64_t>(lua_tonumber(L, -1)) : 0;
+  lua_pop(L, 1);
+  return given ? v : g_hyle_node->app().sequence(self);
+}
+
+static int hyle_push_transfer(lua_State* L, const hyle::wire::Bytes& to, uint64_t amount) {
+  const hyle::KeyPair kp = hyle_program_key();
+  const uint64_t seq = hyle_self_seq(L, kp.pub);
+  hyle::services::Decoded d;
+  d.transfers.push_back(
+      hyle::services::make_transfer(kp, hyle_view(to), amount, seq, hyle_chain_view()));
+  hyle_push_bytes(L, hyle::services::encode_ops(d));
+  return 1;
+}
+
+int lua_ces_hyle_op_transfer(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  return hyle_push_transfer(L, hyle_account_dest(hyle_fld_key_req(L, "to")),
+                            hyle_fld_u64(L, "amount", 0));
+}
+
+// Fund a K,V mapping: a transfer whose destination is the entry itself. Anyone may do it.
+int lua_ces_hyle_op_fund(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  return hyle_push_transfer(L, hyle_entry_dest(hyle_fld_bytes(L, "name")),
+                            hyle_fld_u64(L, "amount", 0));
+}
+
+static int hyle_push_entry(lua_State* L, const hyle::services::EntryOp& op) {
+  hyle::services::Decoded d;
+  d.entries.push_back(op);
+  hyle_push_bytes(L, hyle::services::encode_ops(d));
+  return 1;
+}
+
+// Publish or update: first Put owns the name, and only the owner may Put again.
+int lua_ces_hyle_op_entry_put(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
+  const hyle::wire::Bytes payload = hyle_fld_bytes(L, "payload");
+  return hyle_push_entry(
+      L, hyle::services::make_entry_put(kp, hyle_view(name), hyle_self_seq(L, kp.pub),
+                                      hyle_fld_u64(L, "fund", 0), hyle_view(payload),
+                                      hyle_chain_view()));
+}
+
+int lua_ces_hyle_op_entry_del(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
+  return hyle_push_entry(L, hyle::services::make_entry_del(kp, hyle_view(name),
+                                                         hyle_self_seq(L, kp.pub),
+                                                         hyle_chain_view()));
+}
+
+int lua_ces_hyle_op_entry_give(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
+  return hyle_push_entry(
+      L, hyle::services::make_entry_give(kp, hyle_view(name), hyle_self_seq(L, kp.pub),
+                                       hyle_fld_key_req(L, "to"), hyle_chain_view()));
+}
+
+// The cull. Unsigned by construction: anyone may reap an entry whose rent ran out, and
+// collects rip_bounty for doing it.
+int lua_ces_hyle_op_entry_rip(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (!hyle_need_node(L)) return 2;
+  const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
+  hyle::PubKey culler = hyle_fld_key(L, "culler");
+  if (hyle::services::is_mint_sentinel(culler)) culler = hyle_program_key().pub;
+  return hyle_push_entry(L, hyle::services::make_entry_rip(hyle_view(name), culler));
+}
+
+// ---------------------------------------------------------------------------
+// sudo: run one act with its own guards waived, on a supermajority's authority.
+//
+// The act is opaque `inner` bytes (an op batch of transfers/entries; only the mint sentinel
+// creates credit, every other act must find the money it moves). Approval is collected ON
+// CHAIN: propose() opens the proposal carrying the program's own vote, approve() adds more,
+// and the vote that reaches quorum executes the act. A one-validator chain is its own
+// supermajority, so its propose() reaches quorum at once. propose/approve are ordinary signed
+// ops from the program, so they ride submit() into a block; on solo, tick to commit.
+// ---------------------------------------------------------------------------
+
+static int hyle_push_inner(lua_State* L, const hyle::services::Decoded& d) {
+  hyle_push_bytes(L, hyle::services::encode_ops(d));
+  return 1;
+}
+
+// A sudo transfer with no source: mints from the mint sentinel.
+int lua_ces_hyle_sudo_op_mint(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  hyle::services::Decoded d;
+  hyle::services::TransferOp t;
+  t.from = hyle::services::MINT_SENTINEL;
+  t.to = hyle_account_dest(hyle_fld_key_req(L, "to"));
+  t.amount = hyle_fld_u64(L, "amount", 0);
+  d.transfers.push_back(t);
+  return hyle_push_inner(L, d);
+}
+
+int lua_ces_hyle_sudo_op_seize(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  hyle::services::Decoded d;
+  hyle::services::TransferOp t;
+  t.from = hyle_fld_key_req(L, "from");
+  t.to = hyle_account_dest(hyle_fld_key_req(L, "to"));
+  t.amount = hyle_fld_u64(L, "amount", 0);
+  d.transfers.push_back(t);
+  return hyle_push_inner(L, d);
+}
+
+static int hyle_sudo_entry(lua_State* L, hyle::services::EntryKind kind) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  hyle::services::Decoded d;
+  hyle::services::EntryOp e;
+  e.kind = kind;
+  e.signer = hyle_fld_key(L, "owner");  // who the act makes the owner
+  const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
+  e.name = name;
+  e.amount = hyle_fld_u64(L, "fund", 0);
+  e.aux = hyle_fld_key(L, "to");
+  e.payload = hyle_fld_bytes(L, "payload");
+  d.entries.push_back(e);
+  return hyle_push_inner(L, d);
+}
+
+int lua_ces_hyle_sudo_op_entry_put(lua_State* L) {
+  return hyle_sudo_entry(L, hyle::services::EntryKind::Put);
+}
+int lua_ces_hyle_sudo_op_entry_give(lua_State* L) {
+  return hyle_sudo_entry(L, hyle::services::EntryKind::Give);
+}
+int lua_ces_hyle_sudo_op_entry_del(lua_State* L) {
+  return hyle_sudo_entry(L, hyle::services::EntryKind::Del);
+}
+int lua_ces_hyle_sudo_op_entry_rip(lua_State* L) {
+  return hyle_sudo_entry(L, hyle::services::EntryKind::Rip);
+}
+
+// The current validator set and 2/3+1 of it, as the app weighs a proposal's votes.
+static std::vector<hyle::PubKey> hyle_members() {
+  std::vector<hyle::PubKey> out;
+  if (!g_hyle_node) return out;
+  for (const auto& v : g_hyle_node->node().validators_for(g_hyle_node->height() + 1)) {
+    hyle::PubKey k{};
+    std::memcpy(k.data(), v.public_key.data(), v.public_key.size());
+    out.push_back(k);
+  }
+  return out;
+}
+static unsigned hyle_quorum() {
+  return static_cast<unsigned>((2 * hyle_members().size()) / 3 + 1);
+}
+
+int lua_ces_hyle_sudo_quorum(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  lua_pushnumber(L, static_cast<lua_Number>(hyle_quorum()));
+  return 1;
+}
+
+// Open a proposal for an act, carrying the program's own vote. On a one-validator chain that
+// is quorum, so the next committed block executes it. -> true | nil,reason
+int lua_ces_hyle_sudo_propose(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 1, &n);
+  const hyle::wire::View inner(reinterpret_cast<const uint8_t*>(s), n);
+  const hyle::KeyPair kp = hyle_program_key();
+  const uint64_t seq = g_hyle_node->app().sequence(kp.pub);
+  const hyle::services::Admit a =
+      g_hyle_node->submit(hyle::services::make_sudo_propose(kp, seq, inner, hyle_chain_view()));
+  if (a != hyle::services::Admit::Ok) {
+    lua_pushnil(L);
+    lua_pushstring(L, hyle::services::admit_reason(a));
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Add the program's approval to a member's open proposal. `inner` is the act being approved,
+// exactly as proposed (its hash is what the vote commits to). -> true | nil,reason
+int lua_ces_hyle_sudo_approve(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  const hyle::PubKey proposer = hyle_arg_key(L, 1);
+  size_t n = 0;
+  const char* s = luaL_checklstring(L, 2, &n);
+  const hyle::Hash inner_hash =
+      hyle::sha256(hyle::wire::View(reinterpret_cast<const uint8_t*>(s), n));
+  const hyle::KeyPair kp = hyle_program_key();
+  const uint64_t seq = g_hyle_node->app().sequence(kp.pub);
+  const hyle::services::Admit a = g_hyle_node->submit(
+      hyle::services::make_sudo_approve(kp, seq, proposer, inner_hash, hyle_chain_view()));
+  if (a != hyle::services::Admit::Ok) {
+    lua_pushnil(L);
+    lua_pushstring(L, hyle::services::admit_reason(a));
+    return 2;
+  }
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// Inspect a member's open proposal: the act, how many current members have approved, and how
+// many are needed. -> {created, approvals, quorum, inner, inner_hash} | nil
+int lua_ces_hyle_sudo_pending(lua_State* L) {
+  if (!hyle_need_node(L)) return 2;
+  const hyle::PubKey proposer = hyle_arg_key(L, 1);
+  hyle::services::Pending p;
+  if (!g_hyle_node->app().pending_info(proposer, p)) { lua_pushnil(L); return 1; }
+  const std::vector<hyle::PubKey> members = hyle_members();
+  lua_newtable(L);
+  hyle_set_u64(L, "created", p.created);
+  hyle_set_u64(L, "approvals", g_hyle_node->app().pending_approvals(p, members));
+  hyle_set_u64(L, "quorum", static_cast<uint64_t>((2 * members.size()) / 3 + 1));
+  hyle_set_bytes(L, "inner", p.inner.data(), p.inner.size());
+  const hyle::Hash ih = hyle::sha256(hyle::wire::View(p.inner.data(), p.inner.size()));
+  hyle_set_bytes(L, "inner_hash", ih.data(), ih.size());
+  return 1;
+}
+
+// submit(inner) is propose(inner): the one-call path a solo chain uses. The name is kept for
+// the faucet and any caller that just wants to run an act on a chain it is the quorum of.
+int lua_ces_hyle_sudo_submit(lua_State* L) {
+  return lua_ces_hyle_sudo_propose(L);
+}
+
+// ---------------------------------------------------------------------------
+// Membership governance. Votes accumulate on-chain until a supermajority agrees; the
+// change then takes effect two heights later. A one-validator chain settles at once.
+// ---------------------------------------------------------------------------
+
+static int hyle_vote(lua_State* L, hyle::consensus::Governance::Kind kind) {
+  if (!hyle_need_node(L)) return 2;
+  const hyle::PubKey target = hyle_arg_key(L, 1);
+  g_hyle_node->node().submit_gov_vote(kind, target);
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int lua_ces_hyle_vote_add(lua_State* L) {
+  return hyle_vote(L, hyle::consensus::Governance::Kind::Add);
+}
+int lua_ces_hyle_vote_remove(lua_State* L) {
+  return hyle_vote(L, hyle::consensus::Governance::Kind::Remove);
+}
+
+// ---------------------------------------------------------------------------
+
+static void hyle_fn(lua_State* L, const char* name, lua_CFunction fn) {
+  lua_pushcfunction(L, fn);
+  lua_setfield(L, -2, name);
+}
+
+// Install the ces.hyle table. Call with the ces table on top of the stack.
 void install_ces_hyle_api(lua_State* L) {
-  lua_newtable(L);                                      // ces.hyle
-  lua_newtable(L);                                      // ces.hyle.solo
-  lua_pushcfunction(L, guarded<lua_ces_hyle_start>);    lua_setfield(L, -2, "start");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_tick>);     lua_setfield(L, -2, "tick");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_height>);   lua_setfield(L, -2, "height");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_chain_id>); lua_setfield(L, -2, "chain_id");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_balance>);  lua_setfield(L, -2, "balance");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_accounts>); lua_setfield(L, -2, "accounts");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_entries>);  lua_setfield(L, -2, "entries");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_last_block_time>); lua_setfield(L, -2, "last_block_time");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_txs>);      lua_setfield(L, -2, "txs");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_queries>);  lua_setfield(L, -2, "queries");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_running>);  lua_setfield(L, -2, "running");
-  lua_pushcfunction(L, guarded<lua_ces_hyle_stop>);     lua_setfield(L, -2, "stop");
-  lua_setfield(L, -2, "solo");                          // ces.hyle.solo = <table>
-  lua_setfield(L, -2, "hyle");                          // ces.hyle = <table>
+  lua_newtable(L);  // ces.hyle
+
+  hyle_fn(L, "running",    guarded<lua_ces_hyle_running>);
+  hyle_fn(L, "height",     guarded<lua_ces_hyle_height>);
+  hyle_fn(L, "chain_id",   guarded<lua_ces_hyle_chain_id>);
+  hyle_fn(L, "self",       guarded<lua_ces_hyle_self>);
+  hyle_fn(L, "mint_key",   guarded<lua_ces_hyle_mint_key>);
+  hyle_fn(L, "info",       guarded<lua_ces_hyle_info>);
+  hyle_fn(L, "config",     guarded<lua_ces_hyle_config>);
+  hyle_fn(L, "account",    guarded<lua_ces_hyle_account>);
+  hyle_fn(L, "entry",      guarded<lua_ces_hyle_entry>);
+  hyle_fn(L, "tx_result",  guarded<lua_ces_hyle_tx_result>);
+  hyle_fn(L, "validators", guarded<lua_ces_hyle_validators>);
+  hyle_fn(L, "submit",     guarded<lua_ces_hyle_submit>);
+  hyle_fn(L, "vote_add",    guarded<lua_ces_hyle_vote_add>);
+  hyle_fn(L, "vote_remove", guarded<lua_ces_hyle_vote_remove>);
+
+  lua_newtable(L);  // ces.hyle.op
+  hyle_fn(L, "transfer",   guarded<lua_ces_hyle_op_transfer>);
+  hyle_fn(L, "fund",       guarded<lua_ces_hyle_op_fund>);
+  hyle_fn(L, "entry_put",  guarded<lua_ces_hyle_op_entry_put>);
+  hyle_fn(L, "entry_del",  guarded<lua_ces_hyle_op_entry_del>);
+  hyle_fn(L, "entry_give", guarded<lua_ces_hyle_op_entry_give>);
+  hyle_fn(L, "entry_rip",  guarded<lua_ces_hyle_op_entry_rip>);
+  lua_setfield(L, -2, "op");
+
+  lua_newtable(L);  // ces.hyle.sudo
+  hyle_fn(L, "propose", guarded<lua_ces_hyle_sudo_propose>);
+  hyle_fn(L, "approve", guarded<lua_ces_hyle_sudo_approve>);
+  hyle_fn(L, "pending", guarded<lua_ces_hyle_sudo_pending>);
+  hyle_fn(L, "submit",  guarded<lua_ces_hyle_sudo_submit>);
+  hyle_fn(L, "quorum",  guarded<lua_ces_hyle_sudo_quorum>);
+  lua_newtable(L);  // ces.hyle.sudo.op
+  hyle_fn(L, "mint",       guarded<lua_ces_hyle_sudo_op_mint>);
+  hyle_fn(L, "seize",      guarded<lua_ces_hyle_sudo_op_seize>);
+  hyle_fn(L, "entry_put",  guarded<lua_ces_hyle_sudo_op_entry_put>);
+  hyle_fn(L, "entry_give", guarded<lua_ces_hyle_sudo_op_entry_give>);
+  hyle_fn(L, "entry_del",  guarded<lua_ces_hyle_sudo_op_entry_del>);
+  hyle_fn(L, "entry_rip",  guarded<lua_ces_hyle_sudo_op_entry_rip>);
+  lua_setfield(L, -2, "op");
+  lua_setfield(L, -2, "sudo");
+
+  lua_newtable(L);  // ces.hyle.solo
+  hyle_fn(L, "start", guarded<lua_ces_hyle_start>);
+  hyle_fn(L, "tick",  guarded<lua_ces_hyle_tick>);
+  hyle_fn(L, "stop",  guarded<lua_ces_hyle_stop>);
+  lua_setfield(L, -2, "solo");
+
+  lua_setfield(L, -2, "hyle");  // ces.hyle = <table>
 }
 
 #endif // CES_HYLE

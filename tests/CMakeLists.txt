@@ -17,6 +17,14 @@ target_link_libraries(cestests
 # relative to the build dir.
 target_compile_definitions(cestests PRIVATE CES_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 
+# With --hyle, the tests link hyle too, so HyleSoloTests can be a real client: it encodes
+# and SIGNS its own chain ops, exactly as an outside user would, and hands the bytes to the
+# extension. Without hyle, test_hyle.cpp compiles to nothing.
+if(CES_HYLE)
+  target_link_libraries(cestests PRIVATE hyle_services)
+  target_compile_definitions(cestests PRIVATE CES_HYLE=1)
+endif()
+
 # E2E tests need the binaries they shell out to, plus the compute
 # child stub (the handler fork+execs cescompmockd).
 add_dependencies(cestests cesh cesc cesproxy cescompmockd cesluajitd)

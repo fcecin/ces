@@ -21,6 +21,8 @@ print_help() {
     echo "  --asan          Enables AddressSanitizer."
     echo "  --hyle          Fetch + link the hyle consensus engine (core + services)"
     echo "                  into cesluajitd. Pulls Rust/malachite-cpp; first build is slow."
+    echo "  --hyle-src PATH Build --hyle against a local hyle checkout instead of the"
+    echo "                  published one. Implies --hyle."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
     echo "                    --test                Run all tests"
@@ -81,6 +83,10 @@ build_one_config() {
     local HYLE_ARG="-DCES_HYLE=OFF"
     [ "$ENABLE_HYLE" = true ] && HYLE_ARG="-DCES_HYLE=ON"
 
+    # An empty FETCHCONTENT_SOURCE_DIR_HYLE means "download it", so passing this every run
+    # keeps a once-used local checkout from sticking in the cache.
+    local HYLE_SRC_ARG="-DFETCHCONTENT_SOURCE_DIR_HYLE=${HYLE_SRC}"
+
     # Portable -march by default; --native pins to the build host.
     local MARCH="x86-64-v3"
     [ "$ENABLE_NATIVE" = true ] && MARCH="native"
@@ -93,6 +99,7 @@ build_one_config() {
         -DCMAKE_BUILD_TYPE="${BUILD_TYPE_CAMEL}" \
         -DCES_MARCH="${MARCH}" \
         $HYLE_ARG \
+        "$HYLE_SRC_ARG" \
         $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
@@ -109,6 +116,7 @@ DO_CLEAN=false
 ENABLE_ASAN=false
 ENABLE_NATIVE=false
 ENABLE_HYLE=false
+HYLE_SRC=""
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter
@@ -147,6 +155,16 @@ while [ $i -lt ${#ARGS[@]} ]; do
             ;;
         --hyle)
             ENABLE_HYLE=true
+            ;;
+        --hyle-src)
+            ENABLE_HYLE=true
+            next_i=$((i + 1))
+            if [ $next_i -ge ${#ARGS[@]} ]; then
+                echo "Error: --hyle-src needs a path" >&2
+                exit 1
+            fi
+            HYLE_SRC="$(cd "${ARGS[$next_i]}" && pwd)"
+            i=$next_i
             ;;
         --asan)
             ENABLE_ASAN=true
