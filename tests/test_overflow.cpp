@@ -285,4 +285,35 @@ BOOST_FIXTURE_TEST_CASE(ConservationWithRepeatedOverflowReverts, OverflowFixture
 // exercised structurally above; their per-op reverts live in the respective
 // handler tests.
 
+// Mint/admin credit (_brr) saturates at the cap instead of feeding a
+// >2^47 value into the int48 balance (which would wrap NEGATIVE).
+BOOST_FIXTURE_TEST_CASE(BrrCredit_SaturatesAtCapNoWrap, OverflowFixture) {
+  KeyPair a;
+  fund(a.getPublicKeyAsHash(), ces::BALANCE_MAX - 100);
+  server->_brr(a.getPublicKeyAsHash(), 1'000'000);   // way past the cap
+  server->_drainLogic();
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), ces::BALANCE_MAX);
+  BOOST_CHECK(bal(a.getPublicKeyAsHash()) > 0);       // never wrapped negative
+}
+
+// A fresh account minted with a >2^47 amount is capped at BALANCE_MAX, not
+// truncated by the int48 constructor.
+BOOST_FIXTURE_TEST_CASE(BrrCredit_FreshAccountCapsNotTruncates, OverflowFixture) {
+  KeyPair a;
+  server->_brr(a.getPublicKeyAsHash(),
+               static_cast<int64_t>(ces::BALANCE_MAX) + 500'000);
+  server->_drainLogic();
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), ces::BALANCE_MAX);
+}
+
+// A non-positive admin credit is a no-op (a negative amount must not convert to
+// a huge unsigned credit and mint a max balance).
+BOOST_FIXTURE_TEST_CASE(BrrCredit_NonPositiveIsNoop, OverflowFixture) {
+  KeyPair a;
+  server->_brr(a.getPublicKeyAsHash(), -1);
+  server->_drainLogic();
+  BOOST_CHECK(!server->_accountExists(a.getPublicKeyAsHash()));
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

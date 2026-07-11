@@ -129,6 +129,13 @@ void CescoSession::builtinInterpreter(const uint8_t* data, size_t len) {
       continue;
     }
 
+    // Bound the line buffer so a client that never sends a newline can't grow
+    // it without limit. 64 KiB is far beyond any real admin command.
+    if (lineBuffer_.size() >= 64 * 1024) {
+      lineBuffer_.clear();
+      enqueue("line too long\ncesco> ");
+      continue;
+    }
     lineBuffer_ += static_cast<char>(b);
   }
 }

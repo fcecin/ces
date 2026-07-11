@@ -175,9 +175,10 @@ public:
   template <typename T>
   T peek(size_t offset) const {
     T out{};
+    const size_t available = (v_.size() > offset) ? (v_.size() - offset) : 0;
     logkv::serializer<T>::read(
       reinterpret_cast<const char*>(v_.data() + offset),
-      v_.size() - offset, out);
+      available, out);
     return out;
   }
 
@@ -237,9 +238,10 @@ public:
   template <typename T>
   static T peek(std::span<const uint8_t> data, size_t offset) {
     T out{};
+    const size_t available = (data.size() > offset) ? (data.size() - offset) : 0;
     logkv::serializer<T>::read(
       reinterpret_cast<const char*>(data.data() + offset),
-      data.size() - offset, out);
+      available, out);
     return out;
   }
 

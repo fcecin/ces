@@ -80,7 +80,19 @@ void Wallet::loadFromString(const std::string& colonSeparated) {
 
 void Wallet::saveToFile(const fs::path& path) const {
   fs::create_directories(path.parent_path());
-  std::ofstream f(path);
+  // Create the file empty and tighten its permissions to owner-only BEFORE
+  // writing any key bytes, so the private keys never sit in a world-readable
+  // file (re-opening an existing file to truncate does not reset its mode).
+  {
+    std::ofstream create(path, std::ios::trunc);
+    if (!create.is_open())
+      throw std::runtime_error("Cannot write wallet file: " + path.string());
+  }
+  auto permErr = setSecurePermission(path);
+  if (!permErr.empty())
+    throw std::runtime_error("Failed to set wallet file permissions: " + permErr);
+
+  std::ofstream f(path, std::ios::trunc);
   if (!f.is_open())
     throw std::runtime_error("Cannot write wallet file: " + path.string());
   for (size_t i = 0; i < keys_.size(); ++i) {
@@ -90,9 +102,6 @@ void Wallet::saveToFile(const fs::path& path) const {
     f << "\n";
   }
   f.flush();
-  auto permErr = setSecurePermission(path);
-  if (!permErr.empty())
-    throw std::runtime_error("Failed to set wallet file permissions: " + permErr);
 }
 
 // =============================================================================

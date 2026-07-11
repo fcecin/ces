@@ -186,12 +186,19 @@ void CesClientAsync::startReceive() {
 
 void CesClientAsync::onReceive(const boost::system::error_code& ec, size_t bytes) {
   if (ec || closed_) return;
-  if (bytes >= 1) {
-    switch (recvBuf_[0]) {
-    case minx::MINX_INFO:    handleInfo(recvBuf_.data(), bytes); break;
-    case minx::MINX_MESSAGE: handleMessage(recvBuf_.data(), bytes); break;
-    default: break;
+  // A malformed/truncated reply must not throw out of here (a fromBytes parse can
+  // throw): that would skip startReceive() and leave the client permanently deaf
+  // to this peer. Drop the bad datagram, keep the receive loop alive.
+  try {
+    if (bytes >= 1) {
+      switch (recvBuf_[0]) {
+      case minx::MINX_INFO:    handleInfo(recvBuf_.data(), bytes); break;
+      case minx::MINX_MESSAGE: handleMessage(recvBuf_.data(), bytes); break;
+      default: break;
+      }
     }
+  } catch (const std::exception&) {
+    // Bad packet from the peer; ignore it.
   }
   startReceive();
 }

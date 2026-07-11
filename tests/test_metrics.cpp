@@ -70,6 +70,20 @@ BOOST_AUTO_TEST_CASE(PrepayCostMonotonicInBp) {
   BOOST_CHECK_LE(c1, c2);
 }
 
+BOOST_AUTO_TEST_CASE(PrepayCostHugeDaysIsBoundedAndExact) {
+  // Regression: the old form looped `daysAdded` times -> a huge day count was a
+  // logic-strand CPU DoS. The bounded form runs O(window) and stays exact: days
+  // beyond the 90-day window all pay full price. This case would have run ~4e9
+  // iterations before; it must complete instantly.
+  const uint32_t big = 4'000'000'000u;   // near UINT32_MAX
+  uint64_t c = ces::computePrepayCost(/*feePerDay=*/100, /*bp=*/0, big, /*held=*/0);
+  BOOST_CHECK_GE(c, static_cast<uint64_t>(big - 90) * 100u);  // >= out-of-window tail
+  BOOST_CHECK_LE(c, static_cast<uint64_t>(big) * 100u);       // <= flat
+  // Discount-off stays the pure flat multiply even at huge days.
+  BOOST_CHECK_EQUAL(ces::computePrepayCost(100, 10000, big, 0),
+                    static_cast<uint64_t>(big) * 100u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 

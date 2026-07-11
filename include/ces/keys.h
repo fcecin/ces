@@ -115,6 +115,12 @@ public:
         return false;
       }
 
+      // Reject non-canonical (high-S) signatures: sign() always emits low-S, so
+      // a high-S copy is a malleated form and must not verify (one wire form).
+      if (secp256k1_ecdsa_signature_normalize(ctx, nullptr, &sig)) {
+        return false;
+      }
+
       // 4. Hash if not already 32 bytes
       auto msgHash = prepareDigest(data);
 

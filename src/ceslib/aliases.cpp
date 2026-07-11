@@ -38,14 +38,17 @@ Alias& Aliases::ActiveAlias::data() { return it->second; }
 const Alias& Aliases::ActiveAlias::data() const { return it->second; }
 
 HashPrefix Aliases::ActiveAlias::getOwner() const {
-  return it->second.getOwner();
+  return exists() ? it->second.getOwner() : HashPrefix{};
 }
 HashPrefix Aliases::ActiveAlias::getEditor() const {
-  return it->second.getEditor();
+  return exists() ? it->second.getEditor() : HashPrefix{};
 }
-uint16_t Aliases::ActiveAlias::getOp() const { return it->second.getOp(); }
+uint16_t Aliases::ActiveAlias::getOp() const {
+  return exists() ? it->second.getOp() : 0;
+}
 const AliasData& Aliases::ActiveAlias::getContent() const {
-  return it->second.getContent();
+  static const AliasData kEmpty{};
+  return exists() ? it->second.getContent() : kEmpty;
 }
 
 void Aliases::ActiveAlias::setOwner(const HashPrefix& owner) {

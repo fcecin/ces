@@ -195,7 +195,12 @@ void ChannelMeter::doTick() {
                                              mc.lastBytesReceived);
     mc.deltaMemByteSeconds  = guardedDelta(m->memoryByteSeconds,
                                              mc.lastMemByteSeconds);
-    mc.deltaAgeSec          = (now - mc.lastMeteredAtUs) / kMicrosPerSecond;
+    // Guard a backwards system-clock jump (now < lastMeteredAtUs) the same way
+    // guardedDelta guards the byte counters, so a clock step can't bill a huge
+    // spurious age.
+    mc.deltaAgeSec          = (now > mc.lastMeteredAtUs)
+                                ? (now - mc.lastMeteredAtUs) / kMicrosPerSecond
+                                : 0;
 
     // Report measured usage to the host. It prices the usage in its own
     // units, charges the payer, and closes (peer, channelId) itself if the

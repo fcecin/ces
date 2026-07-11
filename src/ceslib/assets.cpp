@@ -38,14 +38,17 @@ Asset& Assets::ActiveAsset::data() { return it->second; }
 const Asset& Assets::ActiveAsset::data() const { return it->second; }
 
 HashPrefix Assets::ActiveAsset::getOwnerId() const {
-  return it->second.getOwnerId();
+  return exists() ? it->second.getOwnerId() : HashPrefix{};
 }
-uint32_t Assets::ActiveAsset::getPrice() const { return it->second.getPrice(); }
+uint32_t Assets::ActiveAsset::getPrice() const {
+  return exists() ? it->second.getPrice() : 0;
+}
 uint16_t Assets::ActiveAsset::getBalance() const {
-  return it->second.getBalance();
+  return exists() ? it->second.getBalance() : 0;
 }
 const AssetData& Assets::ActiveAsset::getContent() const {
-  return it->second.getContent();
+  static const AssetData kEmpty{};
+  return exists() ? it->second.getContent() : kEmpty;
 }
 
 void Assets::ActiveAsset::setContent(const AssetData& content) {

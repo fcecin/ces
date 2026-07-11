@@ -138,8 +138,11 @@ uint8_t CesFileClient::read(
     kVerbRead, env,
     /*fixedPre=*/sizeof(uint64_t) + sizeof(minx::Hash),
     nullptr,
-    [](const ces::Bytes& p) -> uint64_t {
-      return ces::Buffer::peek<uint64_t>(p.data());
+    [length](const ces::Bytes& p) -> uint64_t {
+      // Cap the server-declared body length at what we asked for, so a hostile
+      // or buggy server can't make us allocate an unbounded response.
+      uint64_t declared = ces::Buffer::peek<uint64_t>(p.data());
+      return declared < length ? declared : length;
     },
     {}, resp, body);
   if (rc != CES_OK) return rc;

@@ -43,6 +43,30 @@ BOOST_AUTO_TEST_CASE(Get_ExactSizeWorks) {
   BOOST_CHECK_THROW(parser.get<uint8_t>(), std::out_of_range);
 }
 
+// ---- peek<T> out-of-range regression ----
+//
+// Before the fix: peek<T>(offset) passed `size() - offset` to the serializer,
+// which underflows to a huge size_t when offset > size (-> over-read) and
+// silently returns a default on a partial read. After the fix: `available` is
+// clamped like get<>, so a bad offset fails closed (default), never over-reads.
+BOOST_AUTO_TEST_CASE(Peek_OutOfRangeReturnsDefaultNoOverread) {
+  ces::Buffer buf;
+  buf.put<uint32_t>(0x11223344u);   // 4 bytes, big-endian
+  // (literal 0 is a null-pointer-constant that also matches the static
+  // peek(const uint8_t*) overload, so name the offset type explicitly)
+  BOOST_CHECK_EQUAL(buf.peek<uint32_t>(static_cast<size_t>(0)), 0x11223344u);
+  BOOST_CHECK_EQUAL(buf.peek<uint32_t>(100), 0u);          // offset > size
+  BOOST_CHECK_EQUAL(buf.peek<uint32_t>(2), 0u);            // partial (offset+4 > size)
+}
+
+BOOST_AUTO_TEST_CASE(Peek_StaticSpanOutOfRangeReturnsDefault) {
+  std::array<uint8_t, 4> arr{0x11, 0x22, 0x33, 0x44};
+  std::span<const uint8_t> sp(arr.data(), arr.size());
+  BOOST_CHECK_EQUAL((ces::Buffer::peek<uint32_t>(sp, 0)), 0x11223344u);
+  BOOST_CHECK_EQUAL((ces::Buffer::peek<uint32_t>(sp, 100)), 0u);  // offset > size
+  BOOST_CHECK_EQUAL((ces::Buffer::peek<uint32_t>(sp, 2)), 0u);    // partial
+}
+
 // ---- runtime-width putLE regression ----
 //
 // Before the fix: ces::Buffer::putLE(Bytes&, T, uint8_t byteCount)

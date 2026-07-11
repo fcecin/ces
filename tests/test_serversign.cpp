@@ -93,4 +93,32 @@ BOOST_FIXTURE_TEST_CASE(DistinctInputsDistinctSigs, CesFixture) {
   BOOST_CHECK(!verifyOver(pub, sa, b));   // a's digest does not verify b's signature
 }
 
+// Regression: a secp256k1 signature is malleable -- (r, s) and (r, n-s) are both
+// valid for the same (message, pubkey). sign() always emits low-S, so the
+// high-S twin (n-s) must be REJECTED so exactly one wire form verifies.
+BOOST_AUTO_TEST_CASE(Secp_HighSMalleatedSignatureRejected) {
+  ces::KeyPair kp(ces::KeyAlgo::SECP256K1);
+  const std::string msg = "malleability test message";
+  std::span<const uint8_t> data(
+    reinterpret_cast<const uint8_t*>(msg.data()), msg.size());
+  ces::Signature sig = kp.signData(data);
+  BOOST_REQUIRE(kp.getPublicKey().verifySignature(data, sig));  // low-S verifies
+
+  // s' = n - s (secp256k1 group order); r and the decorator stay the same.
+  static const uint8_t N[32] = {
+    0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFE,
+    0xBA,0xAE,0xDC,0xE6,0xAF,0x48,0xA0,0x3B,0xBF,0xD2,0x5E,0x8C,0xD0,0x36,0x41,0x41};
+  ces::Signature malled = sig;
+  const uint8_t* s = sig.data() + 1 + 32;   // [decorator][r 32][s 32]
+  uint8_t* sm = malled.data() + 1 + 32;
+  int borrow = 0;
+  for (int i = 31; i >= 0; --i) {
+    int diff = static_cast<int>(N[i]) - static_cast<int>(s[i]) - borrow;
+    borrow = diff < 0 ? 1 : 0;
+    sm[i] = static_cast<uint8_t>(diff + (borrow ? 256 : 0));
+  }
+  // The high-S malleated twin must NOT verify (it did before the low-S guard).
+  BOOST_CHECK(!kp.getPublicKey().verifySignature(data, malled));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

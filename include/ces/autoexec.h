@@ -48,7 +48,12 @@ inline std::optional<AssetData> buildAutoexecContent(
   req.budget = budget;
   req.time = getMicrosSinceEpoch();
   req.input = input;
-  auto packetBytes = req.toBytes(keyPair);
+  minx::Bytes packetBytes;
+  try {
+    packetBytes = req.toBytes(keyPair);
+  } catch (const std::exception&) {
+    return std::nullopt;  // input too large to fit a signed packet
+  }
 
   AssetData content{};
   if (packetBytes.size() > content.size() - 2)

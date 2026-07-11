@@ -4669,6 +4669,8 @@ void CesServer::incomingProveWork(const SockAddr& addr,
       if (creditAmount < cfg_.feeAccount)
         return;
       creditAmount -= cfg_.feeAccount;
+      if (creditAmount > static_cast<uint64_t>(BALANCE_MAX))
+        creditAmount = static_cast<uint64_t>(BALANCE_MAX);
       Account newAccount(msg.ckey, creditAmount, 0);
       accounts_.createAccount(mapKey, newAccount);
     } else {
@@ -5383,6 +5385,10 @@ void CesServer::deployBuiltinVmPrograms() {
 }
 
 void CesServer::_brrInner(const minx::Hash& accountKey, int64_t amount) {
+  if (amount <= 0)
+    return;
+  if (amount > BALANCE_MAX)
+    amount = BALANCE_MAX;
   HashPrefix id = Account::getMapKey(accountKey);
   ActiveAccount acc = accounts_.get(id);
   if (acc.exists()) {
@@ -5937,6 +5943,8 @@ void CesServer::dispatchGossipFanout(const Hash& authorId, const Hash& msgId,
       [this, peerKey, authorized](uint8_t rc, uint64_t paid) {
         if (rc != CES_OK || paid == 0) return;
         uint64_t credit = paid < authorized ? paid : authorized;
+        if (credit > static_cast<uint64_t>(BALANCE_MAX))
+          credit = static_cast<uint64_t>(BALANCE_MAX);
         postLogic([this, peerKey, credit]() {
           HashPrefix pid = Account::getMapKey(peerKey);
           ActiveAccount peer = accounts_.get(pid);
@@ -6026,6 +6034,8 @@ void CesServer::handleGossip(const CesGossip& req, const SockAddr& addr,
             static_cast<uint64_t>(discountedFlatFee(-1, cfg_.feeTx, FeeKind::Tx));
           if (skim > collectable) skim = collectable;
           uint64_t delivered = collectable - skim;
+          if (delivered > static_cast<uint64_t>(BALANCE_MAX))
+            delivered = static_cast<uint64_t>(BALANCE_MAX);
           {
             ActiveAccount s = accounts_.get(senderPfx);
             if (s.exists()) s.debit(collectable);   // leg 2

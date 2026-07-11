@@ -3675,4 +3675,36 @@ BOOST_AUTO_TEST_CASE(DifferentialFastVsReferenceCore) {
   )"), 1000000, 1, ces::Bytes{1, 2, 3, 4, 5, 6, 7, 8, 9});
 }
 
+// Regression: buildAutoexecContent must RETURN nullopt (not throw) when the
+// input is too large to fit a signed packet.
+BOOST_AUTO_TEST_CASE(BuildAutoexecContent_OversizeInputReturnsNullopt) {
+  ces::KeyPair kp;
+  minx::Hash programAssetId; programAssetId.fill(0x11);
+  ces::HashPrefix serverId{}; serverId.fill(0x22);
+  ces::Bytes huge(4096, 0x7);   // far past what a 1280-byte packet can carry
+  auto out = ces::buildAutoexecContent(programAssetId, 1000, huge, kp, serverId);
+  BOOST_CHECK(!out.has_value());
+  // A small input still succeeds.
+  ces::Bytes small{1, 2, 3};
+  auto ok = ces::buildAutoexecContent(programAssetId, 1000, small, kp, serverId);
+  BOOST_CHECK(ok.has_value());
+}
+
+// Regression: CesCrossTransfer::writePayload must throw (not silently truncate
+// the uint8 length prefix while writing the full body) when destServer > 255.
+BOOST_AUTO_TEST_CASE(CesCrossTransfer_OverlongDestServerThrows) {
+  ces::KeyPair kp;
+  ces::CesCrossTransfer req;
+  req.originId = kp.getPublicKeyAsHash();
+  req.serverId = ces::Account::getMapKey(kp.getPublicKeyAsHash());
+  req.reqNonce = ces::CES_NONCELESS;
+  req.destKey = kp.getPublicKeyAsHash();
+  req.amount = 1;
+  req.destServer = std::string(256, 'x');   // one over the uint8 prefix
+  BOOST_CHECK_THROW(req.toBytes(kp), std::exception);
+  // A normal-length address serializes fine.
+  req.destServer = "host.example.com:53830";
+  BOOST_CHECK_NO_THROW(req.toBytes(kp));
+}
+
 BOOST_AUTO_TEST_SUITE_END()

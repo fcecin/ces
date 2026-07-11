@@ -4,6 +4,7 @@
 
 #include <boost/stacktrace.hpp>
 #include <ces/util/ctrlc.h>
+#include <cstdlib>
 #include <iostream>
 
 namespace ces {
@@ -16,13 +17,13 @@ extern "C" void interrupt_handler(int) { internal::g_interrupted += 1; }
 extern "C" void abrt_handler(int s) {
   std::cerr << "SIGABRT\n";
   std::cerr << boost::stacktrace::stacktrace() << std::endl;
-  std::exit(s);
+  std::_Exit(s);
 }
 
 extern "C" void segv_handler(int s) {
   std::cerr << "SIGSEGV\n";
   std::cerr << boost::stacktrace::stacktrace() << std::endl;
-  std::exit(s);
+  std::_Exit(s);
 }
 
 struct SignalInstaller {

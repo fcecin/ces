@@ -191,6 +191,8 @@ struct CesCrossTransfer {
   }
 
   void writePayload(minx::Buffer& buf) {
+    if (destServer.size() > 255)
+      throw std::runtime_error("destServer too long");
     buf.put(originId);
     buf.put(serverId);
     buf.put(reqNonce);

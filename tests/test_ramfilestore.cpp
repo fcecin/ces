@@ -5,6 +5,8 @@
 #include "test_common.h"
 #include <ces/ramfilestore.h>
 
+#include <fstream>
+
 using namespace ces;
 
 BOOST_AUTO_TEST_SUITE(RamfileTests)
@@ -605,6 +607,27 @@ BOOST_FIXTURE_TEST_CASE(CyclicChainRejected, CesFixture) {
   BOOST_CHECK_EQUAL(ramfileScan(*client, headKey, keys), CES_ERROR_INTERNAL);
 
   BOOST_CHECK_EQUAL(ramfileFund(*client, headKey, 1), CES_ERROR_INTERNAL);
+}
+
+// Regression: a malformed line in a scan file must be SKIPPED, not throw out of
+// readRamfileScan (its documented contract is "returns empty on failure").
+BOOST_FIXTURE_TEST_CASE(ReadScanSkipsMalformedLines, CesFixture) {
+  std::string scanPath = (tempDir / "bad.scan").string();
+  {
+    std::ofstream ofs(scanPath);
+    minx::Hash h1; h1.fill(0); h1[0] = 0xAB;
+    minx::Hash h2; h2.fill(0); h2[0] = 0xCD;
+    ofs << minx::hashToString(h1) << "\n";
+    ofs << "not-a-valid-64-hex-line\n";   // malformed
+    ofs << "\n";                           // blank
+    ofs << minx::hashToString(h2) << "\n";
+  }
+  auto keys = readRamfileScan(scanPath);
+  BOOST_REQUIRE_EQUAL(keys.size(), 2u);    // two valid keys, malformed line skipped
+  minx::Hash e1; e1.fill(0); e1[0] = 0xAB;
+  minx::Hash e2; e2.fill(0); e2[0] = 0xCD;
+  BOOST_CHECK(keys[0] == e1);
+  BOOST_CHECK(keys[1] == e2);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

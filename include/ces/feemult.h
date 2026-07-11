@@ -54,8 +54,13 @@ inline uint64_t computePrepayCost(uint64_t feePerDay, uint16_t bp,
   if (bp >= 10000)
     return static_cast<uint64_t>(daysAdded) * feePerDay;
   constexpr uint32_t W = static_cast<uint32_t>(kPrepaidDiscountWindowDays);
+  // Any day at distance D >= W pays full price (effBp = 10000). D = daysHeld + i
+  // grows past W for every i > W, so only the first min(daysAdded, W) days can be
+  // discounted; the rest is a flat tail. Bounding the loop to W keeps this O(W)
+  // regardless of daysAdded.
+  const uint32_t inWindow = daysAdded < W ? daysAdded : W;
   uint64_t total = 0;
-  for (uint32_t i = 1; i <= daysAdded; ++i) {
+  for (uint32_t i = 1; i <= inWindow; ++i) {
     uint32_t D = daysHeld + i;
     uint64_t effBp;
     if (D >= W) {
@@ -68,6 +73,7 @@ inline uint64_t computePrepayCost(uint64_t feePerDay, uint16_t bp,
     }
     total += feePerDay * effBp / 10000;
   }
+  total += static_cast<uint64_t>(daysAdded - inWindow) * feePerDay;
   return total;
 }
 

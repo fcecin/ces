@@ -47,6 +47,12 @@ void RpcServer::onReadyRead() {
 
   QByteArray data = socket->property("_buf").toByteArray();
   data += socket->readAll();
+  // Bound the buffered request so a large/absent Content-Length can't grow it
+  // without limit (localhost, but still).
+  if (data.size() > 4 * 1024 * 1024) {
+    socket->close();
+    return;
+  }
   socket->setProperty("_buf", data);
 
   int headerEnd = data.indexOf("\r\n\r\n");

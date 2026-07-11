@@ -205,7 +205,9 @@ uint8_t CesComputeClient::instances(const std::string& path,
     if (!impl_->chan->readExact(countBuf, 4)) return false;
     preamble.insert(preamble.end(), countBuf.begin(), countBuf.end());
     uint32_t count = ces::Buffer::peek<uint32_t>(countBuf.data());
-    out.reserve(count);
+    // Don't pre-allocate on a server-declared count; a hostile value would OOM.
+    // The loop self-limits: readExact fails once the real entries run out.
+    out.reserve(count < 65536 ? count : 65536);
     for (uint32_t i = 0; i < count; ++i) {
       ces::Bytes e;
       if (!impl_->chan->readExact(e, 64)) return false;

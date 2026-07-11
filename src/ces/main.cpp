@@ -1138,6 +1138,10 @@ int main(int argc, char* argv[]) {
   // -- Handle credit/debit commands (no networking needed) --
   if (cmd_credit->parsed() || cmd_debit->parsed()) {
     if (cmd_credit->parsed()) {
+      if (optCreditAmount <= 0) {
+        std::cerr << "Error: amount must be a positive number.\n";
+        return 1;
+      }
       minx::Hash key;
       minx::stringToHash(key, optCreditAccount);
       server->_brr(key, optCreditAmount);
@@ -1145,6 +1149,10 @@ int main(int argc, char* argv[]) {
       std::cout << "Credited " << optCreditAmount << " to "
                 << optCreditAccount << "\n";
     } else {
+      if (optDebitAmount <= 0) {
+        std::cerr << "Error: amount must be a positive number.\n";
+        return 1;
+      }
       minx::Hash key;
       minx::stringToHash(key, optDebitAccount);
       server->_burn(key, optDebitAmount);

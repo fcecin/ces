@@ -1755,4 +1755,28 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
   }
 }
 
+// Regression: acceptInbound must reject a duplicate (peer, channelId) - returning
+// null and NOT creating a second untracked session over the in-flight one.
+BOOST_AUTO_TEST_CASE(AcceptInboundRejectsDuplicateCoords) {
+  boost::asio::io_context io;
+  PlexPeerRudpListener listener;              // onSend no-ops with no minx set
+  minx::Rudp rudp(&listener);
+  ces::CesPlex plex(rudp, io, /*host=*/nullptr, /*meter=*/nullptr);
+
+  minx::SockAddr peer(boost::asio::ip::make_address_v6("::1"), 40000);
+  auto s1 = plex.acceptInbound(peer, 7);
+  BOOST_CHECK(s1 != nullptr);
+  BOOST_CHECK_EQUAL(plex._pendingSessionCount(), 1u);
+
+  auto s2 = plex.acceptInbound(peer, 7);      // same coords -> rejected
+  BOOST_CHECK(s2 == nullptr);
+  BOOST_CHECK_EQUAL(plex._pendingSessionCount(), 1u);
+
+  auto s3 = plex.acceptInbound(peer, 8);      // different channel -> distinct
+  BOOST_CHECK(s3 != nullptr);
+  BOOST_CHECK_EQUAL(plex._pendingSessionCount(), 2u);
+
+  io.stop();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

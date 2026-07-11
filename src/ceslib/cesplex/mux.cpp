@@ -327,10 +327,18 @@ std::shared_ptr<minx::Rudp::ChannelHandler> CesPlex::acceptInbound(
   // events (bytes, close) directly to it. The Session uses the
   // stream as a regular Asio AsyncStream to drive the select
   // handshake.
+  auto key = std::make_pair(peer, channelId);
+  if (sessions_.find(key) != sessions_.end()) {
+    // Duplicate accept for coords we already track: reject so RUDP does not
+    // wire a second stream over the in-flight one (see the header contract).
+    LOGDEBUG << "CesPlex: duplicate inbound accept, rejecting"
+             << SVAR(peer) << VAR(channelId);
+    return nullptr;
+  }
   auto stream = std::make_shared<minx::RudpStream>(io_.get_executor());
   auto session =
     std::make_shared<Session>(*this, peer, channelId, stream);
-  sessions_.emplace(std::make_pair(peer, channelId), session);
+  sessions_.emplace(key, session);
   session->start();
   LOGTRACE << "CesPlex: new inbound channel"
            << SVAR(peer) << VAR(channelId);

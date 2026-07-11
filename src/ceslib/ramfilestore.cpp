@@ -378,7 +378,11 @@ std::vector<minx::Hash> readRamfileScan(const std::string& path) {
   while (std::getline(ifs, line)) {
     if (line.empty()) continue;
     minx::Hash h;
-    minx::stringToHash(h, line);
+    try {
+      minx::stringToHash(h, line);
+    } catch (const std::exception&) {
+      continue;  // skip a malformed line instead of failing the whole scan
+    }
     keys.push_back(h);
   }
   return keys;

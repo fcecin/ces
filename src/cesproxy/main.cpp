@@ -38,8 +38,15 @@ int main(int argc, char** argv) {
 
   CLI11_PARSE(app, argc, argv);
 
-  auto listenEp = ces::Resolver::resolveTcp(listenAddr, listenPort);
-  auto upstreamEp = ces::Resolver::resolveUdp(upstreamAddr, upstreamPort);
+  boost::asio::ip::tcp::endpoint listenEp;
+  boost::asio::ip::udp::endpoint upstreamEp;
+  try {
+    listenEp = ces::Resolver::resolveTcp(listenAddr, listenPort);
+    upstreamEp = ces::Resolver::resolveUdp(upstreamAddr, upstreamPort);
+  } catch (const std::exception& e) {
+    std::cerr << "cesproxy: address resolve failed: " << e.what() << "\n";
+    return 1;
+  }
 
   minx::MinxProxyConfig config;
   config.numChannels = channels;
