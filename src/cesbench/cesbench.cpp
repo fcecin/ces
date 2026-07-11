@@ -354,8 +354,9 @@ int main(int argc, char* argv[]) {
     uint32_t actualNonce = 0;
     HashPrefix id = Account::getMapKey(sender.key.getPublicKeyAsHash());
 
-    HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0;
-    server->unsignedQueryAccount(id, actualBalance, actualNonce, xd, xa, xt);
+    HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0; uint32_t xal = 0;
+    server->unsignedQueryAccount(id, actualBalance, actualNonce, xd, xa, xt,
+                                 xal);
 
     bool ok = true;
     if (actualBalance != expectedBalance) {
@@ -381,9 +382,9 @@ int main(int argc, char* argv[]) {
   std::cout << "Verifying receiver..." << std::flush;
   int64_t recvBal = 0;
   uint32_t recvNonce = 0;
-  { HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0;
+  { HashPrefix xd{}; uint64_t xa = 0; uint32_t xt = 0; uint32_t xal = 0;
   server->unsignedQueryAccount(Account::getMapKey(receiverPub), recvBal,
-                               recvNonce, xd, xa, xt); }
+                               recvNonce, xd, xa, xt, xal); }
 
   // +1: the receiver was seeded with 1 credit so the account exists.
   bool recvOk = (recvBal == static_cast<int64_t>(totalVolumeExpected) + 1);

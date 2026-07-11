@@ -93,9 +93,9 @@ cesweb/             L3 HTTP gateway (Node) serving CES files plus a /dev
                     terminal via the cesh CLI; self-contained, own CLAUDE.md
 ```
 
-## Data model: the two-type ledger
+## Data model: the three-type ledger
 
-CES has exactly two ledger types: Account and Asset. Files, programs, schedules, namespaces, autoexec, and the market all compose out of those two. No separate file/program/namespace tables.
+CES has exactly three ledger types: Account, Asset, and Alias. Files, programs, schedules, namespaces, autoexec, and the market all compose out of those; no separate file/program/namespace tables.
 
 Account (map key = first 8 bytes of the raw pubkey, not a hash of it; a key-tail disambiguates prefix collisions):
 - `balance` is sign-overloaded: positive = ordinary account, negative = unsettled payment account.
@@ -111,6 +111,11 @@ Asset (map key = full 32-byte hash):
 - `content` is ~210 bytes of arbitrary user bytes.
 
 The asset is the generative primitive. Files are chains of assets; VM programs are assets (`CES_RUN_ASSET`); autoexec and scheduled runs are key-patterns on assets; `/f/<name>` namespaces are gated by who owns the asset at `sha256("/f/<name>")` (transferable via `CES_GIVE_ASSET`).
+
+Alias (map key = server-allocated uint32, never reused; full reference: docs/aliases.md):
+- a 1024-byte account-bound memory cell: owner(8) | editor(8) | op(2) | content(1002), patch-written (`CES_SET_ALIAS` offset+bytes; owner floor 8, editor floor 18), window-read (`CES_QUERY_ALIAS`), rent paid by the owner account.
+- `editor` is a single granted co-writer (content only): the shared-memory/mailbox primitive. One writer per trust domain; untrusted duplex = a pair of cells.
+- executable: account hooks (pointer or inline GATE/WATCH fired by transfers) and `ALIAS_OP_INLINE_PROGRAM` cells run via `CES_RUN_ALIAS`/`SYS_SCHEDULE_ALIAS`. VM runs carry three identities: caller (pays gas, allowance-bounded), self (the boot asset; 0 = alias program, asset-custody syscalls disabled), programOwner (the consenting principal: the account the run ACTS AS for alias writes and the allowance-exempt syscalls; derived from the cell or asset that carries the code, never from the invoker; 0 = none). Alias syscalls: SYS_READ/WRITE_ALIAS, SYS_LOAD_CODE_ALIAS, SYS_SCHEDULE_ALIAS.
 
 Asset day-counter is rent. Daily maintenance decrements every asset's balance by 1; assets at <= 1 die. Keep alive via `CES_FUND_ASSET`.
 

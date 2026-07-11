@@ -45,16 +45,17 @@ class CesPlex;
 constexpr uint64_t MEMORY_PRICE = 10'000;   // raw credits per byte-day of RAM
 
 // Row footprint (value + key + overhead), in bytes. Account 64 : Asset 256
-// holds the 4x ratio. Alias is the resizable memory area; 128 today, grows to
-// 16 KiB once its read/write moves onto chunked RUDP (a fixed UDP op can't
-// carry it).
+// holds the 4x ratio. Alias is the resizable memory area, pinned at the most
+// a fixed CES_* UDP op can carry (a whole-value CES_SET_ALIAS patch rides
+// inside MINX's 1280-byte payload ceiling, like the gossip msg cap). Growing
+// past it needs chunked RUDP.
 constexpr uint64_t ACCOUNT_BYTES = 64;
 constexpr uint64_t ASSET_BYTES   = 256;
-constexpr uint64_t ALIAS_BYTES   = 128;
+constexpr uint64_t ALIAS_BYTES   = ALIAS_ENTRY_BYTES;
 
 constexpr uint64_t BASE_FEE_ACCOUNT = ACCOUNT_BYTES * MEMORY_PRICE;   // 640,000
 constexpr uint64_t BASE_FEE_ASSET   = ASSET_BYTES   * MEMORY_PRICE;   // 2,560,000
-constexpr uint64_t BASE_FEE_ALIAS   = ALIAS_BYTES   * MEMORY_PRICE;   // 1,280,000
+constexpr uint64_t BASE_FEE_ALIAS   = ALIAS_BYTES   * MEMORY_PRICE;   // 10,240,000
 constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 // Query fee covers dedup + state write. The network share is billed
 // separately (feeNetKiB*) and the bind contract removed the per-op
@@ -634,10 +635,14 @@ public:
   // the scheduled-run queue is at capacity, CES_OK otherwise.
   // `allowance` is the per-run caller-debit cap the future run will see;
   // UINT64_MAX = no enforcement (the autoexec / cron-from-API default).
+  // `aliasId` nonzero schedules an alias's inline program instead (assetId
+  // ignored; the fired run boots the cell's code area with self = 0 and
+  // programOwner = the cell's owner).
   uint8_t scheduleRun(const HashPrefix& callerPrefix, const minx::Hash& assetId,
                       uint64_t budget, uint64_t allowance,
                       const ces::Bytes& input,
-                      uint64_t time_us, bool prepaid = false);
+                      uint64_t time_us, bool prepaid = false,
+                      uint32_t aliasId = 0);
 
   uint8_t crossTransfer(const minx::Hash& originKey,
                         const minx::Hash& destKey, uint64_t amount,
@@ -674,7 +679,15 @@ public:
   void unsignedQueryAccount(const HashPrefix& queryId, int64_t& outBalance,
                             uint32_t& outNonce, HashPrefix& outLastXferDest,
                             uint64_t& outLastXferAmount,
-                            uint32_t& outLastXferTime);
+                            uint32_t& outLastXferTime, uint32_t& outAliasId);
+  void unsignedQueryAccount(const HashPrefix& queryId, int64_t& outBalance,
+                            uint32_t& outNonce, HashPrefix& outLastXferDest,
+                            uint64_t& outLastXferAmount,
+                            uint32_t& outLastXferTime) {
+    uint32_t aliasId = 0;
+    unsignedQueryAccount(queryId, outBalance, outNonce, outLastXferDest,
+                         outLastXferAmount, outLastXferTime, aliasId);
+  }
 
   uint8_t createAsset(const minx::Hash& originKey, const HashPrefix& ownerId,
                       const minx::Hash& assetId, const AssetData& content,
@@ -721,16 +734,21 @@ public:
                    uint64_t priceLimit, uint32_t providedNonce,
                    int64_t buyFee = -1, int64_t errFee = -1);
 
-  // Alias ops: a dependable, account-owned 128-byte sidecar (local/aliases.md).
-  // setAlias binds/edits the origin account's single alias: with no live alias
-  // it allocates a fresh id, otherwise it overwrites the existing one in place
-  // (the id is stable across edits; delete to drop or rotate it). Charges one
-  // day at the feeAlias rate. deleteAlias erases it and clears the account
-  // link; queryAlias is a public read. All run on logicStrand_.
-  uint8_t setAlias(const minx::Hash& originKey, uint16_t op,
-                   const AliasData& content, uint32_t providedNonce,
-                   uint32_t& outAliasId, int64_t fee = -1,
-                   int64_t errFee = -1);
+  // Alias ops: a dependable, account-owned 1 KiB sidecar (local/aliases.md).
+  // setAlias patches bytes into an alias's value image at offset. aliasId 0
+  // targets the origin's own alias: with no live alias it allocates a fresh
+  // id (zeroed image), otherwise it patches in place (the id is stable across
+  // patches; delete to drop or rotate it). A nonzero aliasId targets any
+  // alias the origin owns or edits; an editor may write content only
+  // (ALIAS_PATCH_MIN_EDITOR), an owner everything but the server-set owner
+  // field (ALIAS_PATCH_MIN_OWNER). Out-of-bounds or under-floor patches
+  // reject whole. Charges the signer one day at the feeAlias rate.
+  // deleteAlias erases the origin's own alias and clears the account link;
+  // queryAlias is a public read. All run on logicStrand_.
+  uint8_t setAlias(const minx::Hash& originKey, uint32_t aliasId,
+                   uint16_t offset, const ces::Bytes& bytes,
+                   uint32_t providedNonce, uint32_t& outAliasId,
+                   int64_t fee = -1, int64_t errFee = -1);
 
   uint8_t deleteAlias(const minx::Hash& originKey, uint32_t providedNonce,
                       int64_t errFee = -1);
@@ -1388,6 +1406,8 @@ private:
     std::function<void(const HashPrefix&)> saveAccountFn;
     // Hook called before mutating an asset. Empty = no undo tracking.
     std::function<void(const minx::Hash&)> saveAssetFn;
+    // Hook called before mutating an alias. Empty = no undo tracking.
+    std::function<void(uint32_t)> saveAliasFn;
 
     // Deferred side effects. Empty = side effect is discarded.
     std::function<void(const std::string&, uint16_t,
@@ -1409,6 +1429,12 @@ private:
     std::function<uint8_t(const minx::Hash& assetId, uint64_t budget,
                           uint64_t allowance, const ces::Bytes& input,
                           uint64_t time_us)> scheduleFn;
+
+    // Invoked by SYS_SCHEDULE_ALIAS; same contract as scheduleFn with an
+    // alias id target. Empty = syscall disabled.
+    std::function<uint8_t(uint32_t aliasId, uint64_t budget,
+                          uint64_t allowance, const ces::Bytes& input,
+                          uint64_t time_us)> scheduleAliasFn;
 
     // Invoked by VmHost::creditDest when a program's SYS_TRANSFER credits an
     // account: lets executeVmRun record a deferred XFER_VM hook to fire after
@@ -1438,6 +1464,13 @@ private:
   // commits or reverts. Factored out of the incomingMessage switch to
   // keep that function readable.
   void handleRunAsset(const CesRunAsset& req, const HashPrefix& originPrefix,
+                      const SockAddr& addr, const MinxMessage& msg);
+
+  // CES_RUN_ALIAS dispatch: public invocation of an ALIAS_OP_INLINE_PROGRAM
+  // cell. Caller pays gas; the run gets self = 0 and programOwner = the
+  // cell's owner (consented code). Same dedup/scheduling shape as
+  // handleRunAsset.
+  void handleRunAlias(const CesRunAlias& req, const HashPrefix& originPrefix,
                       const SockAddr& addr, const MinxMessage& msg);
 
   // CES_GOSSIP: sink-or-dedup, collect the sender's budget (leg 2), skim, fan
@@ -1521,23 +1554,28 @@ private:
   };
   VmRunResult executeVmRun(const VmRunRequest& req);
 
-  // Run an account's CESVM trigger (account hook). v1: the inbound GATE on a
-  // wire transfer. Loads the trigger asset, runs it on the free grant (minimum
-  // compute, CESVM_HOOK_GRANT_*) with the hooked account as caller,
-  // programOwner empty (no consenting principal), allowance 0 (read-only), and
-  // an event descriptor in io[INPUT]. Returns true = accept (clean TERM),
-  // false = reject (abort/fault/out-of-gas, or a rotted/missing trigger asset:
-  // a gate fails closed). Must run on logicStrand_; callers must not hold an
-  // ActiveAccount/ActiveAsset handle across it (the run may rehash the maps).
-  bool runAccountHook(const minx::Hash& hookedKey,
-                      const minx::Hash& triggerAssetKey, uint64_t invokeKind,
+  // Run an account's CESVM trigger (account hook) on already-resolved code.
+  // Runs on the free grant (minimum compute, CESVM_HOOK_GRANT_*) with the
+  // hooked account as caller, allowance 0 (no caller spend), and an event
+  // descriptor in io[INPUT]. `selfAssetKey` is the trigger asset for pointer
+  // hooks or all-zero for inline code; `programOwnerPrefix` is the consenting
+  // principal (the hooked account for inline / owned-trigger WATCHES; empty
+  // for every GATE — purity — and for foreign immutable code). Returns true =
+  // accept (clean TERM), false = reject (abort/fault/out-of-gas). Must run on
+  // logicStrand_; callers must not hold an ActiveAccount/ActiveAsset handle
+  // across it (the run may rehash the maps).
+  bool runAccountHook(const minx::Hash& hookedKey, ces::Bytes code,
+                      const minx::Hash& selfAssetKey,
+                      const HashPrefix& programOwnerPrefix,
+                      uint64_t invokeKind,
                       const minx::Hash& counterpartyKey, uint64_t amount,
                       int64_t balance, uint64_t refillCeiling);
-  // Fire `accountKey`'s hook iff it exists, matches `wantOp` (GATE or WATCH),
-  // and the account is a real positive-balance match for the key. Returns true
-  // = accept / no hook (proceed), false = reject (GATE only; callers of a WATCH
-  // ignore the result). Read-only peek: holds no ActiveAccount/alias handle
-  // across the run. Extracts the trigger key + refill ceiling from the sidecar.
+  // Fire `accountKey`'s hook iff it exists, matches `wantOp`'s CLASS (gate or
+  // watch, pointer or inline form), and the account is a real positive-balance
+  // match for the key. Returns true = accept / no hook (proceed), false =
+  // reject (GATE only; callers of a WATCH ignore the result). Read-only peek:
+  // holds no ActiveAccount/alias handle across the run. Resolves the code
+  // (trigger asset or inline area), refill ceiling, self, and principal.
   bool fireAccountHook(const minx::Hash& accountKey, uint16_t wantOp,
                        uint64_t invokeKind, const minx::Hash& counterpartyKey,
                        uint64_t amount);
@@ -1733,7 +1771,7 @@ private:
   // Scheduled (delayed) runAsset entries — RAM only, not persisted.
   struct ScheduledRun {
     HashPrefix callerPrefix;     // account that pays for gas
-    minx::Hash assetId;          // program to run
+    minx::Hash assetId;          // program to run (aliasId == 0)
     uint64_t budget;             // gas budget
     uint64_t allowance =         // per-run caller-debit cap (default = none)
       std::numeric_limits<uint64_t>::max();
@@ -1741,6 +1779,9 @@ private:
     // true = budget already debited at submission (future-time wire
     // CES_RUN_ASSET); executeScheduledRun must not debit again.
     bool prepaid = false;
+    // Discriminant: 0 = asset run (assetId is live); nonzero = run this
+    // alias's inline program (assetId ignored; op re-checked at fire time).
+    uint32_t aliasId = 0;
   };
   // Map key: (timeUs, seq) tuple. `timeUs` sorts entries by their firing
   // deadline; `seq` is a monotonic tiebreaker so two runs scheduled for
@@ -1761,7 +1802,7 @@ private:
                               const minx::Hash& assetId, uint64_t budget,
                               uint64_t allowance, const ces::Bytes& input,
                               uint64_t time_us, bool prepaid,
-                              ScheduleKey& outKey);
+                              ScheduleKey& outKey, uint32_t aliasId = 0);
 
   // Presence cache: tracks last known address of authenticated clients
   // for unsolicited push (send()). Updated on every dispatchSigned.

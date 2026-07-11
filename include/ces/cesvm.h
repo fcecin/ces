@@ -40,7 +40,7 @@
  * Syscalls (dense range 0..22; see CesVMSyscall enum below for the
  * authoritative IDs and per-call ABI doc):
  *   0  NOP                  S=ok
- *   1  READ_ACCOUNT         io[4]=prefix_ptr → R=balance, io[5]=nonce, S=ok
+ *   1  READ_ACCOUNT         io[4]=prefix_ptr → R=balance, io[5]=nonce, io[6]=aliasId (0 = none), S=ok
  *   2  TRANSFER             io[4]=dest_key_ptr, io[5]=amount → S=error_code
  *   3  READ_ASSET           io[4]=key_ptr, io[5]=owner_out, io[6]=content_out → io[7]=balance (raw u16: bits 0..12 days, bit 13 immut, bit 14 aowned, bit 15 priv), io[8]=price, S=ok/ASSET_NOT_FOUND
  *   4  CREATE_ASSET_RANDOM  io[4]=content_ptr, io[5]=days, io[6]=key_out_ptr → S=ok
@@ -62,14 +62,22 @@
  *  20  DEPOSIT              io[4]=amount → S=error_code (caller → programOwner)
  *  21  WITHDRAW             io[4]=amount → S=error_code (programOwner → caller)
  *  22  UPDATE_ASSET_META    io[4]=key_ptr, io[5]=new_owner_ptr, io[6]=new_price → S=error_code (owner/price only, content untouched)
+ *  25  READ_ALIAS           io[4]=alias_id, io[5]=offset, io[6]=len, io[7]=dest_ptr → R=len, S=ok/ALIAS_NOT_FOUND/BAD_INPUT (public windowed read of the value image)
+ *  26  WRITE_ALIAS          io[4]=alias_id, io[5]=offset, io[6]=len, io[7]=src_ptr → S=error_code (patch as programOwner: owner floor 8, editor floor 18; principal-less runs always NOT_OWNER)
+ *  27  LOAD_CODE_ALIAS      io[4]=alias_id → R=code_offset, S=ok/ALIAS_NOT_FOUND (appends the whole ALIAS_INLINE_CODE_BYTES area)
+ *  28  SCHEDULE_ALIAS       io[4]=alias_id, io[5]=budget, io[6]=child_allowance, io[7]=input_ptr, io[8]=input_len, io[9]=time_us → S=ok/QUEUE_FULL/ALLOWANCE_EXCEEDED/ALIAS_NOT_FOUND (target must be ALIAS_OP_INLINE_PROGRAM)
  *
  * Preloaded io locations (read-only context, set before execution):
  *   io[752]        = input length (bytes)
  *   io[754]        = initial budget (credits)
  *   io[755]        = start time (microseconds since epoch)
  *   io[756..759]   = caller public key (32 bytes)
- *   io[760..763]   = self asset key (32 bytes)
+ *   io[760..763]   = self asset key (32 bytes; all-zero = alias program:
+ *                    no boot asset, asset-custody syscalls disabled)
  *   io[892..1019]  = input data (up to 1024 bytes)
+ *   io[1023]       = programOwner account prefix (8 bytes; all-zero = no
+ *                    principal: allowance-exempt syscalls no-op, alias
+ *                    writes rejected)
  *
  * Program-writable io locations:
  *   io[753]        = output length (bytes, set by program)
@@ -301,6 +309,36 @@ enum CesVMSyscall : uint64_t {
   // asset creations. This is the bare array primitive; sequence membership is
   // metadata held by the owner (all cells share one owner), not read from keys.
   SYS_CREATE_ASSET_RANGE = 24,
+  // SYS_READ_ALIAS — public windowed read of an alias's value image
+  // (owner|editor|op|content; see alias.h layout constants). io[4]=alias id,
+  // io[5]=offset, io[6]=len, io[7]=dest cell ptr. R=len, S=ok /
+  // ALIAS_NOT_FOUND (also for an out-of-bounds window) / BAD_INPUT.
+  // Bills feeQuery.
+  SYS_READ_ALIAS      = 25,
+  // SYS_WRITE_ALIAS — patch bytes into an alias's value image, acting as the
+  // run's programOwner principal (the owner of the cell or asset that
+  // carries this code, when that owner consented to it; see docs/aliases.md
+  // section 5). Same
+  // floors as the wire op: owner from ALIAS_PATCH_MIN_OWNER, editor from
+  // ALIAS_PATCH_MIN_EDITOR. A principal-less run (empty programOwner: any
+  // gate, a foreign-code hook, bare CES_RUN_ASSET) always gets NOT_OWNER —
+  // no consenting principal, no write authority; the same emptiness keeps
+  // gates pure. io[4]=alias id,
+  // io[5]=offset, io[6]=len, io[7]=src cell ptr. S=error_code. Bills
+  // feeAlias (one upfront day, wire parity). Undo-log atomic.
+  SYS_WRITE_ALIAS     = 26,
+  // SYS_LOAD_CODE_ALIAS — append an alias's whole inline code area
+  // (ALIAS_INLINE_CODE_BYTES, zero-padded so load bases are link-time
+  // constants) to the code buffer. io[4]=alias id. R=code offset, S=ok /
+  // ALIAS_NOT_FOUND. Bills feeQuery. The loaded code runs under the current
+  // run's identities (linking, not calling).
+  SYS_LOAD_CODE_ALIAS = 27,
+  // SYS_SCHEDULE_ALIAS — enqueue a future run of an alias's inline program
+  // (the async alias-to-alias call). Same ABI as SYS_SCHEDULE with io[4] =
+  // alias id instead of an asset key ptr. The target must be
+  // ALIAS_OP_INLINE_PROGRAM at queue AND fire time; the fired run gets
+  // self = 0 and programOwner = the cell's owner (consented code).
+  SYS_SCHEDULE_ALIAS  = 28,
 };
 
 // Invocation kind — which entry path started this run. Preloaded into
@@ -323,6 +361,8 @@ enum CesVMInvoke : uint64_t {
   INVOKE_DIRECT        = 0,   // CES_RUN_ASSET (also the zero-init default).
   INVOKE_SCHEDULED     = 1,   // SYS_SCHEDULE fire.
   INVOKE_AUTOEXEC      = 2,   // boot autoexec.
+  INVOKE_DIRECT_ALIAS  = 3,   // CES_RUN_ALIAS (public inline-program run).
+  INVOKE_SCHEDULED_ALIAS = 4, // SYS_SCHEDULE_ALIAS fire.
 
   // Account-hook subrange.
   INVOKE_HOOK_XFER_IN  = 16,  // a local transfer credited this account.
@@ -562,6 +602,10 @@ static constexpr uint64_t CESVM_IO_BUDGET_REMAINING = 1021;
 // that do read it dispatch on how they were invoked (direct call, scheduled,
 // autoexec, account hook). See CesVMInvoke.
 static constexpr uint64_t CESVM_IO_INVOKE_KIND = 1022;
+// The run's programOwner principal (8-byte account prefix; all-zero = no
+// principal). Informational copy for the program; authorization always reads
+// the host-side field, never this cell.
+static constexpr uint64_t CESVM_IO_PROGRAM_OWNER = 1023;
 static constexpr uint64_t CESVM_MAX_INPUT     = 1024;
 static constexpr uint64_t CESVM_MAX_OUTPUT    = 1024;
 
@@ -643,9 +687,17 @@ public:
   { notImpl("readAccountBalance"); }
   virtual uint32_t readAccountNonce  (const HashPrefix&)
   { notImpl("readAccountNonce"); }
+  virtual uint32_t readAccountAliasId(const HashPrefix&)
+  { notImpl("readAccountAliasId"); }
   virtual bool     readAsset(const minx::Hash&, HashPrefix&, AssetData&,
                              uint16_t&, uint32_t&)
   { notImpl("readAsset"); }
+  // Windowed read of an alias's value image into `dest` (len bytes at
+  // offset). Returns false for an unknown id or an out-of-bounds window.
+  // Backs SYS_READ_ALIAS and SYS_LOAD_CODE_ALIAS.
+  virtual bool     readAlias(uint32_t /*id*/, uint32_t /*offset*/,
+                             uint32_t /*len*/, uint8_t* /*dest*/)
+  { notImpl("readAlias"); }
 
   // ---- Writes — return CES_OK on success, error code otherwise ------------
   virtual uint8_t  transfer       (const minx::Hash&, uint64_t)
@@ -689,6 +741,11 @@ public:
   { notImpl("buyAsset"); }
   virtual uint8_t  giveAsset      (const minx::Hash&, const HashPrefix&)
   { notImpl("giveAsset"); }
+  // Patch an alias's value image as the run's programOwner principal (see
+  // SYS_WRITE_ALIAS). Returns a CES error code.
+  virtual uint8_t  writeAlias     (uint32_t /*id*/, uint32_t /*offset*/,
+                                   const uint8_t*, uint32_t /*len*/)
+  { notImpl("writeAlias"); }
   // Schedule a future runAsset. `allowance` is the per-run caller-debit cap
   // the future run will see — the syscall handler snapshots `host.allowance`
   // at queue time so the child inherits the parent's remaining headroom.
@@ -696,6 +753,11 @@ public:
                                    uint64_t /*allowance*/,
                                    const uint8_t*, size_t, uint64_t /*time_us*/)
   { notImpl("schedule"); }
+  // Schedule a future run of an alias's inline program (SYS_SCHEDULE_ALIAS).
+  virtual uint8_t  scheduleAlias  (uint32_t /*aliasId*/, uint64_t /*budget*/,
+                                   uint64_t /*allowance*/,
+                                   const uint8_t*, size_t, uint64_t /*time_us*/)
+  { notImpl("scheduleAlias"); }
   // SYS_RPC — fire-and-forget MINX/RUDP stream call. The dispatcher reads
   // the request body from the cesh file at `fileHeadKey`, signs a footer
   // envelope (see the SYS_RPC enum comment), ships it to (host, port) on
@@ -761,6 +823,7 @@ public:
   uint64_t feeTx        = 0;
   uint64_t feeAsset     = 0;
   uint64_t feeAccount   = 0;
+  uint64_t feeAlias    = 0;   // per-patch upfront day (SYS_WRITE_ALIAS)
   uint64_t feeSendClient = 0;  // no UDP equivalent — see CesServerVmHost ctor
 
   // Inputs for the per-day attenuated prepay-cost math (CREATE/FUND asset).

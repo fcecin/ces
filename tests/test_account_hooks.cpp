@@ -17,6 +17,16 @@ using namespace ces;
 
 namespace {
 
+// Write op + content on the signer's own alias as one patch at ALIAS_OFF_OP
+// (op is host-endian in the image).
+uint8_t setAliasOpContent(CesServer& srv, const minx::Hash& k, uint16_t op,
+                          const AliasData& content, uint32_t& outId) {
+  ces::Bytes b(sizeof(op) + content.size());
+  std::memcpy(b.data(), &op, sizeof(op));
+  std::memcpy(b.data() + sizeof(op), content.data(), content.size());
+  return srv.setAlias(k, 0, ces::ALIAS_OFF_OP, b, 0, outId);
+}
+
 // A gate program's asset content. buildBootBlock pads to the 210-byte block.
 AssetData gateAccept() {
   VmProgram p;
@@ -117,7 +127,7 @@ struct HookFixture {
     ces::Buffer::pokeLE<uint64_t>(sidecar.data() + 32, ceiling);
     uint32_t id = 0;
     uint8_t arc =
-      server->setAlias(owner.getPublicKeyAsHash(), op, sidecar, 0, id);
+      setAliasOpContent(*server, owner.getPublicKeyAsHash(), op, sidecar, id);
     server->_drainLogic();
     BOOST_REQUIRE_EQUAL(arc, static_cast<int>(CES_OK));
     return triggerKey;
@@ -225,8 +235,8 @@ BOOST_AUTO_TEST_CASE(MissingTriggerFailsClosed) {
   std::memcpy(sidecar.data(), ghost.data(), KEY_SIZE);
   uint32_t id = 0;
   // The ghost asset does not exist, so the set-time check must reject this.
-  uint8_t arc = server->setAlias(recv.getPublicKeyAsHash(),
-                                 ALIAS_OP_HOOK_GATE, sidecar, 0, id);
+  uint8_t arc = setAliasOpContent(*server, recv.getPublicKeyAsHash(),
+                                  ALIAS_OP_HOOK_GATE, sidecar, id);
   server->_drainLogic();
   BOOST_CHECK_EQUAL(arc, static_cast<int>(CES_ERROR_HOOK_TARGET));
   (void)key;
@@ -248,8 +258,8 @@ BOOST_AUTO_TEST_CASE(SetTimeRejectsForeignMutableTarget) {
   AliasData sidecar{};
   std::memcpy(sidecar.data(), foreign.data(), KEY_SIZE);
   uint32_t id = 0;
-  uint8_t arc = server->setAlias(recv.getPublicKeyAsHash(),
-                                 ALIAS_OP_HOOK_GATE, sidecar, 0, id);
+  uint8_t arc = setAliasOpContent(*server, recv.getPublicKeyAsHash(),
+                                  ALIAS_OP_HOOK_GATE, sidecar, id);
   server->_drainLogic();
   BOOST_CHECK_EQUAL(arc, static_cast<int>(CES_ERROR_HOOK_TARGET));
 }
@@ -440,7 +450,8 @@ void installWatchOn(CesServer* s, KeyPair& who, const AssetData& code,
   ces::Buffer::pokeLE<uint64_t>(sc.data() + 32, ceiling);
   uint32_t id = 0;
   BOOST_REQUIRE_EQUAL(
-      s->setAlias(who.getPublicKeyAsHash(), ALIAS_OP_HOOK_WATCH, sc, 0, id),
+      setAliasOpContent(*s, who.getPublicKeyAsHash(), ALIAS_OP_HOOK_WATCH, sc,
+                        id),
       static_cast<int>(CES_OK));
   s->_drainLogic();
 }

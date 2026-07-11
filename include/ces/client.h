@@ -182,6 +182,22 @@ public:
     return runAssetResultAllowanceUsed_;
   }
 
+  // Execute an alias's inline program (ALIAS_OP_INLINE_PROGRAM cell). Same
+  // contract as runAsset with an alias-id target: caller pays gas, allowance
+  // caps caller-side spend; the run acts as the cell's owner for alias
+  // writes and the allowance-exempt syscalls.
+  uint8_t runAlias(uint32_t aliasId, uint64_t budget,
+                   const ces::Bytes& input,
+                   uint64_t& outVmError, uint64_t& outBudgetUsed,
+                   ces::Bytes& outOutput,
+                   bool nonceless = false,
+                   uint64_t allowance =
+                     std::numeric_limits<uint64_t>::max());
+
+  // Alias id linked to the account in the most recent queryAccount() reply
+  // (0 = none).
+  uint32_t getLastQueryAccountAliasId() const { return accQueryAliasId_; }
+
   // Originate a gossip from this client. The home server floods the message
   // across the peer mesh and charges this client's account the first-hop relay
   // fee (a burn -- a client has no ledger to receive the conserved leg). dest
@@ -209,11 +225,15 @@ public:
                      uint32_t& outPrice);
 
   // --- Alias Operations ---
-  uint8_t setAlias(uint16_t op, const AliasData& content,
-                   uint32_t& outAliasId);
+  // writeAlias patches bytes into an alias's value image at offset (aliasId 0
+  // = my own alias, created on first use). readAlias is the unsigned windowed
+  // read of the image; outFound is false for an unknown id or an
+  // out-of-bounds window.
+  uint8_t writeAlias(uint32_t aliasId, uint16_t offset, const ces::Bytes& bytes,
+                     uint32_t& outAliasId);
   uint8_t deleteAlias();
-  uint8_t queryAlias(uint32_t aliasId, HashPrefix& outOwner, uint16_t& outOp,
-                     AliasData& outContent, bool& outFound);
+  uint8_t readAlias(uint32_t aliasId, uint16_t offset, uint16_t length,
+                    ces::Bytes& outBytes, bool& outFound);
 
   /**
    * Query a peer-table slot (Unsigned/Public) for discovery.
@@ -325,6 +345,7 @@ private:
   HashPrefix accQueryLastXferDest_{};
   uint64_t accQueryLastXferAmount_ = 0;
   uint32_t accQueryLastXferTime_ = 0;
+  uint32_t accQueryAliasId_ = 0;
   std::atomic<uint64_t> accQueryGen_ = 0;
 
   minx::Hash solQueryHash_;
@@ -382,9 +403,8 @@ private:
   std::atomic<uint64_t> deleteAliasGen_ = 0;
 
   uint32_t queryAliasResultId_ = 0;
-  HashPrefix queryAliasResultOwner_{};
-  uint16_t queryAliasResultOp_ = 0;
-  AliasData queryAliasResultContent_{};
+  uint16_t queryAliasResultOffset_ = 0;
+  ces::Bytes queryAliasResultBytes_;
   uint8_t queryAliasResultFound_ = 0;
   std::atomic<uint64_t> queryAliasGen_ = 0;
 
@@ -441,6 +461,15 @@ private:
   uint64_t runAssetResultBudgetUsed_ = 0;
   uint64_t runAssetResultAllowanceUsed_ = 0;
   ces::Bytes runAssetResultOutput_;
+
+  HashPrefix runAliasResultOriginId_;
+  uint32_t runAliasResultNonce_ = 0;
+  uint8_t runAliasResultCode_ = 0;
+  uint64_t runAliasResultVmError_ = 0;
+  uint64_t runAliasResultBudgetUsed_ = 0;
+  uint64_t runAliasResultAllowanceUsed_ = 0;
+  ces::Bytes runAliasResultOutput_;
+  std::atomic<uint64_t> runAliasGen_ = 0;
 
   HashPrefix gossipResultOriginId_;
   uint8_t gossipResultCode_ = 0;

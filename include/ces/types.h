@@ -45,7 +45,8 @@ enum op_code_t : uint8_t {
   CES_DELETE_ALIAS = 0x17,             // signed: erase this account's alias
   CES_QUERY_ALIAS = 0x18,              // unsigned: read an alias by id
   CES_SET_ASSET_OWNER_PAYS = 0x19,     // signed: toggle an asset's owner-pays (auto-fund) bit
-  CES_CREATE_ASSET_RANGE = 0x1a        // signed: atomically create N account-owned cells at a prefix
+  CES_CREATE_ASSET_RANGE = 0x1a,       // signed: atomically create N account-owned cells at a prefix
+  CES_RUN_ALIAS = 0x1b                 // signed: execute an alias's inline program (CesVM)
 };
 
 /**
@@ -94,6 +95,7 @@ enum result_code_t : uint8_t {
   CES_QUERY_ALIAS_RESULT = 0x18,
   CES_SET_ASSET_OWNER_PAYS_RESULT = 0x19,
   CES_CREATE_ASSET_RANGE_RESULT = 0x1a,
+  CES_RUN_ALIAS_RESULT = 0x1b,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };

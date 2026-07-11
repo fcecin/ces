@@ -3,6 +3,7 @@
  * GVM core (github.com/FluxBP/gvm) adapted for CES server-side execution.
  */
 
+#include <ces/alias.h>
 #include <ces/cesvm.h>
 #include <ces/keys.h>
 
@@ -71,6 +72,8 @@ CesVMResult CesVM::execute(const ces::Bytes& code,
   io_[CESVM_IO_INVOKE_KIND] = host.invokeKind;
   writeIoBytes(CESVM_IO_CALLER_KEY, host.callerKey.data(), KEY_SIZE);
   writeIoBytes(CESVM_IO_SELF_KEY, host.selfAssetKey.data(), KEY_SIZE);
+  writeIoBytes(CESVM_IO_PROGRAM_OWNER, host.programOwner.data(),
+               host.programOwner.size());
   if (inputLen > 0)
     writeIoBytes(CESVM_IO_INPUT, host.input.data(), inputLen);
 
@@ -1186,6 +1189,7 @@ void CesVM::hostCall(CesVMHost& host) {
     if (!billCredits(host.feeQuery)) return;
     R() = static_cast<uint64_t>(host.readAccountBalance(id));
     io_[5] = host.readAccountNonce(id);
+    io_[6] = host.readAccountAliasId(id);   // 0 = no alias
     S() = CES_OK;
     break;
   }
@@ -1344,6 +1348,114 @@ void CesVM::hostCall(CesVMHost& host) {
     io_[CESVM_IO_BUDGET_REMAINING] = budget_ - budgetUsed_;
     R() = granted;
     S() = CES_OK;
+    break;
+  }
+
+  case SYS_READ_ALIAS: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    // io[4]=alias id, io[5]=offset, io[6]=len, io[7]=dest cell ptr
+    uint32_t aliasId = static_cast<uint32_t>(io_[4]);
+    uint64_t off = io_[5];
+    uint64_t len = io_[6];
+    if (off > ALIAS_VALUE_BYTES || len > ALIAS_VALUE_BYTES ||
+        off + len > ALIAS_VALUE_BYTES) {
+      S() = CES_ERROR_BAD_INPUT;
+      break;
+    }
+    if (!billCredits(host.feeQuery)) return;
+    ces::Bytes tmp(len);
+    if (!host.readAlias(aliasId, static_cast<uint32_t>(off),
+                        static_cast<uint32_t>(len), tmp.data())) {
+      S() = CES_ERROR_ALIAS_NOT_FOUND;
+      break;
+    }
+    if (len > 0) {
+      writeIoBytes(io_[7], tmp.data(), len);
+      if (term_) return;
+    }
+    R() = len;
+    S() = CES_OK;
+    break;
+  }
+
+  case SYS_WRITE_ALIAS: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    // io[4]=alias id, io[5]=offset, io[6]=len, io[7]=src cell ptr
+    uint32_t aliasId = static_cast<uint32_t>(io_[4]);
+    uint64_t off = io_[5];
+    uint64_t len = io_[6];
+    if (off > ALIAS_VALUE_BYTES || len > ALIAS_VALUE_BYTES ||
+        off + len > ALIAS_VALUE_BYTES) {
+      S() = CES_ERROR_BAD_INPUT;
+      break;
+    }
+    ces::Bytes tmp(len);
+    if (len > 0) {
+      readIoBytes(io_[7], tmp.data(), len);
+      if (term_) return;
+    }
+    if (!billCredits(host.feeAlias)) return;
+    S() = host.writeAlias(aliasId, static_cast<uint32_t>(off), tmp.data(),
+                          static_cast<uint32_t>(len));
+    break;
+  }
+
+  case SYS_LOAD_CODE_ALIAS: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    if (code_.size() + ALIAS_INLINE_CODE_BYTES > CESVM_MAX_CODE) {
+      term_ = CESVM_CODEFULL;
+      return;
+    }
+    uint32_t aliasId = static_cast<uint32_t>(io_[4]);
+    if (!billCredits(host.feeQuery)) return;
+    uint64_t offset = code_.size();
+    code_.resize(offset + ALIAS_INLINE_CODE_BYTES);
+    if (!host.readAlias(aliasId, ALIAS_OFF_CONTENT, ALIAS_INLINE_CODE_BYTES,
+                        &code_[offset])) {
+      code_.resize(offset);
+      S() = CES_ERROR_ALIAS_NOT_FOUND;
+      break;
+    }
+    R() = offset;
+    S() = CES_OK;
+    break;
+  }
+
+  case SYS_SCHEDULE_ALIAS: {
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+    // io[4]=alias id, io[5]=budget, io[6]=child_allowance,
+    // io[7]=input_ptr, io[8]=input_len, io[9]=time_us
+    // Same billing and allowance carve as SYS_SCHEDULE.
+    uint32_t aliasId = static_cast<uint32_t>(io_[4]);
+    uint64_t childBudget = io_[5];
+    uint64_t childAllowance = io_[6];
+    size_t inputLen = std::min(io_[8], uint64_t(CESVM_MAX_INPUT));
+    ces::Bytes input(inputLen);
+    if (inputLen > 0) {
+      readIoBytes(io_[7], input.data(), inputLen);
+      if (term_) return;
+    }
+    uint64_t time_us = io_[9];
+    uint64_t now = static_cast<uint64_t>(
+      std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
+    uint64_t duration = (time_us > now) ? (time_us - now) : 0;
+    uint64_t hostingCost = CESVM_SCHEDULE_BASE_COST +
+                           CESVM_SCHEDULE_PER_SEC * duration / US_PER_SEC;
+    if (!bill(hostingCost)) return;
+    if (host.allowance != std::numeric_limits<uint64_t>::max()) {
+      if (childAllowance > host.allowance) {
+        S() = CES_ERROR_ALLOWANCE_EXCEEDED;
+        break;
+      }
+      host.allowance -= childAllowance;
+    }
+    S() = host.scheduleAlias(aliasId, childBudget, childAllowance,
+                             input.data(), inputLen, time_us);
+    if (S() != CES_OK &&
+        host.allowance != std::numeric_limits<uint64_t>::max()) {
+      host.allowance += childAllowance;
+    }
     break;
   }
 

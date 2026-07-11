@@ -40,6 +40,9 @@ const Alias& Aliases::ActiveAlias::data() const { return it->second; }
 HashPrefix Aliases::ActiveAlias::getOwner() const {
   return it->second.getOwner();
 }
+HashPrefix Aliases::ActiveAlias::getEditor() const {
+  return it->second.getEditor();
+}
 uint16_t Aliases::ActiveAlias::getOp() const { return it->second.getOp(); }
 const AliasData& Aliases::ActiveAlias::getContent() const {
   return it->second.getContent();
@@ -57,13 +60,8 @@ void Aliases::ActiveAlias::setContent(const AliasData& content) {
   persistWithMode(Alias::SerMode::Full, [&](Alias& a) { a.setContent(content); });
 }
 
-void Aliases::ActiveAlias::updateFull(const HashPrefix& owner, uint16_t op,
-                                      const AliasData& content) {
-  persistWithMode(Alias::SerMode::Full, [&](Alias& a) {
-    a.setOwner(owner);
-    a.setOp(op);
-    a.setContent(content);
-  });
+void Aliases::ActiveAlias::updateValue(const Alias& value) {
+  persistWithMode(Alias::SerMode::Full, [&](Alias& a) { a = value; });
 }
 
 } // namespace ces

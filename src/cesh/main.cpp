@@ -405,28 +405,58 @@ int main(int argc, char* argv[]) {
   cmd_asq->add_option("id", asset_id_arg, "Asset ID or name")->required();
 
   // ---- Subcommand: alias (L1 account sidecar) ----
+  // Raw byte access to the value image (owner|editor|op|content); cesh does
+  // not interpret the structure.
   auto* cmd_alias =
     app.add_subcommand("alias", "Account alias (L1 dependable sidecar)");
   cmd_alias->require_subcommand(0, 1);
   uint32_t alias_id_arg = 0;
-  uint16_t alias_op_arg = ces::ALIAS_OP_STRING;
+  uint16_t alias_offset_arg = 0;
+  uint16_t alias_length_arg = ces::ALIAS_VALUE_BYTES;
   std::string alias_content_arg, alias_hexcontent_arg;
 
-  auto* cmd_alias_set =
+  auto* cmd_alias_write =
     cmd_alias->add_subcommand(
-      "set", "Set this account's alias (creates on first use, edits in place after)");
-  cmd_alias_set->add_option("--content", alias_content_arg,
-                            "Content (text, <= 50 bytes)");
-  cmd_alias_set->add_option("--hexcontent", alias_hexcontent_arg,
-                            "Content (hex bytes, <= 50)");
-  cmd_alias_set->add_option("--op", alias_op_arg, "Op code (default 1 = STRING)");
+      "write", "Patch bytes into an alias's value image (signed)");
+  cmd_alias_write->add_option("offset", alias_offset_arg, "Image byte offset")
+    ->required();
+  cmd_alias_write->add_option("--id", alias_id_arg,
+                              "Target alias id (default 0 = my own; "
+                              "created on first use)");
+  cmd_alias_write->add_option("--content", alias_content_arg,
+                              "Patch bytes (text)");
+  cmd_alias_write->add_option("--hexcontent", alias_hexcontent_arg,
+                              "Patch bytes (hex)");
 
   auto* cmd_alias_rm =
     cmd_alias->add_subcommand("rm", "Delete this account's alias");
 
-  auto* cmd_alias_get =
-    cmd_alias->add_subcommand("get", "Read an alias by id (unsigned)");
-  cmd_alias_get->add_option("id", alias_id_arg, "Alias id")->required();
+  std::string alias_run_input_arg;
+  uint64_t alias_run_budget_arg = 0;
+  uint64_t alias_run_allowance_arg = std::numeric_limits<uint64_t>::max();
+  bool alias_run_nonceless = false;
+  auto* cmd_alias_run =
+    cmd_alias->add_subcommand(
+      "run", "Execute an alias's inline program (op = INLINE_PROGRAM)");
+  cmd_alias_run->add_option("id", alias_id_arg, "Alias id")->required();
+  cmd_alias_run->add_option("--budget", alias_run_budget_arg,
+                            "Gas budget in credits")->required();
+  cmd_alias_run->add_option("--allowance", alias_run_allowance_arg,
+                            "Per-run cap on caller-account debits inside the "
+                            "VM (default: unlimited)");
+  cmd_alias_run->add_option("--input", alias_run_input_arg,
+                            "Input data (hex string)");
+  cmd_alias_run->add_flag("--nonceless", alias_run_nonceless,
+                          "Use auto-nonce (no sequential nonce)");
+
+  auto* cmd_alias_read =
+    cmd_alias->add_subcommand(
+      "read", "Read a byte window of an alias's value image (unsigned)");
+  cmd_alias_read->add_option("id", alias_id_arg, "Alias id")->required();
+  cmd_alias_read->add_option("offset", alias_offset_arg,
+                             "Image byte offset (default 0)");
+  cmd_alias_read->add_option("length", alias_length_arg,
+                             "Bytes to read (default: offset to end of image)");
 
   // ---- ramfile subcommands ----
   // In-ledger RAM-backed asset-chain file API (L1) — distinct from the
@@ -1009,15 +1039,22 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
-  if (cmd_alias_get->parsed()) {
+  if (cmd_alias_read->parsed()) {
     try {
       auto sess = makeSession();
       auto& cc = sess->client();
-      HashPrefix owner{};
-      uint16_t op = 0;
-      AliasData content{};
+      if (cmd_alias_read->count("length") == 0) {
+        if (alias_offset_arg > ces::ALIAS_VALUE_BYTES) {
+          std::cerr << "Error: offset past end of image.\n";
+          return 1;
+        }
+        alias_length_arg =
+          static_cast<uint16_t>(ces::ALIAS_VALUE_BYTES - alias_offset_arg);
+      }
+      ces::Bytes bytes;
       bool found = false;
-      uint8_t rc = cc.queryAlias(alias_id_arg, owner, op, content, found);
+      uint8_t rc = cc.readAlias(alias_id_arg, alias_offset_arg,
+                                alias_length_arg, bytes, found);
       if (rc != CES_OK) {
         std::cerr << "Query Failed: " << errorString(rc) << "\n";
         return 1;
@@ -1027,25 +1064,16 @@ int main(int argc, char* argv[]) {
         else std::cerr << "Alias not found.\n";
         return g_quiet ? 0 : 1;
       }
-      size_t len = 0;
-      while (len < content.size() && content[len] != 0) ++len;
-      std::string txt(reinterpret_cast<const char*>(content.data()), len);
       if (g_quiet) {
-        std::cout << "{\"aliasId\":" << alias_id_arg
-                  << ",\"owner\":\"" << jesc(hashPrefixToString(owner))
-                  << "\",\"op\":" << op
-                  << ",\"contentHex\":\"" << ces::bytesToHex(content) << "\"}\n";
+        // Pipe mode: data only, raw bytes.
+        std::cout.write(reinterpret_cast<const char*>(bytes.data()),
+                        static_cast<std::streamsize>(bytes.size()));
       } else {
-        print_header("Alias (Unsigned)");
+        print_header("Alias Read (Unsigned)");
         print_field("Alias ID", std::to_string(alias_id_arg));
-        print_field("Owner ID", hashPrefixToString(owner));
-        print_field("Op", std::to_string(op));
-        // op is the content schema: STRING renders as text, everything else
-        // (NONE/raw and any unknown op) renders as hex.
-        if (op == ces::ALIAS_OP_STRING)
-          print_field("Content", txt);
-        else
-          print_field("Content", ces::bytesToHex(content));
+        print_field("Offset", std::to_string(alias_offset_arg));
+        print_field("Length", std::to_string(bytes.size()));
+        print_field("Bytes", ces::bytesToHex(bytes));
         std::cout << std::endl;
       }
     } catch (std::exception& e) {
@@ -1093,8 +1121,8 @@ int main(int argc, char* argv[]) {
      cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
-     cmd_gossip->parsed() || cmd_alias_set->parsed() ||
-     cmd_alias_rm->parsed());
+     cmd_gossip->parsed() || cmd_alias_write->parsed() ||
+     cmd_alias_rm->parsed() || cmd_alias_run->parsed());
 
   if (!needs_actor)
     return 0;
@@ -1129,35 +1157,61 @@ int main(int argc, char* argv[]) {
     auto sess = makeSession(&actorKey);
     auto& cc = sess->client();
 
-    // ---- alias signed handlers (set / update / rm) ----
-    auto resolveAliasContent = [&]() -> AliasData {
-      AliasData d{};
+    // ---- alias signed handlers (write / rm) ----
+    if (cmd_alias_write->parsed()) {
       ces::Bytes bytes;
       if (!alias_hexcontent_arg.empty())
         bytes = ces::parseHex(alias_hexcontent_arg);
       else if (!alias_content_arg.empty())
         bytes.assign(alias_content_arg.begin(), alias_content_arg.end());
-      if (bytes.size() > d.size())
-        throw std::runtime_error("alias content exceeds " +
-                                 std::to_string(d.size()) + " bytes");
-      for (size_t i = 0; i < bytes.size(); ++i) d[i] = bytes[i];
-      return d;
-    };
-    if (cmd_alias_set->parsed()) {
-      AliasData ctn = resolveAliasContent();
+      if (alias_offset_arg + bytes.size() > ces::ALIAS_VALUE_BYTES) {
+        std::cerr << "Error: patch runs past end of image ("
+                  << ces::ALIAS_VALUE_BYTES << " bytes).\n";
+        return 1;
+      }
       uint32_t id = 0;
-      uint8_t rc = cc.setAlias(alias_op_arg, ctn, id);
+      uint8_t rc = cc.writeAlias(alias_id_arg, alias_offset_arg, bytes, id);
       if (rc != CES_OK) {
-        std::cerr << "Alias set failed: " << errorString(rc) << "\n";
+        std::cerr << "Alias write failed: " << errorString(rc) << "\n";
         return 1;
       }
       if (g_quiet) std::cout << "{\"aliasId\":" << id << "}\n";
       else {
-        print_header("Alias Set");
+        print_header("Alias Write");
         print_field("Alias ID", std::to_string(id));
         std::cout << "Success.\n";
       }
       return 0;
+    }
+    if (cmd_alias_run->parsed()) {
+      ces::Bytes input;
+      if (!alias_run_input_arg.empty())
+        input = ces::parseHex(alias_run_input_arg);
+      uint64_t vmError = 0, budgetUsed = 0;
+      ces::Bytes output;
+      uint8_t rc = cc.runAlias(alias_id_arg, alias_run_budget_arg, input,
+                               vmError, budgetUsed, output,
+                               alias_run_nonceless, alias_run_allowance_arg);
+      if (rc == CES_OK) {
+        if (g_quiet) {
+          std::cout << "{\"vmError\":" << vmError
+                    << ",\"budgetUsed\":" << budgetUsed
+                    << ",\"outputHex\":\"" << ces::bytesToHex(output)
+                    << "\"}\n";
+        } else {
+          print_header("Alias Executed");
+          print_field("Alias ID", std::to_string(alias_id_arg));
+          print_field("VM Error", std::to_string(vmError));
+          print_field("Budget Used", std::to_string(budgetUsed));
+          if (!output.empty())
+            print_field("Output", ces::bytesToHex(output));
+          std::cout << "Success.\n";
+        }
+        return 0;
+      }
+      std::cerr << "Alias run failed: " << errorString(rc)
+                << " (vmError " << vmError << ")\n";
+      return 1;
     }
     if (cmd_alias_rm->parsed()) {
       uint8_t rc = cc.deleteAlias();

@@ -1534,29 +1534,71 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
   sPriv.fill(0xEE);
 
   KeyPair a;
-  ces::AliasData content{};
+  // op + content as one patch at ALIAS_OFF_OP (op is host-endian in the image).
+  const uint16_t op = ces::ALIAS_OP_STRING;
   const char* s = "persist me";
-  for (std::size_t i = 0; s[i]; ++i) content[i] = static_cast<uint8_t>(s[i]);
+  ces::Bytes patch(sizeof(op));
+  std::memcpy(patch.data(), &op, sizeof(op));
+  for (std::size_t i = 0; s[i]; ++i)
+    patch.push_back(static_cast<uint8_t>(s[i]));
 
   uint32_t id = 0;
 
-  // --- PHASE 1: create an alias, clean stop, explicit snapshot ---
+  // --- PHASE 1: create an alias, patch an editor grant, mutate it through
+  // a VM run (the re-journal durability path), clean stop, snapshot ---
   {
     CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
     cfg.feeAccount = 0;   // isolate persistence from rent
+    cfg.feeAlias = 0;
+    cfg.feeAsset = 0;
     cfg.feeQuery = 0;
     cfg.maxAlias = 1000;
     CesServer srv(cfg);
     srv.start(0);
 
-    srv._brr(a.getPublicKeyAsHash(), 10'000'000);
+    srv._brr(a.getPublicKeyAsHash(), 1'000'000'000);
     srv._drainLogic();
 
     BOOST_REQUIRE_EQUAL(
-      srv.setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, content, 0, id),
+      srv.setAlias(a.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_OP, patch, 0, id),
       CES_OK);
     srv._drainLogic();
     BOOST_REQUIRE(id != 0);
+
+    // Editor grant (a distinctive prefix) must survive the reload.
+    ces::HashPrefix editor;
+    editor.fill(0x3C);
+    ces::Bytes grant(editor.begin(), editor.end());
+    uint32_t id2 = 0;
+    BOOST_REQUIRE_EQUAL(
+      srv.setAlias(a.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_EDITOR, grant,
+                   0, id2),
+      CES_OK);
+    srv._drainLogic();
+
+    // VM write path: an asset program owned by `a` (so the scheduled run's
+    // principal is `a`) writes 'V' into a's own cell. VM mutations bypass
+    // the store WAL and rely on executeVmRun's commit re-journal + flush;
+    // this pins that the byte is durable.
+    VmProgram q;
+    q.set(Imm(20), Ref(CESVM_IO_PROGRAM_OWNER));
+    q.sysReadAccount({.prefixPtr = Imm(20)});
+    q.set(Imm(21), Imm('V'));
+    q.sysWriteAlias({.aliasId = Ref(6),
+                     .offset = Imm(ces::ALIAS_OFF_CONTENT + 700),
+                     .len = Imm(1),
+                     .srcPtr = Imm(21)});
+    q.term();
+    minx::Hash pgm;
+    pgm.fill(0x44);
+    HashPrefix aPfx = Account::getMapKey(a.getPublicKeyAsHash());
+    BOOST_REQUIRE_EQUAL(
+      srv.createAsset(a.getPublicKeyAsHash(), aPfx, pgm, q.buildBootBlock(),
+                      2, 0),
+      CES_OK);
+    srv._drainLogic();
+    BOOST_REQUIRE(
+      srv._executeScheduledRunSync(aPfx, pgm, 1'000'000, 0, {}));
 
     srv.stop(false);
     srv._save();   // snapshot the alias store + generator cell
@@ -1566,18 +1608,24 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
   {
     CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
     cfg.feeAccount = 0;
+    cfg.feeAlias = 0;
     cfg.feeQuery = 0;
     cfg.maxAlias = 1000;
     CesServer srv2(cfg);
     srv2.start(0);
 
-    // The alias cell reloaded intact.
+    // The alias cell reloaded intact: header, editor grant, wire-patched
+    // content, AND the VM-written byte (re-journal durability).
     ces::Alias out;
     BOOST_CHECK(srv2.queryAlias(id, out));
     BOOST_CHECK_EQUAL(out.getOp(), ces::ALIAS_OP_STRING);
     BOOST_CHECK(out.getOwner() ==
                 ces::Account::getMapKey(a.getPublicKeyAsHash()));
+    ces::HashPrefix editor;
+    editor.fill(0x3C);
+    BOOST_CHECK(out.getEditor() == editor);
     BOOST_CHECK_EQUAL(out.getContent()[0], static_cast<uint8_t>('p'));
+    BOOST_CHECK_EQUAL(out.getContent()[700], static_cast<uint8_t>('V'));
 
     // The account->alias link reloaded.
     BOOST_CHECK_EQUAL(srv2._aliasIdOf(a.getPublicKeyAsHash()), id);
@@ -1588,7 +1636,8 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
     srv2._drainLogic();
     uint32_t id2 = 0;
     BOOST_REQUIRE_EQUAL(
-      srv2.setAlias(b.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, content, 0, id2),
+      srv2.setAlias(b.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_OP, patch, 0,
+                    id2),
       CES_OK);
     srv2._drainLogic();
     BOOST_CHECK(id2 != 0);

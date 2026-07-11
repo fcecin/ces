@@ -46,6 +46,7 @@ static void push8(ces::Bytes& code, uint64_t val) {
 struct NullVmHost : CesVMHost {
   int64_t  readAccountBalance(const HashPrefix&) override { return 0; }
   uint32_t readAccountNonce  (const HashPrefix&) override { return 0; }
+  uint32_t readAccountAliasId(const HashPrefix&) override { return 0; }
   bool     readAsset(const minx::Hash&, HashPrefix&, AssetData&,
                      uint16_t&, uint32_t&) override { return false; }
   uint8_t  transfer    (const minx::Hash&, uint64_t)              override { return CES_OK; }

@@ -476,9 +476,11 @@ public:
         programOwnerPrefix_(setup.programOwnerPrefix),
         saveAccountFn_(setup.saveAccountFn),
         saveAssetFn_(setup.saveAssetFn),
+        saveAliasFn_(setup.saveAliasFn),
         udpSink_(setup.sendUdpFn),
         crossSink_(setup.crossTransferFn),
         scheduleSink_(setup.scheduleFn),
+        scheduleAliasSink_(setup.scheduleAliasFn),
         creditHookSink_(setup.creditHookFn),
         enableVerifySig_(setup.enableVerifySig) {
     this->allowance = setup.allowance;
@@ -493,6 +495,7 @@ public:
     this->feeTx      = server_.discountFee(FeeKind::Tx,          server_.cfg_.feeTx);
     this->feeAsset   = server_.discountFee(FeeKind::AssetRent,   server_.cfg_.feeAsset);
     this->feeAccount = server_.discountFee(FeeKind::AccountRent, server_.cfg_.feeAccount);
+    this->feeAlias   = server_.discountFee(FeeKind::AccountRent, server_.cfg_.feeAlias);
     // SYS_SEND_CLIENT has no UDP equivalent; pick a placeholder bounded by
     // existing fees. TODO: resolve this fee/cost properly — outbound push
     // is its own resource (presence cache + UDP bandwidth) and probably
@@ -518,6 +521,20 @@ public:
   uint32_t readAccountNonce(const HashPrefix& id) override {
     auto aa = server_.accounts_.get(id);
     return aa.exists() ? aa.nonce() : 0;
+  }
+  uint32_t readAccountAliasId(const HashPrefix& id) override {
+    auto aa = server_.accounts_.get(id);
+    return aa.exists() ? aa.data().getAliasId() : 0;
+  }
+  bool readAlias(uint32_t id, uint32_t offset, uint32_t len,
+                 uint8_t* dest) override {
+    Alias al;
+    if (!server_.queryAlias(id, al)) return false;
+    if (offset > ALIAS_VALUE_BYTES || len > ALIAS_VALUE_BYTES ||
+        offset + len > ALIAS_VALUE_BYTES)
+      return false;
+    if (len > 0) std::memcpy(dest, al.imageData() + offset, len);
+    return true;
   }
   bool readAsset(const minx::Hash& key, HashPrefix& owner, AssetData& content,
                  uint16_t& balance, uint32_t& price) override {
@@ -612,6 +629,7 @@ public:
   // ---- Asset writes -------------------------------------------------------
   uint8_t createAsset(const minx::Hash& key, const AssetData& content,
                       uint16_t days) override {
+    if (key == minx::Hash{}) return CES_ERROR_BAD_INPUT;   // reserved sentinel
     auto it = server_.assets_->find(key);
     if (it != server_.assets_->end()) return CES_ERROR_ASSET_EXISTS;
     maybeSaveAsset(key);
@@ -629,9 +647,13 @@ public:
 
   uint8_t createAssetManaged(const minx::Hash& key, const AssetData& content,
                              uint16_t days) override {
+    if (key == minx::Hash{}) return CES_ERROR_BAD_INPUT;   // reserved sentinel
     auto it = server_.assets_->find(key);
     if (it != server_.assets_->end()) return CES_ERROR_ASSET_EXISTS;
     maybeSaveAsset(key);
+    // No boot asset (self is the zero sentinel): nothing for a managed
+    // asset to be owned by.
+    if (this->selfAssetKey == minx::Hash{}) return CES_ERROR_DISABLED;
     bool priv = isAssetPrivate(days);
     bool immut = isAssetImmutable(days);
     uint32_t storeDays = 1u + assetDays(days);
@@ -833,6 +855,56 @@ public:
                          {input, input + inputLen}, time_us);
   }
 
+  uint8_t scheduleAlias(uint32_t aliasId, uint64_t budget, uint64_t allowance,
+                        const uint8_t* input, size_t inputLen,
+                        uint64_t time_us) override {
+    if (!scheduleAliasSink_) return CES_ERROR_DISABLED;
+    return scheduleAliasSink_(aliasId, budget, allowance,
+                              {input, input + inputLen}, time_us);
+  }
+
+  // Patch an alias's value image as the programOwner principal. Same rules
+  // as the wire CES_SET_ALIAS minus create-on-first-use (a VM run cannot
+  // mint cells; it patches cells that exist). A principal-less run (empty
+  // programOwner: every gate, foreign-code hooks, bare CES_RUN_ASSET) gets
+  // NOT_OWNER — no consenting principal means no write authority, and the
+  // same emptiness keeps gates pure. Undo-log tracked; the wire path's
+  // hook-target validation runs against the resulting image with the
+  // principal as setter.
+  uint8_t writeAlias(uint32_t id, uint32_t offset, const uint8_t* src,
+                     uint32_t len) override {
+    if (programOwnerPrefix_ == HashPrefix{}) return CES_ERROR_NOT_OWNER;
+    if (id == 0) return CES_ERROR_ALIAS_NOT_FOUND;
+    auto al = server_.aliases_.get(id);
+    if (!al.exists()) return CES_ERROR_ALIAS_NOT_FOUND;
+    size_t patchFloor;
+    if (al.getOwner() == programOwnerPrefix_)
+      patchFloor = ALIAS_PATCH_MIN_OWNER;
+    else if (al.getEditor() == programOwnerPrefix_)
+      patchFloor = ALIAS_PATCH_MIN_EDITOR;
+    else
+      return CES_ERROR_NOT_OWNER;
+    if (offset > ALIAS_VALUE_BYTES || len > ALIAS_VALUE_BYTES ||
+        offset + len > ALIAS_VALUE_BYTES)
+      return CES_ERROR_BAD_INPUT;
+    if (offset < patchFloor)   // wire parity: a floor violation is NOT_OWNER
+      return CES_ERROR_NOT_OWNER;
+    Alias next = al.data();
+    if (len > 0) std::memcpy(next.imageData() + offset, src, len);
+    if (aliasOpIsHook(next.getOp())) {
+      minx::Hash triggerKey{};
+      std::memcpy(triggerKey.data(), next.getContent().data(), KEY_SIZE);
+      auto trigger = server_.assets_.get(triggerKey);
+      bool ok = trigger.exists() &&
+                (isAssetImmutable(trigger.data().getBalance()) ||
+                 trigger.data().getOwnerId() == programOwnerPrefix_);
+      if (!ok) return CES_ERROR_HOOK_TARGET;
+    }
+    if (saveAliasFn_) saveAliasFn_(id);
+    al.data() = next;
+    return CES_OK;
+  }
+
   uint8_t rpc(const std::string& host, uint16_t port,
               const minx::Hash& fileHeadKey,
               const minx::Hash& followupProgramKey,
@@ -876,6 +948,7 @@ private:
   HashPrefix programOwnerPrefix_;
   std::function<void(const HashPrefix&)>                 saveAccountFn_;
   std::function<void(const minx::Hash&)>                 saveAssetFn_;
+  std::function<void(uint32_t)>                          saveAliasFn_;
   std::function<void(const std::string&, uint16_t,
                      const uint8_t*, size_t)>            udpSink_;
   std::function<void(const minx::Hash&, uint64_t,
@@ -883,6 +956,8 @@ private:
                      const minx::Hash&)>                 crossSink_;
   std::function<uint8_t(const minx::Hash&, uint64_t, uint64_t,
                         const ces::Bytes&, uint64_t)>    scheduleSink_;
+  std::function<uint8_t(uint32_t, uint64_t, uint64_t,
+                        const ces::Bytes&, uint64_t)>    scheduleAliasSink_;
   std::function<void(const minx::Hash&, uint64_t)>      creditHookSink_;
   bool enableVerifySig_;
 
@@ -2179,7 +2254,8 @@ void CesServer::unsignedQueryAccount(const HashPrefix& queryId,
                                      int64_t& outBalance, uint32_t& outNonce,
                                      HashPrefix& outLastXferDest,
                                      uint64_t& outLastXferAmount,
-                                     uint32_t& outLastXferTime) {
+                                     uint32_t& outLastXferTime,
+                                     uint32_t& outAliasId) {
   ActiveAccount acc = accounts_.get(queryId);
   if (acc.exists()) {
     outBalance = acc.balance();
@@ -2187,12 +2263,14 @@ void CesServer::unsignedQueryAccount(const HashPrefix& queryId,
     outLastXferDest = acc.data().getLastXferDest();
     outLastXferAmount = acc.data().getLastXferAmount();
     outLastXferTime = acc.data().getLastXferTime();
+    outAliasId = acc.data().getAliasId();
   } else {
     outBalance = 0;
     outNonce = 0;
     outLastXferDest = {};
     outLastXferAmount = 0;
     outLastXferTime = 0;
+    outAliasId = 0;
   }
 }
 
@@ -2384,6 +2462,12 @@ uint8_t CesServer::createAsset(const minx::Hash& originKey,
   rentFee = resolveFee(rentFee, cfg_.feeAsset);  // raw per-day rate
   errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
 
+  // The all-zero key is reserved: it is the VM's "no boot asset" self
+  // sentinel (an alias program's io self-key), so it must never name a real
+  // asset.
+  if (assetId == minx::Hash{})
+    return CES_ERROR_BAD_INPUT;
+
   ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
   if (!origin.exists())
     return CES_ERROR_ORIGIN_NOT_FOUND;
@@ -2440,7 +2524,8 @@ uint8_t CesServer::createAssetRange(const minx::Hash& originKey,
   if (!origin.exists())
     return CES_ERROR_ORIGIN_NOT_FOUND;
 
-  if (count == 0 || count > CESVM_MAX_ASSET_RANGE)
+  if (count == 0 || count > CESVM_MAX_ASSET_RANGE ||
+      firstKey == minx::Hash{})   // all-zero key reserved (VM self sentinel)
     return CES_ERROR_BAD_INPUT;
 
   uint64_t perCell = attenuatedFundCost(
@@ -2823,10 +2908,10 @@ void CesServer::_setAliasNextId(uint32_t next) {
   aliases_->update(0, gen);
 }
 
-uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
-                            const AliasData& content, uint32_t providedNonce,
-                            uint32_t& outAliasId, int64_t fee,
-                            int64_t errFee) {
+uint8_t CesServer::setAlias(const minx::Hash& originKey, uint32_t aliasId,
+                            uint16_t offset, const ces::Bytes& bytes,
+                            uint32_t providedNonce, uint32_t& outAliasId,
+                            int64_t fee, int64_t errFee) {
   fee = discountedFlatFee(fee, cfg_.feeAlias, FeeKind::AccountRent);
   errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
   outAliasId = 0;
@@ -2835,14 +2920,53 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
   if (!origin.exists())
     return CES_ERROR_ORIGIN_NOT_FOUND;
 
+  // Bounds: nobody writes the server-set owner field, and a patch may not run
+  // past the end of the value image. An illegal write rejects whole.
+  if (offset < ALIAS_PATCH_MIN_OWNER ||
+      offset + bytes.size() > ALIAS_VALUE_BYTES)
+    return CES_ERROR_BAD_INPUT;
+
+  // Resolve the target cell and the signer's patch floor. aliasId 0 is the
+  // signer's own alias (create on first use); nonzero must be a live cell the
+  // signer owns or edits.
+  uint32_t targetId = aliasId == 0 ? origin.data().getAliasId() : aliasId;
+  Aliases::ActiveAlias existing = aliases_.get(targetId);
+  bool live = targetId != 0 && existing.exists();
+  bool create = false;
+  size_t patchFloor = ALIAS_PATCH_MIN_OWNER;
+  if (aliasId == 0) {
+    // Own alias: a stale link (cell reclaimed) counts as none.
+    create = !(live && existing.getOwner() == origin.id);
+  } else {
+    if (!live)
+      return CES_ERROR_ALIAS_NOT_FOUND;
+    if (existing.getOwner() == origin.id)
+      patchFloor = ALIAS_PATCH_MIN_OWNER;
+    else if (existing.getEditor() == origin.id)
+      patchFloor = ALIAS_PATCH_MIN_EDITOR;
+    else
+      return CES_ERROR_NOT_OWNER;
+  }
+  if (offset < patchFloor)
+    return CES_ERROR_NOT_OWNER;
+
+  // Build the resulting value image (zeroed on create) so hook validation
+  // sees exactly what would be committed.
+  Alias next = create ? Alias(origin.id, HashPrefix{}, 0, AliasData{})
+                      : existing.data();
+  if (!bytes.empty())
+    std::memcpy(next.imageData() + offset, bytes.data(), bytes.size());
+
   // Hook sidecars point at a trigger program that runs with unbounded gas
   // headroom relative to the account's own money; if the target could change
   // after this check, a stranger could swap in draining bytecode. Require the
   // trigger asset to be IMMUTABLE or owned by the setter, so the code the
-  // account committed to can never change under it. Checked once, here.
-  if (aliasOpIsHook(op)) {
+  // account committed to can never change under it. Checked on every patch
+  // that leaves a hook op in place (the setter here is the signer, owner or
+  // editor).
+  if (aliasOpIsHook(next.getOp())) {
     minx::Hash triggerKey{};
-    std::memcpy(triggerKey.data(), content.data(), KEY_SIZE);
+    std::memcpy(triggerKey.data(), next.getContent().data(), KEY_SIZE);
     auto trigger = assets_.get(triggerKey);
     bool ok = trigger.exists() &&
               (isAssetImmutable(trigger.data().getBalance()) ||
@@ -2858,17 +2982,12 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
   if (rc != CES_OK)
     return rc;
 
-  uint32_t id = origin.data().getAliasId();
-  Aliases::ActiveAlias existing = aliases_.get(id);
-  bool haveOwn = id != 0 && existing.exists() && existing.getOwner() == origin.id;
-
-  if (haveOwn) {
-    // Edit in place: keep the id so it stays dependable across edits.
-    existing.updateFull(origin.id, op, content);   // persists Full
-    outAliasId = id;
+  if (!create) {
+    // Patch in place: the id stays dependable across edits.
+    existing.updateValue(next);   // persists Full
+    outAliasId = targetId;
   } else {
-    // No live alias of ours (fresh account, or a stale link whose cell was
-    // reclaimed): allocate a fresh id and bind it to the account.
+    // No live alias of ours: allocate a fresh id and bind it to the account.
     if (aliases_->getObjects().size() >= cfg_.maxAlias) {
       origin.chargeError(errFee);
       LOGDEBUG << "setAlias: max aliases reached";
@@ -2876,9 +2995,8 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
     }
     uint32_t newId = allocAliasId(aliases_);
     {
-      Alias newAlias(origin.id, op, content);
       Alias::SerModeGuard guard(Alias::SerMode::Full);
-      aliases_->update(newId, newAlias);
+      aliases_->update(newId, next);
     }
     {
       origin.data().setAliasId(newId);
@@ -2894,7 +3012,8 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint16_t op,
   accounts_.checkFlush(static_cast<uint64_t>(fee));
   aliases_.checkFlush(static_cast<uint64_t>(fee));
   checkAutoSnapshot();
-  LOGTRACE << "setAlias ok" << VAR(outAliasId) << VAR(op);
+  LOGTRACE << "setAlias ok" << VAR(outAliasId) << VAR(offset)
+           << VAR(bytes.size());
   return CES_OK;
 }
 
@@ -3469,8 +3588,8 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
         [this](const CesSetAlias& req, const HashPrefix& originPrefix,
                const SockAddr& addr, const MinxMessage& msg) {
           uint32_t outId = 0;
-          uint8_t rc = setAlias(req.originId, req.op, req.content,
-                                req.reqNonce, outId);
+          uint8_t rc = setAlias(req.originId, req.aliasId, req.offset,
+                                req.bytes, req.reqNonce, outId);
           CesSetAliasResult res;
           res.originId = originPrefix;
           res.reqNonce = req.reqNonce;
@@ -3506,10 +3625,14 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
         bool found = queryAlias(req.aliasId, al);
         CesQueryAliasResult res;
         res.aliasId = req.aliasId;
-        res.owner = found ? al.getOwner() : HashPrefix{};
-        res.op = found ? al.getOp() : static_cast<uint16_t>(0);
-        res.content = found ? al.getContent() : AliasData{};
-        res.found = found ? 1 : 0;
+        res.offset = req.offset;
+        size_t off = req.offset, len = req.length;
+        if (found && off + len <= ALIAS_VALUE_BYTES) {
+          res.bytes.assign(al.imageData() + off, al.imageData() + off + len);
+          res.found = 1;
+        } else {
+          res.found = 0;   // unknown id or out-of-bounds window
+        }
         sendUnsignedReply(addr, msg, std::move(res));
       });
       break;
@@ -3524,12 +3647,14 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
         HashPrefix lastXferDest{};
         uint64_t lastXferAmount = 0;
         uint32_t lastXferTime = 0;
+        uint32_t aliasId = 0;
         unsignedQueryAccount(req.accountMapKey, bal, nonce,
-                             lastXferDest, lastXferAmount, lastXferTime);
+                             lastXferDest, lastXferAmount, lastXferTime,
+                             aliasId);
 
         CesUnsignedQueryAccountResult res{req.accountMapKey, bal, nonce,
                                           lastXferDest, lastXferAmount,
-                                          lastXferTime};
+                                          lastXferTime, aliasId};
         sendUnsignedReply(addr, msg, std::move(res));
       });
       break;
@@ -3658,6 +3783,18 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
       break;
     }
 
+    case CES_RUN_ALIAS: {
+      CesRunAlias req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesRunAlias& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          handleRunAlias(req, originPrefix, addr, msg);
+        }, /*noncelessOk=*/true);
+      break;
+    }
+
     case CES_GOSSIP: {
       CesGossip req;
       req.fromBytes(msg.data);
@@ -3702,13 +3839,16 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
 
   // --- Atomic context: undo log + deferred effects ---
   struct UndoEntry {
-    enum Kind { AccountEntry, AssetEntry, ScheduleEntry } kind;
+    enum Kind { AccountEntry, AssetEntry, AliasEntry, ScheduleEntry } kind;
     HashPrefix accountKey;
     Account oldAccount;
     bool accountExisted;
     minx::Hash assetKey;
     Asset oldAsset;
     bool assetExisted;
+    uint32_t aliasKey;
+    Alias oldAlias;
+    bool aliasExisted;
     ScheduleKey scheduleKey;       // Schedule kind: the enqueued run to erase
   };
   std::vector<UndoEntry> undoLog;
@@ -3759,6 +3899,19 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
     }
     undoLog.push_back(std::move(e));
   };
+  auto saveAlias = [&](uint32_t id) {
+    auto it = aliases_->find(id);
+    UndoEntry e{};
+    e.kind = UndoEntry::AliasEntry;
+    e.aliasKey = id;
+    if (it != aliases_->end()) {
+      e.oldAlias = it->second;
+      e.aliasExisted = true;
+    } else {
+      e.aliasExisted = false;
+    }
+    undoLog.push_back(std::move(e));
+  };
   auto revert = [&]() {
     for (auto it = undoLog.rbegin(); it != undoLog.rend(); ++it) {
       if (it->kind == UndoEntry::AccountEntry) {
@@ -3781,6 +3934,16 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
         } else {
           assets_->getObjects().erase(it->assetKey);
         }
+      } else if (it->kind == UndoEntry::AliasEntry) {
+        if (it->aliasExisted) {
+          auto mapIt = aliases_->find(it->aliasKey);
+          if (mapIt != aliases_->end())
+            mapIt->second = it->oldAlias;
+          else
+            aliases_->getObjects().emplace(it->aliasKey, it->oldAlias);
+        } else {
+          aliases_->getObjects().erase(it->aliasKey);
+        }
       } else { // Schedule: undo the SYS_SCHEDULE enqueue
         scheduledRuns_.erase(it->scheduleKey);
       }
@@ -3793,6 +3956,7 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
   setup.programOwnerPrefix = req.programOwnerPrefix;
   setup.saveAccountFn = [&](const HashPrefix& id) { saveAccount(id); };
   setup.saveAssetFn = [&](const minx::Hash& key) { saveAsset(key); };
+  setup.saveAliasFn = [&](uint32_t id) { saveAlias(id); };
   setup.sendUdpFn = [&](const std::string& addr, uint16_t port,
                         const uint8_t* data, size_t len) {
     deferredUdp.push_back({addr, port, {data, data + len}});
@@ -3823,6 +3987,28 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
     uint8_t rc = scheduleRunUndoable(req.callerPrefix, assetId, budget,
                                      allowance, input, time_us,
                                      /*prepaid=*/false, key);
+    if (rc == CES_OK) {
+      UndoEntry e{};
+      e.kind = UndoEntry::ScheduleEntry;
+      e.scheduleKey = key;
+      undoLog.push_back(std::move(e));
+    }
+    return rc;
+  };
+  // SYS_SCHEDULE_ALIAS: same undo contract, alias-id target. The target must
+  // be a live ALIAS_OP_INLINE_PROGRAM cell at queue time (re-checked at fire).
+  setup.scheduleAliasFn = [&](uint32_t aliasId, uint64_t budget,
+                              uint64_t allowance, const ces::Bytes& input,
+                              uint64_t time_us) -> uint8_t {
+    auto al = aliases_.get(aliasId);
+    if (aliasId == 0 || !al.exists())
+      return CES_ERROR_ALIAS_NOT_FOUND;
+    if (al.getOp() != ALIAS_OP_INLINE_PROGRAM)
+      return CES_ERROR_BAD_INPUT;
+    ScheduleKey key;
+    uint8_t rc = scheduleRunUndoable(req.callerPrefix, minx::Hash{}, budget,
+                                     allowance, input, time_us,
+                                     /*prepaid=*/false, key, aliasId);
     if (rc == CES_OK) {
       UndoEntry e{};
       e.kind = UndoEntry::ScheduleEntry;
@@ -3930,6 +4116,12 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
           Asset::SerModeGuard guard(Asset::SerMode::Full);
           assets_->persist(sit);
         }
+      } else if (e.kind == UndoEntry::AliasEntry) {
+        auto lit = aliases_->find(e.aliasKey);
+        if (lit != aliases_->end()) {
+          Alias::SerModeGuard guard(Alias::SerMode::Full);
+          aliases_->persist(lit);
+        }
       }
       // Schedule entries: scheduledRuns_ is RAM-only, nothing to journal.
     }
@@ -3984,6 +4176,7 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
   if (!undoLog.empty() || spent < req.budget || vmHost.refilledTotal > 0) {
     accounts_->flush();
     assets_->flush();
+    aliases_->flush();
   }
 
   // Fire deferred XFER_VM watch hooks: a program's SYS_TRANSFER credited a
@@ -4015,22 +4208,15 @@ uint64_t CesServer::hookFreeGrant() {
 // See the declaration in server.h for the identity/economics model and
 // local/account_hooks_design.md for the full design.
 // ----------------------------------------------------------------------------
-bool CesServer::runAccountHook(const minx::Hash& hookedKey,
-                               const minx::Hash& triggerAssetKey,
+bool CesServer::runAccountHook(const minx::Hash& hookedKey, ces::Bytes code,
+                               const minx::Hash& selfAssetKey,
+                               const HashPrefix& programOwnerPrefix,
                                uint64_t invokeKind,
                                const minx::Hash& counterpartyKey,
                                uint64_t amount, int64_t balance,
                                uint64_t refillCeiling) {
   // A hook never fires from inside a hook (no cascades, bounded nesting).
   if (inHook_) return true;
-
-  auto asset = assets_.get(triggerAssetKey);
-  if (!asset.exists()) {
-    // Rotted/missing trigger (e.g. rent-starved): a GATE fails closed.
-    LOGDEBUG << "runAccountHook: trigger asset missing" << BVAR(triggerAssetKey);
-    return false;
-  }
-  AssetData content = asset.data().getContent();
 
   uint64_t gasMult = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
   if (gasMult == 0) gasMult = 1;
@@ -4052,9 +4238,9 @@ bool CesServer::runAccountHook(const minx::Hash& hookedKey,
   VmRunRequest vreq;
   vreq.callerPrefix       = Account::getMapKey(hookedKey);
   vreq.callerKey          = hookedKey;
-  vreq.selfAssetKey       = triggerAssetKey;
-  vreq.programOwnerPrefix = HashPrefix{};   // empty: no consenting principal
-  vreq.code               = ces::Bytes(content.begin(), content.end());
+  vreq.selfAssetKey       = selfAssetKey;   // zero = inline (no boot asset)
+  vreq.programOwnerPrefix = programOwnerPrefix;
+  vreq.code               = std::move(code);
   vreq.input              = std::move(input);
   vreq.budget             = grant;
   vreq.allowance          = 0;              // read-only: no caller-account spend
@@ -4086,27 +4272,67 @@ bool CesServer::fireAccountHook(const minx::Hash& accountKey, uint16_t wantOp,
         peek.data().getAliasId() != 0))
     return true;  // no eligible account / no sidecar
   auto al = aliases_.get(peek.data().getAliasId());
+  uint16_t op = al.exists() ? al.getOp() : ALIAS_OP_NONE;
+  // Match the requested hook CLASS across pointer and inline forms.
+  bool wantGate = (wantOp == ALIAS_OP_HOOK_GATE);
   if (!(al.exists() && al.getOwner() == peek.id &&
-        al.data().getOp() == wantOp))
+        (wantGate ? aliasOpIsGate(op) : aliasOpIsWatch(op))))
     return true;  // no hook of the requested type
   const AliasData& sc = al.data().getContent();
-  minx::Hash triggerKey{};
-  std::memcpy(triggerKey.data(), sc.data(), KEY_SIZE);
-  uint64_t ceiling = ces::Buffer::peekLE<uint64_t>(sc.data() + 32);
-  // A GATE runs as a PURE PREDICATE: no refill, so it has no money side effect.
-  // That keeps the composed sequence (OUT gate + IN gate + the transfer)
-  // atomic even though each hook run commits in its own executeVmRun and there
-  // is no journal enclosing the whole transfer: a later gate's reject cannot
-  // strand an earlier gate's charge, because gates never charge. Only WATCHES
-  // (which run AFTER the transfer commits, so there is nothing to be atomic
-  // with) may refill. A gate that needs more than the free grant is too
-  // expensive to run synchronously before every transfer anyway - that logic
-  // belongs in a watch.
-  if (wantOp == ALIAS_OP_HOOK_GATE) ceiling = 0;
+
+  ces::Bytes code;
+  minx::Hash selfAssetKey{};
+  HashPrefix principal{};
+  uint64_t ceiling;
+  if (aliasOpIsInline(op)) {
+    // Inline: the content is the code (fixed area, zero-padded so load bases
+    // are link-time constants); the ceiling rides the content trailer. The
+    // hooked account patched this exact bytecode into its own cell — that is
+    // consent — so a WATCH runs with the account as programOwner
+    // (allowance-exempt syscalls and alias writes). self stays zero: no
+    // boot asset.
+    code.assign(sc.data(), sc.data() + ALIAS_INLINE_CODE_BYTES);
+    ceiling = ces::Buffer::peekLE<uint64_t>(
+      sc.data() + (ALIAS_OFF_INLINE_CEILING - ALIAS_OFF_CONTENT));
+    if (!wantGate) principal = peek.id;
+  } else {
+    // Pointer: content[0..32) names the trigger asset, ceiling at [32..40).
+    minx::Hash triggerKey{};
+    std::memcpy(triggerKey.data(), sc.data(), KEY_SIZE);
+    auto trigger = assets_.get(triggerKey);
+    if (!trigger.exists()) {
+      // Rotted/missing trigger (e.g. rent-starved): a GATE fails closed.
+      LOGDEBUG << "fireAccountHook: trigger asset missing" << BVAR(triggerKey);
+      return false;
+    }
+    const AssetData& content = trigger.data().getContent();
+    code.assign(content.begin(), content.end());
+    selfAssetKey = triggerKey;
+    ceiling = ces::Buffer::peekLE<uint64_t>(sc.data() + 32);
+    // A WATCH whose trigger the account itself owns AT FIRE TIME is
+    // consented code (same trust statement as inline): it runs with the
+    // account as principal. Foreign immutable code never gets a principal —
+    // installing a stranger's watch grants it the refill ceiling, never the
+    // authority to act as the account.
+    if (!wantGate && trigger.data().getOwnerId() == peek.id)
+      principal = peek.id;
+  }
+  // A GATE runs as a PURE PREDICATE: no refill and no principal, so it has no
+  // money side effect. That keeps the composed sequence (OUT gate + IN gate +
+  // the transfer) atomic even though each hook run commits in its own
+  // executeVmRun and there is no journal enclosing the whole transfer: a later
+  // gate's reject cannot strand an earlier gate's charge, because gates never
+  // charge. Only WATCHES (which run AFTER the transfer commits, so there is
+  // nothing to be atomic with) may refill, spend programOwner through the
+  // allowance-exempt syscalls, or write cells. A gate that needs more than
+  // the free grant is too expensive to run
+  // synchronously before every transfer anyway - that logic belongs in a
+  // watch.
+  if (wantGate) ceiling = 0;
   int64_t bal = peek.balance();
   // peek's iterator is invalid after this call; do not reuse it.
-  return runAccountHook(accountKey, triggerKey, invokeKind, counterpartyKey,
-                        amount, bal, ceiling);
+  return runAccountHook(accountKey, std::move(code), selfAssetKey, principal,
+                        invokeKind, counterpartyKey, amount, bal, ceiling);
 }
 
 // ----------------------------------------------------------------------------
@@ -4195,6 +4421,11 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
   // --- Load program asset ---
   auto programAsset = assets_.get(req.assetId);
   if (!programAsset.exists()) {
+    // Nothing ran: refund the reserved budget (the same contract as the
+    // unused-budget refund inside executeVmRun and the schedule-failure
+    // branch above).
+    auto refund = accounts_.get(originPrefix);
+    if (refund.exists()) refund.credit(req.budget);
     res.rcode = CES_ERROR_ASSET_NOT_FOUND;
     sendSignedReply(addr, msg, std::move(res));
     return;
@@ -4216,6 +4447,120 @@ void CesServer::handleRunAsset(const CesRunAsset& req,
   vreq.allowance          = req.allowance;
   vreq.gasMult            = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
   vreq.enableVerifySig    = true;
+
+  VmRunResult vres = executeVmRun(vreq);
+  res.rcode         = vres.rcode;
+  res.vmError       = vres.vmError;
+  res.budgetUsed    = vres.budgetUsed;
+  res.allowanceUsed = vres.allowanceUsed;
+  res.output        = std::move(vres.output);
+
+  tpsInc();
+  checkAutoSnapshot();
+  sendSignedReply(addr, msg, std::move(res));
+}
+
+// ----------------------------------------------------------------------------
+// handleRunAlias
+// Wire CES_RUN_ALIAS path: public invocation of an ALIAS_OP_INLINE_PROGRAM
+// cell. Same dedup / gas-reservation / future-time shape as handleRunAsset;
+// the run boots the cell's inline code area with self = 0 (no boot asset)
+// and programOwner = the cell's owner (consented code) while the caller
+// pays gas and allowance-bounded spend.
+// ----------------------------------------------------------------------------
+
+void CesServer::handleRunAlias(const CesRunAlias& req,
+                               const HashPrefix& originPrefix,
+                               const SockAddr& addr,
+                               const MinxMessage& msg) {
+  CesRunAliasResult res;
+  res.originId = originPrefix;
+  res.vmError = CESVM_OK;
+  res.budgetUsed = 0;
+  res.allowanceUsed = 0;
+
+  // --- Nonceless dedup ---
+  uint32_t effectiveNonce;
+  uint64_t sigHash = 0;
+  switch (resolveNonceless(req.time, req.sig, originPrefix,
+                           req.reqNonce, effectiveNonce, sigHash)) {
+    case NoncelessResult::Stale:
+      res.reqNonce = req.reqNonce;
+      res.rcode = CES_ERROR_WRONG_NONCE;
+      sendSignedReply(addr, msg, std::move(res));
+      return;
+    case NoncelessResult::Duplicate:
+      res.reqNonce = req.reqNonce;
+      res.rcode = CES_OK; // already processed
+      sendSignedReply(addr, msg, std::move(res));
+      return;
+    case NoncelessResult::Proceed:
+      break;
+  }
+  res.reqNonce = effectiveNonce;
+
+  // --- Pre-execution: validate and debit gas ---
+  {
+    auto origin = accounts_.get(originPrefix);
+    uint8_t rc = origin.validateSpend(0, req.budget, effectiveNonce,
+                                      resolveFee(-1, cfg_.getFeeError()));
+    if (rc != CES_OK) {
+      res.rcode = rc;
+      sendSignedReply(addr, msg, std::move(res));
+      return;
+    }
+    origin.debit(req.budget);
+    accounts_.checkFlush(req.budget);
+  }
+
+  if (req.reqNonce == CES_NONCELESS)
+    recordDedup(sigHash);
+
+  // --- Scheduled execution? ---
+  if (req.time > 0 && req.reqNonce != CES_NONCELESS) {
+    uint64_t now = getMicrosSinceEpoch();
+    if (req.time > now) {
+      res.rcode = scheduleRun(originPrefix, minx::Hash{}, req.budget,
+                              req.allowance, req.input, req.time,
+                              /*prepaid=*/true, req.aliasId);
+      if (res.rcode != CES_OK) {
+        auto refund = accounts_.get(originPrefix);
+        if (refund.exists()) refund.credit(req.budget);
+      }
+      sendSignedReply(addr, msg, std::move(res));
+      return;
+    }
+  }
+
+  // --- Load the inline program ---
+  auto al = aliases_.get(req.aliasId);
+  if (req.aliasId == 0 || !al.exists() ||
+      al.getOp() != ALIAS_OP_INLINE_PROGRAM) {
+    // Missing cell, or one that has not opted in to public invocation
+    // (hooks fire only from their own deposit path; data cells are not
+    // code). Nothing ran: refund the reserved budget.
+    auto refund = accounts_.get(originPrefix);
+    if (refund.exists()) refund.credit(req.budget);
+    res.rcode = (req.aliasId == 0 || !al.exists())
+                  ? CES_ERROR_ALIAS_NOT_FOUND
+                  : CES_ERROR_BAD_INPUT;
+    sendSignedReply(addr, msg, std::move(res));
+    return;
+  }
+  const AliasData& sc = al.data().getContent();
+
+  VmRunRequest vreq;
+  vreq.callerPrefix       = originPrefix;
+  vreq.callerKey          = req.originId;
+  vreq.selfAssetKey       = minx::Hash{};   // no boot asset
+  vreq.programOwnerPrefix = al.getOwner();  // consented: the cell's owner
+  vreq.code = ces::Bytes(sc.data(), sc.data() + ALIAS_INLINE_CODE_BYTES);
+  vreq.input              = req.input;
+  vreq.budget             = req.budget;
+  vreq.allowance          = req.allowance;
+  vreq.gasMult            = discountFee(FeeKind::VMMult, cfg_.feeVmMult);
+  vreq.enableVerifySig    = true;
+  vreq.invokeKind         = INVOKE_DIRECT_ALIAS;
 
   VmRunResult vres = executeVmRun(vreq);
   res.rcode         = vres.rcode;
@@ -5340,8 +5685,9 @@ void CesServer::_l2QueryAccount(
       HashPrefix lastDest{};
       uint64_t lastAmount = 0;
       uint32_t lastTime = 0;
+      uint32_t aliasId = 0;
       self->unsignedQueryAccount(qid, bal, nonce, lastDest,
-                                 lastAmount, lastTime);
+                                 lastAmount, lastTime, aliasId);
       boost::asio::post(cbExecutor,
         [cb, bal, nonce, lastDest, lastAmount, lastTime]() {
           cb(bal, nonce, lastDest, lastAmount, lastTime);
@@ -7271,32 +7617,44 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
     accounts_.checkFlush(run.budget);
   }
 
-  // Load program
-  auto programAsset = assets_.get(run.assetId);
-  if (!programAsset.exists()) return true; // program gone but account OK
-
-  HashPrefix programOwnerPrefix = programAsset.data().getOwnerId();
-  AssetData programContent = programAsset.data().getContent();
+  // Load program: an asset (aliasId == 0) or an alias's inline code area.
+  VmRunRequest vreq;
+  if (run.aliasId != 0) {
+    auto al = aliases_.get(run.aliasId);
+    // The cell must still exist and still opt in as a public program at fire
+    // time (the owner may have repurposed or dropped it since queue time).
+    if (!al.exists() || al.getOp() != ALIAS_OP_INLINE_PROGRAM)
+      return true; // program gone but account OK
+    const AliasData& sc = al.data().getContent();
+    vreq.selfAssetKey       = minx::Hash{};   // no boot asset
+    vreq.programOwnerPrefix = al.getOwner();  // consented: the cell's owner
+    vreq.code = ces::Bytes(sc.data(), sc.data() + ALIAS_INLINE_CODE_BYTES);
+    vreq.invokeKind         = INVOKE_SCHEDULED_ALIAS;
+  } else {
+    auto programAsset = assets_.get(run.assetId);
+    if (!programAsset.exists()) return true; // program gone but account OK
+    const AssetData& programContent = programAsset.data().getContent();
+    vreq.selfAssetKey       = run.assetId;
+    vreq.programOwnerPrefix = programAsset.data().getOwnerId();
+    vreq.code = ces::Bytes(programContent.begin(), programContent.end());
+    // Scheduled / autoexec / RPC-followup runs all fire through this path;
+    // they self-describe as SCHEDULED (autoexec, a boot-time scheduled run,
+    // shares it). A distinct AUTOEXEC kind would need a flag on the run
+    // record.
+    vreq.invokeKind         = INVOKE_SCHEDULED;
+  }
 
   // Same transactional core as the wire path: a scheduled run is now atomic
   // (undo-log rollback, durable re-journal, deferred cross-transfer) instead
   // of mutating directly. The raw (undiscounted) gas multiplier preserves the
   // prepaid budget contract locked in at schedule time; wire CES_RUN_ASSET
   // discounts via FeeKind::VMMult because the caller spends a fresh budget.
-  VmRunRequest vreq;
   vreq.callerPrefix       = run.callerPrefix;
   vreq.callerKey          = callerKey;
-  vreq.selfAssetKey       = run.assetId;
-  vreq.programOwnerPrefix = programOwnerPrefix;
-  vreq.code               = ces::Bytes(programContent.begin(), programContent.end());
   vreq.input              = run.input;
   vreq.budget             = run.budget;
   vreq.allowance          = run.allowance;
   vreq.gasMult            = cfg_.feeVmMult;
-  // Scheduled / autoexec / RPC-followup runs all fire through this path;
-  // they self-describe as SCHEDULED (autoexec, a boot-time scheduled run,
-  // shares it). A distinct AUTOEXEC kind would need a flag on the run record.
-  vreq.invokeKind         = INVOKE_SCHEDULED;
   vreq.enableVerifySig    = false;
   executeVmRun(vreq);
 
@@ -7309,10 +7667,11 @@ uint8_t CesServer::scheduleRun(const HashPrefix& callerPrefix,
                                 uint64_t budget,
                                 uint64_t allowance,
                                 const ces::Bytes& input,
-                                uint64_t time_us, bool prepaid) {
+                                uint64_t time_us, bool prepaid,
+                                uint32_t aliasId) {
   ScheduleKey key;
   return scheduleRunUndoable(callerPrefix, assetId, budget, allowance, input,
-                             time_us, prepaid, key);
+                             time_us, prepaid, key, aliasId);
 }
 
 uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
@@ -7320,16 +7679,18 @@ uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
                                         uint64_t budget, uint64_t allowance,
                                         const ces::Bytes& input,
                                         uint64_t time_us, bool prepaid,
-                                        ScheduleKey& outKey) {
+                                        ScheduleKey& outKey,
+                                        uint32_t aliasId) {
   if (scheduledRuns_.size() >= cfg_.maxScheduledEntries)
     return CES_ERROR_QUEUE_FULL;
   if (time_us == 0) time_us = 1; // "next tick"
   outKey = ScheduleKey{time_us, scheduledSeq_++};
   LOGTRACE << "scheduleRun" << VAR(time_us) << VAR(budget) << VAR(allowance)
-           << VAR(scheduledRuns_.size());
+           << VAR(aliasId) << VAR(scheduledRuns_.size());
   scheduledRuns_.emplace(
     outKey,
-    ScheduledRun{callerPrefix, assetId, budget, allowance, input, prepaid});
+    ScheduledRun{callerPrefix, assetId, budget, allowance, input, prepaid,
+                 aliasId});
   return CES_OK;
 }
 

@@ -8,6 +8,7 @@
  * asset content cell).
  */
 
+#include <ces/alias.h>
 #include <ces/asset.h>
 #include <ces/lang/bundle.h>
 #include <ces/lang/casm.h>
@@ -32,6 +33,7 @@ int main(int argc, char** argv) {
   std::string bundleDir;
   std::string salt;
   bool boot = false;
+  bool alias = false;
   bool hex = false;
 
   app.add_option("input", inPath, "source file (.cesl or .casm)")
@@ -42,11 +44,18 @@ int main(int argc, char** argv) {
     ->check(CLI::IsMember({"cesl", "casm"}));
   app.add_flag("--boot", boot,
                "enforce the 210-byte boot-block limit and pad to 210");
+  auto* aliasFlag =
+    app.add_flag("--alias", alias,
+                 "enforce the alias inline-code limit and pad to the inline "
+                 "code area (deploy with `cesh alias write` at the content "
+                 "offset)");
+  aliasFlag->excludes("--boot");
   app.add_flag("--hex", hex, "print hex to stdout instead of writing a file");
   app.add_option("--bundle", bundleDir,
                  "write a multi-asset bundle (boot + chunks + key tables + "
                  "manifest) to this directory")
     ->excludes("--boot")
+    ->excludes("--alias")
     ->excludes("--hex")
     ->excludes("-o");
   app.add_option("--salt", salt,
@@ -166,6 +175,15 @@ int main(int argc, char** argv) {
     }
     code.resize(ces::AssetData{}.size(), 0);
   }
+  if (alias) {
+    if (rawSize > ces::ALIAS_INLINE_CODE_BYTES) {
+      std::cerr << "cesc: " << rawSize << " bytes exceeds the "
+                << ces::ALIAS_INLINE_CODE_BYTES
+                << "-byte alias inline code area\n";
+      return 1;
+    }
+    code.resize(ces::ALIAS_INLINE_CODE_BYTES, 0);
+  }
 
   if (hex) {
     std::cout << ces::bytesToHex({code.data(), code.size()}) << "\n";
@@ -186,6 +204,8 @@ int main(int argc, char** argv) {
             static_cast<std::streamsize>(code.size()));
   out.close();
   std::cout << "wrote " << outPath << " (" << rawSize << " bytes"
-            << (boot ? ", padded to 210-byte boot block" : "") << ")\n";
+            << (boot ? ", padded to 210-byte boot block"
+                : alias ? ", padded to the alias inline code area" : "")
+            << ")\n";
   return 0;
 }

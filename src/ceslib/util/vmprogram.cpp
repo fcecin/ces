@@ -572,6 +572,29 @@ VmProgram& VmProgram::sysSchedule(ScheduleArgs a) {
   });
 }
 
+VmProgram& VmProgram::sysReadAlias(ReadAliasArgs a) {
+  return hostxv(SYS_READ_ALIAS, {a.aliasId, a.offset, a.len, a.destPtr});
+}
+
+VmProgram& VmProgram::sysWriteAlias(WriteAliasArgs a) {
+  return hostxv(SYS_WRITE_ALIAS, {a.aliasId, a.offset, a.len, a.srcPtr});
+}
+
+VmProgram& VmProgram::sysLoadCodeAlias(LoadCodeAliasArgs a) {
+  return hostxv(SYS_LOAD_CODE_ALIAS, {a.aliasId});
+}
+
+VmProgram& VmProgram::sysScheduleAlias(ScheduleAliasArgs a) {
+  return hostxv(SYS_SCHEDULE_ALIAS, {
+    a.aliasId,
+    a.budget,
+    a.childAllowance,
+    a.inputPtr,
+    a.inputLen,
+    a.timeUs,
+  });
+}
+
 VmProgram& VmProgram::sysRpc(RpcArgs a) {
   // io[3] = SYS_RPC, io[4..10] = the seven args in order.
   return hostxv(SYS_RPC, {

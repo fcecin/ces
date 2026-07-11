@@ -1,7 +1,8 @@
-// Alias ledger ops: set (upsert) / query / delete, the id generator,
-// id-stability across edits, delete-to-rotate, the store cap, and daily rent
-// (charge + reclaim). Direct server methods (like transfer), nonce-skip
-// (reqNonce=0). Fees are pinned so charges are exact.
+// Alias ledger ops: patch write (upsert on own alias) / windowed query /
+// delete, the id generator, id-stability across edits, delete-to-rotate, the
+// editor grant (content-only patch floor), patch bounds, the store cap, and
+// daily rent (charge + reclaim). Direct server methods (like transfer),
+// nonce-skip (reqNonce=0). Fees are pinned so charges are exact.
 
 #include "test_common.h"
 
@@ -9,6 +10,7 @@
 #include <ces/alias.h>
 #include <ces/types.h>
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -52,23 +54,40 @@ struct AliasFixtureBase {
   int64_t bal(const minx::Hash& k) { return server->_balanceOf(k); }
   uint32_t aliasIdOf(const minx::Hash& k) { return server->_aliasIdOf(k); }
 
-  ces::AliasData str(const std::string& s) {
-    ces::AliasData d{};
-    for (std::size_t i = 0; i < s.size() && i < d.size(); ++i)
-      d[i] = static_cast<uint8_t>(s[i]);
-    return d;
+  ces::Bytes str(const std::string& s) {
+    ces::Bytes b;
+    b.assign(s.begin(), s.end());
+    return b;
   }
 
-  uint8_t setAlias(const minx::Hash& k, uint16_t op, const ces::AliasData& c,
-                   uint32_t& outId) {
-    uint8_t rc = server->setAlias(k, op, c, 0, outId);
+  uint8_t patchAlias(const minx::Hash& k, uint32_t aliasId, uint16_t offset,
+                     const ces::Bytes& bytes, uint32_t& outId) {
+    uint8_t rc = server->setAlias(k, aliasId, offset, bytes, 0, outId);
     server->_drainLogic();
     return rc;
+  }
+  // Convenience: write op + content in one patch on the signer's own alias
+  // (op is host-endian in the image; LE on all supported targets).
+  uint8_t setAlias(const minx::Hash& k, uint16_t op, const ces::Bytes& content,
+                   uint32_t& outId) {
+    ces::Bytes b(2 + content.size());
+    std::memcpy(b.data(), &op, sizeof(op));
+    std::memcpy(b.data() + 2, content.data(), content.size());
+    return patchAlias(k, 0, ces::ALIAS_OFF_OP, b, outId);
   }
   uint8_t deleteAlias(const minx::Hash& k) {
     uint8_t rc = server->deleteAlias(k, 0);
     server->_drainLogic();
     return rc;
+  }
+  ces::HashPrefix pfx(KeyPair& kp) {
+    return ces::Account::getMapKey(kp.getPublicKeyAsHash());
+  }
+  ces::Bytes pfxBytes(KeyPair& kp) {
+    ces::HashPrefix p = pfx(kp);
+    ces::Bytes b;
+    b.assign(p.begin(), p.end());
+    return b;
   }
 };
 
@@ -303,36 +322,136 @@ BOOST_FIXTURE_TEST_CASE(DailyRentReclaimsWhenOwnerAccountGone, AliasRentFixture)
 
 // Full wire path: client SDK -> protocol -> server dispatch -> result, over the
 // real UDP transport (CesFixture: funded client + live server, PoW diff 1).
-// Also pins id-stability across a wire edit.
-BOOST_FIXTURE_TEST_CASE(OverTheWireSetQueryDelete, CesFixture) {
-  ces::AliasData content{};
-  const char* s = "wire test";
-  for (std::size_t i = 0; s[i]; ++i)
-    content[i] = static_cast<uint8_t>(s[i]);
+// Pins id-stability across a wire patch, the windowed read (skip-the-header
+// pattern), and out-of-bounds window rejection.
+BOOST_FIXTURE_TEST_CASE(OverTheWireWriteReadDelete, CesFixture) {
+  const std::string s = "wire test";
+  ces::Bytes content;
+  content.assign(s.begin(), s.end());
 
   uint32_t id = 0;
-  CES_REQUIRE_OK(client->setAlias(ces::ALIAS_OP_STRING, content, id));   // allocate
+  CES_REQUIRE_OK(client->writeAlias(0, ces::ALIAS_OFF_CONTENT, content, id));
   BOOST_CHECK(id > 0);
 
-  HashPrefix owner{};
-  uint16_t op = 0;
-  ces::AliasData out{};
+  // Windowed read of the content only (header skipped).
+  ces::Bytes out;
   bool found = false;
-  CES_REQUIRE_OK(client->queryAlias(id, owner, op, out, found));
+  CES_REQUIRE_OK(client->readAlias(id, ces::ALIAS_OFF_CONTENT,
+                                   static_cast<uint16_t>(content.size()),
+                                   out, found));
   BOOST_CHECK(found);
-  BOOST_CHECK_EQUAL(op, ces::ALIAS_OP_STRING);
+  BOOST_REQUIRE_EQUAL(out.size(), content.size());
   BOOST_CHECK_EQUAL(out[0], static_cast<uint8_t>('w'));
 
+  // Patch a single byte in place; the id is stable.
+  ces::Bytes one;
+  one.push_back('W');
   uint32_t id2 = 0;
-  CES_CHECK_OK(client->setAlias(ces::ALIAS_OP_NONE, content, id2));       // edit in place
-  BOOST_CHECK_EQUAL(id2, id);                                             // id stable
-  CES_REQUIRE_OK(client->queryAlias(id, owner, op, out, found));
+  CES_CHECK_OK(client->writeAlias(0, ces::ALIAS_OFF_CONTENT, one, id2));
+  BOOST_CHECK_EQUAL(id2, id);
+  CES_REQUIRE_OK(client->readAlias(id, ces::ALIAS_OFF_CONTENT, 1, out, found));
   BOOST_CHECK(found);
-  BOOST_CHECK_EQUAL(op, ces::ALIAS_OP_NONE);
+  BOOST_REQUIRE_EQUAL(out.size(), 1u);
+  BOOST_CHECK_EQUAL(out[0], static_cast<uint8_t>('W'));
+
+  // An out-of-bounds window reads as not-found.
+  CES_REQUIRE_OK(client->readAlias(id, ces::ALIAS_VALUE_BYTES - 1, 2, out, found));
+  BOOST_CHECK(!found);
 
   CES_CHECK_OK(client->deleteAlias());
-  CES_REQUIRE_OK(client->queryAlias(id, owner, op, out, found));
+  CES_REQUIRE_OK(client->readAlias(id, 0, 1, out, found));
   BOOST_CHECK(!found);
+}
+
+// Owner grants an editor by patching the editor field; the editor may then
+// patch content on the owner's cell, but never the header, and a stranger may
+// not patch at all.
+BOOST_FIXTURE_TEST_CASE(EditorGrantAndPatchFloors, AliasFixture) {
+  KeyPair a, b, c;
+  fund(a.getPublicKeyAsHash(), 1'000'000);
+  fund(b.getPublicKeyAsHash(), 1'000'000);
+  fund(c.getPublicKeyAsHash(), 1'000'000);
+
+  uint32_t id = 0;
+  CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_NONE,
+                        str("owner data"), id));
+
+  // Grant B: owner patches the editor field.
+  uint32_t idEdit = 0;
+  CES_CHECK_OK(patchAlias(a.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_EDITOR,
+                          pfxBytes(b), idEdit));
+  BOOST_CHECK_EQUAL(idEdit, id);
+
+  // B patches content on A's cell by id.
+  uint32_t idB = 0;
+  CES_CHECK_OK(patchAlias(b.getPublicKeyAsHash(), id, ces::ALIAS_OFF_CONTENT,
+                          str("from B"), idB));
+  BOOST_CHECK_EQUAL(idB, id);
+  ces::Alias out;
+  BOOST_CHECK(server->queryAlias(id, out));
+  BOOST_CHECK_EQUAL(out.getContent()[0], static_cast<uint8_t>('f'));
+  BOOST_CHECK(out.getOwner() == pfx(a));      // header untouched
+  BOOST_CHECK(out.getEditor() == pfx(b));
+
+  // B may not touch the header: editor, op, or the last header byte.
+  CES_CHECK_RC_EQ(patchAlias(b.getPublicKeyAsHash(), id, ces::ALIAS_OFF_EDITOR,
+                             pfxBytes(b), idB), CES_ERROR_NOT_OWNER);
+  CES_CHECK_RC_EQ(patchAlias(b.getPublicKeyAsHash(), id, ces::ALIAS_OFF_OP,
+                             str("xx"), idB), CES_ERROR_NOT_OWNER);
+  CES_CHECK_RC_EQ(patchAlias(b.getPublicKeyAsHash(), id,
+                             ces::ALIAS_OFF_CONTENT - 1, str("x"), idB),
+                  CES_ERROR_NOT_OWNER);
+
+  // A stranger may not patch at all.
+  CES_CHECK_RC_EQ(patchAlias(c.getPublicKeyAsHash(), id, ces::ALIAS_OFF_CONTENT,
+                             str("intruder"), idB), CES_ERROR_NOT_OWNER);
+
+  // Owner revokes: zero the editor field; B loses write access.
+  ces::Bytes zero(sizeof(ces::HashPrefix), 0);
+  CES_CHECK_OK(patchAlias(a.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_EDITOR,
+                          zero, idEdit));
+  CES_CHECK_RC_EQ(patchAlias(b.getPublicKeyAsHash(), id, ces::ALIAS_OFF_CONTENT,
+                             str("late"), idB), CES_ERROR_NOT_OWNER);
+}
+
+// Patch bounds: nobody writes the owner field, and no patch may run past the
+// end of the value image. An editor grant does not create cells: patching a
+// dead id fails.
+BOOST_FIXTURE_TEST_CASE(PatchBoundsAndTargets, AliasFixture) {
+  KeyPair a;
+  fund(a.getPublicKeyAsHash(), 1'000'000);
+  uint32_t id = 0;
+
+  // Owner field is server-set; offset 0 rejects even for the owner.
+  CES_CHECK_RC_EQ(patchAlias(a.getPublicKeyAsHash(), 0, ces::ALIAS_OFF_OWNER,
+                             str("xxxxxxxx"), id), CES_ERROR_BAD_INPUT);
+
+  // Past-the-end rejects whole.
+  CES_CHECK_RC_EQ(patchAlias(a.getPublicKeyAsHash(), 0,
+                             ces::ALIAS_VALUE_BYTES - 1, str("xy"), id),
+                  CES_ERROR_BAD_INPUT);
+
+  // A nonzero target must exist.
+  CES_CHECK_RC_EQ(patchAlias(a.getPublicKeyAsHash(), 999999,
+                             ces::ALIAS_OFF_CONTENT, str("x"), id),
+                  CES_ERROR_ALIAS_NOT_FOUND);
+
+  // A partial patch preserves the rest of the image.
+  CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING,
+                        str("abcdef"), id));
+  ces::Bytes mid;
+  mid.push_back('X');
+  uint32_t id2 = 0;
+  CES_CHECK_OK(patchAlias(a.getPublicKeyAsHash(), 0,
+                          ces::ALIAS_OFF_CONTENT + 2, mid, id2));
+  BOOST_CHECK_EQUAL(id2, id);
+  ces::Alias out;
+  BOOST_CHECK(server->queryAlias(id, out));
+  BOOST_CHECK_EQUAL(out.getOp(), ces::ALIAS_OP_STRING);   // op preserved
+  BOOST_CHECK_EQUAL(out.getContent()[0], static_cast<uint8_t>('a'));
+  BOOST_CHECK_EQUAL(out.getContent()[1], static_cast<uint8_t>('b'));
+  BOOST_CHECK_EQUAL(out.getContent()[2], static_cast<uint8_t>('X'));
+  BOOST_CHECK_EQUAL(out.getContent()[3], static_cast<uint8_t>('d'));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

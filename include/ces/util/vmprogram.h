@@ -812,6 +812,48 @@ public:
   };
   VmProgram& sysRpc(RpcArgs args);
 
+  // SYS_READ_ALIAS — public windowed read of an alias's value image
+  // (owner|editor|op|content; offsets in alias.h). R = bytes read.
+  struct ReadAliasArgs {
+    VmVal aliasId;  // io[4] — alias id (value, not a pointer)
+    VmVal offset;   // io[5] — image byte offset
+    VmVal len;      // io[6] — bytes to read
+    VmVal destPtr;  // io[7] — cell index where the window is written
+  };
+  VmProgram& sysReadAlias(ReadAliasArgs a);
+
+  // SYS_WRITE_ALIAS — patch bytes into an alias's value image, acting as
+  // the run's programOwner principal (owner floor 8, editor floor 18;
+  // principal-less runs always fail). hostx: a rejected write aborts.
+  struct WriteAliasArgs {
+    VmVal aliasId;  // io[4]
+    VmVal offset;   // io[5]
+    VmVal len;      // io[6]
+    VmVal srcPtr;   // io[7] — cell index of the patch bytes
+  };
+  VmProgram& sysWriteAlias(WriteAliasArgs a);
+
+  // SYS_LOAD_CODE_ALIAS — append an alias's whole inline code area to the
+  // code buffer. R = offset of the loaded area (a link-time constant when
+  // the boot size is fixed).
+  struct LoadCodeAliasArgs {
+    VmVal aliasId;  // io[4]
+  };
+  VmProgram& sysLoadCodeAlias(LoadCodeAliasArgs a);
+
+  // SYS_SCHEDULE_ALIAS — queue a future run of an alias's inline program
+  // (must be ALIAS_OP_INLINE_PROGRAM). Same allowance-carve contract as
+  // sysSchedule.
+  struct ScheduleAliasArgs {
+    VmVal aliasId;        // io[4]
+    VmVal budget;         // io[5]
+    VmVal childAllowance; // io[6]
+    VmVal inputPtr;       // io[7]
+    VmVal inputLen;       // io[8]
+    VmVal timeUs;         // io[9] — wall clock microseconds (0 = next tick)
+  };
+  VmProgram& sysScheduleAlias(ScheduleAliasArgs a);
+
   // Generic syscall dispatch. Populates io[3] with `syscallNum`, then
   // emits OP_SET for each (slot, value) pair in `slots`, then OP_HOSTX.
   // Use this for one-off tests where adding a typed wrapper above is

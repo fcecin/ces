@@ -24,14 +24,14 @@ public:
     const Alias& data() const;
 
     HashPrefix getOwner() const;
+    HashPrefix getEditor() const;
     uint16_t getOp() const;
     const AliasData& getContent() const;
 
     void setOwner(const HashPrefix& owner);
     void setOp(uint16_t op);
     void setContent(const AliasData& content);
-    void updateFull(const HashPrefix& owner, uint16_t op,
-                    const AliasData& content);
+    void updateValue(const Alias& value);
 
   private:
     template <typename Mutator>

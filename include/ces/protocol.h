@@ -584,7 +584,7 @@ struct CesUnsignedQueryAccount {
 #define CES_UNSIGNED_QUERY_ACCOUNT_RESULT_FIELDS(X)                            \
   X(HashPrefix, queryId) X(int64_t, bal) X(uint32_t, nonce)                    \
   X(HashPrefix, lastXferDest) X(uint64_t, lastXferAmount)                      \
-  X(uint32_t, lastXferTime)
+  X(uint32_t, lastXferTime) X(uint32_t, aliasId)
 struct CesUnsignedQueryAccountResult {
   CES_DECLARE_FIELDS(CES_UNSIGNED_QUERY_ACCOUNT_RESULT_FIELDS)
   CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_UNSIGNED_QUERY_ACCOUNT_RESULT_FIELDS)
@@ -905,15 +905,48 @@ struct CesQueryAssetResult {
   CES_INJECT_SIGNED_METHODS(CES_QUERY_ASSET_RESULT)
 };
 
-// --- CES_SET_ALIAS (set this account's alias: create on first use, edit in
-// place after; the id is stable across edits, delete to drop it) ---
-#define CES_SET_ALIAS_FIELDS(X)                                                \
-  X(Hash, originId) X(HashPrefix, serverId)                                    \
-  X(uint32_t, reqNonce) X(uint16_t, op) X(AliasData, content)
+// --- CES_SET_ALIAS (patch bytes into an alias's value image) ---
+// The write is a patch: offset + bytes address the ALIAS_VALUE_BYTES image
+// (owner | editor | op | content). aliasId 0 targets the signer's own alias
+// (created zeroed on first use; the id is stable across patches, delete to
+// drop it); nonzero targets any alias the signer owns or edits. The server
+// enforces the patch floors (ALIAS_PATCH_MIN_*) and bounds; an illegal write
+// rejects whole.
 struct CesSetAlias {
-  CES_DECLARE_FIELDS(CES_SET_ALIAS_FIELDS)
+  Hash originId;
+  HashPrefix serverId{};
+  uint32_t reqNonce;
+  uint32_t aliasId;
+  uint16_t offset;
+  ces::Bytes bytes;   // patch payload; its size is the write length
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(serverId) + sizeof(reqNonce) +
+           sizeof(aliasId) + sizeof(offset) + sizeof(uint16_t) + bytes.size();
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(serverId);
+    buf.put(reqNonce);
+    buf.put(aliasId);
+    buf.put(offset);
+    buf.put(static_cast<uint16_t>(bytes.size()));
+    buf.putBytes(bytes);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<Hash>();
+    serverId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    aliasId = buf.get<uint32_t>();
+    offset = buf.get<uint16_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > ALIAS_VALUE_BYTES) len = ALIAS_VALUE_BYTES;
+    bytes = buf.getBytes<ces::Bytes>(len);
+  }
+
   Signature sig{};
-  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_SET_ALIAS_FIELDS)
   CES_INJECT_SIGNED_METHODS(CES_SET_ALIAS)
 };
 
@@ -946,21 +979,135 @@ struct CesDeleteAliasResult {
   CES_INJECT_SIGNED_METHODS(CES_DELETE_ALIAS_RESULT)
 };
 
-// --- CES_QUERY_ALIAS (unsigned: read an alias by id) ---
-#define CES_QUERY_ALIAS_FIELDS(X) X(uint32_t, aliasId)
+// --- CES_QUERY_ALIAS (unsigned: windowed read of an alias's value image) ---
+// offset + length address the ALIAS_VALUE_BYTES image; an out-of-bounds
+// window returns found = 0. The whole image is public.
+#define CES_QUERY_ALIAS_FIELDS(X)                                              \
+  X(uint32_t, aliasId) X(uint16_t, offset) X(uint16_t, length)
 struct CesQueryAlias {
   CES_DECLARE_FIELDS(CES_QUERY_ALIAS_FIELDS)
   CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_QUERY_ALIAS_FIELDS)
   CES_INJECT_UNSIGNED_METHODS(CES_QUERY_ALIAS)
 };
 
-#define CES_QUERY_ALIAS_RESULT_FIELDS(X)                                       \
-  X(uint32_t, aliasId) X(HashPrefix, owner) X(uint16_t, op)                    \
-    X(AliasData, content) X(uint8_t, found)
 struct CesQueryAliasResult {
-  CES_DECLARE_FIELDS(CES_QUERY_ALIAS_RESULT_FIELDS)
-  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_QUERY_ALIAS_RESULT_FIELDS)
+  uint32_t aliasId = 0;
+  uint16_t offset = 0;
+  ces::Bytes bytes;   // the requested window; empty unless found
+  uint8_t found = 0;
+
+  size_t getPayloadSize() const {
+    return sizeof(aliasId) + sizeof(offset) + sizeof(uint16_t) + bytes.size() +
+           sizeof(found);
+  }
+
+  void writePayload(minx::Buffer& buf) const {
+    buf.put(aliasId);
+    buf.put(offset);
+    buf.put(static_cast<uint16_t>(bytes.size()));
+    buf.putBytes(bytes);
+    buf.put(found);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    aliasId = buf.get<uint32_t>();
+    offset = buf.get<uint16_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > ALIAS_VALUE_BYTES) len = ALIAS_VALUE_BYTES;
+    bytes = buf.getBytes<ces::Bytes>(len);
+    found = buf.get<uint8_t>();
+  }
+
   CES_INJECT_UNSIGNED_METHODS(CES_QUERY_ALIAS_RESULT)
+};
+
+// --- CES_RUN_ALIAS (execute an alias's inline program) ---
+// The alias-id twin of CES_RUN_ASSET: the target must be
+// ALIAS_OP_INLINE_PROGRAM; the run gets self = 0 and programOwner = the
+// cell's owner. Caller pays gas; allowance caps caller-side spend.
+struct CesRunAlias {
+  Hash originId;
+  HashPrefix serverId{};
+  uint32_t reqNonce;
+  uint32_t aliasId;
+  uint64_t budget;
+  uint64_t allowance = std::numeric_limits<uint64_t>::max();
+  uint64_t time = 0; // UTC epoch microseconds (required for CES_NONCELESS dedup)
+  ces::Bytes input; // up to 1024 bytes
+  Signature sig{};
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(serverId) + sizeof(reqNonce) +
+           sizeof(aliasId) + sizeof(budget) + sizeof(allowance) +
+           sizeof(time) + 2 + input.size();
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(serverId);
+    buf.put(reqNonce);
+    buf.put(aliasId);
+    buf.put(budget);
+    buf.put(allowance);
+    buf.put(time);
+    buf.put(static_cast<uint16_t>(input.size()));
+    buf.putBytes(input);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<Hash>();
+    serverId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    aliasId = buf.get<uint32_t>();
+    budget = buf.get<uint64_t>();
+    allowance = buf.get<uint64_t>();
+    time = buf.get<uint64_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 1024) len = 1024;
+    input = buf.getBytes<ces::Bytes>(len);
+  }
+  CES_INJECT_SIGNED_METHODS(CES_RUN_ALIAS)
+};
+
+struct CesRunAliasResult {
+  HashPrefix originId;
+  uint32_t reqNonce;
+  uint8_t rcode;
+  uint64_t vmError;
+  uint64_t budgetUsed;
+  uint64_t allowanceUsed;
+  ces::Bytes output; // up to 1024 bytes
+  Signature sig{};
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(reqNonce) + sizeof(rcode) +
+           sizeof(vmError) + sizeof(budgetUsed) + sizeof(allowanceUsed) +
+           2 + output.size();
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(reqNonce);
+    buf.put(rcode);
+    buf.put(vmError);
+    buf.put(budgetUsed);
+    buf.put(allowanceUsed);
+    buf.put(static_cast<uint16_t>(output.size()));
+    buf.putBytes(output);
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    rcode = buf.get<uint8_t>();
+    vmError = buf.get<uint64_t>();
+    budgetUsed = buf.get<uint64_t>();
+    allowanceUsed = buf.get<uint64_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 1024) len = 1024;
+    output = buf.getBytes<ces::Bytes>(len);
+  }
+  CES_INJECT_SIGNED_METHODS(CES_RUN_ALIAS_RESULT)
 };
 
 // --- UNSIGNED ASSET QUERIES & SERVER INFO ---

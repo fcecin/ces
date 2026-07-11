@@ -641,8 +641,8 @@ uint8_t CesClient::createAssetRange(const Hash& firstKey, uint32_t count,
   });
 }
 
-uint8_t CesClient::setAlias(uint16_t op, const AliasData& content,
-                            uint32_t& outAliasId) {
+uint8_t CesClient::writeAlias(uint32_t aliasId, uint16_t offset,
+                              const ces::Bytes& bytes, uint32_t& outAliasId) {
   outAliasId = 0;
   uint32_t reqNonce;
   if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
@@ -653,8 +653,9 @@ uint8_t CesClient::setAlias(uint16_t op, const AliasData& content,
   req.originId = myFullKey;
   req.serverId = getServerId();
   req.reqNonce = reqNonce;
-  req.op = op;
-  req.content = content;
+  req.aliasId = aliasId;
+  req.offset = offset;
+  req.bytes = bytes;
   uint8_t rc = sendSigned(req, setAliasGen_, setAliasResultCode_, [&] {
     return setAliasResultNonce_ == reqNonce &&
            setAliasResultOriginId_ == myId;
@@ -680,12 +681,12 @@ uint8_t CesClient::deleteAlias() {
   });
 }
 
-uint8_t CesClient::queryAlias(uint32_t aliasId, HashPrefix& outOwner,
-                              uint16_t& outOp, AliasData& outContent,
-                              bool& outFound) {
+uint8_t CesClient::readAlias(uint32_t aliasId, uint16_t offset,
+                             uint16_t length, ces::Bytes& outBytes,
+                             bool& outFound) {
   if (!ensureServerTicket())
     return CES_ERROR_INTERNAL;
-  CesQueryAlias req{aliasId};
+  CesQueryAlias req{aliasId, offset, length};
   minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
                         req.toBytes()};
   uint64_t g = queryAliasGen_;
@@ -696,15 +697,14 @@ uint8_t CesClient::queryAlias(uint32_t aliasId, HashPrefix& outOwner,
       ces::waitFor(retryIntervalMs_, [&]() { return g < queryAliasGen_; });
     switch (res) {
     case ces::WaitResult::Success:
-      if (queryAliasResultId_ != aliasId) {
+      if (queryAliasResultId_ != aliasId ||
+          queryAliasResultOffset_ != offset) {
         g = queryAliasGen_;
         if (++staleCount < tries_) { --i; }
         continue;
       }
       outFound = queryAliasResultFound_ != 0;
-      outOwner = queryAliasResultOwner_;
-      outOp = queryAliasResultOp_;
-      outContent = queryAliasResultContent_;
+      outBytes = queryAliasResultBytes_;
       return CES_OK;
     case ces::WaitResult::Interrupted:
       return CES_ERROR_INTERNAL;
@@ -915,6 +915,52 @@ uint8_t CesClient::runAsset(const Hash& assetId, uint64_t budget,
     outVmError = runAssetResultVmError_;
     outBudgetUsed = runAssetResultBudgetUsed_;
     outOutput = runAssetResultOutput_;
+  }
+  return rc;
+}
+
+uint8_t CesClient::runAlias(uint32_t aliasId, uint64_t budget,
+                            const ces::Bytes& input,
+                            uint64_t& outVmError, uint64_t& outBudgetUsed,
+                            ces::Bytes& outOutput,
+                            bool nonceless,
+                            uint64_t allowance) {
+  LOGTRACE << "runAlias";
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+
+  uint32_t reqNonce;
+  if (nonceless) {
+    reqNonce = CES_NONCELESS;
+  } else {
+    if (getMyNonce(reqNonce) != CES_OK)
+      return CES_ERROR_INTERNAL;
+  }
+
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+
+  CesRunAlias req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.aliasId = aliasId;
+  req.budget = budget;
+  req.allowance = allowance;
+  req.time = getMicrosSinceEpoch();
+  req.input = input;
+
+  uint8_t rc = sendSigned(req, runAliasGen_, runAliasResultCode_, [&] {
+    if (nonceless)
+      return runAliasResultOriginId_ == myId;
+    return runAliasResultNonce_ == reqNonce &&
+           runAliasResultOriginId_ == myId;
+  });
+
+  if (rc != CES_ERROR_INTERNAL && rc != CES_ERROR_TIMEOUT) {
+    outVmError = runAliasResultVmError_;
+    outBudgetUsed = runAliasResultBudgetUsed_;
+    outOutput = runAliasResultOutput_;
   }
   return rc;
 }
@@ -1247,9 +1293,8 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
     case CES_QUERY_ALIAS_RESULT:
       handleUnsigned(CesQueryAliasResult{}, queryAliasGen_, [&](auto& r) {
         queryAliasResultId_ = r.aliasId;
-        queryAliasResultOwner_ = r.owner;
-        queryAliasResultOp_ = r.op;
-        queryAliasResultContent_ = r.content;
+        queryAliasResultOffset_ = r.offset;
+        queryAliasResultBytes_ = r.bytes;
         queryAliasResultFound_ = r.found;
       });
       break;
@@ -1263,6 +1308,7 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         accQueryLastXferDest_ = r.lastXferDest;
         accQueryLastXferAmount_ = r.lastXferAmount;
         accQueryLastXferTime_ = r.lastXferTime;
+        accQueryAliasId_ = r.aliasId;
       });
       break;
 
@@ -1375,6 +1421,19 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         runAssetResultBudgetUsed_ = r.budgetUsed;
         runAssetResultAllowanceUsed_ = r.allowanceUsed;
         runAssetResultOutput_ = std::move(r.output);
+      });
+      break;
+
+    case CES_RUN_ALIAS_RESULT:
+      handleSigned(CesRunAliasResult{}, "run alias", runAliasGen_,
+                   [&](auto& r) {
+        runAliasResultOriginId_ = r.originId;
+        runAliasResultNonce_ = r.reqNonce;
+        runAliasResultCode_ = r.rcode;
+        runAliasResultVmError_ = r.vmError;
+        runAliasResultBudgetUsed_ = r.budgetUsed;
+        runAliasResultAllowanceUsed_ = r.allowanceUsed;
+        runAliasResultOutput_ = std::move(r.output);
       });
       break;
 
