@@ -40,22 +40,20 @@ __mods["main"] = function()
 --   entry <name>              owner, balance, timestamps, payload
 --   txr <hex32>               did this tx apply, and at what height
 --   submit <hex>              admit signed ops; the bytes are opaque, sign them yourself
---   faucet <amount>           mint to YOUR key (the one that bound this channel)
+--   nodekey                   (owner only) the validator private key, to load into cesh
 --
 -- `submit` is the whole service: the K,V verbs (publish, update, give, delete, fund) are
 -- hyle entry ops, so a client encodes and SIGNS one itself and hands it over. This program
 -- never holds a user's key and never inspects the bytes.
 --
--- `faucet` is the devnet's credit source. It sudo-mints to conn.pubkey -- the key CES already
--- authenticated at bind -- and that same key IS the caller's hyle account, so there is nothing
--- to look up and nothing to spoof. Per-caller cap, in RAM, reset on restart: a devnet faucet,
--- not an economy.
+-- Money comes only from the validator. `nodekey` hands the node/validator private key to the
+-- owner, who loads it into cesh and mints as the node (`cesh hyle <pid> mint <to> <amount>`).
+-- The chain gates minting to validators, so a non-owner client cannot create money.
 
 local cfg = {}
 local running = false
 local heartbeat = nil
 local last_err = nil
-local minted = {}       -- hex pubkey -> faucet total, this instance
 local bufs = {}         -- conn id -> partial line
 
 local height_spark = {}
@@ -94,7 +92,9 @@ local function do_start()
 
   local ok, err = ces.hyle.solo.start{
     chain_id     = cfg.chain_id or "hylesolo",
-    alloc        = num("alloc", 1000000000),
+    -- The sole validator (this program) is allocated the operator's dev bankroll: whoever holds
+    -- the node key (via `nodekey`) can transfer it out or mint more.
+    alloc        = num("alloc", 1000000000000000),
     fee_transfer = num("fee_transfer", 10),
     fee_entry    = num("fee_entry", 10),
     fee_mint     = num("fee_mint", 1),
@@ -103,6 +103,8 @@ local function do_start()
     rent_rate    = num("rent_rate", 1),
     rip_bounty   = num("rip_bounty", 10),
     sudo_ttl_secs = num("sudo_ttl_secs", 0),
+    block_retention   = num("block_retention", 1024),
+    snapshot_interval = num("snapshot_interval", 0),
   }
   if not ok then
     last_err = tostring(err)
@@ -142,7 +144,6 @@ local function do_stop()
   if heartbeat then ces.cancel(heartbeat); heartbeat = nil end
   ces.hyle.solo.stop()
   height_spark = {}
-  minted = {}
   ces.log("hylesolo: stopped")
   return "stopped"
 end
@@ -168,9 +169,9 @@ function cmds.config()
   if not c then return "err no_chain" end
   return string.format(
     "ok fee_mint=%d fee_transfer=%d fee_entry=%d fee_sudo=%d rent_rate=%d rip_bounty=%d " ..
-    "sudo_ttl_secs=%d reward_base=%d",
+    "sudo_ttl_secs=%d reward_base=%d member_cap=%d member_floor=%d max_value_bytes=%d",
     c.fee_mint, c.fee_transfer, c.fee_entry, c.fee_sudo, c.rent_rate, c.rip_bounty,
-    c.sudo_ttl_secs, c.reward_base)
+    c.sudo_ttl_secs, c.reward_base, c.member_cap, c.member_floor, c.max_value_bytes)
 end
 
 cmds["self"] = function()
@@ -226,26 +227,15 @@ function cmds.submit(conn, rest)
   return "ok " .. table.concat(out, " ")
 end
 
--- Mint to the key that bound this channel. CES authenticated it; it is also, byte for byte,
--- that caller's hyle account.
-function cmds.faucet(conn, rest)
-  local amt = tonumber(rest:match("^(%d+)"))
-  if not amt or amt <= 0 then return "err bad_amount" end
-  if not conn.pubkey or #conn.pubkey ~= 32 then return "err no_caller_identity" end
-
-  local cap = num("faucet_max", 1000000)
-  local who = hex(conn.pubkey)
-  local had = minted[who] or 0
-  if had + amt > cap then return "err faucet_cap_reached" end
-
-  -- Propose the mint (as the sole validator, this program is the whole quorum), then tick
-  -- to commit it in this call so the caller sees it land.
-  local ok, err = ces.hyle.sudo.submit(ces.hyle.sudo.op.mint{ to = conn.pubkey, amount = amt })
-  if not ok then return "err " .. tostring(err) end
-  ces.hyle.solo.tick()
-
-  minted[who] = had + amt
-  return string.format("ok minted=%d to=%s", amt, who)
+-- Hand the node/validator private key to the owner, and only the owner. It is absolute chain
+-- authority: whoever holds it is the validator and can mint or sudo. The owner then loads it
+-- into cesh and acts as the node (`cesh hyle <pid> mint <to> <amount>`). Minting is a validator
+-- op the chain gates; there is no path for a non-validator caller to create money.
+function cmds.nodekey(conn)
+  if not conn.pubkey or #conn.pubkey ~= 32 or hex(conn.pubkey) ~= hex(ces.owner_pubkey()) then
+    return "err not_owner"
+  end
+  return "ok " .. hex(ces.hyle.self_secret())
 end
 
 local function dispatch(conn, line)
@@ -370,8 +360,10 @@ local function build_panel()
                          label = "rip bounty", value = num("rip_bounty", 10) }),
             mene.field({ name = "sudo_ttl_secs", kind = "number",
                          label = "sudo timeout secs (0=never)", value = num("sudo_ttl_secs", 0) }),
-            mene.field({ name = "faucet_max", kind = "number",
-                         label = "faucet cap per caller", value = num("faucet_max", 1000000) }),
+            mene.field({ name = "snapshot_interval", kind = "number",
+                         label = "snapshot every N blocks (0=off)", value = num("snapshot_interval", 0) }),
+            mene.field({ name = "block_retention", kind = "number",
+                         label = "blocks kept in RAM", value = num("block_retention", 1024) }),
             mene.field({ name = "autostart", kind = "number",
                          label = "autostart (0/1)", value = num("autostart", 1) })),
           mene.submit({ kind = "primary" }, "Apply + save")))
@@ -393,7 +385,7 @@ local function build_panel()
       elseif ev.on == "cfg" and type(ev.value) == "table" then
         local keys = { "chain_id", "block_pace_ms", "alloc", "fee_transfer", "fee_entry",
                        "fee_mint", "fee_sudo", "reward_base", "rent_rate", "rip_bounty",
-                       "sudo_ttl_secs", "faucet_max", "autostart" }
+                       "sudo_ttl_secs", "snapshot_interval", "block_retention", "autostart" }
         local c, lines = {}, {}
         for _, k in ipairs(keys) do
           c[k] = tostring(ev.value[k] or "")
@@ -485,8 +477,10 @@ local spec = {
     "rip_bounty = 10",
     "# a pending sudo proposal past this age cannot execute and is cleared. 0 = never.",
     "sudo_ttl_secs = 0",
-    "# devnet faucet: most one caller may mint, per instance",
-    "faucet_max = 1000000",
+    "# snapshot every N blocks and drop older ones; 0 = keep a rolling block_retention window",
+    "snapshot_interval = 0",
+    "# blocks kept in RAM when snapshot_interval = 0",
+    "block_retention = 1024",
     "",
   }, "\n"),
   on_config = function(c)
@@ -508,5 +502,5 @@ ces.run()
 
 end
 
-CES_MANIFEST = { name = "HyleSolo", version = "0.2", description = "The hyle development net: a one-validator, transportless hyle-services blockchain hosted inside cesluajitd over the ces.hyle binding, with the full interface -- ops, entries, governance, sudo. Its own program key is the sole validator, so it is its own quorum and commits a block every block_pace_ms. The extension config IS the hyle genesis and economy. Serves a line protocol over ces.conn: clients sign their own ops and submit them as opaque bytes, and `faucet` sudo-mints to the key that bound the channel, which is also that caller's hyle account. Requires a cesluajitd built with --hyle." }
+CES_MANIFEST = { name = "HyleSolo", version = "0.2", description = "The hyle development net: a one-validator, transportless hyle-services blockchain hosted inside cesluajitd over the ces.hyle binding, with the full interface -- ops, entries, governance, sudo. Its own program key is the sole validator, so it is its own quorum and commits a block every block_pace_ms. The extension config IS the hyle genesis and economy. Serves a line protocol over ces.conn: clients sign their own ops and submit them as opaque bytes. Money comes only from the validator: `nodekey` hands the node key to the owner, who mints from cesh. Requires a cesluajitd built with --hyle." }
 return require("main")

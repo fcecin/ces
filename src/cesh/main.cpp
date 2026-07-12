@@ -27,6 +27,30 @@
 
 using namespace ces;
 
+// One `--in` token appended to a byte buffer: "hex:XX" | "file:PATH" | "text:S" | bare text.
+// The shared shape for every data-in option (file put, hyle put).
+static void appendInToken(ces::Bytes& out, const std::string& s) {
+  if (s.rfind("hex:", 0) == 0) {
+    ces::Bytes b = ces::parseHex(std::string_view(s).substr(4));
+    out.insert(out.end(), b.begin(), b.end());
+  } else if (s.rfind("file:", 0) == 0) {
+    std::ifstream ifs(s.substr(5), std::ios::binary);
+    if (!ifs) throw std::runtime_error("cannot open " + s.substr(5));
+    out.insert(out.end(), std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+  } else if (s.rfind("text:", 0) == 0) {
+    const std::string t = s.substr(5);
+    out.insert(out.end(), t.begin(), t.end());
+  } else {
+    out.insert(out.end(), s.begin(), s.end());
+  }
+}
+
+#ifdef CES_HYLE
+// Client-side hyle verbs. Isolated in the shell, guarded by the --hyle build; the CES client
+// engine (ceslib) never links hyle. Defines HyleCli + runHyle() in an anonymous namespace.
+#include "cesh_hyle.inc"
+#endif
+
 // Local UDP bind port for cesh; 0 = auto-assign, allows parallel instances.
 constexpr uint16_t CESH_LOCAL_PORT = 0;
 
@@ -469,27 +493,10 @@ int main(int argc, char* argv[]) {
   std::string file_key_arg, file_path_arg, file_meta_arg;
   uint16_t file_days_arg = 30;
 
-  // Shared composable data buffer — --in appends in CLI order
-  // Prefix: "hex:" for hex bytes, "file:" for file, else text
+  // Composable data buffer: --in appends each token in CLI order (text/hex:/file:).
   ces::Bytes file_composed_data;
   std::string file_in_arg; // CLI11 target
-  auto inAppender = [&](const std::string& s) {
-    if (s.substr(0, 4) == "hex:") {
-      auto bytes = ces::parseHex(std::string_view(s).substr(4));
-      file_composed_data.insert(file_composed_data.end(),
-                                 bytes.begin(), bytes.end());
-    } else if (s.substr(0, 5) == "file:") {
-      std::ifstream ifs(s.substr(5), std::ios::binary);
-      if (!ifs) throw std::runtime_error("cannot open " + s.substr(5));
-      file_composed_data.insert(file_composed_data.end(),
-        std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
-    } else if (s.substr(0, 5) == "text:") {
-      auto text = s.substr(5);
-      file_composed_data.insert(file_composed_data.end(), text.begin(), text.end());
-    } else {
-      file_composed_data.insert(file_composed_data.end(), s.begin(), s.end());
-    }
-  };
+  auto inAppender = [&](const std::string& s) { appendInToken(file_composed_data, s); };
 
   auto* cmd_fp = cmd_file->add_subcommand("put", "Upload file");
   cmd_fp->add_option("key", file_key_arg, "File key (asset name)")->required();
@@ -661,6 +668,40 @@ int main(int argc, char* argv[]) {
   cmd_dial->add_option("--pubkey", dial_pubkey_arg,
                        "Client public key (64 hex) that signed the bind "
                        "(required with --extsign).");
+
+#ifdef CES_HYLE
+  // ---- hyle: client-side chain verbs (needs --rpc-port; --hyle build only) ----
+  std::vector<std::string> hyle_args;
+  std::string hyle_source_arg = "/s/hylesolo.lua";
+  std::vector<std::string> hyle_in_tokens;
+  std::string hyle_out_arg;
+  uint64_t hyle_fund_arg = 0;
+  bool hyle_wait_arg = false;
+  auto* cmd_hyle = app.add_subcommand(
+    "hyle",
+    "Interact with a hyle chain hosted by a compute instance (e.g. hylesolo), over "
+    "/ces/lua/1. `hyle list` shows instances; every other verb names one by pid. Reads "
+    "relay through; writes build + sign an op and submit it.");
+  cmd_hyle->add_option(
+    "args", hyle_args,
+    "list  |  <pid> <verb> [operands], verb one of: info | config | self | height | mintkey | "
+    "account <hex32> | entry <name> | get <name> | txr <hex32> | nodekey | "
+    "put <name> [value] | del <name> | give <name> <newowner-hex32> | rip <name> | "
+    "transfer <hex32|e:name> <amount> | mint <hex32> <amount> | seize <from> <to> <amount> | "
+    "propose --in <inner> | approve <proposer> --in <inner> | submit --in <op bytes> "
+    "(mint/seize/propose/approve are validator-only)")->required();
+  cmd_hyle->add_option("--source", hyle_source_arg,
+                       "list: compute source path to enumerate (default /s/hylesolo.lua).");
+  cmd_hyle->add_option("--in", hyle_in_tokens,
+                       "put value / submit op bytes, repeatable and appended in order: text:S | "
+                       "hex:XX | file:PATH | bare text. Carries binary or large content a value "
+                       "cannot be typed as.");
+  cmd_hyle->add_option("--out", hyle_out_arg,
+                       "get: write the raw value bytes to this file (default: stdout).");
+  cmd_hyle->add_option("--fund", hyle_fund_arg, "put: initial entry funding.");
+  cmd_hyle->add_flag("--wait", hyle_wait_arg,
+                     "Write verbs: poll txr until the tx applies or is rejected.");
+#endif
 
   // ---- autoexec subcommands ----
   auto* cmd_autoexec = app.add_subcommand("autoexec", "Boot-time program execution");
@@ -1124,6 +1165,10 @@ int main(int argc, char* argv[]) {
      cmd_gossip->parsed() || cmd_alias_write->parsed() ||
      cmd_alias_rm->parsed() || cmd_alias_run->parsed());
 
+#ifdef CES_HYLE
+  needs_actor = needs_actor || cmd_hyle->parsed();
+#endif
+
   if (!needs_actor)
     return 0;
 
@@ -1152,6 +1197,32 @@ int main(int argc, char* argv[]) {
     da.verbose     = dial_verbose_arg;
     return runDial(da);
   }
+
+#ifdef CES_HYLE
+  // ---- hyle — build/sign/relay to a chain-hosting instance (only needs --rpc-port) ----
+  if (cmd_hyle->parsed()) {
+    HyleCli hc;
+    hc.host = server_arg;
+    if (auto colon = hc.host.rfind(':'); colon != std::string::npos)
+      hc.host = hc.host.substr(0, colon);
+    if (hc.host.empty()) hc.host = "localhost";
+    hc.rpcPort = rpcPort_arg;
+    hc.actorKey = actorKey;
+    if (!server_key_arg.empty()) {
+      minx::Hash pk{};
+      try { minx::stringToHash(pk, server_key_arg); hc.expectedServerPk = pk; }
+      catch (...) { std::cerr << "Error: bad --server-key.\n"; return 1; }
+    }
+    hc.source = hyle_source_arg;
+    hc.inTokens = hyle_in_tokens;
+    hc.outPath = hyle_out_arg;
+    hc.args = hyle_args;
+    hc.fund = hyle_fund_arg;
+    hc.wait = hyle_wait_arg;
+    hc.quiet = g_quiet;
+    return runHyle(hc);
+  }
+#endif
 
   try {
     auto sess = makeSession(&actorKey);

@@ -24,7 +24,9 @@
 
 #include <minx/types.h>
 
+#include <chrono>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -55,5 +57,30 @@ struct DialArgs {
 };
 
 int runDial(const DialArgs& args);
+
+// A bound + ATTACHed /ces/lua/1 session that exchanges newline-delimited request/reply
+// lines. Lets a caller drive an instance's line protocol (e.g. hylesolo) by reusing the
+// exact CesPlex bind + ATTACH handshake runDial uses, without duplicating it. Not
+// thread-safe: one request at a time from a single thread.
+class DialLineSession {
+public:
+  DialLineSession();
+  ~DialLineSession();
+  DialLineSession(const DialLineSession&) = delete;
+  DialLineSession& operator=(const DialLineSession&) = delete;
+
+  // Bind + ATTACH to args.pid (signerKey / rpcPort / serverHost / expectedServerPk used;
+  // extSign/verbose ignored). Returns "" on success, else an error message.
+  std::string open(const DialArgs& args);
+
+  // Send `line` (a '\n' is appended) and read back one reply line (without the trailing
+  // '\n') into `reply`. Returns "" on success, else an error message.
+  std::string request(const std::string& line, std::string& reply,
+                      std::chrono::milliseconds timeout = std::chrono::seconds(15));
+
+private:
+  struct Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 } // namespace ces

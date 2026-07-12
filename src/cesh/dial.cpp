@@ -26,6 +26,7 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/posix/stream_descriptor.hpp>
 #include <boost/asio/read.hpp>
+#include <boost/asio/read_until.hpp>
 #include <boost/asio/signal_set.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/write.hpp>
@@ -43,6 +44,7 @@
 #include <cstring>
 #include <functional>
 #include <future>
+#include <istream>
 #include <iostream>
 #include <memory>
 #include <random>
@@ -666,6 +668,52 @@ public:
     return code;
   }
 
+  // Synchronous line I/O over the ATTACHed stream: post to taskIO_, wait on a future.
+  // Mirrors the bind()/attach() future pattern above. Used by DialLineSession.
+  std::string writeAll(std::span<const uint8_t> data) {
+    if (!stream_) return "no stream";
+    auto run = std::make_shared<std::promise<std::string>>();
+    auto fut = run->get_future();
+    auto strm = stream_;
+    auto buf = std::make_shared<std::vector<uint8_t>>(data.begin(), data.end());
+    boost::asio::post(taskIO_, [strm, buf, run]() {
+      boost::asio::async_write(
+        *strm, boost::asio::buffer(*buf),
+        [buf, run](const boost::system::error_code& ec, std::size_t) {
+          run->set_value(ec ? ("write: " + ec.message()) : std::string());
+        });
+    });
+    if (fut.wait_for(std::chrono::seconds(15)) != std::future_status::ready)
+      return "write timeout";
+    return fut.get();
+  }
+
+  // Read one '\n'-terminated line (newline dropped) into out. lineBuf_ carries any
+  // bytes read past the newline to the next call. Touched only on taskIO_.
+  std::string readLine(std::string& out, std::chrono::milliseconds timeout) {
+    if (!stream_) return "no stream";
+    auto run = std::make_shared<std::promise<std::pair<std::string, std::string>>>();
+    auto fut = run->get_future();
+    auto strm = stream_;
+    boost::asio::post(taskIO_, [this, strm, run]() {
+      boost::asio::async_read_until(
+        *strm, lineBuf_, '\n',
+        [this, run](const boost::system::error_code& ec, std::size_t) {
+          if (ec) { run->set_value({"read: " + ec.message(), std::string()}); return; }
+          std::istream is(&lineBuf_);
+          std::string line;
+          std::getline(is, line);
+          if (!line.empty() && line.back() == '\r') line.pop_back();
+          run->set_value({std::string(), line});
+        });
+    });
+    if (fut.wait_for(timeout) != std::future_status::ready) return "read timeout";
+    auto pr = fut.get();
+    if (!pr.first.empty()) return pr.first;
+    out = pr.second;
+    return "";
+  }
+
 private:
   void scheduleTick() {
     if (!tickTimer_ || !rudp_) return;
@@ -694,6 +742,7 @@ private:
   minx::SockAddr peer_;
   uint32_t channel_ = 0;
   std::shared_ptr<minx::RudpStream> stream_;
+  boost::asio::streambuf lineBuf_;
 };
 
 // Map ATTACH status → cesh exit code per spec.
@@ -823,6 +872,49 @@ int runDial(const DialArgs& args) {
   }
 
   return dialer.runDataPump();
+}
+
+struct DialLineSession::Impl {
+  Dialer dialer;
+  uint64_t token = 0;
+  bool opened = false;
+};
+
+DialLineSession::DialLineSession() : impl_(std::make_unique<Impl>()) {}
+DialLineSession::~DialLineSession() = default;
+
+std::string DialLineSession::open(const DialArgs& args) {
+  const std::string host = args.serverHost.empty() ? "localhost" : args.serverHost;
+  minx::SockAddr peer;
+  std::string err;
+  if (!resolvePeer(host, args.rpcPort, peer, err)) return err;
+  std::string e = impl_->dialer.start(peer);
+  if (!e.empty()) return e;
+
+  minx::Hash serverPk{};
+  const minx::Hash* expected = args.expectedServerPk ? &*args.expectedServerPk : nullptr;
+  e = impl_->dialer.bind(args.signerKey, expected, impl_->token, serverPk);
+  if (!e.empty()) return "bind: " + e;
+
+  uint8_t status = 0;
+  uint64_t connId = 0;
+  e = impl_->dialer.attach(args.signerKey, impl_->token, args.pid, status, connId);
+  if (!e.empty()) return "attach: " + e;
+  if (status != CES_OK) return std::string("attach: ") + attachErrorName(status);
+
+  impl_->opened = true;
+  return "";
+}
+
+std::string DialLineSession::request(const std::string& line, std::string& reply,
+                                     std::chrono::milliseconds timeout) {
+  if (!impl_->opened) return "session not open";
+  std::string wire = line;
+  wire.push_back('\n');
+  std::string e = impl_->dialer.writeAll(std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(wire.data()), wire.size()));
+  if (!e.empty()) return e;
+  return impl_->dialer.readLine(reply, timeout);
 }
 
 } // namespace ces

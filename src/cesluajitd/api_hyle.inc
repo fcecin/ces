@@ -204,6 +204,10 @@ int lua_ces_hyle_start(lua_State* L) {
   g.config.sudo_ttl_secs = hyle_cfg_u64(L, "sudo_ttl_secs", 0);
   // The proof-of-work epoch key. Seeded from the chain id so two chains do not share one.
   g.config.mint_genesis_key = hyle::sha256(hyle_chain_view());
+  // Consensus rules (validator-set bounds, max block payload): part of the chain definition.
+  g.config.member_cap      = static_cast<unsigned>(hyle_cfg_u64(L, "member_cap", 21));
+  g.config.member_floor    = static_cast<unsigned>(hyle_cfg_u64(L, "member_floor", 1));
+  g.config.max_value_bytes = hyle_cfg_u64(L, "max_value_bytes", 4u << 20);
 
   std::string err;
   if (!g.validate(err)) {
@@ -213,8 +217,16 @@ int lua_ces_hyle_start(lua_State* L) {
     return 2;
   }
 
-  const uint64_t pace = hyle_cfg_u64(L, "block_pace_ms", 1000);  // Lua drives the ticks; pace is advisory
-  g_hyle_node = std::make_unique<hyle::services::Runtime>(g, *g_hyle_key, pace, nullptr);
+  // Node operational config (pacing, RAM history policy): distinct from the genesis above, which
+  // is the chain's consensus definition. snapshot_interval > 0 snapshots every N blocks and
+  // drops older ones; else a rolling block_retention window bounds RAM.
+  hyle::services::NodeOptions opts;
+  opts.block_pace_ms     = hyle_cfg_u64(L, "block_pace_ms", 1000);  // Lua drives ticks; advisory
+  opts.block_retention   = hyle_cfg_u64(L, "block_retention", 1024);
+  opts.snapshot_interval = hyle_cfg_u64(L, "snapshot_interval", 0);
+  opts.mempool_capacity  = static_cast<std::size_t>(hyle_cfg_u64(L, "mempool_capacity", 8192));
+  // data_dir/evidence_dir left empty: solo is in-RAM, no WAL, and dies on stop.
+  g_hyle_node = std::make_unique<hyle::services::Runtime>(g, *g_hyle_key, opts, nullptr);
 
   g_hyle_txs = 0;
   g_hyle_queries = 0;
@@ -265,6 +277,15 @@ int lua_ces_hyle_chain_id(lua_State* L) {
 int lua_ces_hyle_self(lua_State* L) {
   const hyle::KeyPair kp = hyle_program_key();
   lua_pushlstring(L, reinterpret_cast<const char*>(kp.pub.data()), kp.pub.size());
+  return 1;
+}
+
+// The validator's 32-byte private key. This IS absolute chain authority (mint, sudo), so a
+// program must only ever hand it to a caller it has authenticated as the owner. A caller
+// holding it can act as the node from cesh.
+int lua_ces_hyle_self_secret(lua_State* L) {
+  const hyle::KeyPair kp = hyle_program_key();
+  lua_pushlstring(L, reinterpret_cast<const char*>(kp.priv.data()), kp.priv.size());
   return 1;
 }
 
@@ -328,6 +349,9 @@ int lua_ces_hyle_config(lua_State* L) {
   hyle_set_u64(L, "reward_max_diff", c.reward_max_diff);
   hyle_set_u64(L, "mint_capacity", c.mint_capacity);
   hyle_set_u64(L, "pbts_window_secs", c.pbts_window_secs);
+  hyle_set_u64(L, "member_cap", c.member_cap);
+  hyle_set_u64(L, "member_floor", c.member_floor);
+  hyle_set_u64(L, "max_value_bytes", c.max_value_bytes);
   return 1;
 }
 
@@ -432,6 +456,12 @@ int lua_ces_hyle_submit(lua_State* L) {
     }
   if (fail == nullptr)
     for (const auto& o : d.entries) {
+      const hyle::services::Admit a = g_hyle_node->submit(o);
+      if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
+      ids.push_back(hyle::services::tx_id(cv, o));
+    }
+  if (fail == nullptr)
+    for (const auto& o : d.sudos) {
       const hyle::services::Admit a = g_hyle_node->submit(o);
       if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
       ids.push_back(hyle::services::tx_id(cv, o));
@@ -697,8 +727,8 @@ int lua_ces_hyle_sudo_pending(lua_State* L) {
   return 1;
 }
 
-// submit(inner) is propose(inner): the one-call path a solo chain uses. The name is kept for
-// the faucet and any caller that just wants to run an act on a chain it is the quorum of.
+// submit(inner) is propose(inner): the one-call path a solo chain uses -- any caller that just
+// wants to run an act on a chain it is the sole quorum of.
 int lua_ces_hyle_sudo_submit(lua_State* L) {
   return lua_ces_hyle_sudo_propose(L);
 }
@@ -737,7 +767,8 @@ void install_ces_hyle_api(lua_State* L) {
   hyle_fn(L, "running",    guarded<lua_ces_hyle_running>);
   hyle_fn(L, "height",     guarded<lua_ces_hyle_height>);
   hyle_fn(L, "chain_id",   guarded<lua_ces_hyle_chain_id>);
-  hyle_fn(L, "self",       guarded<lua_ces_hyle_self>);
+  hyle_fn(L, "self",        guarded<lua_ces_hyle_self>);
+  hyle_fn(L, "self_secret", guarded<lua_ces_hyle_self_secret>);
   hyle_fn(L, "mint_key",   guarded<lua_ces_hyle_mint_key>);
   hyle_fn(L, "info",       guarded<lua_ces_hyle_info>);
   hyle_fn(L, "config",     guarded<lua_ces_hyle_config>);

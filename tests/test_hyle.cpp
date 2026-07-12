@@ -31,7 +31,12 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <unistd.h>
+
+#include <cctype>
 #include <cstring>
+#include <fstream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -61,6 +66,17 @@ std::string hexOf(const std::string& s) {
 
 hyle::wire::View sv(const std::string& s) {
   return hyle::wire::View(reinterpret_cast<const uint8_t*>(s.data()), s.size());
+}
+
+void unhex(const std::string& h, uint8_t* out, std::size_t n) {
+  auto nyb = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return 0;
+  };
+  for (std::size_t i = 0; i < n && i * 2 + 1 < h.size(); i++)
+    out[i] = static_cast<uint8_t>((nyb(h[i * 2]) << 4) | nyb(h[i * 2 + 1]));
 }
 
 // The invariant the whole design rests on: a CES ed25519 identity IS a hyle identity.
@@ -111,8 +127,7 @@ std::string confFor(uint64_t rentRate) {
     << "fee_mint = 1\n"
     << "reward_base = 2\n"
     << "rent_rate = " << rentRate << "\n"
-    << "rip_bounty = 10\n"
-    << "faucet_max = 1000000\n";
+    << "rip_bounty = 10\n";
   return s.str();
 }
 
@@ -120,6 +135,7 @@ struct HyleFixture {
   ExtNode node;
   ces::KeyPair userKey;  // binds the CES channel AND owns the hyle account: same 32 bytes
   hyle::KeyPair user;
+  hyle::KeyPair validator;  // the node key, read via nodekey; the only key that may mint
   uint64_t pid = 0;
   std::unique_ptr<PlexLuaPeer> peer;
   std::unique_ptr<PlexLineReader> lines;
@@ -149,6 +165,26 @@ struct HyleFixture {
     auto r = peer->attach(userKey, token, pid);
     CES_REQUIRE_RC_EQ(r.status, CES_OK);
     lines = std::make_unique<PlexLineReader>(*peer);
+
+    // Read the node/validator private key over an owner-authenticated channel (the server is the
+    // extension owner). Only this key can mint; the fixture uses it to fund test accounts.
+    {
+      PlexLuaPeer sp;
+      BOOST_REQUIRE(sp.start() != 0);
+      uint64_t st = 0;
+      BOOST_REQUIRE(sp.bind(node.rpcPort, node.server->_serverKeyPair(), st));
+      auto sr = sp.attach(node.server->_serverKeyPair(), st, pid);
+      CES_REQUIRE_RC_EQ(sr.status, CES_OK);
+      PlexLineReader sl(sp);
+      const std::string q = "nodekey\n";
+      BOOST_REQUIRE(peerWrite(sp, ces::Bytes(q.begin(), q.end())));
+      const std::string nk = sl.nextLine(std::chrono::seconds(10));
+      BOOST_REQUIRE_MESSAGE(nk.rfind("ok ", 0) == 0, "nodekey failed: " + nk);
+      hyle::PrivKey vsec{};
+      unhex(nk.substr(3), vsec.data(), 32);
+      validator = hyle::KeyPair::from_secret(vsec);
+      sp.stop();
+    }
 
     // The chain autostarts. A refused genesis is the likely reason it did not, and the
     // program reports it, so surface that rather than time out on a bare "no chain".
@@ -206,8 +242,22 @@ struct HyleFixture {
     return false;
   }
 
-  bool faucet(uint64_t amount) {
-    return cmd("faucet " + std::to_string(amount)).rfind("ok ", 0) == 0;
+  // Mint to the user, signed by the node/validator key: a sudo propose whose act is an unsigned
+  // transfer from the mint sentinel. On a one-validator chain the propose is its own quorum.
+  bool faucet(uint64_t amount) { return mintTo(user.pub, amount); }
+
+  bool mintTo(const hyle::PubKey& to, uint64_t amount) {
+    hyle::services::Decoded inner;
+    hyle::services::TransferOp t;
+    t.from = hyle::services::MINT_SENTINEL;
+    t.to = acctDest(to);
+    t.amount = amount;
+    inner.transfers.push_back(t);
+    const hyle::wire::Bytes ib = hyle::services::encode_ops(inner);
+    hyle::services::Decoded d;
+    d.sudos.push_back(hyle::services::make_sudo_propose(
+        validator, seqOf(validator.pub), hyle::wire::View(ib.data(), ib.size()), sv(kChain)));
+    return submitApplied(hexOf(hyle::services::encode_ops(d)));
   }
 };
 
@@ -617,6 +667,280 @@ BOOST_AUTO_TEST_CASE(TheProgramFacingSurfaceOfTheBinding) {
   BOOST_TEST_MESSAGE("binding surface checks: " << report.size());
 
   stopExt(n);
+}
+
+// The client side, end to end: the real cesh binary's `hyle` verbs against a live hylesolo
+// chain. Proves the shell builds + signs ops with hyle_services, speaks the line protocol over
+// /ces/lua/1, and that a CES ed25519 identity owns the hyle entry it publishes. cesh links
+// hyle_services; the CES client engine (ceslib) does not.
+BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
+  namespace e2e = ces::e2e;
+  const std::string cesh = e2e::findCeshBinary();
+  const std::string wallet = "00" + hexOf(userKey.getPrivateKey().data(), 32);
+  const std::string userHex = hexOf(user.pub);
+  const std::string srvKey = hexOf(node.server->_serverKeyPair().getPublicKeyAsHash());
+  auto conn = [&](const std::string& w) {
+    return "CESH_WALLET=\"" + w + "\" " + cesh + " -l fatal --server localhost:" +
+           std::to_string(node.mainPort) + " --rpc-port " + std::to_string(node.rpcPort) +
+           " --server-key " + srvKey + " hyle ";
+  };
+  const std::string base = conn(wallet);
+  // `list` enumerates instances; every other verb names one by pid on the command line.
+  const std::string ph = base + std::to_string(pid) + " ";
+
+  // Enumerate: list shows the instance and its pid.
+  e2e::assertContains(e2e::runExpect(base + "list").out, "pid=" + std::to_string(pid), "list");
+
+  // Reads relay through untouched.
+  e2e::assertContains(e2e::runExpect(ph + "info").out, "ok chain=", "info");
+  e2e::assertContains(e2e::runExpect(ph + "self").out, "ok ", "self");
+  e2e::assertContains(e2e::runExpect(ph + "height").out, "ok ", "height");
+  e2e::assertContains(e2e::runExpect(ph + "config").out, "fee_transfer=", "config");
+  e2e::assertContains(e2e::runExpect(ph + "config").out, "member_cap=", "config exposes consensus params");
+  e2e::assertContains(e2e::runExpect(ph + "mintkey").out, "ok ", "mintkey");
+  e2e::assertContains(e2e::runExpect(ph + "account " + userHex).out, "exists=", "account");
+
+  // Money exists only through the validator. The node operator = the extension owner = the
+  // server key; it reads the validator private key via the owner-gated `nodekey`, loads it into
+  // cesh, and mints as the validator. A non-owner cannot read the node key.
+  const ces::KeyPair& srvKp = node.server->_serverKeyPair();
+  const std::string srvDec = (srvKp.getAlgorithm() == ces::KeyAlgo::SECP256K1) ? "01" : "00";
+  const std::string srvWallet = srvDec + hexOf(srvKp.getPrivateKey().data(), 32);
+  e2e::assertContains(e2e::runShell(ph + "nodekey").out, "not_owner", "nodekey is owner-gated");
+  const std::string nk = e2e::runExpect(conn(srvWallet) + std::to_string(pid) + " nodekey").out;
+  std::string vpriv;
+  if (const auto p = nk.find("ok "); p != std::string::npos)
+    for (char ch : nk.substr(p + 3)) {
+      if (std::isxdigit(static_cast<unsigned char>(ch))) vpriv.push_back(ch);
+      else break;
+    }
+  BOOST_REQUIRE_MESSAGE(vpriv.size() == 64u, "owner reads a 32-byte node key: " + nk);
+  const ces::KeyPair vkey(vpriv, ces::KeyAlgo::ED25519);
+  node.server->_brr(vkey.getPublicKeyAsHash(), 10'000'000'000);  // fund the operator's channel
+  node.server->_drainLogic();
+  const std::string opPh = conn("00" + vpriv) + std::to_string(pid) + " ";
+
+  // The operator mints to the user account; the recipient is any key.
+  e2e::assertContains(e2e::runExpect(opPh + "mint " + userHex + " 10000000 --wait").out, "applied",
+                      "the validator mints");
+  e2e::assertContains(e2e::runExpect(ph + "account " + userHex).out, "balance=10000000",
+                      "mint credited the recipient");
+
+  // Sudo, general form: the operator proposes an arbitrary inner act via --in. Here the act is a
+  // mint to a fresh key; on a one-validator chain the propose is its own quorum and executes, so
+  // the raw propose path and the specialized `mint` verb converge on the same effect.
+  {
+    const hyle::KeyPair pro = hyleKeyOf(ces::KeyPair::generate());
+    hyle::services::Decoded inner;
+    hyle::services::TransferOp t;
+    t.from = hyle::services::MINT_SENTINEL;
+    t.to = acctDest(pro.pub);
+    t.amount = 777;
+    inner.transfers.push_back(t);
+    const std::string innerHex = hexOf(hyle::services::encode_ops(inner));
+    e2e::assertContains(e2e::runExpect(opPh + "propose --in hex:" + innerHex + " --wait").out,
+                        "applied", "a general sudo propose executes");
+    e2e::assertContains(e2e::runExpect(ph + "account " + hexOf(pro.pub)).out, "balance=777",
+                        "the proposed mint credited the recipient");
+  }
+
+  // Sudo seize: the operator moves real credit out of an account it does not own. Fund a victim
+  // first, then seize part of it to the user; the mint sentinel is not involved, so the money
+  // must already exist.
+  {
+    const hyle::KeyPair vic = hyleKeyOf(ces::KeyPair::generate());
+    const std::string vicHex = hexOf(vic.pub);
+    e2e::assertContains(e2e::runExpect(opPh + "mint " + vicHex + " 5000 --wait").out, "applied",
+                        "fund the victim");
+    e2e::assertContains(e2e::runExpect(opPh + "seize " + vicHex + " " + userHex + " 2000 --wait").out,
+                        "applied", "seize");
+    e2e::assertContains(e2e::runExpect(ph + "account " + vicHex).out, "balance=3000",
+                        "seize removed the victim's funds");
+  }
+
+  // Sudo approve: on a one-validator chain a propose already reached quorum, so an approve finds no
+  // open proposal. The shell must still build a well-formed Approve the chain admits and processes;
+  // multi-validator vote accumulation is covered by hyle's own SudoTests.
+  {
+    hyle::services::Decoded inner;
+    hyle::services::TransferOp t;
+    t.from = hyle::services::MINT_SENTINEL;
+    t.to = acctDest(user.pub);
+    t.amount = 1;
+    inner.transfers.push_back(t);
+    const std::string innerHex = hexOf(hyle::services::encode_ops(inner));
+    e2e::assertContains(
+        e2e::runShell(opPh + "approve " + hexOf(validator.pub) + " --in hex:" + innerHex + " --wait")
+            .out,
+        "tx ", "approve builds and submits a valid sudo op");
+  }
+
+  // Publish a key with value "hello" (68656c6c6f), owned by the CES identity.
+  const auto putR = e2e::runExpect(ph + "put greeting hello --fund 500 --wait");
+  e2e::assertContains(putR.out, "applied", "put");
+  {
+    const auto r = e2e::runExpect(ph + "entry greeting");
+    e2e::assertContains(r.out, "payload=68656c6c6f", "entry shows the value as hex");
+    e2e::assertContains(r.out, "owner=" + userHex, "owner is the CES identity");
+  }
+  // get returns the value as raw bytes (no chrome), the content view of an entry.
+  BOOST_TEST(e2e::runExpect(ph + "get greeting").out == "hello", "get emits the raw value");
+
+  // A tx id names the applied transaction; txr reads its result back.
+  std::string txid;
+  if (const auto p = putR.out.find("tx "); p != std::string::npos)
+    for (char ch : putR.out.substr(p + 3)) {
+      if (std::isxdigit(static_cast<unsigned char>(ch))) txid.push_back(ch);
+      else break;
+    }
+  BOOST_TEST(txid.size() == 64u, "put reports a 32-byte tx id");
+  if (txid.size() == 64u)
+    e2e::assertContains(e2e::runExpect(ph + "txr " + txid).out, "applied=1", "txr");
+
+  // Owner updates the value to "goodbye" (676f6f64627965).
+  e2e::assertContains(e2e::runExpect(ph + "put greeting goodbye --wait").out, "applied", "update");
+  BOOST_TEST(e2e::runExpect(ph + "get greeting").out == "goodbye", "get sees the update");
+
+  // Value from hex, read back through the record and through get --out.
+  e2e::assertContains(e2e::runExpect(ph + "put hx --in hex:deadbeef --wait").out, "applied",
+                      "put hex value");
+  e2e::assertContains(e2e::runExpect(ph + "entry hx").out, "payload=deadbeef", "hex stored");
+
+  // Binary value: put every byte 0x00..0xff from a file, read it back to a file, compare.
+  {
+    const std::string blobPath = "/tmp/ceshyle-blob-" + std::to_string(::getpid());
+    const std::string outPath = "/tmp/ceshyle-out-" + std::to_string(::getpid());
+    std::string blob;
+    for (int b = 0; b < 256; b++) blob.push_back(static_cast<char>(b));
+    std::ofstream(blobPath, std::ios::binary).write(blob.data(), blob.size());
+
+    e2e::assertContains(
+        e2e::runExpect(ph + "put blob --in file:" + blobPath + " --fund 500 --wait").out,
+        "applied", "put binary value from a file");
+    e2e::runExpect(ph + "get blob --out " + outPath);
+    std::ifstream in(outPath, std::ios::binary);
+    const std::string got((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    BOOST_TEST(got == blob, "binary value round-trips through --in file: and get --out");
+    ::unlink(blobPath.c_str());
+    ::unlink(outPath.c_str());
+  }
+
+  // Raw submit: relay an op the client encoded and signed itself, opaque to cesh (carrier path).
+  {
+    hyle::services::Decoded d;
+    d.entries.push_back(hyle::services::make_entry_put(
+        user, sv("raw"), seqOf(user.pub), /*fund=*/500, sv("viaraw"), sv(kChain)));
+    const std::string opsHex = hexOf(hyle::services::encode_ops(d));
+    e2e::assertContains(e2e::runExpect(ph + "submit --in hex:" + opsHex + " --wait").out,
+                        "applied", "raw submit of a client-signed op");
+    BOOST_TEST(e2e::runExpect(ph + "get raw").out == "viaraw", "raw-submitted value is readable");
+  }
+
+  // Transfer credit to a fresh account, which the transfer creates.
+  const std::string dstHex = hexOf(hyleKeyOf(ces::KeyPair::generate()).pub);
+  e2e::assertContains(e2e::runExpect(ph + "transfer " + dstHex + " 1000 --wait").out, "applied",
+                      "transfer");
+  e2e::assertContains(e2e::runExpect(ph + "account " + dstHex).out, "balance=1000",
+                      "transfer credited the destination");
+
+  // Give ownership of a key away; the record's owner changes.
+  e2e::assertContains(e2e::runExpect(ph + "give greeting " + dstHex + " --wait").out, "applied",
+                      "give");
+  e2e::assertContains(e2e::runExpect(ph + "entry greeting").out, "owner=" + dstHex,
+                      "ownership transferred");
+
+  // Delete a key the caller still owns; the entry is then gone.
+  e2e::assertContains(e2e::runExpect(ph + "del hx --wait").out, "applied", "del");
+  e2e::assertContains(e2e::runShell(ph + "entry hx").out, "not_found", "entry gone after delete");
+
+  // Error paths.
+  e2e::assertContains(e2e::runShell(base + "info").out, "instance pid", "a verb without a pid");
+  e2e::assertContains(e2e::runShell(ph + "put novalue").out, "needs a value", "put without a value");
+  e2e::assertContains(e2e::runShell(ph + "entry nonesuch").out, "not_found", "read a missing key");
+  const std::string secpWallet =
+      "01" + hexOf(ces::KeyPair::generate(ces::KeyAlgo::SECP256K1).getPrivateKey().data(), 32);
+  e2e::assertContains(e2e::runShell(conn(secpWallet) + std::to_string(pid) + " put k v").out,
+                      "ed25519", "a secp256k1 key cannot act as a hyle identity");
+  // Minting is validator-only: a funded non-validator's sudo is admitted but rejected at apply.
+  e2e::assertContains(e2e::runShell(ph + "mint " + userHex + " 100 --wait").out, "rejected",
+                      "a non-validator mint is refused by the chain");
+}
+
+// The permissionless cull, driven by the shell's `rip` verb: a rent-starved entry is reaped by a
+// caller who signs nothing on the chain (a rip carries no signature) and collects the bounty. Rent
+// only bites with rent_rate > 0, so this stands up its own high-rent chain.
+BOOST_AUTO_TEST_CASE(CeshRipsAStarvedEntry) {
+  namespace e2e = ces::e2e;
+  HyleFixture f(/*rentRate=*/1000);
+  const std::string cesh = e2e::findCeshBinary();
+  const std::string wallet = "00" + hexOf(f.userKey.getPrivateKey().data(), 32);
+  const std::string srvKey = hexOf(f.node.server->_serverKeyPair().getPublicKeyAsHash());
+  const std::string ph = "CESH_WALLET=\"" + wallet + "\" " + cesh + " -l fatal --server localhost:" +
+                         std::to_string(f.node.mainPort) + " --rpc-port " +
+                         std::to_string(f.node.rpcPort) + " --server-key " + srvKey + " hyle " +
+                         std::to_string(f.pid) + " ";
+
+  BOOST_REQUIRE(f.faucet(50000));
+  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+  // A small fund against a live footprint drains thousands per second: the entry starves in
+  // seconds. Fund is charged to the owner up front, so capture the balance after the put.
+  e2e::assertContains(e2e::runExpect(ph + "put doomed x --fund 20000 --wait").out, "applied",
+                      "put a doomed entry");
+  e2e::assertContains(e2e::runExpect(ph + "entry doomed").out, "ok ", "the entry exists");
+  const uint64_t before = f.balOf(f.user.pub);
+
+  bool reaped = false;
+  for (int i = 0; i < 40 && !reaped; i++) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    e2e::runShell(ph + "rip doomed");
+    reaped = e2e::runShell(ph + "entry doomed").out.find("not_found") != std::string::npos;
+  }
+  BOOST_TEST(reaped, "the shell's rip verb reaped the starved entry");
+  // The culler (this wallet's hyle identity) collected the bounty; a rip refunds the owner nothing.
+  BOOST_TEST(f.balOf(f.user.pub) == before + 10);
+}
+
+// The operator funds many fresh identities from the node key; they then act independently --
+// publish their own keys, transfer credit between each other, and gift ownership.
+BOOST_FIXTURE_TEST_CASE(OperatorFundsManyIdentitiesWhoInteract, HyleFixture) {
+  constexpr int N = 8;
+  std::vector<hyle::KeyPair> id;
+  for (int i = 0; i < N; i++) id.push_back(hyleKeyOf(ces::KeyPair::generate()));
+
+  for (const auto& k : id) BOOST_REQUIRE(mintTo(k.pub, 1000000));
+  for (const auto& k : id) BOOST_TEST(balOf(k.pub) == 1000000u);
+
+  auto put = [&](const hyle::KeyPair& k, const std::string& name, const std::string& val) {
+    hyle::services::Decoded d;
+    d.entries.push_back(hyle::services::make_entry_put(
+        k, sv(name), seqOf(k.pub), 500, sv(val), sv(kChain)));
+    return submitApplied(hexOf(hyle::services::encode_ops(d)));
+  };
+
+  for (int i = 0; i < N; i++) BOOST_REQUIRE(put(id[i], "k" + std::to_string(i), "v"));
+  for (int i = 0; i < N; i++)
+    BOOST_TEST(field(cmd("entry k" + std::to_string(i)), "owner") == hexOf(id[i].pub));
+
+  // id0 pays id1.
+  const uint64_t before = balOf(id[1].pub);
+  {
+    hyle::services::Decoded d;
+    d.transfers.push_back(hyle::services::make_transfer(
+        id[0], hyle::wire::View(acctDest(id[1].pub)), 250000, seqOf(id[0].pub), sv(kChain)));
+    BOOST_REQUIRE(submitApplied(hexOf(hyle::services::encode_ops(d))));
+  }
+  BOOST_TEST(balOf(id[1].pub) == before + 250000u);
+
+  // id2 gifts its key to id3; ownership moves.
+  {
+    hyle::services::Decoded d;
+    d.entries.push_back(hyle::services::make_entry_give(
+        id[2], sv("k2"), seqOf(id[2].pub), id[3].pub, sv(kChain)));
+    BOOST_REQUIRE(submitApplied(hexOf(hyle::services::encode_ops(d))));
+  }
+  BOOST_TEST(field(cmd("entry k2"), "owner") == hexOf(id[3].pub));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

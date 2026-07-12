@@ -251,12 +251,17 @@ if(CES_HYLE)
   FetchContent_Declare(
     hyle
     GIT_REPOSITORY https://github.com/fcecin/hyle.git
-    GIT_TAG        main
+    GIT_TAG        e81bbf5860ef0fcfdf741f4d23732ab458815408
   )
   FetchContent_MakeAvailable(hyle)
   target_link_libraries(cesluajitd PRIVATE hyle_services)
   target_compile_definitions(cesluajitd PRIVATE CES_HYLE=1)
-  message(STATUS "CES_HYLE ON: cesluajitd links hyle_services (+ core) from github.com/fcecin/hyle")
+  # cesh links it too, for the client-side hyle verbs (build + sign ops, speak a
+  # chain's line protocol). Linked to the cesh target only, never ceslib: the CES
+  # client engine stays hyle-free; all hyle knowledge rides in the shell.
+  target_link_libraries(cesh PRIVATE hyle_services)
+  target_compile_definitions(cesh PRIVATE CES_HYLE=1)
+  message(STATUS "CES_HYLE ON: cesluajitd + cesh link hyle_services (+ core) from github.com/fcecin/hyle")
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)

@@ -1,4 +1,4 @@
-# ces
+# CES
 
 __NOTE: This is experimental software.__
 
