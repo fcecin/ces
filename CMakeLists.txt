@@ -264,6 +264,17 @@ if(CES_HYLE)
   message(STATUS "CES_HYLE ON: cesluajitd + cesh link hyle_services (+ core) from github.com/fcecin/hyle")
 endif()
 
+# Outbound mail: builtin:mail + the SMTP/TLS client. Off by default; build.sh
+# --mail. Needs system OpenSSL.
+option(CES_MAIL "Enable outbound mail (builtin:mail + SMTP with TLS)" OFF)
+if(CES_MAIL)
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(ceslib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(ceslib PUBLIC CES_MAIL=1)
+  target_compile_definitions(cesluajitd PRIVATE CES_MAIL=1)
+  message(STATUS "CES_MAIL ON: builtin:mail + SMTP/TLS (OpenSSL)")
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)
 find_package(Qt6 QUIET COMPONENTS Widgets Network)
 if(Qt6_FOUND)

@@ -182,7 +182,10 @@ enum error_code_t : uint8_t {
                                      // rejected the incoming transfer
   CES_ERROR_HOOK_TARGET = 0x26,      // hook sidecar points at an asset that is
                                      // not immutable and not owned by the setter
-  CES_ERROR_LAST = CES_ERROR_HOOK_TARGET
+  // SYS_L2_CALL — the 8-byte discriminator names no built-in mounted on this
+  // server, or the target built-in does not implement the L2-call handler.
+  CES_ERROR_UNSUPPORTED = 0x27,
+  CES_ERROR_LAST = CES_ERROR_UNSUPPORTED
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -357,6 +360,7 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_ALIAS_NOT_FOUND:                  return "CES_ERROR_ALIAS_NOT_FOUND";
   case CES_ERROR_HOOK_REJECTED:                    return "CES_ERROR_HOOK_REJECTED";
   case CES_ERROR_HOOK_TARGET:                      return "CES_ERROR_HOOK_TARGET";
+  case CES_ERROR_UNSUPPORTED:                      return "CES_ERROR_UNSUPPORTED";
   default:                                         return "UNKNOWN_ERROR";
   }
 }

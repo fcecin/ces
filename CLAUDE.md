@@ -18,6 +18,7 @@ CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind 
 - `xxx.h` maps to `xxx.cpp`. Every header `include/ces/.../<name>.h` has a matching `src/ceslib/<name>.cpp` (or wherever its translation unit lives) under the same name. Renaming a header renames its cpp.
 - No "Step N" or "Phase A/B" comments. Reference what the code does today, not which iteration of a plan it came from.
 - Comments and authored text, including this file, commit messages, and CLI output: terse, factual, no narration or design history, plain ASCII, no em-dashes.
+- Do not add environment-variable reads without explicit confirmation, and never use env vars to drive tests or inject test prerequisites. Tests take their input from code and fixtures only, never from the environment or the network. The documented client vars (`CESH_SERVER`, `CESH_WALLET`) are the existing exception, not license for more. An ad hoc check against a live external service (e.g. real SMTP) belongs in a gitignored `local/` tool that takes arguments, not an env-gated suite test.
 
 ## Build
 

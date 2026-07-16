@@ -215,6 +215,53 @@ int lua_ces_gossip_send(lua_State* L) {
   return 0;
 }
 
+#ifdef CES_MAIL
+// ces.mail.send{to=, subject=, body=, attach=} - one-way outbound email via the
+// server's relay. Routed into builtin:mail, which estimates the encoded size and
+// burns the program's OWN account per encoded MB (the anti-spam gate); no /s/
+// restriction. `attach` is an optional file-store path (a private /m/ path is
+// owner-gated to this program).
+int lua_ces_mail_send(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  lua_getfield(L, 1, "to");
+  size_t tolen = 0;
+  const char* to = luaL_checklstring(L, -1, &tolen);
+  lua_getfield(L, 1, "subject");
+  size_t sjlen = 0;
+  const char* sj = luaL_optlstring(L, -1, "", &sjlen);
+  lua_getfield(L, 1, "body");
+  size_t bdlen = 0;
+  const char* bd = luaL_optlstring(L, -1, "", &bdlen);
+  if (tolen == 0 || tolen > 0xFFFF)
+    return luaL_error(L, "ces.mail.send: 'to' must be 1..65535 bytes");
+  if (sjlen > 0xFFFF)
+    return luaL_error(L, "ces.mail.send: 'subject' exceeds 65535 bytes");
+  if (bdlen > 256u * 1024u)
+    return luaL_error(L, "ces.mail.send: 'body' exceeds 256 KiB");
+  lua_getfield(L, 1, "attach");
+  size_t atlen = 0;
+  const char* at = luaL_optlstring(L, -1, "", &atlen);   // file-store path
+  if (atlen > 0xFFFF)
+    return luaL_error(L, "ces.mail.send: 'attach' path too long");
+  // Body: [u16 toLen][to][u16 subjLen][subject][u32 bodyLen][body]
+  //       [u16 pathLen][attach] (BE).
+  std::vector<uint8_t> body;
+  body.push_back(uint8_t((tolen >> 8) & 0xFF));
+  body.push_back(uint8_t(tolen & 0xFF));
+  body.insert(body.end(), to, to + tolen);
+  body.push_back(uint8_t((sjlen >> 8) & 0xFF));
+  body.push_back(uint8_t(sjlen & 0xFF));
+  body.insert(body.end(), sj, sj + sjlen);
+  put_u32(body, static_cast<uint32_t>(bdlen));
+  body.insert(body.end(), bd, bd + bdlen);
+  body.push_back(uint8_t((atlen >> 8) & 0xFF));
+  body.push_back(uint8_t(atlen & 0xFF));
+  body.insert(body.end(), at, at + atlen);
+  write_frame(TAG_MAIL_OUT, 0, body.data(), body.size());
+  return 0;
+}
+#endif  // CES_MAIL
+
 // ces.peer.send(peer_pubkey, service, bytes) - fire a targeted message to a
 // peer's same-service extension over the /ces/peer/1 mesh. Free (unmetered,
 // server-to-server), fire-and-forget. No-op if there is no live link to peer.

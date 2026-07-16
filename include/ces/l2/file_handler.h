@@ -172,6 +172,13 @@ public:
   // Read the file's program-account ed25519 private key from its sidecar.
   bool readProgramPrivkey(const std::string& name,
                           std::array<uint8_t, 32>& outProgramPrivkey);
+  // Read a file's size in bytes (for mail-attachment cost estimation, before
+  // any read work). Returns false if the file doesn't exist.
+  bool attachmentSize(const std::string& name, uint64_t& outSize);
+  // Read a file's content for a mail attachment, bounded by maxBytes. Returns
+  // CES_OK, CES_ERROR_FILE_NOT_FOUND, or CES_ERROR_BAD_INPUT (over maxBytes).
+  uint8_t readAttachment(const std::string& name, uint64_t maxBytes,
+                         ces::Bytes& outContent);
   // Debit `amount` from the file's program account (rolls rent first). The
   // file is DELETED if the post-roll balance cannot cover it; returns false.
   bool debitBalance(const std::string& name, uint64_t amount);

@@ -786,6 +786,16 @@ void install_ces_api(lua_State* L) {
   lua_setfield(L, -2, "send");
   lua_setfield(L, -2, "gossip");
 
+#ifdef CES_MAIL
+  // ces.mail.send{to=, subject=, body=, attach=} - one-way outbound email via
+  // the server's relay (builtin:mail). Charged (burned) from the program's own
+  // account per encoded MB. Present only in a --mail build.
+  lua_newtable(L);
+  lua_pushcfunction(L, guarded<lua_ces_mail_send>);
+  lua_setfield(L, -2, "send");
+  lua_setfield(L, -2, "mail");
+#endif  // CES_MAIL
+
   // ces.peer.send(peer_pubkey, service, bytes) fires a targeted, free message
   // over the /ces/peer/1 mesh to a peer server's same-service extension;
   // ces.peer.listen(service, fn) registers fn(from_pubkey, bytes) for inbound.

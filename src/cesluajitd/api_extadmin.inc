@@ -393,6 +393,55 @@ static void drain_gossip(lua_State* mainL) {
   }
 }
 
+// Dispatch a paid SYS_L2_CALL to the program's global on_l2call, and settle it
+// back to the host. Frame body:
+//   [u64 callId][u64 value][8 payer][u32 payloadLen][payload]
+// Delivery is acceptance-based: the instant a handler exists we ack DELIVERED
+// (the value is the program's now) and run on_l2call(payload, {payer, value,
+// callid}) as a coroutine; with no handler we ack NO_HANDLER so the host
+// refunds. What the handler does after acceptance is the program's business.
+static void drain_l2call(lua_State* mainL) {
+  constexpr size_t H = sizeof(uint64_t) + sizeof(uint64_t) + 8 + sizeof(uint32_t);
+  while (!g_l2call_q.empty()) {
+    Frame f = std::move(g_l2call_q.front());
+    g_l2call_q.pop_front();
+    if (f.body.size() < H) continue;
+    const uint8_t* b = f.body.data();
+    uint64_t callId = get_u64(b);
+    uint64_t value  = get_u64(b + 8);
+    const uint8_t* payer = b + 16;                   // 8-byte account prefix
+    uint32_t plen = get_u32(b + 24);
+    if (f.body.size() < H + plen) continue;
+    const uint8_t* payload = b + H;
+
+    lua_getglobal(mainL, "on_l2call");
+    bool haveHandler = lua_isfunction(mainL, -1);
+
+    // Settle to the host: delivered iff a handler exists.
+    std::vector<uint8_t> rb;
+    put_u64(rb, callId);
+    rb.push_back(haveHandler ? 0 : 1);               // 0 delivered, 1 no-handler
+    write_frame(TAG_L2_CALL_RESULT, 0, rb.data(), rb.size());
+
+    if (!haveHandler) { lua_pop(mainL, 1); continue; }
+
+    lua_State* co = lua_newthread(mainL);            // mainL: [handler, co]
+    int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);    // pop co, ref it
+    g_coro_refs[co] = ref;
+    lua_xmove(mainL, co, 1);                          // handler -> co
+
+    lua_pushlstring(co, reinterpret_cast<const char*>(payload), plen);  // arg1
+    lua_createtable(co, 0, 3);                                          // arg2
+    lua_pushlstring(co, reinterpret_cast<const char*>(payer), 8);
+    lua_setfield(co, -2, "payer");
+    lua_pushnumber(co, static_cast<lua_Number>(value));
+    lua_setfield(co, -2, "value");
+    lua_pushnumber(co, static_cast<lua_Number>(callId));
+    lua_setfield(co, -2, "callid");
+    g_ready.push_back({co, 2});
+  }
+}
+
 // Inbound /ces/peer/1 mesh message: [32 from][u16 service_len][service]
 // [u32 len][payload]. Dispatch the per-service handler registered via
 // ces.peer.listen(service, fn) as fn(from_pubkey, payload) in a coroutine.
@@ -537,6 +586,7 @@ int lua_ces_run(lua_State* L) {
     drain_luarpc_advance(L);
     drain_gossip(L);
     drain_peer(L);
+    drain_l2call(L);
     drain_ready(L);
     // Watched panel: render-and-push if the frame changed (500ms budget inside).
     mene_ui_tick(L, g_ext_panel_ref);

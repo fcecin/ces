@@ -296,7 +296,22 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # back to bare-name PATH lookup. Set explicitly to use a specific
 # binary or pin a path that's not next to ces.
 # compute_child_binary = ""
-
+)"
+#ifdef CES_MAIL
+       << R"(#
+# Outbound mail relay (ces.mail.send). Empty relay host = mail is logged and
+# dropped. Credentials ride AUTH LOGIN; STARTTLS is used when the relay
+# advertises it. Secure this file if you set a password.
+# mail_relay_host = ""      # e.g. "localhost"
+# mail_relay_port = 587
+# mail_from       = ""      # e.g. "no-reply@your-domain.example"
+# mail_user       = ""      # SMTP AUTH user (empty = no AUTH)
+# mail_pass       = ""      # SMTP AUTH password (empty = no AUTH)
+# mail_fee_per_mb        = 0          # credits burned per MB of outgoing mail
+# mail_max_encoded_bytes = 20971520   # 20 MiB cap on one message
+)"
+#endif
+       << R"(
 # === CesPlex mounts: the crucial L2 wiring (rpc_port only). ===
 # CesPlex is implementation-agnostic. Each entry wires a protocol name to a
 # builtin handler impl, and this map is the ONLY thing that decides what the
@@ -445,6 +460,14 @@ int main(int argc, char* argv[]) {
   // <storeDir>/s/<name>.lua, autolaunched at boot when enabled.
   // Names are arbitrary basenames; CLI flag is repeatable.
   std::vector<std::string> optExtensions;
+#ifdef CES_MAIL
+  // Mail relay (SMTP submission for ces.mail.send / builtin:mail).
+  std::string optMailRelayHost;
+  uint16_t    optMailRelayPort = 587;
+  std::string optMailFrom, optMailUser, optMailPass;
+  uint64_t    optMailFeePerMB = 0;
+  uint64_t    optMailMaxEncodedBytes = 20ull * 1024 * 1024;
+#endif  // CES_MAIL
   // CesPlex mounts — `proto=target` pairs. Target is
   // "builtin:<name>" (statically linked handler).
   std::vector<std::string> optCesplexMounts;
@@ -604,6 +627,26 @@ int main(int argc, char* argv[]) {
       ->default_val(std::to_string(DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS));
     app.add_option("--peer", optPeers,
       "Peer server as key@host:port (repeatable)");
+
+#ifdef CES_MAIL
+    // --- Mail relay (ces.mail.send / builtin:mail) ---
+    app.add_option("--mailrelayhost", optMailRelayHost,
+      "SMTP submission relay host for outbound mail (empty = log + drop)")
+      ->default_val("");
+    app.add_option("--mailrelayport", optMailRelayPort,
+      "SMTP submission relay port")->default_val("587");
+    app.add_option("--mailfrom", optMailFrom,
+      "From address for outbound mail")->default_val("");
+    app.add_option("--mailuser", optMailUser,
+      "SMTP AUTH LOGIN user (empty = no AUTH)")->default_val("");
+    app.add_option("--mailpass", optMailPass,
+      "SMTP AUTH LOGIN password (empty = no AUTH)")->default_val("");
+    app.add_option("--mailfeepermb", optMailFeePerMB,
+      "Credits burned per MB of outgoing mail (0 = free)")->default_val("0");
+    app.add_option("--mailmaxencodedbytes", optMailMaxEncodedBytes,
+      "Max encoded size of one email, bytes")
+      ->default_val(std::to_string(20ull * 1024 * 1024));
+#endif  // CES_MAIL
 
     // --- File-storage feature (CesPlex builtin:file) ---
     app.add_option("--filestoremaxbytes", optFileStoreMaxBytes,
@@ -832,6 +875,18 @@ int main(int argc, char* argv[]) {
       applyIfDefault("fee_file_write", optFeeFileWrite, "--feefilewrite");
       applyIfDefault("fee_file_read",  optFeeFileRead,  "--feefileread");
 
+#ifdef CES_MAIL
+      // Mail relay (ces.mail.send / builtin:mail).
+      applyIfDefault("mail_relay_host", optMailRelayHost, "--mailrelayhost");
+      applyIfDefault("mail_relay_port", optMailRelayPort, "--mailrelayport");
+      applyIfDefault("mail_from",       optMailFrom,      "--mailfrom");
+      applyIfDefault("mail_user",       optMailUser,      "--mailuser");
+      applyIfDefault("mail_pass",       optMailPass,      "--mailpass");
+      applyIfDefault("mail_fee_per_mb", optMailFeePerMB,  "--mailfeepermb");
+      applyIfDefault("mail_max_encoded_bytes", optMailMaxEncodedBytes,
+                     "--mailmaxencodedbytes");
+#endif  // CES_MAIL
+
       // Compute feature knobs.
       applyIfDefault("compute_max_instances",    optComputeMaxInstances,
                      "--computemaxinstances");
@@ -1031,6 +1086,17 @@ int main(int argc, char* argv[]) {
   config.cesFileStoreMaxBytes = optFileStoreMaxBytes;
   config.cesFileStoreDir      = optFileStoreDir;
   config.cesExtensionsDir     = optExtensionsDir;
+
+#ifdef CES_MAIL
+  // Mail relay (ces.mail.send / builtin:mail). Empty relay host => log + drop.
+  config.mailRelayHost = optMailRelayHost;
+  config.mailRelayPort = optMailRelayPort;
+  config.mailFrom      = optMailFrom;
+  config.mailUser      = optMailUser;
+  config.mailPass      = optMailPass;
+  config.mailFeePerMB        = optMailFeePerMB;
+  config.mailMaxEncodedBytes = optMailMaxEncodedBytes;
+#endif  // CES_MAIL
   config.extFundingPerDay     = optExtFundingPerDay;
   config.extLocalBudget       = optExtLocalBudget;
   if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;

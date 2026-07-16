@@ -167,6 +167,16 @@ public:
                      const minx::Hash& msgId, const minx::Hash& dest,
                      const uint8_t* msg, std::size_t len);
 
+  // SYS_L2_CALL delivery: route the paid call into the target live instance
+  // (blob = [u64 pid BE][payload]) via TAG_L2_CALL_IN; the child settles it
+  // with a TAG_L2_CALL_RESULT (delivered / no-handler), else the timeout
+  // sweep refunds. Runs on the CesPlex strand (like every handler entry).
+  uint8_t cesplexL2Call(const L2CallRequest& req, L2CallReport report) override;
+  // Settle a pending L2 call by callId (from the child's result frame).
+  void l2Result(uint64_t callId, bool delivered);
+  // Refund L2 calls whose deadline passed (instance never replied / died).
+  void l2SweepTimeouts(uint64_t nowUs);
+
   // ---- /ces/lua/1 + /ces/peer/1 cross-handler primitives. Used by the lua /
   // peer handlers; all run on rpcTaskIO_'s strand. ----
 
@@ -205,6 +215,17 @@ public:
   // helpers reach it via server->computeHandler(); not a stable API.
   CesServer* server_ = nullptr;
   std::map<uint64_t, std::shared_ptr<Instance>> instances_;
+  // In-flight SYS_L2_CALLs awaiting the child's result frame (or timeout).
+  // Keyed by the host-owned callId. Touched only on the CesPlex strand.
+  // RAM-ONLY, like the caller-side record: a hard crash between accept and the
+  // result frame loses the refund. See the DURABILITY GAP note on
+  // CesServer::PendingL2Call (server.h) for the full analysis and the fix.
+  struct PendingL2 {
+    L2CallReport report;
+    minx::Hash payee;          // instance program pubkey, minted on delivery
+    uint64_t deadlineUs = 0;
+  };
+  std::map<uint64_t, PendingL2> pendingL2_;
   std::map<std::array<uint8_t, 8>, std::set<uint64_t>> byPrefix_;
   std::map<std::string, std::set<uint64_t>> byName_;
   // Source path -> expiry (us) of a spawn in flight. Bridges the async connect-back

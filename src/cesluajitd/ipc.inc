@@ -31,6 +31,12 @@ constexpr uint8_t  TAG_EXT_SAVE_CONFIG  = 0x19;  // child → server (persist /s
 constexpr uint8_t  TAG_EXT_UI_PUSH      = 0x1a;  // child → server (panel render frame, one-way)
 constexpr uint8_t  TAG_EXT_UI_WATCH     = 0x1b;  // server → child ([u8 on]; drives the change-detect tick)
 
+constexpr uint8_t  TAG_L2_CALL_IN       = 0x1c;  // server → child (paid VM->L2 call -> on_l2call)
+constexpr uint8_t  TAG_L2_CALL_RESULT   = 0x1d;  // child → server (delivered / no-handler)
+#ifdef CES_MAIL
+constexpr uint8_t  TAG_MAIL_OUT         = 0x1e;  // child → server (ces.mail.send)
+#endif
+
 constexpr uint8_t  TAG_GOSSIP_IN        = 0x13;  // server → child (a flooded message)
 constexpr uint8_t  TAG_GOSSIP_OUT       = 0x14;  // child → server (ces.gossip.send)
 
@@ -111,6 +117,7 @@ std::deque<Frame> g_reply_q;     // pending API_REPLY frames
 std::deque<Frame> g_conn_q;      // pending CONN_* frames (drained by run())
 std::deque<Frame> g_gossip_q;    // pending GOSSIP_IN frames (drained by run())
 std::deque<Frame> g_peer_q;      // pending PEER_MSG_IN frames (drained by run())
+std::deque<Frame> g_l2call_q;    // pending L2_CALL_IN frames (drained by run())
 
 // Cooperative I/O scheduler state (single-threaded: only the IPC thread that
 // runs run()/the main chunk touches these). A coroutine that calls a host
@@ -290,6 +297,7 @@ void route_to_queue(Frame f) {
            f.tag == TAG_CONN_CLOSED) g_conn_q.push_back(std::move(f));
   else if (f.tag == TAG_GOSSIP_IN) g_gossip_q.push_back(std::move(f));
   else if (f.tag == TAG_PEER_MSG_IN) g_peer_q.push_back(std::move(f));
+  else if (f.tag == TAG_L2_CALL_IN) g_l2call_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
 }
 

@@ -1750,6 +1750,43 @@ void CesVM::hostCall(CesVMHost& host) {
     break;
   }
 
+  case SYS_L2_CALL: {
+    // Paid, reliable call into an in-CES (L2) built-in. See SYS_L2_CALL in
+    // cesvm.h for the io layout. The syscall owns the burn: a synchronous
+    // reject burns nothing; CES_OK burns `value` and enqueues. Settlement is
+    // delivery-based and resolved later via a followup run (INVOKE_L2_RETURN).
+    if (!bill(CESVM_COST_PER_SYSCALL)) return;
+
+    // Discriminator: 8 raw bytes (sha256 of the built-in name, truncated),
+    // matched as a flat array so routing is endian-independent.
+    uint8_t disc[8];
+    readIoBytes(io_[4], disc, sizeof(disc));
+    if (term_) return;
+
+    uint64_t value = io_[5];
+
+    // Provider-ABI blob, opaque to core. Bounded to keep the inline path small.
+    constexpr uint64_t kMaxL2Blob = 1024;
+    uint64_t blobLen = io_[7];
+    if (blobLen > kMaxL2Blob) { S() = CES_ERROR_BAD_INPUT; break; }
+    std::vector<uint8_t> blob(blobLen);
+    if (blobLen > 0) {
+      readIoBytes(io_[6], blob.data(), blobLen);
+      if (term_) return;
+    }
+
+    minx::Hash followupKey;
+    readIoBytes(io_[8], followupKey.data(), followupKey.size());
+    if (term_) return;
+
+    uint64_t followupBudget = io_[9];
+    uint32_t followupTag = static_cast<uint32_t>(io_[10]);
+
+    S() = host.l2call(disc, value, blob.data(), blob.size(),
+                      followupKey, followupBudget, followupTag);
+    break;
+  }
+
   default:
     term_ = CESVM_SYSCALL;
   }

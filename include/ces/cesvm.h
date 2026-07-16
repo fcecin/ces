@@ -339,6 +339,23 @@ enum CesVMSyscall : uint64_t {
   // ALIAS_OP_INLINE_PROGRAM at queue AND fire time; the fired run gets
   // self = 0 and programOwner = the cell's owner (consented code).
   SYS_SCHEDULE_ALIAS  = 28,
+  // SYS_L2_CALL — paid, reliable call into an in-CES (L2) service, routed by
+  // an 8-byte discriminator: the first 8 bytes of sha256(built-in mount name),
+  // treated as a flat byte array (endian-independent, never a native int).
+  // io[4] = discriminator cell (the 8 bytes = one io cell)
+  // io[5] = value            (u64, burned from caller on accept)
+  // io[6] = blob cell        (provider-ABI payload, opaque to core)
+  // io[7] = blob len         (bytes)
+  // io[8] = followup cell    (32-byte followup VM asset key; 0 = fire-and-forget)
+  // io[9] = followup budget  (u64)
+  // io[10]= followup tag     (u32)
+  // The syscall OWNS the burn: a synchronous reject (unmounted discriminator,
+  // queue full) returns a code and burns nothing; CES_OK atomically burns
+  // `value` and enqueues a persistent call. Settlement is delivery-based and
+  // core-owned: delivered -> mint payee; not-delivered (no-handler / timeout)
+  // -> refund payer. Resolution schedules a followup run (invokeKind =
+  // INVOKE_L2_RETURN, input [tag][outcome]) unless followup cell is zero.
+  SYS_L2_CALL         = 29,
 };
 
 // Invocation kind — which entry path started this run. Preloaded into
@@ -363,6 +380,7 @@ enum CesVMInvoke : uint64_t {
   INVOKE_AUTOEXEC      = 2,   // boot autoexec.
   INVOKE_DIRECT_ALIAS  = 3,   // CES_RUN_ALIAS (public inline-program run).
   INVOKE_SCHEDULED_ALIAS = 4, // SYS_SCHEDULE_ALIAS fire.
+  INVOKE_L2_RETURN     = 5,   // SYS_L2_CALL resolution (delivered / refunded).
 
   // Account-hook subrange.
   INVOKE_HOOK_XFER_IN  = 16,  // a local transfer credited this account.
@@ -769,6 +787,19 @@ public:
                                    const minx::Hash&, const minx::Hash&,
                                    uint64_t, uint32_t)
   { notImpl("rpc"); }
+
+  // SYS_L2_CALL — route to an in-CES (L2) built-in by 8-byte discriminator,
+  // burn `value` from the caller on accept, enqueue a persistent call, and
+  // settle on delivery (delivered -> mint payee; no-handler / timeout ->
+  // refund payer). Zero followupKey = fire-and-forget. Returns the queue
+  // result (CES_OK = accepted + burned; reject codes burn nothing).
+  virtual uint8_t  l2call         (const uint8_t* /*discriminator8*/,
+                                   uint64_t /*value*/,
+                                   const uint8_t*, size_t /*blob*/,
+                                   const minx::Hash& /*followupKey*/,
+                                   uint64_t /*followupBudget*/,
+                                   uint32_t /*followupTag*/)
+  { notImpl("l2call"); }
 
   // ---- Caller debit chokepoint --------------------------------------------
   // For *spending* (transfer amounts, asset purchase prices, cross-transfer

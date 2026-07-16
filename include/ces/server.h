@@ -276,6 +276,9 @@ struct CesConfig {
   size_t   rpcMaxRequestBytes  = DEFAULT_RPC_MAX_REQUEST_BYTES;
   size_t   rpcMaxResponseBytes = DEFAULT_RPC_MAX_RESPONSE_BYTES;
   uint32_t rpcResponseTimeoutMs = DEFAULT_RPC_RESPONSE_TIMEOUT_MS;
+  // SYS_L2_CALL: caps concurrent in-flight VM->L2 calls. queueL2Call returns
+  // CES_ERROR_QUEUE_FULL past this, burning nothing.
+  uint32_t l2MaxPending        = 4096;
 
   // Per-channel RUDP pacing advertised in the handshake. The effective
   // bucket is min(local, peer) per parameter. Defaults mean "unlimited"
@@ -497,6 +500,23 @@ struct CesConfig {
   // without pulling Lua into the mix.
   std::string cesComputeChildBinary = "cesluajitd";
 
+#ifdef CES_MAIL
+  // Outbound mail relay (ces.mail.send). Empty host => mail is logged + dropped.
+  // Credentials ride AUTH LOGIN; keep them in an operator secrets file, never
+  // committed. STARTTLS is used when the relay advertises it (see util/smtp.h).
+  std::string mailRelayHost;
+  uint16_t    mailRelayPort = 587;
+  std::string mailFrom;
+  std::string mailUser;
+  std::string mailPass;
+
+  // Outbound mail charging (builtin:mail / ces.mail.send). mailFeePerMB is the
+  // credits burned per megabyte of encoded (on-the-wire) message; 0 = free.
+  // mailMaxEncodedBytes caps one message's encoded size (default 20 MiB).
+  uint64_t mailFeePerMB = 0;
+  uint64_t mailMaxEncodedBytes = 20ull * 1024 * 1024;
+#endif  // CES_MAIL
+
   // L2 compute program UDP port range: [computePortBase, computePortBase
   // + computePortCount - 1]. Each launched child binds its outbound CES
   // client to a port the server allocates statically from this range. The
@@ -571,6 +591,9 @@ class PeerHandler;
 class LuaHandler;
 class FileHandler;
 class ComputeHandler;
+#ifdef CES_MAIL
+class MailHandler;
+#endif
 
 // Rudp::Listener for the rpc port. Owns the back-pointer to CesServer
 // for onSend (forward to rpcMinx_) and onAccept (delegate to CesPlex
@@ -847,6 +870,9 @@ public:
   LuaHandler* luaHandler() { return luaHandler_.get(); }
   FileHandler* fileHandler() { return fileHandler_.get(); }
   ComputeHandler* computeHandler() { return computeHandler_.get(); }
+#ifdef CES_MAIL
+  MailHandler* mailHandler() { return mailHandler_.get(); }
+#endif
 
   // Test hook: add a peer with a pre-resolved plex endpoint (simulates a
   // completed probe) without starting the peer miner. Drives the
@@ -1233,6 +1259,32 @@ public:
   // the account doesn't exist (collected by daily maintenance).
   int64_t _l2ProgramAccountBalanceSync(const minx::Hash& pubkey);
 
+  // Test hook: register an L2-call handler under `name` (its discriminator =
+  // first 8 bytes of sha256(name)) so a VM SYS_L2_CALL routes to it. Handlers
+  // wired via [cesplex_mounts] register automatically in the mount loop; this
+  // is for unit tests that mount a mock handler directly.
+  void _testRegisterL2Handler(const std::string& name, CesPlexHandler* handler);
+
+#ifdef CES_MAIL
+  // Outbound email (send-only). ces.mail.send from an /s/ extension frames to
+  // the compute handler, which calls mailDeliver on the CesPlex strand. The
+  // default logs and drops; a production build wires an SMTP relay here, and
+  // tests install a recording sink via _testSetMailSink.
+  struct MailMessage {
+    std::string to, subject, body;
+    std::string attachmentName;   // empty = no attachment
+    std::string attachmentData;
+  };
+  void mailDeliver(const MailMessage& m);
+  void _testSetMailSink(std::function<void(const MailMessage&)> sink);
+
+  // Charge (burn) `price` from `payer` for one outbound mail. Returns false if
+  // the account can't cover it (the send is denied, nothing burned). Blocking;
+  // runs the check-and-burn atomically on the logic strand. No payee -- the fee
+  // is destroyed (anti-spam), never credited.
+  bool mailChargeSync(const minx::Hash& payer, uint64_t price);
+#endif  // CES_MAIL
+
   // The L2 verb primitive: run `fn` as one atomic logicStrand_ task with a
   // LedgerTxn over the account/asset stores (dedup + debit + credit + reads).
   // Blocks until the task completes. The caller must not be on logicStrand_
@@ -1398,6 +1450,47 @@ private:
   // Context describing how an individual VM run wires its host lambdas.
   // Two code paths use this: the CES_RUN_ASSET handler (undo-log + deferred
   // side effects) and the scheduled run handler (direct mutations, stubs).
+  // A paid VM->L2 call in flight (SYS_L2_CALL). Built by the VmHost l2 sink,
+  // buffered in executeVmRun, fired on commit as a drainL2Call post. The burn
+  // already parked `value` in the self-account (undo-logged); settlement moves
+  // it self->payee (delivered) or self->payer (refund).
+  //
+  // DURABILITY GAP (deliberate, documented, not yet closed): this record is
+  // RAM-ONLY. It lives as a shared_ptr flowing drainL2Call -> completeL2Call
+  // (and, once handed to builtin:compute, in ComputeHandler::pendingL2_) and is
+  // never journaled. The two ledger LEGS it coordinates ARE persisted -- the
+  // burn (committed atomically with the VM run) and the settle (its own
+  // logicStrand mutation). What is not persisted is the in-flight INTENT
+  // between them.
+  //
+  // Consequence of a HARD crash in the burn..settle window: on restart the burn
+  // is recovered (payer debited; the self-account resets to its bottomless
+  // baseline), but this record is gone, so no settle ever fires. The payer is
+  // neither refunded nor served -- `value` is silently lost. Conservation still
+  // holds (totalCredits_ recomputes from the loaded accounts and matches the
+  // sum; nothing is minted), so this is a durability/fairness gap, NOT a ledger
+  // integrity bug. It is bounded: only calls in-flight at the instant of a hard
+  // crash, and a graceful shutdown drains cleanly.
+  //
+  // To close it: make the pending set a persisted, transactional
+  // logKV structure. The burn+enqueue already commit atomically; also durably
+  // record {payerKey, value, target, deadline, callId}. On boot, recovery walks
+  // the surviving entries and either re-dispatches them or refunds the payer
+  // (treat unresolved-at-restart as a timeout) -- exactly-once across a crash.
+  struct PendingL2Call {
+    uint64_t callId = 0;
+    CesPlexHandler* handler = nullptr;   // resolved at accept (stable ptr)
+    minx::Hash payerKey;                 // burned account; the refund target
+    uint64_t value = 0;                  // credits burned; settled on delivery
+    ces::Bytes blob;                     // provider-ABI payload
+    minx::Hash followupProgramKey;       // resolution run (0 = fire-and-forget)
+    uint64_t followupBudget = 0;
+    uint64_t followupAllowance =
+      std::numeric_limits<uint64_t>::max();
+    uint32_t followupTag = 0;
+    bool resolved = false;               // logic-strand-guarded idempotency
+  };
+
   struct VmHostSetup {
     HashPrefix callerPrefix;
     HashPrefix programOwnerPrefix;
@@ -1421,6 +1514,13 @@ private:
     std::function<void(const minx::Hash& dest, uint64_t amount,
                        const std::string& server,
                        const minx::Hash& peerKey)> crossTransferFn;
+
+    // Invoked by VmHost::l2call after it resolves the discriminator, checks
+    // backpressure, and burns `value` (caller -> self-account) via the undo
+    // log. executeVmRun buffers the PendingL2Call and posts the drain on
+    // commit, so an aborted VM rolls the burn back and never dispatches.
+    // Empty = syscall disabled.
+    std::function<void(PendingL2Call)> l2CallFn;
 
     // Invoked by SYS_SCHEDULE. Enqueues a future VM run paid by `callerPrefix`
     // and returns the schedule rc (CES_OK / QUEUE_FULL). executeVmRun records
@@ -1650,6 +1750,9 @@ private:
   std::unique_ptr<LuaHandler> luaHandler_;
   std::unique_ptr<FileHandler> fileHandler_;
   std::unique_ptr<ComputeHandler> computeHandler_;
+#ifdef CES_MAIL
+  std::unique_ptr<MailHandler> mailHandler_;
+#endif
 
   // SYS_RPC dispatcher state. queueRpc runs on the logic strand
   // (validates the file, materializes request bytes, signs the
@@ -1699,6 +1802,26 @@ private:
   void    completeRpc(std::shared_ptr<PendingRpc> pending,
                        uint8_t errorCode,
                        ces::Bytes responseBody);
+
+  // SYS_L2_CALL dispatcher trio (mirrors the RPC trio's threading). The
+  // enqueue is deferred: the VmHost l2 sink buffers a PendingL2Call and
+  // executeVmRun posts the drain on commit, so an aborted run rolls the burn
+  // back and never dispatches. drainL2Call runs on rpcTaskIO_ (hand to the
+  // built-in); completeL2Call on the logic strand (settle once, via a
+  // self-account transfer). l2Registry_ maps the 8-byte discriminator
+  // (sha256 of the built-in mount name, first 8 bytes, read big-endian) to
+  // the mounted handler; built once in the mount loop. PendingL2Call is
+  // declared above (VmHostSetup's l2 sink carries it).
+  void    drainL2Call(std::shared_ptr<PendingL2Call> pending);
+  void    completeL2Call(std::shared_ptr<PendingL2Call> pending,
+                         L2CallOutcome outcome, const minx::Hash& payee);
+
+  std::unordered_map<uint64_t, CesPlexHandler*> l2Registry_;
+  std::atomic<size_t> l2PendingCount_{0};
+  uint64_t l2NextCallId_ = 1;            // logic strand only
+#ifdef CES_MAIL
+  std::function<void(const MailMessage&)> mailSink_;   // relay / test override
+#endif
 
   boost::asio::strand<boost::asio::io_context::executor_type> logicStrand_;
   std::thread verifyPoWThread_;

@@ -47,6 +47,7 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/mail_handler.h>
 #include <ces/l2/peer_handler.h>
 #include <ces/buffer.h>
 #include <ces/client.h>
@@ -166,6 +167,15 @@ constexpr uint8_t kIpcTagExtUiWatch     = 0x1b;  // server → child ([u8 on])
 
 constexpr uint8_t kIpcTagGossipIn       = 0x13;  // server → child (flooded message)
 constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip.send)
+
+// SYS_L2_CALL — paid VM->L2 call routed into a live instance's on_l2call.
+constexpr uint8_t kIpcTagL2CallIn       = 0x1c;  // server → child (paid call)
+constexpr uint8_t kIpcTagL2CallResult   = 0x1d;  // child → server (delivered/no-handler)
+#ifdef CES_MAIL
+constexpr uint8_t kIpcTagMailOut        = 0x1e;  // child → server (ces.mail.send)
+#endif
+// Refund a call the instance never acknowledged (crashed / wedged).
+constexpr uint64_t kL2CallTimeoutUs = 30'000'000;  // 30 s
 
 // Peer-mesh messaging (must match cesluajitd TAG_PEER_*). Targeted, free,
 // service-tagged messages over /ces/peer/1 between same-named extensions.
@@ -1111,6 +1121,52 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
       sv->luaHandler()->handleConnClose(inst->pid, connId);
     return;
   }
+  if (tag == kIpcTagL2CallResult) {
+    // Payload: [u64 callId][u8 status]  (0 = delivered, else no-handler). The
+    // child sends this the moment it accepts (or refuses) a SYS_L2_CALL.
+    if (body.size() < kIpcHdr + sizeof(uint64_t) + 1) return;
+    uint64_t callId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
+    uint8_t status = body[kIpcHdr + sizeof(uint64_t)];
+    inst->owner->l2Result(callId, status == 0);
+    return;
+  }
+#ifdef CES_MAIL
+  if (tag == kIpcTagMailOut) {
+    // ces.mail.send from a program. Routes into builtin:mail, which burns the
+    // program's OWN account per encoded MB (the charge is the anti-spam gate;
+    // no /s/ restriction). Payload:
+    //   [u16 toLen][to][u16 subjLen][subject][u32 bodyLen][body]
+    //   [u16 pathLen][attachment path]  (BE).
+    const uint8_t* p = body.data() + kIpcHdr;
+    size_t n = body.size() - kIpcHdr, off = 0;
+    auto has = [&](size_t k) { return off + k <= n; };
+    if (!has(2)) return;
+    uint16_t toLen = ces::Buffer::peek<uint16_t>(p + off); off += 2;
+    if (!has(toLen)) return;
+    std::string to(reinterpret_cast<const char*>(p + off), toLen); off += toLen;
+    if (!has(2)) return;
+    uint16_t sjLen = ces::Buffer::peek<uint16_t>(p + off); off += 2;
+    if (!has(sjLen)) return;
+    std::string subj(reinterpret_cast<const char*>(p + off), sjLen); off += sjLen;
+    if (!has(4)) return;
+    uint32_t bdLen = ces::Buffer::peek<uint32_t>(p + off); off += 4;
+    if (!has(bdLen)) return;
+    std::string bdy(reinterpret_cast<const char*>(p + off), bdLen); off += bdLen;
+    std::string path;
+    if (has(2)) {
+      uint16_t pLen = ces::Buffer::peek<uint16_t>(p + off); off += 2;
+      if (has(pLen))
+        path.assign(reinterpret_cast<const char*>(p + off), pLen);
+    }
+    CesServer* sv = inst->owner->server_;
+    if (sv && sv->mailHandler()) {
+      minx::Hash payer;
+      std::memcpy(payer.data(), inst->programPubkey.data(), 32);
+      sv->mailHandler()->mailSubmit(payer, to, subj, bdy, path);
+    }
+    return;
+  }
+#endif  // CES_MAIL
   if (tag == kIpcTagGossipOut) {
     // Payload: [u64 budget BE][32 dest][u32 BE len][len bytes]. ces.gossip.send
     // from the program: originate a flood from this server (server-funded out
@@ -2909,6 +2965,10 @@ void supervisorTick(ComputeHandler& H) {
   const auto& cfg = server->_config();
   uint64_t now = getMicrosSinceEpoch();
 
+  // Refund any SYS_L2_CALL whose target instance never acknowledged (crashed
+  // or wedged past the deadline). Cheap: usually empty.
+  H.l2SweepTimeouts(now);
+
   // Discounted rates for this tick. The metrics pulse refreshes the
   // FeeKind multipliers from l2cpu (slot/cpu) and l2mem (rss/bucket),
   // so the supervisor pays "today's price" — no lock-in across ticks.
@@ -3642,6 +3702,69 @@ void ComputeHandler::deliverGossip(const minx::Hash& author,
   for (auto& [pid, inst] : instances_)
     enqueueOutbound(inst, makeFrame(kIpcTagGossipIn, 0,
                                     body.data(), body.size()));
+}
+
+uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
+                                      L2CallReport report) {
+  // Blob (provider-ABI): [u8 mode][8 target][payload...]. mode 0 = by pid
+  // (target = u64 pid BE); mode 1 = by program (target = 8-byte progPrefix =
+  // sha256(source)[:8]), routed to any live instance of that source. A refusal
+  // here surfaces upstream as a refund.
+  if (req.blob.size() < 1 + sizeof(uint64_t)) return CES_ERROR_BAD_INPUT;
+  uint8_t mode = req.blob[0];
+  uint64_t pid = 0;
+  if (mode == 0) {
+    pid = ces::Buffer::peek<uint64_t>(req.blob.data() + 1);
+  } else if (mode == 1) {
+    std::array<uint8_t, 8> pfx;
+    std::memcpy(pfx.data(), req.blob.data() + 1, 8);
+    auto pit = byPrefix_.find(pfx);
+    if (pit == byPrefix_.end() || pit->second.empty())
+      return CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND;
+    pid = *pit->second.begin();   // any live instance of that program
+  } else {
+    return CES_ERROR_BAD_INPUT;
+  }
+  const uint8_t* payload = req.blob.data() + 1 + sizeof(uint64_t);
+  std::size_t payloadLen = req.blob.size() - 1 - sizeof(uint64_t);
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND;
+  auto inst = it->second;
+  // Frame body: [u64 callId][u64 value][8 payer][u32 payloadLen][payload].
+  ces::Bytes b;
+  ces::Buffer::put<uint64_t>(b, req.callId);
+  ces::Buffer::put<uint64_t>(b, req.value);
+  b.insert(b.end(), req.payer.begin(), req.payer.end());
+  ces::Buffer::put<uint32_t>(b, static_cast<uint32_t>(payloadLen));
+  if (payloadLen) b.insert(b.end(), payload, payload + payloadLen);
+  enqueueOutbound(inst, makeFrame(kIpcTagL2CallIn, 0, b.data(), b.size()));
+  minx::Hash payee;
+  std::memcpy(payee.data(), inst->programPubkey.data(),
+              inst->programPubkey.size());
+  pendingL2_[req.callId] = PendingL2{std::move(report), payee,
+                                     getMicrosSinceEpoch() + kL2CallTimeoutUs};
+  return CES_OK;   // accepted; the result frame or the timeout sweep settles it
+}
+
+void ComputeHandler::l2Result(uint64_t callId, bool delivered) {
+  auto it = pendingL2_.find(callId);
+  if (it == pendingL2_.end()) return;   // already settled (timed out) / unknown
+  it->second.report(callId,
+                    delivered ? L2CallOutcome::Delivered
+                              : L2CallOutcome::NoHandler,
+                    it->second.payee);
+  pendingL2_.erase(it);
+}
+
+void ComputeHandler::l2SweepTimeouts(uint64_t nowUs) {
+  for (auto it = pendingL2_.begin(); it != pendingL2_.end();) {
+    if (nowUs >= it->second.deadlineUs) {
+      it->second.report(it->first, L2CallOutcome::Timeout, minx::Hash{});
+      it = pendingL2_.erase(it);
+    } else {
+      ++it;
+    }
+  }
 }
 
 } // namespace ces

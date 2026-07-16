@@ -257,15 +257,18 @@ uint8_t validateCesFileName(const std::string& name) {
   // Must have at least 2 components total: zone + something.
   if (comp_count < 2) return CES_ERROR_BAD_NAME;
 
-  // First component must be exactly one of the four zone markers.
+  // First component must be exactly one of the zone markers.
   if (firstLen != 1) return CES_ERROR_BAD_NAME;
   char zone = name[firstStart];
-  if (zone != 'h' && zone != 'f' && zone != 'p' && zone != 's')
+  if (zone != 'h' && zone != 'f' && zone != 'p' && zone != 's' &&
+      zone != 'm')
     return CES_ERROR_BAD_NAME;
 
   // Zone-specific rules on the second component.
-  if (zone == 'h') {
-    // Must be exactly 64 lowercase hex chars = 32-byte pubkey.
+  if (zone == 'h' || zone == 'm') {
+    // Must be exactly 64 lowercase hex chars = 32-byte pubkey. /m/ is the
+    // private mail zone: same account-keyed naming as /h/, but not
+    // wire-readable (only builtin:mail reads it, in-process).
     if (secondLen != 64) return CES_ERROR_BAD_NAME;
     for (size_t j = 0; j < secondLen; ++j) {
       char c = name[secondStart + j];
@@ -1084,7 +1087,10 @@ void checkZoneOwnership(
     }
     return;
   }
-  if (zone == 'h') {
+  if (zone == 'h' || zone == 'm') {
+    // /h/ home dir and /m/ private mail zone: both account-keyed, owner is the
+    // 64-hex pubkey in the path. (Wire READ/STAT on /m/ is denied separately;
+    // only builtin:mail reads it in-process.)
     minx::Hash pathPk;
     hexDecodePubkey32(second, pathPk);
     if (std::memcmp(pathPk.data(), signerKey.data(), 32) != 0) {
@@ -1527,6 +1533,9 @@ ReadOutcome readCore(CesServer* server, const std::string& name,
   if (length == 0 || length > kMaxReadLen) return { CES_ERROR_BAD_INPUT, {} };
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) return { rc, {} };
+  // The /m/ mail zone is private: nothing reads it over the wire or from a
+  // program. Only builtin:mail reads it in-process (readAttachment).
+  if (name.size() > 1 && name[1] == 'm') return { CES_ERROR_NOT_OWNER, {} };
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
@@ -1880,6 +1889,10 @@ void dispatchStat(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     name = buf.getBytes<std::string>(nameLen);
   } catch (const std::out_of_range&) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
+  }
+  // /m/ mail zone is private: no wire STAT (metadata) either.
+  if (name.size() > 1 && name[1] == 'm') {
+    sendErrorAndLoop(ctx, CES_ERROR_NOT_OWNER); return;
   }
   const auto& cfg = reqServer(ctx)->_config();
   StatOutcome out = statCore(
@@ -3581,6 +3594,35 @@ std::string FileHandler::readServerFile(const std::string& name) {
   std::ostringstream ss;
   ss << f.rdbuf();
   return ss.str();
+}
+
+bool FileHandler::attachmentSize(const std::string& name, uint64_t& outSize) {
+  CesServer* server = server_;
+  if (!server) return false;
+  std::error_code ec;
+  auto sz = std::filesystem::file_size(
+      resolveContentPath(server->_config().cesFileStoreDir, name), ec);
+  if (ec) return false;
+  outSize = sz;
+  return true;
+}
+
+uint8_t FileHandler::readAttachment(const std::string& name, uint64_t maxBytes,
+                                    ces::Bytes& out) {
+  CesServer* server = server_;
+  if (!server) return CES_ERROR_INTERNAL;
+  auto cPath = resolveContentPath(server->_config().cesFileStoreDir, name);
+  std::error_code ec;
+  auto sz = std::filesystem::file_size(cPath, ec);
+  if (ec) return CES_ERROR_FILE_NOT_FOUND;
+  if (sz > maxBytes) return CES_ERROR_BAD_INPUT;
+  std::ifstream f(cPath, std::ios::binary);
+  if (!f) return CES_ERROR_FILE_NOT_FOUND;
+  std::ostringstream ss;
+  ss << f.rdbuf();
+  const std::string s = ss.str();
+  out.assign(s.begin(), s.end());
+  return CES_OK;
 }
 
 bool FileHandler::writeServerFile(const std::string& name, const std::string& content) {

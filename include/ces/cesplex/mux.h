@@ -34,6 +34,7 @@
 
 #pragma once
 
+#include <ces/buffer.h>
 #include <ces/cesplex/wire.h>
 #include <ces/keys.h>
 #include <ces/types.h>
@@ -45,6 +46,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
@@ -150,6 +152,39 @@ inline constexpr auto kRudpStreamCloseTimeout = std::chrono::seconds(3);
 //   leaks. The framework does not detect or alarm on this; handlers
 //   that spawn async op chains should have their outermost
 //   continuation release the stream on both success AND failure paths.
+
+// -----------------------------------------------------------------------
+// SYS_L2_CALL — VM-to-L2 paid call routing
+// -----------------------------------------------------------------------
+//
+// CesVM's SYS_L2_CALL routes a paid, reliable call into an in-CES (L2)
+// built-in by an 8-byte discriminator (sha256 of the built-in mount name,
+// first 8 bytes, matched as a flat array). Settlement is delivery-based and
+// host-owned: the syscall burns `value` from the caller; on Delivered the
+// host mints it to the payee, on a failure it refunds the caller. The
+// built-in owns the fine addressing (the opaque `blob`) and the attempt.
+
+// Delivery outcome. Delivered => mint payee; NoHandler / Timeout => refund
+// payer. NoHandler is a permanent, immediate refuse (no registered target);
+// Timeout is give-up after the built-in could not hand off to a live target.
+enum class L2CallOutcome { Delivered, NoHandler, Timeout };
+
+// A routed L2 call handed to a built-in. The discriminator already selected
+// the handler; `blob` is the provider-ABI payload, opaque to core.
+struct L2CallRequest {
+  uint64_t   callId = 0;   // host-owned, unique; the idempotency / dedup key
+  HashPrefix payer;        // the burned account; the refund target
+  uint64_t   value = 0;    // credits burned; minted to payee on Delivered
+  Bytes      blob;         // provider-ABI payload (target + inner request)
+};
+
+// The built-in reports the delivery outcome, possibly later and from another
+// thread. On Delivered it names the payee (full 32-byte key, so the host can
+// credit or create the account) to mint. Idempotent by callId.
+using L2CallReport =
+  std::function<void(uint64_t callId, L2CallOutcome outcome,
+                     const minx::Hash& payee)>;
+
 class CesPlexHandler {
 public:
   virtual ~CesPlexHandler() = default;
@@ -166,6 +201,15 @@ public:
   // dropped its strong reference. See the LIFETIME CONTRACT above.
   virtual void serve(std::shared_ptr<minx::RudpStream> stream,
                      BoundChannelContext bound) = 0;
+
+  // SYS_L2_CALL delivery. The discriminator already selected this handler.
+  // Return CES_OK to accept (the handler owns the call and MUST invoke
+  // `report` exactly once, possibly later and from any thread) or an
+  // immediate error to refuse synchronously (the host refunds the caller).
+  // The default refuses: a built-in without an L2-call capability is skipped.
+  virtual uint8_t cesplexL2Call(const L2CallRequest& /*req*/,
+                                L2CallReport /*report*/)
+  { return CES_ERROR_UNSUPPORTED; }
 };
 
 // -----------------------------------------------------------------------

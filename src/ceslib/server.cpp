@@ -2,15 +2,18 @@
 #include <ces/buffer.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/mail_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/l2/peer_handler.h>
 #include <ces/cesvm.h>
 #include <ces/util/ctrlc.h>
+#include <ces/util/hash.h>
 #include <ces/util/helpers.h>
 #include <ces/ramfilestore.h>
 #include <ces/protocol.h>
 #include <ces/server.h>
 #include <ces/util/resolver.h>
+#include <ces/util/smtp.h>
 #include <ces/util/vmprogram.h>
 #include <ces/util/wallet.h>
 
@@ -479,6 +482,7 @@ public:
         saveAliasFn_(setup.saveAliasFn),
         udpSink_(setup.sendUdpFn),
         crossSink_(setup.crossTransferFn),
+        l2Sink_(setup.l2CallFn),
         scheduleSink_(setup.scheduleFn),
         scheduleAliasSink_(setup.scheduleAliasFn),
         creditHookSink_(setup.creditHookFn),
@@ -926,6 +930,37 @@ public:
     return server_.queueRpc(std::move(pending));
   }
 
+  uint8_t l2call(const uint8_t* disc, uint64_t value,
+                 const uint8_t* blob, size_t blobLen,
+                 const minx::Hash& followupKey, uint64_t followupBudget,
+                 uint32_t followupTag) override {
+    if (!l2Sink_) return CES_ERROR_DISABLED;
+    // Discriminator: first 8 bytes of sha256(built-in name), matched as a
+    // flat array. peek<uint64_t> is a fixed big-endian read, so the routing
+    // key is identical on any architecture.
+    uint64_t discKey = ces::Buffer::peek<uint64_t>(disc);
+    auto it = server_.l2Registry_.find(discKey);
+    if (it == server_.l2Registry_.end()) return CES_ERROR_UNSUPPORTED;
+    if (server_.l2PendingCount_.load() >= server_.cfg_.l2MaxPending)
+      return CES_ERROR_QUEUE_FULL;   // backpressure; nothing burned
+    // Burn: park `value` in the bottomless self-account. Undo-logged (caller
+    // and self both saved), so an abort rolls it back; on commit executeVmRun
+    // posts the drain.
+    minx::Hash selfKey = server_.serverKeyPair_.getPublicKeyAsHash();
+    if (uint8_t rc = transfer(selfKey, value); rc != CES_OK) return rc;
+    CesServer::PendingL2Call p;
+    p.handler            = it->second;
+    p.payerKey           = this->callerKey;
+    p.value              = value;
+    p.blob.assign(blob, blob + blobLen);
+    p.followupProgramKey = followupKey;
+    p.followupBudget     = followupBudget;
+    p.followupAllowance  = this->allowance;   // remaining, like rpc
+    p.followupTag        = followupTag;
+    l2Sink_(std::move(p));
+    return CES_OK;
+  }
+
   bool verifySig(const uint8_t* data, size_t dataLen,
                  const uint8_t* sig, const uint8_t* pubkey) override {
     if (!enableVerifySig_) return false;
@@ -954,6 +989,7 @@ private:
   std::function<void(const minx::Hash&, uint64_t,
                      const std::string&,
                      const minx::Hash&)>                 crossSink_;
+  std::function<void(PendingL2Call)>                    l2Sink_;
   std::function<uint8_t(const minx::Hash&, uint64_t, uint64_t,
                         const ces::Bytes&, uint64_t)>    scheduleSink_;
   std::function<uint8_t(uint32_t, uint64_t, uint64_t,
@@ -1456,6 +1492,12 @@ uint16_t CesServer::start(uint16_t serverPort) {
             computeHandler_ = std::make_unique<ComputeHandler>(this);
           return computeHandler_.get();
         }
+#ifdef CES_MAIL
+        if (target == "builtin:mail") {
+          if (!mailHandler_) mailHandler_ = std::make_unique<MailHandler>(this);
+          return mailHandler_.get();
+        }
+#endif
         return nullptr;  // unknown builtin -> skipped below
       };
 
@@ -1464,6 +1506,12 @@ uint16_t CesServer::start(uint16_t serverPort) {
       for (const auto& [proto, target] : cfg_.cesplexMounts) {
         if (CesPlexHandler* h = resolveBuiltin(target)) {
           cesplex_->mount(proto, h);
+          // SYS_L2_CALL routing: key this built-in by the 8-byte discriminator
+          // = first 8 bytes of sha256(mount target name), read big-endian. A
+          // VM program addresses the built-in by that same hash.
+          minx::Hash dh = ces::sha256(
+              reinterpret_cast<const uint8_t*>(target.data()), target.size());
+          l2Registry_[ces::Buffer::peek<uint64_t>(dh.data())] = h;
         } else {
           LOGWARNING << "cesplex: mount skipped, unknown builtin"
                      << SVAR(proto) << SVAR(target);
@@ -3872,6 +3920,7 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
   std::vector<DeferredUdp> deferredUdp;
   std::vector<DeferredCrossXfer> deferredCrossXfers;
   std::vector<DeferredHook> deferredHooks;
+  std::vector<std::shared_ptr<PendingL2Call>> newL2Calls;
 
   auto saveAccount = [&](const HashPrefix& id) {
     auto it = accounts_->find(id);
@@ -3965,6 +4014,12 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
                                const std::string& server,
                                const minx::Hash& peerKey) {
     deferredCrossXfers.push_back({dest, amount, server, peerKey});
+  };
+  // SYS_L2_CALL: the host already burned `value` (caller -> self) under the
+  // undo log; buffer the call and post the drain on commit (below), so an
+  // aborted run rolls the burn back and never dispatches.
+  setup.l2CallFn = [&](PendingL2Call p) {
+    newL2Calls.push_back(std::make_shared<PendingL2Call>(std::move(p)));
   };
   // A program's SYS_TRANSFER to a hooked account: record it to fire the dest's
   // WATCH after this run commits (XFER_VM). Skip while inside a hook (no
@@ -4095,6 +4150,14 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
                 << SVAR(cx.server) << VAR(cx.amount)
                 << BVAR(cx.dest) << BVAR(cx.peerKey);
       }
+    }
+    // Fire deferred L2 calls: assign the call id, count the in-flight slot,
+    // and post the drain to rpcTaskIO_. The burn already committed above via
+    // the undo log; an aborted run never reaches here (newL2Calls discarded).
+    for (auto& sp : newL2Calls) {
+      sp->callId = l2NextCallId_++;
+      l2PendingCount_.fetch_add(1);
+      boost::asio::post(rpcTaskIO_, [this, sp]() { drainL2Call(sp); });
     }
     // Durably journal the VM's committed ledger mutations. VM syscalls mutate
     // the in-memory store directly through the undo log (for atomic rollback),
@@ -5570,6 +5633,74 @@ int64_t CesServer::_l2ProgramAccountBalanceSync(
     });
   return fut.get();
 }
+
+void CesServer::_testRegisterL2Handler(const std::string& name,
+                                       CesPlexHandler* handler) {
+  minx::Hash dh = ces::sha256(
+      reinterpret_cast<const uint8_t*>(name.data()), name.size());
+  uint64_t key = ces::Buffer::peek<uint64_t>(dh.data());
+  std::promise<void> p;
+  auto fut = p.get_future();
+  postLogic([this, key, handler, &p]() {
+    l2Registry_[key] = handler;
+    p.set_value();
+  });
+  fut.get();
+}
+
+#ifdef CES_MAIL
+void CesServer::mailDeliver(const MailMessage& m) {
+  if (mailSink_) { mailSink_(m); return; }   // test / custom relay hook
+  if (cfg_.mailRelayHost.empty()) {
+    LOGINFO << "mail send (no relay configured; dropped)"
+            << SVAR(m.to) << SVAR(m.subject) << VAR(m.body.size());
+    return;
+  }
+  // Off-strand: SMTP blocks. Everything is copied by value and the worker
+  // touches no server state, so the detached thread is safe across shutdown.
+  // Best-effort; no logging from the worker.
+  SmtpConfig sc;
+  sc.host = cfg_.mailRelayHost;
+  sc.port = cfg_.mailRelayPort;
+  sc.from = cfg_.mailFrom;
+  sc.user = cfg_.mailUser;
+  sc.pass = cfg_.mailPass;
+  MailMessage msg = m;
+  std::thread([sc, msg]() {
+    try {
+      if (msg.attachmentName.empty()) {
+        ces::smtpSend(sc, msg.to, msg.subject, msg.body, nullptr, nullptr);
+      } else {
+        ces::MailAttachment att;
+        att.filename = msg.attachmentName;
+        att.data = msg.attachmentData;
+        ces::smtpSend(sc, msg.to, msg.subject, msg.body, &att, nullptr);
+      }
+    } catch (...) {}
+  }).detach();
+}
+
+void CesServer::_testSetMailSink(std::function<void(const MailMessage&)> sink) {
+  mailSink_ = std::move(sink);
+}
+
+bool CesServer::mailChargeSync(const minx::Hash& payer, uint64_t price) {
+  if (price == 0) return true;
+  std::promise<bool> pr;
+  auto fut = pr.get_future();
+  postLogic([this, payer, price, &pr]() {
+    HashPrefix id = Account::getMapKey(payer);
+    ActiveAccount acc = accounts_.get(id);
+    if (!acc.exists() || acc.balance() < static_cast<int64_t>(price)) {
+      pr.set_value(false);
+      return;
+    }
+    _burnInner(payer, static_cast<int64_t>(price));   // debit + destroy (burn)
+    pr.set_value(true);
+  });
+  return fut.get();
+}
+#endif  // CES_MAIL
 
 void CesServer::_l2Transfer(
     const minx::Hash& originKey,
@@ -7944,6 +8075,67 @@ void CesServer::completeRpc(std::shared_ptr<PendingRpc> pending,
 
   if (_rpcCompletionObserver)
     _rpcCompletionObserver(static_cast<uint8_t>(status));
+}
+
+// ---------------------------------------------------------------------------
+// SYS_L2_CALL — drainL2Call (rpcTaskIO_) + completeL2Call (logic strand)
+// ---------------------------------------------------------------------------
+
+void CesServer::drainL2Call(std::shared_ptr<PendingL2Call> pending) {
+  L2CallRequest req;
+  req.callId = pending->callId;
+  req.payer  = Account::getMapKey(pending->payerKey);
+  req.value  = pending->value;
+  req.blob   = pending->blob;
+  // The handler either refuses synchronously (returns non-OK => refund now)
+  // or accepts (CES_OK) and reports the delivery outcome later via this
+  // callback, which hops to the logic strand and settles exactly once.
+  auto self = pending;
+  L2CallReport report =
+    [this, self](uint64_t /*callId*/, L2CallOutcome outcome,
+                 const minx::Hash& payee) {
+      boost::asio::post(logicStrand_,
+        [this, self, outcome, payee]() {
+          completeL2Call(self, outcome, payee);
+        });
+    };
+  uint8_t rc = pending->handler->cesplexL2Call(req, report);
+  if (rc != CES_OK) {
+    // Synchronous refuse (e.g. the built-in has no handler for this call):
+    // refund the payer.
+    boost::asio::post(logicStrand_,
+      [this, pending]() {
+        completeL2Call(pending, L2CallOutcome::NoHandler, minx::Hash{});
+      });
+  }
+}
+
+void CesServer::completeL2Call(std::shared_ptr<PendingL2Call> pending,
+                               L2CallOutcome outcome,
+                               const minx::Hash& payee) {
+  if (pending->resolved) return;   // idempotent: ignore duplicate reports
+  pending->resolved = true;
+  l2PendingCount_.fetch_sub(1);
+
+  // Settle from the self-account (holds the burned value; bottomless). Zero
+  // fees so exactly `value` passes through. Delivered pays the payee; a
+  // failure (NoHandler / Timeout) refunds the payer. A Delivered report with
+  // no payee is treated as a refund (handler-contract violation, fail safe).
+  minx::Hash selfKey = serverKeyPair_.getPublicKeyAsHash();
+  bool payeeZero = true;
+  for (auto b : payee) if (b) { payeeZero = false; break; }
+  minx::Hash target =
+    (outcome == L2CallOutcome::Delivered && !payeeZero) ? payee
+                                                        : pending->payerKey;
+  int64_t outBal = 0;
+  uint8_t rc = transfer(selfKey, target, pending->value,
+                        TransferMode::Open, 0, CES_NONCELESS, outBal,
+                        /*txFee=*/0, /*rentFee=*/0, /*errFee=*/0);
+  if (rc != CES_OK) {
+    LOGDEBUG << "completeL2Call: settle transfer failed"
+             << VAR(int(rc)) << VAR(int(outcome)) << VAR(pending->value);
+  }
+  // Followup run (INVOKE_L2_RETURN) deferred to a later increment.
 }
 
 // --- Autoexec (cron assets on boot) ---

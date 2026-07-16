@@ -23,6 +23,8 @@ print_help() {
     echo "                  into cesluajitd. Pulls Rust/malachite-cpp; first build is slow."
     echo "  --hyle-src PATH Build --hyle against a local hyle checkout instead of the"
     echo "                  published one. Implies --hyle."
+    echo "  --mail          Enable outbound mail (builtin:mail + SMTP with TLS). Needs"
+    echo "                  system OpenSSL. Gated behind CES_MAIL; off by default."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
     echo "                    --test                Run all tests"
@@ -87,6 +89,10 @@ build_one_config() {
     # keeps a once-used local checkout from sticking in the cache.
     local HYLE_SRC_ARG="-DFETCHCONTENT_SOURCE_DIR_HYLE=${HYLE_SRC}"
 
+    # mail feature on/off (builtin:mail + SMTP/TLS).
+    local MAIL_ARG="-DCES_MAIL=OFF"
+    [ "$ENABLE_MAIL" = true ] && MAIL_ARG="-DCES_MAIL=ON"
+
     # Portable -march by default; --native pins to the build host.
     local MARCH="x86-64-v3"
     [ "$ENABLE_NATIVE" = true ] && MARCH="native"
@@ -100,6 +106,7 @@ build_one_config() {
         -DCES_MARCH="${MARCH}" \
         $HYLE_ARG \
         "$HYLE_SRC_ARG" \
+        $MAIL_ARG \
         $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
@@ -117,6 +124,7 @@ ENABLE_ASAN=false
 ENABLE_NATIVE=false
 ENABLE_HYLE=false
 HYLE_SRC=""
+ENABLE_MAIL=false
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter
@@ -165,6 +173,9 @@ while [ $i -lt ${#ARGS[@]} ]; do
             fi
             HYLE_SRC="$(cd "${ARGS[$next_i]}" && pwd)"
             i=$next_i
+            ;;
+        --mail)
+            ENABLE_MAIL=true
             ;;
         --asan)
             ENABLE_ASAN=true
