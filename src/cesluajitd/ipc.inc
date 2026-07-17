@@ -31,8 +31,9 @@ constexpr uint8_t  TAG_EXT_SAVE_CONFIG  = 0x19;  // child → server (persist /s
 constexpr uint8_t  TAG_EXT_UI_PUSH      = 0x1a;  // child → server (panel render frame, one-way)
 constexpr uint8_t  TAG_EXT_UI_WATCH     = 0x1b;  // server → child ([u8 on]; drives the change-detect tick)
 
-constexpr uint8_t  TAG_L2_CALL_IN       = 0x1c;  // server → child (paid VM->L2 call -> on_l2call)
+constexpr uint8_t  TAG_L2_CALL_IN       = 0x1c;  // server → child (paid L2 call -> on_l2call)
 constexpr uint8_t  TAG_L2_CALL_RESULT   = 0x1d;  // child → server (delivered / no-handler)
+constexpr uint8_t  TAG_L2_CALL_REPLY    = 0x1f;  // child → server (on_l2call return bytes)
 #ifdef CES_MAIL
 constexpr uint8_t  TAG_MAIL_OUT         = 0x1e;  // child → server (ces.mail.send)
 #endif
@@ -146,6 +147,7 @@ std::map<uint64_t, ConnExec>    g_conn_exec;     // relay conn id -> serialized 
 std::map<lua_State*, HandlerCo> g_handler_co;    // handler coroutine -> its conn
 std::deque<uint64_t>            g_conn_advance;   // relay conns with an event ready
 std::map<lua_State*, int>       g_coro_refs;     // coroutine -> registry ref (keeps it alive)
+std::map<lua_State*, uint64_t>  g_l2call_co;     // on_l2call coroutine -> its callId (reply)
 static void resume_coro(lua_State* mainL, lua_State* co, int nargs);
 static void conn_advance(lua_State* mainL, uint64_t id);
 static void luarpc_advance(lua_State* mainL, uint64_t id);

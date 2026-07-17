@@ -49,7 +49,7 @@ public:
     L2CallOutcome oc = (mode == Mode::Deliver) ? L2CallOutcome::Delivered
                                                : L2CallOutcome::Timeout;
     minx::Hash p = (mode == Mode::Deliver) ? payee : minx::Hash{};
-    report(req.callId, oc, p);
+    report(req.callId, oc, p, ces::Bytes{});
     return CES_OK;                     // accepted; reported above
   }
 };

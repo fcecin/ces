@@ -49,6 +49,9 @@ class CesServer;
 struct Instance;
 // In-flight EXT_REQ correlation state, also defined in the .cpp.
 struct ExtPending;
+// The CesPlex per-op request (cesplex/session.h); held by shared_ptr for the
+// deferred reply of a client CALL verb.
+struct CesPlexRequest;
 
 // Per-instance monitoring snapshot, surfaced to the web dashboard's
 // Compute tab. CPU is in basis points of one core (10000 = a full core);
@@ -172,9 +175,14 @@ public:
   // with a TAG_L2_CALL_RESULT (delivered / no-handler), else the timeout
   // sweep refunds. Runs on the CesPlex strand (like every handler entry).
   uint8_t cesplexL2Call(const L2CallRequest& req, L2CallReport report) override;
-  // Settle a pending L2 call by callId (from the child's result frame).
+  // The child's TAG_L2_CALL_RESULT: delivered marks the pending call (settle
+  // waits for the reply); no-handler reports it (refund) at once.
   void l2Result(uint64_t callId, bool delivered);
-  // Refund L2 calls whose deadline passed (instance never replied / died).
+  // The child's TAG_L2_CALL_REPLY: on_l2call's return bytes. Reports the call
+  // as Delivered, carrying the reply to the sink (channel respond / followup).
+  void l2Reply(uint64_t callId, const uint8_t* data, size_t len);
+  // Resolve L2 calls whose deadline passed: a delivered-but-silent call keeps
+  // the payment (empty reply); one that never delivered is refunded.
   void l2SweepTimeouts(uint64_t nowUs);
 
   // ---- /ces/lua/1 + /ces/peer/1 cross-handler primitives. Used by the lua /
@@ -215,17 +223,20 @@ public:
   // helpers reach it via server->computeHandler(); not a stable API.
   CesServer* server_ = nullptr;
   std::map<uint64_t, std::shared_ptr<Instance>> instances_;
-  // In-flight SYS_L2_CALLs awaiting the child's result frame (or timeout).
-  // Keyed by the host-owned callId. Touched only on the CesPlex strand.
-  // RAM-ONLY, like the caller-side record: a hard crash between accept and the
-  // result frame loses the refund. See the DURABILITY GAP note on
+  // In-flight L2 calls awaiting the child's reply (or timeout). Keyed by the
+  // host-owned callId, one map for both callers (VM syscall and client CALL
+  // verb) -- they differ only in the report's sink, which the host owns.
+  // Touched only on the CesPlex strand. RAM-ONLY: a hard crash between accept
+  // and the reply loses the refund. See the DURABILITY GAP note on
   // CesServer::PendingL2Call (server.h) for the full analysis and the fix.
   struct PendingL2 {
     L2CallReport report;
     minx::Hash payee;          // instance program pubkey, minted on delivery
+    bool delivered = false;    // RESULT(delivered) seen -> keep money on timeout
     uint64_t deadlineUs = 0;
   };
   std::map<uint64_t, PendingL2> pendingL2_;
+
   std::map<std::array<uint8_t, 8>, std::set<uint64_t>> byPrefix_;
   std::map<std::string, std::set<uint64_t>> byName_;
   // Source path -> expiry (us) of a spawn in flight. Bridges the async connect-back

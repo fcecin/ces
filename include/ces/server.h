@@ -38,6 +38,11 @@ namespace ces {
 // a unique_ptr to one; the full type is only needed in server.cpp.
 class CesPlex;
 
+// Forward declaration — defined in ces/cesplex/session.h. A PendingL2Call
+// bound to a client CALL verb holds one as its reply sink; the full type is
+// only needed in server.cpp.
+struct CesPlexRequest;
+
 // L1 RAM is one uniform good: every ledger row's daily rent is its byte
 // footprint times this one price. Fixed, not load-discounted -- rent tracks
 // occupancy, which the throughput gauge can't see. Disk, compute RSS, and
@@ -665,7 +670,24 @@ public:
                       uint64_t budget, uint64_t allowance,
                       const ces::Bytes& input,
                       uint64_t time_us, bool prepaid = false,
-                      uint32_t aliasId = 0);
+                      uint32_t aliasId = 0,
+                      uint64_t invokeKind = INVOKE_SCHEDULED);
+
+  // Fee-free credit move used to escrow an L2 call: the payer's `value` burn
+  // into the bottomless self-account (Sync, returns success, blocks on the
+  // logic strand). Settlement mints self -> payee or refunds self -> payer.
+  bool l2TransferSync(const minx::Hash& from, const minx::Hash& to,
+                      uint64_t amount);
+
+  // Client CALL-verb entry into the same L2-call machinery. Called on
+  // rpcTaskIO_ by a handler's verb dispatcher: applies backpressure, burns
+  // payer -> self (escrow), mints the callId, and posts drainL2Call. The reply
+  // sink is the held request. Returns CES_OK once escrowed (response is then
+  // deferred to completeL2Call), or an error to answer synchronously (nothing
+  // burned).
+  uint8_t enqueueChannelL2Call(CesPlexHandler* handler, const minx::Hash& payer,
+                               uint64_t value, ces::Bytes blob,
+                               std::shared_ptr<CesPlexRequest> replyCtx);
 
   uint8_t crossTransfer(const minx::Hash& originKey,
                         const minx::Hash& destKey, uint64_t amount,
@@ -1483,11 +1505,18 @@ private:
     minx::Hash payerKey;                 // burned account; the refund target
     uint64_t value = 0;                  // credits burned; settled on delivery
     ces::Bytes blob;                     // provider-ABI payload
+    // Return sink: exactly one is set. A VM caller resolves through a followup
+    // run; a client CALL verb resolves by responding on its held request.
     minx::Hash followupProgramKey;       // resolution run (0 = fire-and-forget)
     uint64_t followupBudget = 0;
     uint64_t followupAllowance =
       std::numeric_limits<uint64_t>::max();
     uint32_t followupTag = 0;
+    std::shared_ptr<CesPlexRequest> replyCtx;   // client CALL sink (null = VM)
+    // Synchronous handler refusal code (0 = none): the concrete reason the
+    // built-in rejected the call (e.g. instance died mid-flight). The channel
+    // sink answers with it instead of the generic outcome mapping.
+    uint8_t syncRefuseRc = 0;
     bool resolved = false;               // logic-strand-guarded idempotency
   };
 
@@ -1814,7 +1843,8 @@ private:
   // declared above (VmHostSetup's l2 sink carries it).
   void    drainL2Call(std::shared_ptr<PendingL2Call> pending);
   void    completeL2Call(std::shared_ptr<PendingL2Call> pending,
-                         L2CallOutcome outcome, const minx::Hash& payee);
+                         L2CallOutcome outcome, const minx::Hash& payee,
+                         const ces::Bytes& reply);
 
   std::unordered_map<uint64_t, CesPlexHandler*> l2Registry_;
   std::atomic<size_t> l2PendingCount_{0};
@@ -1905,6 +1935,9 @@ private:
     // Discriminant: 0 = asset run (assetId is live); nonzero = run this
     // alias's inline program (assetId ignored; op re-checked at fire time).
     uint32_t aliasId = 0;
+    // Invoke kind the fired run self-describes as (INVOKE_SCHEDULED for cron;
+    // INVOKE_L2_RETURN for a SYS_L2_CALL resolution followup).
+    uint64_t invokeKind = INVOKE_SCHEDULED;
   };
   // Map key: (timeUs, seq) tuple. `timeUs` sorts entries by their firing
   // deadline; `seq` is a monotonic tiebreaker so two runs scheduled for
@@ -1925,7 +1958,8 @@ private:
                               const minx::Hash& assetId, uint64_t budget,
                               uint64_t allowance, const ces::Bytes& input,
                               uint64_t time_us, bool prepaid,
-                              ScheduleKey& outKey, uint32_t aliasId = 0);
+                              ScheduleKey& outKey, uint32_t aliasId = 0,
+                              uint64_t invokeKind = INVOKE_SCHEDULED);
 
   // Presence cache: tracks last known address of authenticated clients
   // for unsolicited push (send()). Updated on every dispatchSigned.

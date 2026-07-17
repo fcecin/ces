@@ -173,17 +173,19 @@ enum class L2CallOutcome { Delivered, NoHandler, Timeout };
 // the handler; `blob` is the provider-ABI payload, opaque to core.
 struct L2CallRequest {
   uint64_t   callId = 0;   // host-owned, unique; the idempotency / dedup key
-  HashPrefix payer;        // the burned account; the refund target
+  minx::Hash payer;        // the burned account (full key); the refund target
   uint64_t   value = 0;    // credits burned; minted to payee on Delivered
   Bytes      blob;         // provider-ABI payload (target + inner request)
 };
 
-// The built-in reports the delivery outcome, possibly later and from another
+// The built-in reports the terminal outcome, possibly later and from another
 // thread. On Delivered it names the payee (full 32-byte key, so the host can
-// credit or create the account) to mint. Idempotent by callId.
+// credit or create the account) to mint, and passes the program's reply bytes
+// (empty on NoHandler / Timeout, or when on_l2call returned nothing). The host
+// truncates the reply to the sink's ceiling. Idempotent by callId.
 using L2CallReport =
   std::function<void(uint64_t callId, L2CallOutcome outcome,
-                     const minx::Hash& payee)>;
+                     const minx::Hash& payee, const Bytes& reply)>;
 
 class CesPlexHandler {
 public:

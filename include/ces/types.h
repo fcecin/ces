@@ -408,6 +408,16 @@ constexpr uint64_t PRICE_MAX = static_cast<uint64_t>(UINT32_MAX) * PRICE_UNIT;
 // Default CES server UDP port.
 constexpr uint16_t DEFAULT_PORT = 53830;
 
+// L2 call (SYS_L2_CALL and the builtin:compute CALL verb): a paid memo
+// delivered into a live L2 program, plus its reply. Both memo and reply ride
+// CesPlex/RUDP, so neither is packet-bounded; a client can send a large memo
+// and receive a large reply. The VM's own send and receive are far smaller:
+// it builds its blob in inline io memory and receives the reply truncated into
+// its input window (CES_L2_CALL_VM_REPLY).
+constexpr uint32_t CES_L2_CALL_MAX_MEMO  = 64u * 1024;  // request memo ceiling
+constexpr uint32_t CES_L2_CALL_MAX_REPLY = 64u * 1024;  // reply ceiling
+constexpr uint32_t CES_L2_CALL_VM_REPLY  = 512;         // VM reply truncation
+
 // Convert a user-facing price (whole credits) to stored form.
 // Returns 0 on success, non-zero on validation failure.
 // out receives the stored price on success.

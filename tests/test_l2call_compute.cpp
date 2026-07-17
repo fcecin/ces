@@ -25,6 +25,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstring>
@@ -58,13 +59,47 @@ AssetData buildComputeL2CallProgram(uint64_t value, uint64_t pid) {
   const uint64_t DISC_CELL = 32, BLOB_CELL = 40, FU_CELL = 48;
   auto disc = discOf("builtin:compute");
   pgm.writeBytesToIo(DISC_CELL, disc.data(), 8);
-  uint8_t blob[9];
-  blob[0] = 0;   // mode 0 = address by pid
-  for (int i = 0; i < 8; ++i) blob[1 + i] = uint8_t((pid >> (56 - 8 * i)) & 0xFF);
-  pgm.writeBytesToIo(BLOB_CELL, blob, 9);   // [mode=0][pid BE]
+  uint8_t blob[8];
+  for (int i = 0; i < 8; ++i) blob[i] = uint8_t((pid >> (56 - 8 * i)) & 0xFF);
+  pgm.writeBytesToIo(BLOB_CELL, blob, 8);   // [pid BE]
   pgm.hostv(SYS_L2_CALL, {
-    Imm(DISC_CELL), Imm(value), Imm(BLOB_CELL), Imm(9),
+    Imm(DISC_CELL), Imm(value), Imm(BLOB_CELL), Imm(8),
     Imm(FU_CELL), Imm(0), Imm(0),
+  });
+  pgm.set(Imm(CESVM_IO_OUTPUT_LEN), Imm(1));
+  pgm.stb(Imm(CESVM_IO_OUTPUT * 8), Ref(CESVM_CELL_S));
+  pgm.term();
+  return pgm.buildBootBlock();
+}
+
+// INVOKE_L2_RETURN followup program: input is io[INPUT]=tag, io[INPUT+1]=outcome
+// (0 delivered, 1 no-handler, 2 timeout). Transfers outcome+1 to `marker`, so a
+// delivered resolution credits 1 and a no-handler credits 2 -- both non-zero, so
+// firing and the outcome value are observable.
+AssetData buildL2Followup(const minx::Hash& marker) {
+  VmProgram pgm;
+  const uint64_t DEST_CELL = 32, AMT_CELL = 60;
+  pgm.writeBytesToIo(DEST_CELL, marker.data(), 32);
+  pgm.set(Imm(AMT_CELL), Ref(CESVM_IO_INPUT + 1));   // io[AMT_CELL] = outcome
+  pgm.inc(Imm(AMT_CELL));                            // + 1
+  pgm.hostv(SYS_TRANSFER, { Imm(DEST_CELL), Ref(AMT_CELL) });   // amount = outcome+1
+  pgm.term();
+  return pgm.buildBootBlock();
+}
+
+// Gateway that fires SYS_L2_CALL with a followup set. The blob and the followup
+// key ride the run input: input[0..31] = followup key, input[32..39] =
+// [u64 pid BE]. `value`, budget, and tag are baked.
+AssetData buildL2CallWithFollowup(uint64_t value, uint64_t budget, uint32_t tag) {
+  VmProgram pgm;
+  const uint64_t DISC_CELL = 32;
+  const uint64_t FU_CELL   = CESVM_IO_INPUT;       // input[0..31]  = followup key
+  const uint64_t BLOB_CELL = CESVM_IO_INPUT + 4;   // input[32..39] = [pid]
+  auto disc = discOf("builtin:compute");
+  pgm.writeBytesToIo(DISC_CELL, disc.data(), 8);
+  pgm.hostv(SYS_L2_CALL, {
+    Imm(DISC_CELL), Imm(value), Imm(BLOB_CELL), Imm(8),
+    Imm(FU_CELL), Imm(budget), Imm(tag),
   });
   pgm.set(Imm(CESVM_IO_OUTPUT_LEN), Imm(1));
   pgm.stb(Imm(CESVM_IO_OUTPUT * 8), Ref(CESVM_CELL_S));
@@ -144,6 +179,18 @@ struct L2ComputeFixture {
     cc.disconnect();
     return id;
   }
+  // Paid CALL verb from a client: charges ownerKey -> the instance program
+  // account and returns the on_l2call reply bytes.
+  uint8_t callVerb(uint64_t pid, uint64_t amount, const std::string& memo,
+                   ces::Bytes& reply) {
+    CesComputeClient cc;
+    cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+    ces::Bytes m(memo.begin(), memo.end());
+    uint8_t rc = cc.call(pid, amount, m, reply);
+    cc.disconnect();
+    return rc;
+  }
   int64_t balanceOf(const std::array<uint8_t, 32>& pk) {
     minx::Hash h;
     std::memcpy(h.data(), pk.data(), 32);
@@ -151,6 +198,11 @@ struct L2ComputeFixture {
     uint32_t nonce = 0;
     client->queryAccount(Account::getMapKey(h), bal, nonce);
     return bal;
+  }
+  int64_t signerBalance() {
+    std::array<uint8_t, 32> pk{};
+    std::memcpy(pk.data(), ownerKey.getPublicKeyAsHash().data(), 32);
+    return balanceOf(pk);
   }
   // Deploy + run the gateway program that fires SYS_L2_CALL at `pid`. Returns
   // the synchronous S (CES_OK once accepted + burned).
@@ -215,6 +267,178 @@ BOOST_AUTO_TEST_CASE(NoHandler_LeavesProgramUncredited) {
   // account never received the value.
   std::this_thread::sleep_for(std::chrono::milliseconds(1200));
   BOOST_CHECK_EQUAL(balanceOf(progPk), progBefore);
+}
+
+// The INVOKE_L2_RETURN followup fires on resolution and receives the outcome: a
+// delivered call credits the marker 1 (outcome 0 + 1), then a no-handler call
+// credits 2 more (outcome 1 + 1), leaving the marker at 3.
+BOOST_AUTO_TEST_CASE(FollowupNotifiesOutcome) {
+  std::string okPath = "/h/" + myHex() + "/svc2.lua";
+  deploy(okPath, "function on_l2call(p, c) end\nces.run()\n");
+  uint64_t pidOk = launch(okPath);
+  std::string noPath = "/h/" + myHex() + "/nofu.lua";
+  deploy(noPath, "ces.run()\n");
+  uint64_t pidNo = launch(noPath);
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+
+  minx::Hash marker; marker.fill(0); marker[0] = 0xF0; marker[1] = 0x11;
+  minx::Hash fuKey;  fuKey.fill(0);  fuKey[0] = 0xF0; fuKey[1] = 0x22;
+  CES_REQUIRE_OK(client->createAsset(fuKey, buildL2Followup(marker), 1));
+  server->_brr(marker, 1000);   // seed so the payout transfer has a live dest
+
+  auto markerBal = [&]() {
+    int64_t b = 0; uint32_t n = 0;
+    client->queryAccount(Account::getMapKey(marker), b, n);
+    return b;
+  };
+  auto fireAt = [&](uint64_t pid, uint8_t tag) {
+    minx::Hash gwKey; gwKey.fill(0); gwKey[0] = 0xF0; gwKey[1] = 0x33; gwKey[2] = tag;
+    CES_REQUIRE_OK(client->createAsset(
+      gwKey, buildL2CallWithFollowup(V, 10'000'000, tag), 1));
+    ces::Bytes input(40, 0);
+    std::memcpy(input.data(), fuKey.data(), 32);
+    for (int i = 0; i < 8; ++i) input[32 + i] = uint8_t((pid >> (56 - 8 * i)) & 0xFF);
+    uint64_t vmErr = 0, used = 0;
+    ces::Bytes out;
+    uint8_t rc = client->runAsset(gwKey, 10'000'000, input, vmErr, used, out);
+    BOOST_REQUIRE_EQUAL(rc, CES_OK);
+    BOOST_REQUIRE_EQUAL(vmErr, CESVM_OK);
+    BOOST_REQUIRE(!out.empty());
+    BOOST_REQUIRE_EQUAL(out[0], CES_OK);   // SYS_L2_CALL accepted + burned
+  };
+  auto waitMarker = [&](int64_t want) {
+    for (int i = 0; i < 100; ++i) {
+      if (markerBal() == want) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
+  };
+
+  fireAt(pidOk, 1);   // delivered -> outcome 0 -> marker += 1
+  BOOST_CHECK_MESSAGE(waitMarker(1001),
+                      "delivered followup wrong; got " << markerBal());
+  fireAt(pidNo, 2);   // no-handler -> outcome 1 -> marker += 2
+  BOOST_CHECK_MESSAGE(waitMarker(1003),
+                      "no-handler followup wrong; got " << markerBal());
+}
+
+// The client-facing CALL verb: a bound client pays a live instance, its
+// on_l2call returns bytes, and the reply rides the RUDP channel back. The
+// charge (signer -> program account) lands and the reply matches.
+BOOST_AUTO_TEST_CASE(CallVerb_Delivered_RepliesAndPays) {
+  std::string path = "/h/" + myHex() + "/echo.lua";
+  auto progPk = deploy(path,
+    "function on_l2call(memo, ctx) return 'pong:'..memo end\nces.run()\n");
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+  int64_t before = balanceOf(progPk);
+  ces::Bytes reply;
+  uint8_t rc = callVerb(pid, V, "hi", reply);
+  BOOST_CHECK_EQUAL(rc, CES_OK);
+  std::string rs(reply.begin(), reply.end());
+  BOOST_CHECK_EQUAL(rs, "pong:hi");
+  BOOST_CHECK_EQUAL(balanceOf(progPk), before + (int64_t)V);
+}
+
+// A CALL into a live instance WITHOUT on_l2call fails the verb and refunds the
+// up-front charge; the program account ends where it began.
+BOOST_AUTO_TEST_CASE(CallVerb_NoHandler_RefundsAndErrors) {
+  std::string path = "/h/" + myHex() + "/nohc.lua";
+  auto progPk = deploy(path, "ces.run()\n");
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+  int64_t before = balanceOf(progPk);
+  ces::Bytes reply;
+  uint8_t rc = callVerb(pid, V, "hi", reply);
+  BOOST_CHECK_EQUAL(rc, CES_ERROR_UNSUPPORTED);
+  BOOST_CHECK(reply.empty());
+  // Refund is posted async; poll for the program account to return to `before`.
+  bool refunded = false;
+  for (int i = 0; i < 100; ++i) {
+    if (balanceOf(progPk) == before) { refunded = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_MESSAGE(refunded, "charge not refunded; got " << balanceOf(progPk));
+}
+
+// A CALL naming a pid that is not running is rejected before any charge.
+BOOST_AUTO_TEST_CASE(CallVerb_UnknownPid_NotFound) {
+  ces::Bytes reply;
+  uint8_t rc = callVerb(0xDEADBEEFull, V, "hi", reply);
+  BOOST_CHECK_EQUAL(rc, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND);
+  BOOST_CHECK(reply.empty());
+}
+
+// A large memo and a large reply both ride RUDP intact -- neither is packet
+// bounded. The program echoes the memo, so the reply equals the request.
+BOOST_AUTO_TEST_CASE(CallVerb_LargeMemoAndReply_RoundTrip) {
+  std::string path = "/h/" + myHex() + "/echo2.lua";
+  deploy(path, "function on_l2call(memo, ctx) return memo end\nces.run()\n");
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+  std::string big(40000, 'x');
+  for (size_t i = 0; i < big.size(); ++i) big[i] = char('A' + (i % 26));
+  ces::Bytes reply;
+  uint8_t rc = callVerb(pid, 0, big, reply);
+  BOOST_CHECK_EQUAL(rc, CES_OK);
+  BOOST_REQUIRE_EQUAL(reply.size(), big.size());
+  BOOST_CHECK(std::equal(reply.begin(), reply.end(), big.begin()));
+}
+
+// Escrow money: a delivered call moves exactly `value` plus the per-op fee
+// (burned) from the signer; the payee gets the full `value` -- the payment is
+// never drawn back and the fee never reaches it.
+BOOST_AUTO_TEST_CASE(CallVerb_Escrow_SignerPaysPayeeGetsFull) {
+  std::string path = "/h/" + myHex() + "/echo3.lua";
+  auto progPk = deploy(path, "function on_l2call(m,c) return 'ok' end\nces.run()\n");
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+  int64_t sBefore = signerBalance();
+  int64_t pBefore = balanceOf(progPk);
+  int64_t fee = (int64_t)server->_config().feeQuery;   // undiscounted in tests
+  ces::Bytes reply;
+  uint8_t rc = callVerb(pid, V, "x", reply);
+  BOOST_CHECK_EQUAL(rc, CES_OK);
+  bool ok = false;
+  for (int i = 0; i < 100; ++i) {
+    if (balanceOf(progPk) == pBefore + (int64_t)V &&
+        signerBalance() == sBefore - (int64_t)V - fee) { ok = true; break; }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_MESSAGE(ok, "escrow settle wrong: signer " << signerBalance()
+                          << " want " << (sBefore - (int64_t)V - fee) << ", payee "
+                          << balanceOf(progPk) << " want " << (pBefore + (int64_t)V));
+}
+
+// Escrow refund: a call into an instance without on_l2call never credits the
+// payee (the payment is never routed through it) and refunds the escrowed
+// value; only the per-op fee (burned, nonrefundable) leaves the signer.
+BOOST_AUTO_TEST_CASE(CallVerb_NoHandler_PayeeNeverCredited_EscrowRefunded) {
+  std::string path = "/h/" + myHex() + "/nohc2.lua";
+  auto progPk = deploy(path, "ces.run()\n");
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+  int64_t sBefore = signerBalance();
+  int64_t pBefore = balanceOf(progPk);
+  int64_t fee = (int64_t)server->_config().feeQuery;   // undiscounted in tests
+  ces::Bytes reply;
+  uint8_t rc = callVerb(pid, V, "x", reply);
+  BOOST_CHECK_EQUAL(rc, CES_ERROR_UNSUPPORTED);
+  bool ok = false;
+  for (int i = 0; i < 100; ++i) {
+    if (balanceOf(progPk) == pBefore && signerBalance() == sBefore - fee) {
+      ok = true; break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_MESSAGE(ok, "escrow refund wrong: signer " << signerBalance()
+                          << " want " << (sBefore - fee) << ", payee "
+                          << balanceOf(progPk) << " want " << pBefore);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

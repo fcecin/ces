@@ -16,6 +16,7 @@
 #include <ces/autoexec.h>
 #include <ces/l2/compute_client.h>
 #include <ces/l2/file_client.h>
+#include <ces/l2/mail_client.h>
 #include <ces/ramfilestore.h>
 #include <ces/util/log.h>
 #include <ces/util/hex.h>
@@ -612,6 +613,16 @@ int main(int argc, char* argv[]) {
 
   std::string compute_path_arg;
   uint64_t compute_pid_arg = 0;
+  uint64_t compute_value_arg = 0;
+  // Composable memo buffer for `compute call` (--in appends in CLI order).
+  ces::Bytes compute_memo_data;
+  std::string compute_in_arg;
+  auto computeInAppender = [&](const std::string& s) {
+    appendInToken(compute_memo_data, s);
+  };
+  // Reply output: raw to stdout, --out <file> (binary-safe), or --hex.
+  std::string compute_out_arg;
+  bool compute_hex_output = false;
 
   auto* cmd_clau = cmd_compute->add_subcommand(
     "launch", "Launch a fresh instance of the source file. Mints a new "
@@ -642,6 +653,48 @@ int main(int argc, char* argv[]) {
   cmd_cinst->add_option("remote", compute_path_arg,
                         "Source file path (/h/<hex>/…, /f/<name>/…, "
                         "/p/…, or /s/…)")->required();
+
+  auto* cmd_ccall = cmd_compute->add_subcommand(
+    "call",
+    "Paid call into a running instance's on_l2call. Escrows `value` credits "
+    "from the signer (settled to the instance on delivery, refunded on "
+    "no-handler or timeout), delivers the --in memo, and prints the "
+    "program's reply bytes (raw on stdout in -q mode).");
+  cmd_ccall->add_option("pid", compute_pid_arg,
+                        "pid returned from launch")->required();
+  cmd_ccall->add_option("value", compute_value_arg,
+                        "Credits to pay (may be 0)")->required();
+  cmd_ccall->add_option("--in", compute_in_arg,
+                        "Memo (repeatable): text, text:T, hex:XX, file:path")
+    ->each(computeInAppender)->take_all();
+  cmd_ccall->add_option("--out", compute_out_arg,
+                        "Write reply bytes to file (default: stdout)");
+  cmd_ccall->add_flag("--hex", compute_hex_output, "Print reply as hex string");
+
+  // ---- mail subcommands (L2 outbound email, via --rpc-port) ----
+  auto* cmd_mail = app.add_subcommand(
+    "mail", "L2 outbound email — relay a message via builtin:mail "
+            "(via --rpc-port). The server burns a per-MB anti-spam fee.");
+  cmd_mail->require_subcommand(1);
+
+  std::string mail_to_arg;
+  std::string mail_subject_arg;
+  std::string mail_attach_arg;
+  ces::Bytes mail_body_data;
+  std::string mail_in_arg;
+  auto mailInAppender = [&](const std::string& s) {
+    appendInToken(mail_body_data, s);
+  };
+
+  auto* cmd_msend = cmd_mail->add_subcommand(
+    "send", "Relay one email. Charges (burns) a per-MB fee from the signer.");
+  cmd_msend->add_option("--to", mail_to_arg, "Recipient address")->required();
+  cmd_msend->add_option("--subject", mail_subject_arg, "Subject line");
+  cmd_msend->add_option("--in", mail_in_arg,
+                        "Body (repeatable): text, text:T, hex:XX, file:path")
+    ->each(mailInAppender)->take_all();
+  cmd_msend->add_option("--attach", mail_attach_arg,
+                        "One attachment by store path (e.g. /m/<hex>/note.pdf)");
 
   // ---- dial (open a byte stream to a running compute instance) ----
   auto* cmd_dial = app.add_subcommand(
@@ -1162,7 +1215,7 @@ int main(int argc, char* argv[]) {
      cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
-     cmd_gossip->parsed() || cmd_alias_write->parsed() ||
+     cmd_mail->parsed() || cmd_gossip->parsed() || cmd_alias_write->parsed() ||
      cmd_alias_rm->parsed() || cmd_alias_run->parsed());
 
 #ifdef CES_HYLE
@@ -1895,35 +1948,47 @@ int main(int argc, char* argv[]) {
       return 0;
     };
 
-    // ---- handleDiskFile handler (L2 disk-backed file store) ----
-    auto handleDiskFile = [&]() -> int {
-      if (rpcPort_arg == 0) {
-        std::cerr << "Error: --rpc-port is required for 'file' subcommands.\n";
-        return 1;
-      }
-
-      // Resolve server host:port → we want the host (the rpcPort is the
-      // separate --rpc-port flag). Accept either bare host or host:port
-      // — same as elsewhere in cesh. If the user passed --server host:X,
-      // we ignore X (that's the main CES port, not the file port).
-      std::string host = server_arg;
-      auto colon = host.rfind(':');
-      if (colon != std::string::npos) host = host.substr(0, colon);
-      if (host.empty()) host = "localhost";
-
-      // Server pubkey for response-sig verification — NO paid query:
-      // explicit --server-key wins; otherwise reuse the key the free MINX
-      // handshake already learned on connect.
+    // Shared prologue for the L2 verb handlers (file / compute / mail):
+    // require --rpc-port, strip :port from --server (that is the main CES
+    // port; the rpc port is the separate flag), and resolve the server pubkey
+    // for response-sig verification with NO paid query (explicit --server-key
+    // wins; otherwise reuse the key the free MINX handshake already learned
+    // on connect). Returns false on a usage error (message printed).
+    struct L2Target {
+      std::string host;
       minx::Hash serverPk{};
       bool hasServerPk = false;
-      if (!server_key_arg.empty()) {
-        try { minx::stringToHash(serverPk, server_key_arg); hasServerPk = true; }
-        catch (...) { std::cerr << "Error: bad --server-key hex\n"; return 1; }
-      } else {
-        serverPk = cc.getServerKey();
-        minx::Hash zero{};
-        hasServerPk = (serverPk != zero);
+    };
+    auto resolveL2Target = [&](const char* what, L2Target& out) -> bool {
+      if (rpcPort_arg == 0) {
+        std::cerr << "Error: " << what << " requires --rpc-port\n";
+        return false;
       }
+      out.host = server_arg;
+      auto colon = out.host.rfind(':');
+      if (colon != std::string::npos) out.host = out.host.substr(0, colon);
+      if (out.host.empty()) out.host = "localhost";
+      if (!server_key_arg.empty()) {
+        try {
+          minx::stringToHash(out.serverPk, server_key_arg);
+          out.hasServerPk = true;
+        } catch (...) {
+          std::cerr << "Error: bad --server-key hex\n";
+          return false;
+        }
+      } else {
+        out.serverPk = cc.getServerKey();
+        minx::Hash zero{};
+        out.hasServerPk = (out.serverPk != zero);
+      }
+      return true;
+    };
+
+    // ---- handleDiskFile handler (L2 disk-backed file store) ----
+    auto handleDiskFile = [&]() -> int {
+      L2Target tgt;
+      if (!resolveL2Target("file", tgt)) return 1;
+      auto& [host, serverPk, hasServerPk] = tgt;
       if (!hasServerPk) {
         std::cerr << "Warn: no server key; response sig verification disabled.\n";
       }
@@ -2315,29 +2380,9 @@ int main(int argc, char* argv[]) {
 
     // ---- handleCompute handler ----
     auto handleCompute = [&]() -> int {
-      if (rpcPort_arg == 0) {
-        std::cerr << "Error: compute requires --rpc-port\n";
-        return 1;
-      }
-
-      // Resolve host (strip :port if caller pasted --server host:X).
-      std::string host = server_arg;
-      auto colon = host.rfind(':');
-      if (colon != std::string::npos) host = host.substr(0, colon);
-      if (host.empty()) host = "localhost";
-
-      // Server pubkey for response-sig verification — NO paid query:
-      // explicit --server-key wins; otherwise reuse the free handshake's key.
-      minx::Hash serverPk{};
-      bool hasServerPk = false;
-      if (!server_key_arg.empty()) {
-        try { minx::stringToHash(serverPk, server_key_arg); hasServerPk = true; }
-        catch (...) { std::cerr << "Error: bad --server-key hex\n"; return 1; }
-      } else {
-        serverPk = cc.getServerKey();
-        minx::Hash zero{};
-        hasServerPk = (serverPk != zero);
-      }
+      L2Target tgt;
+      if (!resolveL2Target("compute", tgt)) return 1;
+      auto& [host, serverPk, hasServerPk] = tgt;
 
       auto normalizePath = [&](const std::string& raw) -> std::string {
         if (!raw.empty() && raw[0] == '/') return raw;
@@ -2471,7 +2516,74 @@ int main(int argc, char* argv[]) {
         return 0;
       }
 
+      if (cmd_ccall->parsed()) {
+        ces::Bytes reply;
+        uint8_t crc = cc2.call(compute_pid_arg, compute_value_arg,
+                               compute_memo_data, reply);
+        if (crc != CES_OK) {
+          std::cerr << "CALL Failed: " << errorString(crc) << "\n";
+          return 1;
+        }
+        // Reply is data: --out to a file (binary-safe), --hex as a hex string,
+        // else raw to stdout (same convention as `file read`).
+        if (!compute_out_arg.empty()) {
+          std::ofstream ofs(compute_out_arg, std::ios::binary);
+          ofs.write(reinterpret_cast<const char*>(reply.data()), reply.size());
+          if (!g_quiet) {
+            print_header("Compute Call");
+            print_field("Instance", compute_pid_arg);
+            print_field("Paid",     compute_value_arg);
+            print_field("Bytes",    reply.size());
+            print_field("Output",   compute_out_arg);
+          }
+        } else if (compute_hex_output) {
+          std::cout << ces::bytesToHex(reply) << "\n";
+        } else {
+          std::cout.write(reinterpret_cast<const char*>(reply.data()),
+                          static_cast<std::streamsize>(reply.size()));
+        }
+        return 0;
+      }
+
       std::cerr << "Unknown compute subcommand.\n";
+      return 1;
+    };
+
+    // ---- handleMail handler ----
+    auto handleMail = [&]() -> int {
+      L2Target tgt;
+      if (!resolveL2Target("mail", tgt)) return 1;
+      auto& [host, serverPk, hasServerPk] = tgt;
+
+      CesMailClient mc;
+      uint8_t rc = mc.connect(host, rpcPort_arg, actorKey);
+      if (rc != CES_OK) {
+        std::cerr << "Error: mail connect failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (hasServerPk) mc.setServerPubkey(serverPk);
+
+      if (cmd_msend->parsed()) {
+        uint8_t src = mc.send(mail_to_arg, mail_subject_arg, mail_body_data,
+                              mail_attach_arg);
+        if (src != CES_OK) {
+          std::cerr << "SEND Failed: " << errorString(src) << "\n";
+          return 1;
+        }
+        if (g_quiet) {
+          std::cout << "{\"sent\":true}\n";
+          return 0;
+        }
+        print_header("Mail Sent");
+        print_field("To",      mail_to_arg);
+        print_field("Subject", mail_subject_arg);
+        print_field("Bytes",   mail_body_data.size());
+        if (!mail_attach_arg.empty()) print_field("Attach", mail_attach_arg);
+        std::cout << std::endl;
+        return 0;
+      }
+
+      std::cerr << "Unknown mail subcommand.\n";
       return 1;
     };
 
@@ -2683,6 +2795,10 @@ int main(int argc, char* argv[]) {
     // ---- compute (L2 program instances) ----
 
     else if (cmd_compute->parsed()) return handleCompute();
+
+    // ---- mail (L2 outbound email) ----
+
+    else if (cmd_mail->parsed()) return handleMail();
 
     // ---- autoexec ----
 

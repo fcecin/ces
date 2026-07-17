@@ -1,4 +1,5 @@
 #include <ces/cesplex/mux.h>
+#include <ces/cesplex/session.h>
 #include <ces/buffer.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
@@ -7781,8 +7782,8 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
     // Scheduled / autoexec / RPC-followup runs all fire through this path;
     // they self-describe as SCHEDULED (autoexec, a boot-time scheduled run,
     // shares it). A distinct AUTOEXEC kind would need a flag on the run
-    // record.
-    vreq.invokeKind         = INVOKE_SCHEDULED;
+    // record. A SYS_L2_CALL resolution followup carries INVOKE_L2_RETURN.
+    vreq.invokeKind         = run.invokeKind;
   }
 
   // Same transactional core as the wire path: a scheduled run is now atomic
@@ -7809,10 +7810,11 @@ uint8_t CesServer::scheduleRun(const HashPrefix& callerPrefix,
                                 uint64_t allowance,
                                 const ces::Bytes& input,
                                 uint64_t time_us, bool prepaid,
-                                uint32_t aliasId) {
+                                uint32_t aliasId,
+                                uint64_t invokeKind) {
   ScheduleKey key;
   return scheduleRunUndoable(callerPrefix, assetId, budget, allowance, input,
-                             time_us, prepaid, key, aliasId);
+                             time_us, prepaid, key, aliasId, invokeKind);
 }
 
 uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
@@ -7821,7 +7823,8 @@ uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
                                         const ces::Bytes& input,
                                         uint64_t time_us, bool prepaid,
                                         ScheduleKey& outKey,
-                                        uint32_t aliasId) {
+                                        uint32_t aliasId,
+                                        uint64_t invokeKind) {
   if (scheduledRuns_.size() >= cfg_.maxScheduledEntries)
     return CES_ERROR_QUEUE_FULL;
   if (time_us == 0) time_us = 1; // "next tick"
@@ -7831,7 +7834,7 @@ uint8_t CesServer::scheduleRunUndoable(const HashPrefix& callerPrefix,
   scheduledRuns_.emplace(
     outKey,
     ScheduledRun{callerPrefix, assetId, budget, allowance, input, prepaid,
-                 aliasId});
+                 aliasId, invokeKind});
   return CES_OK;
 }
 
@@ -8084,7 +8087,7 @@ void CesServer::completeRpc(std::shared_ptr<PendingRpc> pending,
 void CesServer::drainL2Call(std::shared_ptr<PendingL2Call> pending) {
   L2CallRequest req;
   req.callId = pending->callId;
-  req.payer  = Account::getMapKey(pending->payerKey);
+  req.payer  = pending->payerKey;
   req.value  = pending->value;
   req.blob   = pending->blob;
   // The handler either refuses synchronously (returns non-OK => refund now)
@@ -8093,40 +8096,45 @@ void CesServer::drainL2Call(std::shared_ptr<PendingL2Call> pending) {
   auto self = pending;
   L2CallReport report =
     [this, self](uint64_t /*callId*/, L2CallOutcome outcome,
-                 const minx::Hash& payee) {
+                 const minx::Hash& payee, const ces::Bytes& reply) {
+      auto rep = std::make_shared<ces::Bytes>(reply);
       boost::asio::post(logicStrand_,
-        [this, self, outcome, payee]() {
-          completeL2Call(self, outcome, payee);
+        [this, self, outcome, payee, rep]() {
+          completeL2Call(self, outcome, payee, *rep);
         });
     };
   uint8_t rc = pending->handler->cesplexL2Call(req, report);
   if (rc != CES_OK) {
-    // Synchronous refuse (e.g. the built-in has no handler for this call):
-    // refund the payer.
+    // Synchronous refuse (e.g. the target instance is gone): refund the payer.
+    // Keep the concrete code so a channel caller sees why, not the generic
+    // outcome mapping.
+    pending->syncRefuseRc = rc;
     boost::asio::post(logicStrand_,
       [this, pending]() {
-        completeL2Call(pending, L2CallOutcome::NoHandler, minx::Hash{});
+        completeL2Call(pending, L2CallOutcome::NoHandler, minx::Hash{},
+                       ces::Bytes{});
       });
   }
 }
 
 void CesServer::completeL2Call(std::shared_ptr<PendingL2Call> pending,
                                L2CallOutcome outcome,
-                               const minx::Hash& payee) {
+                               const minx::Hash& payee,
+                               const ces::Bytes& reply) {
   if (pending->resolved) return;   // idempotent: ignore duplicate reports
   pending->resolved = true;
   l2PendingCount_.fetch_sub(1);
 
   // Settle from the self-account (holds the burned value; bottomless). Zero
   // fees so exactly `value` passes through. Delivered pays the payee; a
-  // failure (NoHandler / Timeout) refunds the payer. A Delivered report with
-  // no payee is treated as a refund (handler-contract violation, fail safe).
+  // failure (NoHandler / Timeout) refunds the payer. The payee is never drawn
+  // from: a payment, once delivered, is final. A Delivered report with no
+  // payee is treated as a refund (handler-contract violation, fail safe).
   minx::Hash selfKey = serverKeyPair_.getPublicKeyAsHash();
   bool payeeZero = true;
   for (auto b : payee) if (b) { payeeZero = false; break; }
-  minx::Hash target =
-    (outcome == L2CallOutcome::Delivered && !payeeZero) ? payee
-                                                        : pending->payerKey;
+  bool delivered = (outcome == L2CallOutcome::Delivered && !payeeZero);
+  minx::Hash target = delivered ? payee : pending->payerKey;
   int64_t outBal = 0;
   uint8_t rc = transfer(selfKey, target, pending->value,
                         TransferMode::Open, 0, CES_NONCELESS, outBal,
@@ -8135,7 +8143,101 @@ void CesServer::completeL2Call(std::shared_ptr<PendingL2Call> pending,
     LOGDEBUG << "completeL2Call: settle transfer failed"
              << VAR(int(rc)) << VAR(int(outcome)) << VAR(pending->value);
   }
-  // Followup run (INVOKE_L2_RETURN) deferred to a later increment.
+
+  // Reply sink. A client CALL verb (replyCtx set) responds on its held request;
+  // a VM caller resolves through the INVOKE_L2_RETURN followup run. Exactly one.
+  if (pending->replyCtx) {
+    auto ctx = pending->replyCtx;
+    // Failure mapping for the channel caller, one code per cause: a
+    // synchronous handler refusal carries its concrete code (e.g.
+    // COMPUTE_INSTANCE_NOT_FOUND when the instance died mid-flight);
+    // NoHandler = the program defines no on_l2call (UNSUPPORTED); a call
+    // never delivered before the deadline = TIMEOUT.
+    uint8_t errRc =
+      pending->syncRefuseRc != 0
+        ? pending->syncRefuseRc
+        : static_cast<uint8_t>(outcome == L2CallOutcome::Timeout
+                                 ? CES_ERROR_TIMEOUT
+                                 : CES_ERROR_UNSUPPORTED);
+    // The reply rides RUDP: capped at the channel ceiling, not packet-bounded.
+    ces::Bytes rep(reply);
+    if (rep.size() > CES_L2_CALL_MAX_REPLY) rep.resize(CES_L2_CALL_MAX_REPLY);
+    boost::asio::post(rpcTaskIO_,
+      [ctx, delivered, errRc, rep = std::move(rep)]() mutable {
+        if (delivered) {
+          // Response framing: [u32 len][32 sha256(reply)] preamble + `len`
+          // reply bytes as body. The response sig covers only the preamble,
+          // so the digest is what makes the body tamper-evident (same shape
+          // as file READ's range hash).
+          ces::Bytes pre;
+          ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(rep.size()));
+          minx::Hash h = sha256(rep.data(), rep.size());
+          pre.insert(pre.end(), h.begin(), h.end());
+          ctx->respond(CES_OK, std::move(pre), std::move(rep));
+        } else {
+          ctx->error(errRc);
+        }
+      });
+    return;
+  }
+
+  // Followup run (INVOKE_L2_RETURN): notify the caller of the resolution. Fires
+  // as the payer, next tick, input io[INPUT]=tag, io[INPUT+1]=outcome (0
+  // delivered, 1 no-handler, 2 timeout), io[INPUT+2..]=reply truncated to the
+  // VM's input window. Skipped when no followup key was set.
+  bool fuZero = true;
+  for (auto b : pending->followupProgramKey) if (b) { fuZero = false; break; }
+  if (!fuZero) {
+    ces::Bytes fin(16, 0);
+    ces::Buffer::pokeLE<uint64_t>(fin.data() + 0, pending->followupTag);
+    ces::Buffer::pokeLE<uint64_t>(fin.data() + 8, static_cast<uint64_t>(outcome));
+    size_t n = std::min<size_t>(reply.size(), CES_L2_CALL_VM_REPLY);
+    fin.insert(fin.end(), reply.begin(), reply.begin() + n);
+    if (scheduleRun(Account::getMapKey(pending->payerKey),
+                    pending->followupProgramKey, pending->followupBudget,
+                    pending->followupAllowance, fin, 0, false, 0,
+                    INVOKE_L2_RETURN) != CES_OK) {
+      LOGDEBUG << "completeL2Call: followup schedule failed";
+    }
+  }
+}
+
+uint8_t CesServer::enqueueChannelL2Call(CesPlexHandler* handler,
+                                        const minx::Hash& payer, uint64_t value,
+                                        ces::Bytes blob,
+                                        std::shared_ptr<CesPlexRequest> replyCtx) {
+  if (l2PendingCount_.load() >= cfg_.l2MaxPending) return CES_ERROR_QUEUE_FULL;
+  // Escrow burn: park `value` in the bottomless self-account. Same model as
+  // the VM syscall; settlement mints self -> payee or refunds self -> payer.
+  if (value > 0 &&
+      !l2TransferSync(payer, serverKeyPair_.getPublicKeyAsHash(), value))
+    return CES_ERROR_INSUFFICIENT_BALANCE;
+  auto pending = std::make_shared<PendingL2Call>();
+  pending->handler  = handler;
+  pending->payerKey = payer;
+  pending->value    = value;
+  pending->blob     = std::move(blob);
+  pending->replyCtx = std::move(replyCtx);
+  postLogic([this, pending]() {
+    pending->callId = l2NextCallId_++;
+    l2PendingCount_.fetch_add(1);
+    boost::asio::post(rpcTaskIO_, [this, pending]() { drainL2Call(pending); });
+  });
+  return CES_OK;
+}
+
+bool CesServer::l2TransferSync(const minx::Hash& from, const minx::Hash& to,
+                               uint64_t amount) {
+  if (amount == 0) return true;
+  std::promise<bool> pr;
+  auto fut = pr.get_future();
+  postLogic([this, from, to, amount, &pr]() {
+    int64_t outBal = 0;
+    uint8_t rc = transfer(from, to, amount, TransferMode::Open, 0, CES_NONCELESS,
+                          outBal, /*txFee=*/0, /*rentFee=*/0, /*errFee=*/0);
+    pr.set_value(rc == CES_OK);
+  });
+  return fut.get();
 }
 
 // --- Autoexec (cron assets on boot) ---

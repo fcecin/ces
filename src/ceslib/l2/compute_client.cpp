@@ -8,6 +8,7 @@
 #include <ces/l2/compute_client.h>
 #include <ces/cesplex/session.h>
 #include <ces/buffer.h>
+#include <ces/ramfilestore.h> // ces::sha256
 #include <ces/types.h>
 
 #include <cstdint>
@@ -24,6 +25,7 @@ constexpr uint8_t kVerbKill      = 0x02;
 constexpr uint8_t kVerbList      = 0x03;
 constexpr uint8_t kVerbStat      = 0x04;
 constexpr uint8_t kVerbInstances = 0x05;
+constexpr uint8_t kVerbCall      = 0x06;
 
 constexpr const char* kComputeProto = "/ces/compute/1";
 
@@ -230,6 +232,48 @@ uint8_t CesComputeClient::instances(const std::string& path,
                                      reader, resp);
   if (rc != CES_OK) out.clear();
   return rc;
+}
+
+uint8_t CesComputeClient::call(uint64_t pid, uint64_t value,
+                               const ces::Bytes& memo, ces::Bytes& reply) {
+  if (memo.size() > CES_L2_CALL_MAX_MEMO) return CES_ERROR_BAD_INPUT;
+  // The memo rides as the request body (hash-committed in the preamble, like
+  // file WRITE), so it is not packet-bounded.
+  minx::Hash memoHash = ces::sha256(memo.data(), memo.size());
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint64_t>(pre, pid);
+  ces::Buffer::put<uint64_t>(pre, value);
+  ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(memo.size()));
+  pre.insert(pre.end(), memoHash.begin(), memoHash.end());
+  auto env = impl_->chan->buildEnvelope(kVerbCall, pre);
+
+  reply.clear();
+  // Reply framing: [u32 len][32 sha256(reply)] fixed preamble + `len` reply
+  // bytes as the body. The body follows the response's signed tail, so it
+  // rides respBodyLen, not the preamble reader. The declared length is capped
+  // at CES_L2_CALL_MAX_REPLY so a hostile or buggy server can't make us
+  // allocate an unbounded response (the server truncates to the same cap).
+  constexpr size_t kCallRespPre = sizeof(uint32_t) + 32;
+  auto bodyLen = [](const ces::Bytes& preamble) -> uint64_t {
+    if (preamble.size() < kCallRespPre) return 0;
+    uint64_t declared = ces::Buffer::peek<uint32_t>(preamble.data());
+    return declared < CES_L2_CALL_MAX_REPLY ? declared : CES_L2_CALL_MAX_REPLY;
+  };
+  ces::Bytes outPre;
+  uint8_t rc = impl_->chan->driveVerb(kVerbCall, env, /*fixedPre=*/kCallRespPre,
+                                     /*readVariablePreamble=*/nullptr, bodyLen,
+                                     /*extraBodyToSend=*/memo, outPre, reply);
+  if (rc != CES_OK) { reply.clear(); return rc; }
+  // The response sig covers only the preamble; the digest in it is what
+  // authenticates the reply bytes.
+  minx::Hash gotHash = ces::sha256(reply.data(), reply.size());
+  if (outPre.size() < kCallRespPre ||
+      std::memcmp(gotHash.data(), outPre.data() + sizeof(uint32_t), 32) != 0) {
+    reply.clear();
+    return CES_ERROR_INTERNAL;
+  }
+  return CES_OK;
 }
 
 } // namespace ces

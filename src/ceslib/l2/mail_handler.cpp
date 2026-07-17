@@ -7,10 +7,13 @@
 #include <ces/buffer.h>
 #include <ces/cesplex/session.h>
 #include <ces/l2/file_handler.h>
+#include <ces/ramfilestore.h> // ces::sha256
 #include <ces/server.h>
 #include <ces/util/log.h>
 
+#include <array>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 
@@ -55,30 +58,56 @@ bool mZoneOwnedBy(const std::string& path, const minx::Hash& payer) {
   return path.compare(3, 64, payerHex) == 0;
 }
 
+// SEND. The body text streams as the request body (hash-committed in the
+// preamble, like file WRITE / compute CALL), so it is not bounded by the
+// envelope; only the small headers ride the signed preamble.
+// Preamble (after nonce): [u16 toLen][to][u16 sjLen][subject]
+// [u32 textLen][32 textHash][u16 pathLen][path]; body = text bytes.
 void dispatchSend(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
                   MailHandler* self) {
   ces::Buffer buf(std::move(pre));
-  std::string to, subject, text, path;
+  std::string to, subject, path;
+  uint32_t textLen = 0;
+  std::array<uint8_t, 32> textHash{};
   try {
     uint16_t toLen = buf.get<uint16_t>();
     to = buf.getBytes<std::string>(toLen);
     uint16_t sjLen = buf.get<uint16_t>();
     subject = buf.getBytes<std::string>(sjLen);
-    uint32_t txLen = buf.get<uint32_t>();
-    text = buf.getBytes<std::string>(txLen);
+    textLen = buf.get<uint32_t>();
+    textHash = buf.get<std::array<uint8_t, 32>>();
     uint16_t pLen = buf.get<uint16_t>();
     path = buf.getBytes<std::string>(pLen);
   } catch (const std::out_of_range&) {
-    req->error(CES_ERROR_BAD_INPUT);
+    req->errorAndClose(CES_ERROR_BAD_INPUT);   // body length unknown
     return;
   }
-  if (to.empty()) {
-    req->error(CES_ERROR_BAD_INPUT);
+  const auto& cfg = static_cast<CesServer*>(req->host)->_config();
+  if (to.empty() || textLen > cfg.mailMaxEncodedBytes) {
+    req->errorAndClose(CES_ERROR_BAD_INPUT);   // body in flight -> close
     return;
   }
-  minx::Hash signer = req->bound.boundPubkey.getHash();
-  uint8_t status = self->mailSubmit(signer, to, subject, text, path);
-  req->respond(status, {});
+  // Consume the body before any check that could loop, so the wire stays in
+  // sync (mirrors compute CALL). textLen == 0 is a valid empty-body message.
+  auto text = std::make_shared<ces::Bytes>(textLen);
+  auto finish = [req, to, subject, path, text, textHash, self]() {
+    minx::Hash got = ces::sha256(text->data(), text->size());
+    if (std::memcmp(got.data(), textHash.data(), 32) != 0) {
+      req->error(CES_ERROR_INTERNAL);
+      return;
+    }
+    minx::Hash signer = req->bound.boundPubkey.getHash();
+    uint8_t status = self->mailSubmit(
+        signer, to, subject, std::string(text->begin(), text->end()), path);
+    req->respond(status, {});
+  };
+  if (textLen == 0) { finish(); return; }
+  boost::asio::async_read(
+    *req->stream, boost::asio::buffer(*text),
+    [finish](const boost::system::error_code& ec, std::size_t) {
+      if (ec) return;   // stream dead
+      finish();
+    });
 }
 
 }  // namespace

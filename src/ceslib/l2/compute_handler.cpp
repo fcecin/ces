@@ -113,6 +113,7 @@ constexpr uint8_t kVerbKill      = 0x02;
 constexpr uint8_t kVerbList      = 0x03;
 constexpr uint8_t kVerbStat      = 0x04;
 constexpr uint8_t kVerbInstances = 0x05;
+constexpr uint8_t kVerbCall      = 0x06;   // paid call into a live instance's on_l2call
 
 constexpr uint16_t kMaxNameLen = 512;   // matches file handler
 constexpr uint16_t kAppPayloadMax = 1024;
@@ -168,9 +169,10 @@ constexpr uint8_t kIpcTagExtUiWatch     = 0x1b;  // server → child ([u8 on])
 constexpr uint8_t kIpcTagGossipIn       = 0x13;  // server → child (flooded message)
 constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip.send)
 
-// SYS_L2_CALL — paid VM->L2 call routed into a live instance's on_l2call.
+// Paid L2 call routed into a live instance's on_l2call (VM syscall or CALL verb).
 constexpr uint8_t kIpcTagL2CallIn       = 0x1c;  // server → child (paid call)
 constexpr uint8_t kIpcTagL2CallResult   = 0x1d;  // child → server (delivered/no-handler)
+constexpr uint8_t kIpcTagL2CallReply    = 0x1f;  // child → server (on_l2call return bytes)
 #ifdef CES_MAIL
 constexpr uint8_t kIpcTagMailOut        = 0x1e;  // child → server (ces.mail.send)
 #endif
@@ -1123,11 +1125,22 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   }
   if (tag == kIpcTagL2CallResult) {
     // Payload: [u64 callId][u8 status]  (0 = delivered, else no-handler). The
-    // child sends this the moment it accepts (or refuses) a SYS_L2_CALL.
+    // child sends this the moment it accepts (or refuses) a paid L2 call.
+    // Delivered marks the pending call; no-handler settles it (refund).
     if (body.size() < kIpcHdr + sizeof(uint64_t) + 1) return;
     uint64_t callId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
-    uint8_t status = body[kIpcHdr + sizeof(uint64_t)];
-    inst->owner->l2Result(callId, status == 0);
+    bool delivered = body[kIpcHdr + sizeof(uint64_t)] == 0;
+    inst->owner->l2Result(callId, delivered);
+    return;
+  }
+  if (tag == kIpcTagL2CallReply) {
+    // Payload: [u64 callId][reply bytes]. on_l2call's return; settles the call
+    // Delivered and routes the bytes to its sink (channel respond / followup).
+    if (body.size() < kIpcHdr + sizeof(uint64_t)) return;
+    uint64_t callId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
+    const uint8_t* rb = body.data() + kIpcHdr + sizeof(uint64_t);
+    size_t rlen = body.size() - kIpcHdr - sizeof(uint64_t);
+    inst->owner->l2Reply(callId, rb, rlen);
     return;
   }
 #ifdef CES_MAIL
@@ -2359,6 +2372,7 @@ void dispatchKill      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchList      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchStat      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 void dispatchInstances (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
+void dispatchCall      (std::shared_ptr<ReqCtx> ctx, ces::Bytes pre);
 
 // ---------------------------------------------------------------------------
 // Helper: compute slot-fee window in credits.
@@ -3101,6 +3115,76 @@ void onFileDeleted(ComputeHandler& H, const std::string& name) {
   });
 }
 
+// CALL(pid, amount, memo) -> reply. A client is just another caller of the L2
+// call: the bound signer's `amount` is escrowed and settled to the instance's
+// program account exactly as SYS_L2_CALL does (never drawn back from the payee),
+// the memo rides as the request body (hash-committed, up to CES_L2_CALL_MAX_MEMO
+// -- RUDP, not packet-bounded), and the held request is answered by the shared
+// completeL2Call with the program's reply, or an error on no-handler / timeout.
+// Preamble (after nonce): [u64 pid BE][u64 amount BE][u32 memoLen][32 memoHash];
+// body = memo bytes.
+void dispatchCall(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
+  ces::Buffer buf(std::move(pre));
+  uint64_t pid = 0, value = 0;
+  uint32_t memoLen = 0;
+  std::array<uint8_t, 32> memoHash{};
+  try {
+    pid      = buf.get<uint64_t>();
+    value    = buf.get<uint64_t>();
+    memoLen  = buf.get<uint32_t>();
+    memoHash = buf.get<std::array<uint8_t, 32>>();
+  } catch (const std::out_of_range&) {
+    ctx->errorAndClose(CES_ERROR_BAD_INPUT); return;   // body length unknown
+  }
+  if (memoLen > CES_L2_CALL_MAX_MEMO) {
+    ctx->errorAndClose(CES_ERROR_BAD_INPUT); return;   // body in flight -> close
+  }
+
+  // Consume the memo body before any check that could loop, so the wire stays
+  // in sync (mirrors file WRITE). memoLen == 0 is a valid bare paid call.
+  auto memo = std::make_shared<ces::Bytes>(memoLen);
+  auto finish = [ctx, pid, value, memo, memoHash]() {
+    minx::Hash got = ces::sha256(memo->data(), memo->size());
+    if (std::memcmp(got.data(), memoHash.data(), 32) != 0) {
+      sendErrorAndLoop(ctx, CES_ERROR_INTERNAL); return;
+    }
+    CesServer* server = reqServer(ctx);
+    ComputeHandler* H = server->computeHandler();
+    // Check the target exists before escrowing (no burn-then-refund in the
+    // common case); a race with instance death still refunds via NoHandler.
+    if (H->instances_.find(pid) == H->instances_.end()) {
+      sendErrorAndLoop(ctx, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND); return;
+    }
+    // Per-op fee, like every compute verb. CALL is non-idempotent (each call
+    // escrows and delivers a fresh memo), so like LAUNCH it opts out of the
+    // NONCELESS sig-dedup: reqNonce=0, a resent envelope is a real,
+    // independently charged second call. The fee is not refunded on
+    // no-handler / timeout; only the escrowed `value` is.
+    const auto& cfg = server->_config();
+    auto chg = chargeSignerSync(
+      server, ctx->bound.boundPubkey,
+      static_cast<int64_t>(server->discountFee(FeeKind::Query, cfg.feeQuery)),
+      /*reqNonce=*/0, ctx->reqSigHash,
+      static_cast<int64_t>(cfg.getFeeError()), /*allowMissingOrigin=*/false);
+    if (chg.status != CES_OK) { sendErrorAndLoop(ctx, chg.status); return; }
+    minx::Hash signer = ctx->bound.boundPubkey.getHash();
+    ces::Bytes blob;   // [u64 pid BE][memo]: the provider-ABI the syscall builds
+    ces::Buffer::put<uint64_t>(blob, pid);
+    blob.insert(blob.end(), memo->begin(), memo->end());
+    uint8_t rc = server->enqueueChannelL2Call(H, signer, value,
+                                              std::move(blob), ctx);
+    if (rc != CES_OK) { sendErrorAndLoop(ctx, rc); return; }
+    // Deferred: completeL2Call responds on ctx and loops to the next verb.
+  };
+  if (memoLen == 0) { finish(); return; }
+  boost::asio::async_read(
+    *ctx->stream, boost::asio::buffer(*memo),
+    [finish](const boost::system::error_code& ec, std::size_t) {
+      if (ec) return;   // stream dead
+      finish();
+    });
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -3118,7 +3202,7 @@ void ComputeHandler::serve(std::shared_ptr<minx::RudpStream> stream,
   // accepts() also gates "still serving?" — false on stop() ends the loop.
   proto.accepts = [self](uint8_t verb) {
     return !self->stopped_.load() &&
-           verb >= kVerbLaunch && verb <= kVerbInstances;
+           verb >= kVerbLaunch && verb <= kVerbCall;
   };
   proto.dispatch = [](std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     switch (ctx->verb) {
@@ -3127,6 +3211,7 @@ void ComputeHandler::serve(std::shared_ptr<minx::RudpStream> stream,
       case kVerbList:      dispatchList     (ctx, std::move(pre)); break;
       case kVerbStat:      dispatchStat     (ctx, std::move(pre)); break;
       case kVerbInstances: dispatchInstances(ctx, std::move(pre)); break;
+      case kVerbCall:      dispatchCall     (ctx, std::move(pre)); break;
       default:             ctx->error(CES_ERROR_BAD_INPUT); break;
     }
   };
@@ -3706,31 +3791,23 @@ void ComputeHandler::deliverGossip(const minx::Hash& author,
 
 uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
                                       L2CallReport report) {
-  // Blob (provider-ABI): [u8 mode][8 target][payload...]. mode 0 = by pid
-  // (target = u64 pid BE); mode 1 = by program (target = 8-byte progPrefix =
-  // sha256(source)[:8]), routed to any live instance of that source. A refusal
-  // here surfaces upstream as a refund.
-  if (req.blob.size() < 1 + sizeof(uint64_t)) return CES_ERROR_BAD_INPUT;
-  uint8_t mode = req.blob[0];
-  uint64_t pid = 0;
-  if (mode == 0) {
-    pid = ces::Buffer::peek<uint64_t>(req.blob.data() + 1);
-  } else if (mode == 1) {
-    std::array<uint8_t, 8> pfx;
-    std::memcpy(pfx.data(), req.blob.data() + 1, 8);
-    auto pit = byPrefix_.find(pfx);
-    if (pit == byPrefix_.end() || pit->second.empty())
-      return CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND;
-    pid = *pit->second.begin();   // any live instance of that program
-  } else {
-    return CES_ERROR_BAD_INPUT;
-  }
-  const uint8_t* payload = req.blob.data() + 1 + sizeof(uint64_t);
-  std::size_t payloadLen = req.blob.size() - 1 - sizeof(uint64_t);
+  // Blob (provider-ABI): [u64 pid BE][payload...]. Paid RPC to a specific live
+  // instance, addressed by pid. The pid is ephemeral (per launch); a caller
+  // learns it from compute STAT / INSTANCES (a VM caller gets it from its own
+  // run input). pid is deliberately the ONLY address: the source file is a
+  // factory, not an addressable service, and whether instance identity (pid)
+  // or file identity (shared program account) wins is an open design question.
+  // Do not add a stable-address mode without resolving it; the bare layout
+  // means any second mode is a breaking blob change. A refusal here surfaces
+  // upstream as a refund.
+  if (req.blob.size() < sizeof(uint64_t)) return CES_ERROR_BAD_INPUT;
+  uint64_t pid = ces::Buffer::peek<uint64_t>(req.blob.data());
+  const uint8_t* payload = req.blob.data() + sizeof(uint64_t);
+  std::size_t payloadLen = req.blob.size() - sizeof(uint64_t);
   auto it = instances_.find(pid);
   if (it == instances_.end()) return CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND;
   auto inst = it->second;
-  // Frame body: [u64 callId][u64 value][8 payer][u32 payloadLen][payload].
+  // Frame body: [u64 callId][u64 value][32 payer][u32 payloadLen][payload].
   ces::Bytes b;
   ces::Buffer::put<uint64_t>(b, req.callId);
   ces::Buffer::put<uint64_t>(b, req.value);
@@ -3741,25 +3818,45 @@ uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
   minx::Hash payee;
   std::memcpy(payee.data(), inst->programPubkey.data(),
               inst->programPubkey.size());
-  pendingL2_[req.callId] = PendingL2{std::move(report), payee,
-                                     getMicrosSinceEpoch() + kL2CallTimeoutUs};
-  return CES_OK;   // accepted; the result frame or the timeout sweep settles it
+  PendingL2 p;
+  p.report     = std::move(report);
+  p.payee      = payee;
+  p.deadlineUs = getMicrosSinceEpoch() + kL2CallTimeoutUs;
+  pendingL2_[req.callId] = std::move(p);
+  return CES_OK;   // accepted; the reply frame or the timeout sweep settles it
 }
 
 void ComputeHandler::l2Result(uint64_t callId, bool delivered) {
   auto it = pendingL2_.find(callId);
   if (it == pendingL2_.end()) return;   // already settled (timed out) / unknown
-  it->second.report(callId,
-                    delivered ? L2CallOutcome::Delivered
-                              : L2CallOutcome::NoHandler,
-                    it->second.payee);
+  if (delivered) {
+    it->second.delivered = true;        // wait for the reply frame to settle
+    return;
+  }
+  // No on_l2call handler: refund now (empty reply), the payee is never touched.
+  it->second.report(callId, L2CallOutcome::NoHandler, minx::Hash{}, ces::Bytes{});
+  pendingL2_.erase(it);
+}
+
+void ComputeHandler::l2Reply(uint64_t callId, const uint8_t* data, size_t len) {
+  auto it = pendingL2_.find(callId);
+  if (it == pendingL2_.end()) return;   // already settled (timed out) / unknown
+  it->second.report(callId, L2CallOutcome::Delivered, it->second.payee,
+                    ces::Bytes(data, data + len));
   pendingL2_.erase(it);
 }
 
 void ComputeHandler::l2SweepTimeouts(uint64_t nowUs) {
   for (auto it = pendingL2_.begin(); it != pendingL2_.end();) {
     if (nowUs >= it->second.deadlineUs) {
-      it->second.report(it->first, L2CallOutcome::Timeout, minx::Hash{});
+      // Delivered-then-silent keeps the payment (empty reply); a call that
+      // never delivered is refunded. Either way the payee is never drawn from.
+      if (it->second.delivered)
+        it->second.report(it->first, L2CallOutcome::Delivered, it->second.payee,
+                          ces::Bytes{});
+      else
+        it->second.report(it->first, L2CallOutcome::Timeout, minx::Hash{},
+                          ces::Bytes{});
       it = pendingL2_.erase(it);
     } else {
       ++it;

@@ -732,6 +732,12 @@ void CesVM::runFast(CesVMHost& host, CesVMResult& result) {
 #define VMOP(i) ((d->regptr & (1u << (i))) ? get(d->val[i]) : d->val[i])
 
 #if CESVM_OPT_THREADED
+// Label-as-value jump table + computed goto: a deliberate GCC/Clang extension
+// (the threaded-dispatch fast core). Both constructs are non-ISO, so -Wpedantic
+// flags them; suppress it just for this dispatch prologue rather than dropping
+// the flag for the whole lib.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
   static const void* const kTbl[] = {
 #define X(n) &&VL_##n,
     CESVM_FAST_HANDLERS(X)
@@ -751,6 +757,7 @@ vm_dispatch:
   if (!billOp()) { io_[0] = pc + 1; return; }
   io_[0] = d->nextPc;
   goto *kTbl[d->h];
+#pragma GCC diagnostic pop
 #else
 #define VM_TARGET(n) case H_##n:
 #define VM_NEXT      continue
