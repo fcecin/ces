@@ -127,7 +127,6 @@ info                      chain, height, cells, quorum, gov_seq, supply
 config                    the genesis economy
 self                      the validator/program pubkey
 height
-mintkey                   the proof-of-work epoch key
 account <hex32>           balance, sequence
 entry <name>              owner, balance, timestamps, payload
 txr <hex32>               did this tx apply, and at what height
@@ -201,19 +200,16 @@ autostart = 1                 # boot the chain when the extension loads
 alloc = 1000000000            # genesis allocation to the program's own account
 fee_transfer = 10
 fee_entry = 10
-fee_mint = 1
 fee_sudo = 1                  # per-op fee for a sudo propose/approve
-reward_base = 2               # proof-of-work mint reward at floor difficulty
 rent_rate = 1                 # per byte-second of entry footprint
 rip_bounty = 10               # paid to whoever reaps a starved entry
 sudo_ttl_secs = 0             # a pending proposal past this age is dead; 0 = never
 faucet_max = 1000000          # most one caller may mint, per instance
 ```
 
-Two economic invariants the chain enforces at genesis, and refuses to boot
+One economic invariant the chain enforces at genesis, and refuses to boot
 without:
 
-- `reward_base > fee_mint` -- a floor-difficulty mint must net positive.
 - with `rent_rate > 0`, `rip_bounty <= min(fee_transfer, fee_entry)` -- a
   bounty worth more than the fee to create a rippable entry is a pump that
   mints money out of the cull.
@@ -240,8 +236,7 @@ rows, the validator pubkey, Start/Stop, and the genesis form.
 - `minted by sudo` -- credit created out of the sentinel.
 - `validator balance` -- the program's own account. It is the genesis `alloc`
   and it does NOT climb per block: the services economy has no proposer block
-  reward, and `reward_base` is the proof-of-work mint reward, not a block
-  subsidy.
+  reward.
 - `mempool` -- admitted ops not yet in a block.
 - `app hash` -- the composite state hash.
 

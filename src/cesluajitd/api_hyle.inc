@@ -28,12 +28,12 @@
 // Surface (drives extensions/hylesolo.lua; see apps/hylesolo in cesdk for the source):
 //   solo lifecycle
 //     ces.hyle.solo.start{ chain_id=, block_pace_ms=, alloc=, fee_transfer=, fee_entry=,
-//                          fee_mint=, fee_sudo=, reward_base=, rent_rate=, rip_bounty=,
-//                          sudo_ttl_secs= } -> true | nil,err
+//                          fee_sudo=, rent_rate=, rip_bounty=, sudo_ttl_secs=,
+//                          credit_autofill_ceiling=, refill_rate= } -> true | nil,err
 //     ces.hyle.solo.tick()   -- advance exactly one height; -> new height
 //     ces.hyle.solo.stop()   -- destroy the node
 //   chain
-//     ces.hyle.running() / height() / chain_id() / self() / mint_key()
+//     ces.hyle.running() / height() / chain_id() / self()
 //     ces.hyle.info()    -- one table: everything live
 //     ces.hyle.config()  -- the genesis economy
 //     ces.hyle.account(pubkey) / entry(name) / tx_result(txid) / validators()
@@ -189,21 +189,16 @@ int lua_ces_hyle_start(lua_State* L) {
   g.chain_id = g_hyle_chain;
   g.validators = { g_hyle_key->pub };
   g.allocations = { { g_hyle_key->pub, hyle_cfg_u64(L, "alloc", 1000000000ull) } };
-  // Defaults must satisfy the genesis economy, which hyle checks: reward_base > fee_mint,
-  // and with rent on, rip_bounty <= min(fee_transfer, fee_entry) -- a bounty worth more
-  // than the fee to create a rippable entry is a pump that mints money out of the cull.
+  // With rent on, hyle checks rip_bounty <= min(fee_transfer, fee_entry) -- a bounty worth
+  // more than the fee to create a rippable entry is a pump that mints money out of the cull.
   g.config.fee_transfer = hyle_cfg_u64(L, "fee_transfer", 10);
   g.config.fee_entry    = hyle_cfg_u64(L, "fee_entry", 10);
-  g.config.fee_mint     = hyle_cfg_u64(L, "fee_mint", 1);
   g.config.fee_sudo     = hyle_cfg_u64(L, "fee_sudo", 1);
-  g.config.reward_base  = hyle_cfg_u64(L, "reward_base", 2);
   // At rate 0 an entry is immortal: its balance buys nothing and nothing can cull it.
   g.config.rent_rate    = hyle_cfg_u64(L, "rent_rate", 1);
   g.config.rip_bounty   = hyle_cfg_u64(L, "rip_bounty", 10);
   // A pending sudo proposal past this age cannot execute and is cleared. 0 = never expires.
   g.config.sudo_ttl_secs = hyle_cfg_u64(L, "sudo_ttl_secs", 0);
-  // The proof-of-work epoch key. Seeded from the chain id so two chains do not share one.
-  g.config.mint_genesis_key = hyle::sha256(hyle_chain_view());
   // Consensus rules (validator-set bounds, max block payload): part of the chain definition.
   g.config.member_cap      = static_cast<unsigned>(hyle_cfg_u64(L, "member_cap", 21));
   g.config.member_floor    = static_cast<unsigned>(hyle_cfg_u64(L, "member_floor", 1));
@@ -292,14 +287,6 @@ int lua_ces_hyle_self_secret(lua_State* L) {
   return 1;
 }
 
-int lua_ces_hyle_mint_key(lua_State* L) {
-  if (!hyle_need_node(L)) return 2;
-  ++g_hyle_queries;
-  const hyle::Hash& k = g_hyle_node->app().mint_key();
-  lua_pushlstring(L, reinterpret_cast<const char*>(k.data()), k.size());
-  return 1;
-}
-
 // State exposes size()/canonical() but no iteration, so count a/e cells over the canonical KV dump.
 // The walk lives in ceslib (countCanonicalKvKeyPrefix), unit-tested there.
 static uint64_t hyle_canon_count(uint8_t prefix) {
@@ -341,16 +328,12 @@ int lua_ces_hyle_config(lua_State* L) {
   ++g_hyle_queries;
   const hyle::services::Config& c = g_hyle_node->app().config();
   lua_newtable(L);
-  hyle_set_u64(L, "fee_mint", c.fee_mint);
   hyle_set_u64(L, "fee_transfer", c.fee_transfer);
   hyle_set_u64(L, "fee_entry", c.fee_entry);
   hyle_set_u64(L, "fee_sudo", c.fee_sudo);
   hyle_set_u64(L, "rent_rate", c.rent_rate);
   hyle_set_u64(L, "rip_bounty", c.rip_bounty);
   hyle_set_u64(L, "sudo_ttl_secs", c.sudo_ttl_secs);
-  hyle_set_u64(L, "reward_base", c.reward_base);
-  hyle_set_u64(L, "reward_max_diff", c.reward_max_diff);
-  hyle_set_u64(L, "mint_capacity", c.mint_capacity);
   hyle_set_u64(L, "pbts_window_secs", c.pbts_window_secs);
   hyle_set_u64(L, "member_cap", c.member_cap);
   hyle_set_u64(L, "member_floor", c.member_floor);
@@ -446,13 +429,7 @@ int lua_ces_hyle_submit(lua_State* L) {
   std::vector<hyle::Hash> ids;
   const char* fail = nullptr;
 
-  for (const auto& o : d.mints) {
-    const hyle::services::Admit a = g_hyle_node->submit(o);
-    if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
-    ids.push_back(hyle::services::tx_id(cv, o));
-  }
-  if (fail == nullptr)
-    for (const auto& o : d.transfers) {
+  for (const auto& o : d.transfers) {
       const hyle::services::Admit a = g_hyle_node->submit(o);
       if (a != hyle::services::Admit::Ok) { fail = hyle::services::admit_reason(a); break; }
       ids.push_back(hyle::services::tx_id(cv, o));
@@ -776,7 +753,6 @@ void install_ces_hyle_api(lua_State* L) {
   hyle_fn(L, "chain_id",   guarded<lua_ces_hyle_chain_id>);
   hyle_fn(L, "self",        guarded<lua_ces_hyle_self>);
   hyle_fn(L, "self_secret", guarded<lua_ces_hyle_self_secret>);
-  hyle_fn(L, "mint_key",   guarded<lua_ces_hyle_mint_key>);
   hyle_fn(L, "info",       guarded<lua_ces_hyle_info>);
   hyle_fn(L, "config",     guarded<lua_ces_hyle_config>);
   hyle_fn(L, "account",    guarded<lua_ces_hyle_account>);

@@ -251,7 +251,7 @@ if(CES_HYLE)
   FetchContent_Declare(
     hyle
     GIT_REPOSITORY https://github.com/fcecin/hyle.git
-    GIT_TAG        ae2b82d400fdc5d135371136ea607723c0910168
+    GIT_TAG        576e0d7b678ca7c1f43ebbc802faa8f7f937788d
   )
   FetchContent_MakeAvailable(hyle)
   target_link_libraries(cesluajitd PRIVATE hyle_services)

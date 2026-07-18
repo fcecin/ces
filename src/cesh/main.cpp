@@ -740,7 +740,7 @@ int main(int argc, char* argv[]) {
     "relay through; writes build + sign an op and submit it.");
   cmd_hyle->add_option(
     "args", hyle_args,
-    "list  |  <pid> <verb> [operands], verb one of: info | config | self | height | mintkey | "
+    "list  |  <pid> <verb> [operands], verb one of: info | config | self | height | "
     "account <hex32> | entry <name> | get <name> | txr <hex32> | nodekey | "
     "put <name> [value] | del <name> | give <name> <newowner-hex32> | rip <name> | "
     "transfer <hex32|e:name> <amount> | mint <hex32> <amount> | seize <from> <to> <amount> | "

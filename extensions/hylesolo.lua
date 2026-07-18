@@ -35,7 +35,6 @@ __mods["main"] = function()
 --   config                    the genesis economy
 --   self                      the validator/program pubkey
 --   height
---   mintkey                   the proof-of-work epoch key
 --   account <hex32>           balance, sequence
 --   entry <name>              owner, balance, timestamps, payload
 --   txr <hex32>               did this tx apply, and at what height
@@ -97,9 +96,7 @@ local function do_start()
     alloc        = num("alloc", 1000000000000000),
     fee_transfer = num("fee_transfer", 10),
     fee_entry    = num("fee_entry", 10),
-    fee_mint     = num("fee_mint", 1),
     fee_sudo     = num("fee_sudo", 1),
-    reward_base  = num("reward_base", 2),
     rent_rate    = num("rent_rate", 1),
     rip_bounty   = num("rip_bounty", 10),
     sudo_ttl_secs = num("sudo_ttl_secs", 0),
@@ -168,10 +165,10 @@ function cmds.config()
   local c = ces.hyle.config()
   if not c then return "err no_chain" end
   return string.format(
-    "ok fee_mint=%d fee_transfer=%d fee_entry=%d fee_sudo=%d rent_rate=%d rip_bounty=%d " ..
-    "sudo_ttl_secs=%d reward_base=%d member_cap=%d member_floor=%d max_value_bytes=%d",
-    c.fee_mint, c.fee_transfer, c.fee_entry, c.fee_sudo, c.rent_rate, c.rip_bounty,
-    c.sudo_ttl_secs, c.reward_base, c.member_cap, c.member_floor, c.max_value_bytes)
+    "ok fee_transfer=%d fee_entry=%d fee_sudo=%d rent_rate=%d rip_bounty=%d " ..
+    "sudo_ttl_secs=%d member_cap=%d member_floor=%d max_value_bytes=%d",
+    c.fee_transfer, c.fee_entry, c.fee_sudo, c.rent_rate, c.rip_bounty,
+    c.sudo_ttl_secs, c.member_cap, c.member_floor, c.max_value_bytes)
 end
 
 cmds["self"] = function()
@@ -180,12 +177,6 @@ end
 
 function cmds.height()
   return "ok " .. string.format("%d", ces.hyle.height())
-end
-
-function cmds.mintkey()
-  local k = ces.hyle.mint_key()
-  if not k then return "err no_chain" end
-  return "ok " .. hex(k)
 end
 
 function cmds.account(conn, rest)
@@ -348,14 +339,10 @@ local function build_panel()
                          label = "block pace ms", value = num("block_pace_ms", 1000) }),
             mene.field({ name = "alloc", kind = "number",
                          label = "genesis alloc", value = num("alloc", 1000000000) }),
-            mene.field({ name = "reward_base", kind = "number",
-                         label = "pow reward base", value = num("reward_base", 2) }),
             mene.field({ name = "fee_transfer", kind = "number",
                          label = "fee transfer", value = num("fee_transfer", 10) }),
             mene.field({ name = "fee_entry", kind = "number",
                          label = "fee entry", value = num("fee_entry", 10) }),
-            mene.field({ name = "fee_mint", kind = "number",
-                         label = "fee mint", value = num("fee_mint", 1) }),
             mene.field({ name = "fee_sudo", kind = "number",
                          label = "fee sudo", value = num("fee_sudo", 1) }),
             mene.field({ name = "rent_rate", kind = "number",
@@ -388,7 +375,7 @@ local function build_panel()
         m.last_msg = do_stop()
       elseif ev.on == "cfg" and type(ev.value) == "table" then
         local keys = { "chain_id", "block_pace_ms", "alloc", "fee_transfer", "fee_entry",
-                       "fee_mint", "fee_sudo", "reward_base", "rent_rate", "rip_bounty",
+                       "fee_sudo", "rent_rate", "rip_bounty",
                        "sudo_ttl_secs", "snapshot_interval", "block_retention", "autostart" }
         local c, lines = {}, {}
         for _, k in ipairs(keys) do
@@ -464,16 +451,13 @@ local spec = {
     "autostart = 1",
     "# genesis allocation to the program's own account (whole credits)",
     "alloc = 1000000000",
-    "# economy. The chain rejects a genesis where reward_base <= fee_mint, or where rent is",
-    "# on and rip_bounty > min(fee_transfer, fee_entry): a bounty worth more than the fee to",
-    "# create a rippable entry mints money out of the cull.",
+    "# economy. With rent on, the chain rejects a genesis where rip_bounty > min(fee_transfer,",
+    "# fee_entry): a bounty worth more than the fee to create a rippable entry mints money out",
+    "# of the cull.",
     "fee_transfer = 10",
     "fee_entry = 10",
-    "fee_mint = 1",
     "# per-op fee for a sudo propose/approve",
     "fee_sudo = 1",
-    "# proof-of-work mint reward at floor difficulty",
-    "reward_base = 2",
     "# rent per byte-second of entry footprint. At 0 an entry is immortal, its funding",
     "# buys nothing, and no one can ever cull it.",
     "rent_rate = 1",

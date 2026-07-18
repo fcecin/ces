@@ -174,12 +174,12 @@ int hyleList(const HyleCli& c) {
   return 0;
 }
 
-// info|config|self|height|mintkey|account|entry|txr|nodekey ride straight through: build the
+// info|config|self|height|account|entry|txr|nodekey ride straight through: build the
 // line, print the chain's reply verbatim. `get` is separate (extracts an entry's value as raw
 // bytes); the write verbs build + sign ops. (nodekey is owner-gated at the program.)
 const std::set<std::string>& hyRelayVerbs() {
   static const std::set<std::string> v = {"info", "config", "self", "height",
-                                          "mintkey", "txr", "nodekey"};
+                                          "txr", "nodekey"};
   return v;
 }
 
@@ -222,7 +222,7 @@ int runHyle(const HyleCli& c) {
   if (pid == 0) return hyErr("instance pid required (see: cesh hyle list)");
   if (c.args.size() < 2)
     return hyErr("usage: cesh hyle <pid> <verb> [args] -- verb is one of info|config|self|height|"
-                 "mintkey|account|entry|get|txr|nodekey|put|del|give|rip|transfer|mint|seize|"
+                 "account|entry|get|txr|nodekey|put|del|give|rip|transfer|mint|seize|"
                  "propose|approve|submit");
   const std::string verb = c.args[1];
   const std::vector<std::string> op(c.args.begin() + 2, c.args.end());  // the verb's operands

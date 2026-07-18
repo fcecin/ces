@@ -124,8 +124,6 @@ std::string confFor(uint64_t rentRate) {
     << "alloc = 1000000000\n"
     << "fee_transfer = 10\n"
     << "fee_entry = 10\n"
-    << "fee_mint = 1\n"
-    << "reward_base = 2\n"
     << "rent_rate = " << rentRate << "\n"
     << "rip_bounty = 10\n";
   return s.str();
@@ -526,7 +524,7 @@ ok("self is program_pubkey", ces.hyle.self() == ces.program_pubkey())
 
 local started, err = ces.hyle.solo.start{
   chain_id = "opstest", alloc = 1000000, fee_transfer = 10, fee_entry = 10,
-  fee_mint = 1, reward_base = 2, rent_rate = 0, rip_bounty = 10,
+  rent_rate = 0, rip_bounty = 10,
 }
 ok("start", started == true, err)
 tick(2)
@@ -535,7 +533,6 @@ ok("height", ces.hyle.height() >= 1)
 ok("chain_id", ces.hyle.chain_id() == "opstest")
 ok("running", ces.hyle.running() == true)
 ok("quorum is 1", ces.hyle.sudo.quorum() == 1)
-ok("mint_key is 32B", #ces.hyle.mint_key() == 32)
 ok("config", ces.hyle.config().fee_entry == 10 and ces.hyle.config().rent_rate == 0)
 
 local me = ces.hyle.self()
@@ -704,7 +701,7 @@ const char* kBuyProgram = R"LUA(
 ces.hyle.solo.start{
   chain_id = "buy", alloc = 0,
   credit_autofill_ceiling = 1000000, refill_rate = 100000,
-  fee_transfer = 1, fee_entry = 1, rent_rate = 0, reward_base = 2,
+  fee_transfer = 1, fee_entry = 1, rent_rate = 0,
 }
 -- Timed block production (the dev net's cadence); handlers never force a tick.
 ces.every(25, function() ces.hyle.solo.tick() end)
@@ -812,7 +809,6 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   e2e::assertContains(e2e::runExpect(ph + "height").out, "ok ", "height");
   e2e::assertContains(e2e::runExpect(ph + "config").out, "fee_transfer=", "config");
   e2e::assertContains(e2e::runExpect(ph + "config").out, "member_cap=", "config exposes consensus params");
-  e2e::assertContains(e2e::runExpect(ph + "mintkey").out, "ok ", "mintkey");
   e2e::assertContains(e2e::runExpect(phq + "account " + userHex).out, "exists=", "account");
 
   // Money exists only through the validator. The node operator = the extension owner = the
