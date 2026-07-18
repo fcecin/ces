@@ -310,6 +310,34 @@ BOOST_AUTO_TEST_CASE(FaucetSudoMintsToTheBoundCaller) {
   BOOST_TEST(f.cmd("faucet 999999999").rfind("err", 0) == 0);  // capped
 }
 
+// The shipped extension sells hyle for CES: a client pays through the compute CALL
+// verb and its hyle account is credited the amount, 1:1, from the validator balance.
+BOOST_AUTO_TEST_CASE(PaidCallBuysHyleFromTheExtension) {
+  HyleFixture f;
+  BOOST_TEST(f.balOf(f.user.pub) == 0u);
+
+  const uint64_t buy = 1234;
+  ces::Bytes reply;
+  CesComputeClient cc;
+  cc.setServerPubkey(f.node.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", f.node.rpcPort, f.userKey));
+  const ces::Bytes memo{'b', 'u', 'y'};
+  const uint8_t rc = cc.call(f.pid, buy, memo, reply);
+  cc.disconnect();
+
+  // The sale is submitted, not confirmed: the call returns a tx id at once.
+  CES_REQUIRE_RC_EQ(rc, CES_OK);
+  BOOST_TEST(std::string(reply.begin(), reply.end()).rfind("ok ", 0) == 0u);
+
+  // Poll the buyer's hyle account (line protocol) until the credit commits.
+  bool credited = false;
+  for (int i = 0; i < 120 && !credited; i++) {
+    if (f.balOf(f.user.pub) == buy) credited = true;
+    else std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_TEST(credited);
+}
+
 // The service: an outside signer publishes K,V. The program relays bytes it cannot read
 // and could not have signed.
 BOOST_AUTO_TEST_CASE(SignerPublishesAndUpdatesAKeyValue) {
@@ -669,6 +697,91 @@ BOOST_AUTO_TEST_CASE(TheProgramFacingSurfaceOfTheBinding) {
   stopExt(n);
 }
 
+// A hyle-hosting program that sells credits for CES: it autofills its validator
+// balance, then on_l2call transfers the paid value to the caller with a max
+// transfer and replies with the caller's new hyle balance.
+const char* kBuyProgram = R"LUA(
+ces.hyle.solo.start{
+  chain_id = "buy", alloc = 0,
+  credit_autofill_ceiling = 1000000, refill_rate = 100000,
+  fee_transfer = 1, fee_entry = 1, rent_rate = 0, reward_base = 2,
+}
+-- Timed block production (the dev net's cadence); handlers never force a tick.
+ces.every(25, function() ces.hyle.solo.tick() end)
+function on_l2call(memo, ctx)
+  if memo == "q" then                       -- value-0 balance query for the caller
+    local a = ces.hyle.account(ctx.payer)
+    return tostring(a and a.balance or 0)
+  end
+  -- Submit the sale to the mempool and return; never wait on consensus.
+  local ids = ces.hyle.submit(ces.hyle.op.transfer{ to = ctx.payer, amount = ctx.value, max = true })
+  return ids and "ok" or "err"
+end
+ces.run()
+)LUA";
+
+// The paid CES -> hyle exchange end to end: a client pays CES through the compute
+// CALL verb, the program sells it hyle from its autofilled balance, and the buyer's
+// hyle account is credited the amount paid (1:1).
+BOOST_AUTO_TEST_CASE(PayCesReceiveHyle) {
+  ExtNode n;
+  const std::string bin = ces::e2e::findBinary("cesluajitd");
+  startExtNode(n, 1, bin, "", "");
+  const ces::KeyPair& srv = n.server->_serverKeyPair();
+  ces::KeyPair user;
+  n.server->_brr(user.getPublicKeyAsHash(), 10'000'000'000);
+  n.server->_drainLogic();
+
+  const std::string path = "/s/buy.lua";
+  const std::string src = kBuyProgram;
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(srv.getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", n.rpcPort, srv));
+    uint64_t bal = 0, cost = 0;
+    CES_REQUIRE_OK(fc.create(path, src.size(), 0, 100'000'000ULL, bal, cost));
+    const ces::Bytes content(src.begin(), src.end());
+    CES_REQUIRE_OK(fc.write(path, 0, content, bal));
+    fc.disconnect();
+  }
+  uint64_t pid = 0;
+  {
+    CesComputeClient cc;
+    cc.setServerPubkey(srv.getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", n.rpcPort, srv));
+    uint64_t startedAt = 0;
+    CES_REQUIRE_OK(cc.launch(path, pid, startedAt));
+    cc.disconnect();
+  }
+  BOOST_REQUIRE(pid > 0);
+  std::this_thread::sleep_for(std::chrono::seconds(1));  // let the chain start
+
+  const uint64_t buy = 1000;
+  CesComputeClient cc;
+  cc.setServerPubkey(srv.getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", n.rpcPort, user));
+
+  // Pay: the sale is submitted to the mempool, the call returns at once.
+  ces::Bytes reply;
+  CES_REQUIRE_RC_EQ(cc.call(pid, buy, ces::Bytes{'b', 'u', 'y'}, reply), CES_OK);
+  BOOST_TEST(std::string(reply.begin(), reply.end()) == "ok");
+
+  // Poll the buyer's hyle balance (a value-0 query call) until the credit lands.
+  bool credited = false;
+  for (int i = 0; i < 100 && !credited; i++) {
+    ces::Bytes q;
+    if (cc.call(pid, 0, ces::Bytes{'q'}, q) == CES_OK &&
+        std::string(q.begin(), q.end()) == std::to_string(buy))
+      credited = true;
+    else
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  cc.disconnect();
+  BOOST_TEST(credited);
+
+  stopExt(n);
+}
+
 // The client side, end to end: the real cesh binary's `hyle` verbs against a live hylesolo
 // chain. Proves the shell builds + signs ops with hyle_services, speaks the line protocol over
 // /ces/lua/1, and that a CES ed25519 identity owns the hyle entry it publishes. cesh links
@@ -679,14 +792,16 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   const std::string wallet = "00" + hexOf(userKey.getPrivateKey().data(), 32);
   const std::string userHex = hexOf(user.pub);
   const std::string srvKey = hexOf(node.server->_serverKeyPair().getPublicKeyAsHash());
-  auto conn = [&](const std::string& w) {
-    return "CESH_WALLET=\"" + w + "\" " + cesh + " -l fatal --server localhost:" +
+  auto conn = [&](const std::string& w, bool q = false) {
+    return "CESH_WALLET=\"" + w + "\" " + cesh + (q ? " -q" : "") + " -l fatal --server localhost:" +
            std::to_string(node.mainPort) + " --rpc-port " + std::to_string(node.rpcPort) +
            " --server-key " + srvKey + " hyle ";
   };
   const std::string base = conn(wallet);
   // `list` enumerates instances; every other verb names one by pid on the command line.
   const std::string ph = base + std::to_string(pid) + " ";
+  // account / entry pretty-print in human mode; -q gives the raw k=v line to parse.
+  const std::string phq = conn(wallet, true) + std::to_string(pid) + " ";
 
   // Enumerate: list shows the instance and its pid.
   e2e::assertContains(e2e::runExpect(base + "list").out, "pid=" + std::to_string(pid), "list");
@@ -698,7 +813,7 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   e2e::assertContains(e2e::runExpect(ph + "config").out, "fee_transfer=", "config");
   e2e::assertContains(e2e::runExpect(ph + "config").out, "member_cap=", "config exposes consensus params");
   e2e::assertContains(e2e::runExpect(ph + "mintkey").out, "ok ", "mintkey");
-  e2e::assertContains(e2e::runExpect(ph + "account " + userHex).out, "exists=", "account");
+  e2e::assertContains(e2e::runExpect(phq + "account " + userHex).out, "exists=", "account");
 
   // Money exists only through the validator. The node operator = the extension owner = the
   // server key; it reads the validator private key via the owner-gated `nodekey`, loads it into
@@ -723,7 +838,7 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   // The operator mints to the user account; the recipient is any key.
   e2e::assertContains(e2e::runExpect(opPh + "mint " + userHex + " 10000000 --wait").out, "applied",
                       "the validator mints");
-  e2e::assertContains(e2e::runExpect(ph + "account " + userHex).out, "balance=10000000",
+  e2e::assertContains(e2e::runExpect(phq + "account " + userHex).out, "balance=10000000",
                       "mint credited the recipient");
 
   // Sudo, general form: the operator proposes an arbitrary inner act via --in. Here the act is a
@@ -740,7 +855,7 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
     const std::string innerHex = hexOf(hyle::services::encode_ops(inner));
     e2e::assertContains(e2e::runExpect(opPh + "propose --in hex:" + innerHex + " --wait").out,
                         "applied", "a general sudo propose executes");
-    e2e::assertContains(e2e::runExpect(ph + "account " + hexOf(pro.pub)).out, "balance=777",
+    e2e::assertContains(e2e::runExpect(phq + "account " + hexOf(pro.pub)).out, "balance=777",
                         "the proposed mint credited the recipient");
   }
 
@@ -754,7 +869,7 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
                         "fund the victim");
     e2e::assertContains(e2e::runExpect(opPh + "seize " + vicHex + " " + userHex + " 2000 --wait").out,
                         "applied", "seize");
-    e2e::assertContains(e2e::runExpect(ph + "account " + vicHex).out, "balance=3000",
+    e2e::assertContains(e2e::runExpect(phq + "account " + vicHex).out, "balance=3000",
                         "seize removed the victim's funds");
   }
 
@@ -779,7 +894,7 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   const auto putR = e2e::runExpect(ph + "put greeting hello --fund 500 --wait");
   e2e::assertContains(putR.out, "applied", "put");
   {
-    const auto r = e2e::runExpect(ph + "entry greeting");
+    const auto r = e2e::runExpect(phq + "entry greeting");
     e2e::assertContains(r.out, "payload=68656c6c6f", "entry shows the value as hex");
     e2e::assertContains(r.out, "owner=" + userHex, "owner is the CES identity");
   }
@@ -804,7 +919,12 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   // Value from hex, read back through the record and through get --out.
   e2e::assertContains(e2e::runExpect(ph + "put hx --in hex:deadbeef --wait").out, "applied",
                       "put hex value");
-  e2e::assertContains(e2e::runExpect(ph + "entry hx").out, "payload=deadbeef", "hex stored");
+  e2e::assertContains(e2e::runExpect(phq + "entry hx").out, "payload=deadbeef", "hex stored");
+
+  // Binary name (contains a NUL): hex-encoded on the wire both ways, so it round-trips.
+  e2e::assertContains(e2e::runExpect(ph + "put hex:00ff41 --in text:binname --wait").out, "applied",
+                      "put a binary-named entry");
+  BOOST_TEST(e2e::runExpect(ph + "get hex:00ff41").out == "binname", "binary name reads back");
 
   // Binary value: put every byte 0x00..0xff from a file, read it back to a file, compare.
   {
@@ -840,13 +960,13 @@ BOOST_FIXTURE_TEST_CASE(CeshClientDrivesTheChain, HyleFixture) {
   const std::string dstHex = hexOf(hyleKeyOf(ces::KeyPair::generate()).pub);
   e2e::assertContains(e2e::runExpect(ph + "transfer " + dstHex + " 1000 --wait").out, "applied",
                       "transfer");
-  e2e::assertContains(e2e::runExpect(ph + "account " + dstHex).out, "balance=1000",
+  e2e::assertContains(e2e::runExpect(phq + "account " + dstHex).out, "balance=1000",
                       "transfer credited the destination");
 
   // Give ownership of a key away; the record's owner changes.
   e2e::assertContains(e2e::runExpect(ph + "give greeting " + dstHex + " --wait").out, "applied",
                       "give");
-  e2e::assertContains(e2e::runExpect(ph + "entry greeting").out, "owner=" + dstHex,
+  e2e::assertContains(e2e::runExpect(phq + "entry greeting").out, "owner=" + dstHex,
                       "ownership transferred");
 
   // Delete a key the caller still owns; the entry is then gone.
@@ -888,7 +1008,7 @@ BOOST_AUTO_TEST_CASE(CeshRipsAStarvedEntry) {
   // seconds. Fund is charged to the owner up front, so capture the balance after the put.
   e2e::assertContains(e2e::runExpect(ph + "put doomed x --fund 20000 --wait").out, "applied",
                       "put a doomed entry");
-  e2e::assertContains(e2e::runExpect(ph + "entry doomed").out, "ok ", "the entry exists");
+  e2e::assertContains(e2e::runExpect(ph + "entry doomed").out, "Owner", "the entry exists");
   const uint64_t before = f.balOf(f.user.pub);
 
   bool reaped = false;

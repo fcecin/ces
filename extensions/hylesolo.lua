@@ -200,6 +200,10 @@ end
 function cmds.entry(conn, rest)
   local name = rest:match("^(%S+)")
   if not name then return "err bad_name" end
+  if name:sub(1, 4) == "hex:" then
+    name = unhex(name:sub(5))
+    if not name then return "err bad_hex_name" end
+  end
   local e = ces.hyle.entry(name)
   if not e then return "err not_found" end
   return string.format("ok owner=%s balance=%d created=%d modified=%d rent=%d payload=%s",
@@ -496,6 +500,20 @@ ces.spawn(function()
   ces.sleep(250)
   maybe_autostart()
 end)
+
+-- Paid purchase over the compute CALL verb: sell the caller `value` hyle from the
+-- validator balance with a max transfer (never fails on a shortfall), 1:1. The
+-- payer key is its hyle account (one key, two ledgers). Reply: the caller's hyle
+-- balance after settlement.
+function on_l2call(memo, ctx)
+  if not (has_binding() and running) then return "err no_chain" end
+  if not ctx.payer or #ctx.payer ~= 32 then return "err bad_payer" end
+  -- Submit the sale into the mempool and return the tx id. We do not wait on consensus:
+  -- the buyer polls `account <yourkey>` (or `txr <id>`) to see when the credit lands.
+  local ids, err = ces.hyle.submit(ces.hyle.op.transfer{ to = ctx.payer, amount = ctx.value, max = true })
+  if not ids then return "err " .. tostring(err) end
+  return "ok " .. hex(ids[1])
+end
 
 serve()
 ces.run()

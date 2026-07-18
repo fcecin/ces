@@ -42,6 +42,7 @@ struct HyleCli {
   bool quiet = false;                     // -q: data-only stdout
   std::vector<std::string> inTokens;      // put: --in value tokens (text/hex:/file:), appended
   std::string outPath;                    // get: --out file for the raw value bytes (else stdout)
+  bool hexOut = false;                    // get: print the value as a hex string
 };
 
 std::string hyHex(const uint8_t* p, std::size_t n) {
@@ -99,6 +100,51 @@ int hyErr(const std::string& msg) {
   return 1;
 }
 
+// True if the bytes are valid UTF-8 with no control chars other than tab/newline/CR.
+bool hyIsText(const std::string& s) {
+  std::size_t i = 0, n = s.size();
+  while (i < n) {
+    const unsigned char c = static_cast<unsigned char>(s[i]);
+    std::size_t len;
+    if (c < 0x80) {
+      if (c < 0x20 && c != '\t' && c != '\n' && c != '\r') return false;
+      len = 1;
+    } else if ((c >> 5) == 0x6) len = 2;
+    else if ((c >> 4) == 0xE) len = 3;
+    else if ((c >> 3) == 0x1E) len = 4;
+    else return false;
+    if (i + len > n) return false;
+    for (std::size_t k = 1; k < len; k++)
+      if ((static_cast<unsigned char>(s[i + k]) >> 6) != 0x2) return false;
+    i += len;
+  }
+  return true;
+}
+
+// Human display of a byte blob: the text if it is text, else hex:<hex> (N bytes).
+// Display only; the exact bytes come from -q / --out / --hex.
+std::string hyRenderBlob(const std::string& s) {
+  if (s.empty()) return "(empty)";
+  if (hyIsText(s)) return s;
+  return "hex:" + hyHex(reinterpret_cast<const uint8_t*>(s.data()), s.size()) +
+         " (" + std::to_string(s.size()) + " bytes)";
+}
+
+// Line-protocol name encoding: safe text rides bare; a name with whitespace, a control
+// byte, or a leading "hex:" is sent as hex:<hex> so it round-trips unambiguously.
+std::string hyWireName(const std::string& raw) {
+  bool safe = !raw.empty() && raw.rfind("hex:", 0) != 0;
+  for (unsigned char c : raw) if (c <= 0x20 || c == 0x7f) { safe = false; break; }
+  return safe ? raw : "hex:" + hyHex(reinterpret_cast<const uint8_t*>(raw.data()), raw.size());
+}
+
+// Resolve a name argument through the shared text:/hex:/file:/bare grammar to raw bytes.
+std::string hyResolveName(const std::string& arg) {
+  ces::Bytes buf;
+  appendInToken(buf, arg);
+  return std::string(buf.begin(), buf.end());
+}
+
 // `cesh hyle list`: enumerate the instances of a source (default /s/hylesolo.lua) with their
 // pids, so the operator picks one and names it explicitly on every other command. This tool
 // does not guess a pid; a stateful client would cache the mapping.
@@ -132,8 +178,8 @@ int hyleList(const HyleCli& c) {
 // line, print the chain's reply verbatim. `get` is separate (extracts an entry's value as raw
 // bytes); the write verbs build + sign ops. (nodekey is owner-gated at the program.)
 const std::set<std::string>& hyRelayVerbs() {
-  static const std::set<std::string> v = {"info",    "config",  "self",  "height",
-                                          "mintkey", "account", "entry", "txr", "nodekey"};
+  static const std::set<std::string> v = {"info", "config", "self", "height",
+                                          "mintkey", "txr", "nodekey"};
   return v;
 }
 
@@ -203,14 +249,14 @@ int runHyle(const HyleCli& c) {
     return sess.request(line, reply);
   };
 
-  // get <name>: fetch an entry and emit its value as raw bytes -- to --out, else stdout
-  // (binary-safe). `entry` shows the record; `get` gives the content, matching cesh file get.
-  // The line protocol addresses the name as a whitespace-delimited token, so keys are small
-  // text identifiers, not arbitrary bytes.
+  // get <name>: fetch an entry and emit its value bytes -- to --out (binary-safe), --hex, else
+  // raw stdout. `entry` shows the record; `get` gives the content, matching cesh file get. The
+  // name takes the text:/hex:/file: grammar and rides hyWireName, so binary keys round-trip.
   if (verb == "get") {
     if (op.empty()) return hyErr("get <name>");
+    const std::string name = hyResolveName(op[0]);
     std::string reply;
-    if (std::string e = ask("entry " + op[0], reply); !e.empty()) return hyErr(e);
+    if (std::string e = ask("entry " + hyWireName(name), reply); !e.empty()) return hyErr(e);
     if (reply.rfind("ok ", 0) != 0) { std::cerr << reply << "\n"; return 1; }
     const ces::Bytes bytes = ces::parseHex(hyField(reply, "payload"));
     if (!c.outPath.empty()) {
@@ -218,6 +264,8 @@ int runHyle(const HyleCli& c) {
       if (!f) return hyErr("cannot open --out " + c.outPath);
       f.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
       if (!c.quiet) std::cout << "wrote " << bytes.size() << " bytes to " << c.outPath << "\n";
+    } else if (c.hexOut) {
+      std::cout << hyHex(bytes) << "\n";
     } else {
       std::cout.write(reinterpret_cast<const char*>(bytes.data()),
                       static_cast<std::streamsize>(bytes.size()));
@@ -232,6 +280,43 @@ int runHyle(const HyleCli& c) {
     if (c.inTokens.empty()) return hyErr("submit needs op bytes: --in <hex:|file:>");
     const std::string ops = hyComposeValue(c.inTokens);
     return hySubmit(sess, hyHex(reinterpret_cast<const uint8_t*>(ops.data()), ops.size()), c);
+  }
+
+  // account / entry pretty-print the record (with balance) in human mode; -q emits the raw
+  // "ok k=v" line for piping. entry's name rides hyWireName so binary keys round-trip, and its
+  // name/value render as text or hex:<...> for the eyes only.
+  if (verb == "account") {
+    if (op.empty()) return hyErr("account <pubkey-hex32>");
+    std::string reply;
+    if (std::string e = ask("account " + op[0], reply); !e.empty()) return hyErr(e);
+    if (reply.rfind("ok ", 0) != 0) { std::cerr << reply << "\n"; return 1; }
+    if (c.quiet) { std::cout << reply << "\n"; return 0; }
+    print_header("Hyle Account");
+    print_field("Pubkey", op[0]);
+    print_field("Balance", hyField(reply, "balance"));
+    print_field("Sequence", hyField(reply, "sequence"));
+    print_field("Exists", hyField(reply, "exists") == "1" ? "yes" : "no");
+    std::cout << std::endl;
+    return 0;
+  }
+  if (verb == "entry") {
+    if (op.empty()) return hyErr("entry <name>");
+    const std::string name = hyResolveName(op[0]);
+    std::string reply;
+    if (std::string e = ask("entry " + hyWireName(name), reply); !e.empty()) return hyErr(e);
+    if (reply.rfind("ok ", 0) != 0) { std::cerr << reply << "\n"; return 1; }
+    if (c.quiet) { std::cout << reply << "\n"; return 0; }
+    const ces::Bytes pl = ces::parseHex(hyField(reply, "payload"));
+    print_header("Hyle Entry");
+    print_field("Name", hyRenderBlob(name));
+    print_field("Owner", hyField(reply, "owner"));
+    print_field("Balance", hyField(reply, "balance"));
+    print_field("Created", hyField(reply, "created"));
+    print_field("Modified", hyField(reply, "modified"));
+    print_field("Rent", hyField(reply, "rent"));
+    print_field("Value", hyRenderBlob(std::string(pl.begin(), pl.end())));
+    std::cout << std::endl;
+    return 0;
   }
 
   if (hyRelayVerbs().count(verb)) {
@@ -268,10 +353,12 @@ int runHyle(const HyleCli& c) {
   }
 
   // put/del/give/rip take an entry key as the first positional; the rest use their own operands.
+  // The key takes the text:/hex:/file: grammar, so it can be UTF-8 or binary, then rides in the
+  // signed op as raw bytes.
   std::string name;
   if (verb == "put" || verb == "del" || verb == "give" || verb == "rip") {
     if (op.empty()) return hyErr(verb + " needs a key: <name>");
-    name = op[0];
+    name = hyResolveName(op[0]);
   }
 
   hyle::services::Decoded d;

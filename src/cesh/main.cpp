@@ -49,6 +49,8 @@ static void appendInToken(ces::Bytes& out, const std::string& s) {
 #ifdef CES_HYLE
 // Client-side hyle verbs. Isolated in the shell, guarded by the --hyle build; the CES client
 // engine (ceslib) never links hyle. Defines HyleCli + runHyle() in an anonymous namespace.
+void print_header(const std::string& title);
+void print_field(const std::string& key, const std::string& val);
 #include "cesh_hyle.inc"
 #endif
 
@@ -728,6 +730,7 @@ int main(int argc, char* argv[]) {
   std::string hyle_source_arg = "/s/hylesolo.lua";
   std::vector<std::string> hyle_in_tokens;
   std::string hyle_out_arg;
+  bool hyle_hex_arg = false;
   uint64_t hyle_fund_arg = 0;
   bool hyle_wait_arg = false;
   auto* cmd_hyle = app.add_subcommand(
@@ -751,6 +754,7 @@ int main(int argc, char* argv[]) {
                        "cannot be typed as.");
   cmd_hyle->add_option("--out", hyle_out_arg,
                        "get: write the raw value bytes to this file (default: stdout).");
+  cmd_hyle->add_flag("--hex", hyle_hex_arg, "get: print the value as a hex string.");
   cmd_hyle->add_option("--fund", hyle_fund_arg, "put: initial entry funding.");
   cmd_hyle->add_flag("--wait", hyle_wait_arg,
                      "Write verbs: poll txr until the tx applies or is rejected.");
@@ -1269,6 +1273,7 @@ int main(int argc, char* argv[]) {
     hc.source = hyle_source_arg;
     hc.inTokens = hyle_in_tokens;
     hc.outPath = hyle_out_arg;
+    hc.hexOut = hyle_hex_arg;
     hc.args = hyle_args;
     hc.fund = hyle_fund_arg;
     hc.wait = hyle_wait_arg;

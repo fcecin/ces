@@ -208,6 +208,9 @@ int lua_ces_hyle_start(lua_State* L) {
   g.config.member_cap      = static_cast<unsigned>(hyle_cfg_u64(L, "member_cap", 21));
   g.config.member_floor    = static_cast<unsigned>(hyle_cfg_u64(L, "member_floor", 1));
   g.config.max_value_bytes = hyle_cfg_u64(L, "max_value_bytes", 4u << 20);
+  // Per-block credit autofill: tops each validator toward the ceiling (0 = off).
+  g.config.credit_autofill_ceiling = hyle_cfg_u64(L, "credit_autofill_ceiling", 0);
+  g.config.refill_rate             = hyle_cfg_u64(L, "refill_rate", 0);
 
   std::string err;
   if (!g.validate(err)) {
@@ -503,12 +506,13 @@ static uint64_t hyle_self_seq(lua_State* L, const hyle::PubKey& self) {
   return given ? v : g_hyle_node->app().sequence(self);
 }
 
-static int hyle_push_transfer(lua_State* L, const hyle::wire::Bytes& to, uint64_t amount) {
+static int hyle_push_transfer(lua_State* L, const hyle::wire::Bytes& to, uint64_t amount,
+                              bool max) {
   const hyle::KeyPair kp = hyle_program_key();
   const uint64_t seq = hyle_self_seq(L, kp.pub);
   hyle::services::Decoded d;
   d.transfers.push_back(
-      hyle::services::make_transfer(kp, hyle_view(to), amount, seq, hyle_chain_view()));
+      hyle::services::make_transfer(kp, hyle_view(to), amount, seq, hyle_chain_view(), max));
   hyle_push_bytes(L, hyle::services::encode_ops(d));
   return 1;
 }
@@ -516,8 +520,11 @@ static int hyle_push_transfer(lua_State* L, const hyle::wire::Bytes& to, uint64_
 int lua_ces_hyle_op_transfer(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (!hyle_need_node(L)) return 2;
+  lua_getfield(L, 1, "max");
+  const bool max = lua_toboolean(L, -1) != 0;
+  lua_pop(L, 1);
   return hyle_push_transfer(L, hyle_account_dest(hyle_fld_key_req(L, "to")),
-                            hyle_fld_u64(L, "amount", 0));
+                            hyle_fld_u64(L, "amount", 0), max);
 }
 
 // Fund a K,V mapping: a transfer whose destination is the entry itself. Anyone may do it.
@@ -525,7 +532,7 @@ int lua_ces_hyle_op_fund(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (!hyle_need_node(L)) return 2;
   return hyle_push_transfer(L, hyle_entry_dest(hyle_fld_bytes(L, "name")),
-                            hyle_fld_u64(L, "amount", 0));
+                            hyle_fld_u64(L, "amount", 0), /*max=*/false);
 }
 
 static int hyle_push_entry(lua_State* L, const hyle::services::EntryOp& op) {
