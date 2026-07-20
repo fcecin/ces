@@ -1730,7 +1730,8 @@ WebAdmin::WebAdmin(boost::asio::io_context& io, CesServer& server)
 
 WebAdmin::~WebAdmin() { stop(); }
 
-bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
+bool WebAdmin::listen(const std::string& bindAddr, uint16_t port,
+                      bool allowPublic) {
   boost::system::error_code ec;
   auto addr = boost::asio::ip::make_address(bindAddr, ec);
   if (ec) {
@@ -1738,10 +1739,19 @@ bool WebAdmin::listen(const std::string& bindAddr, uint16_t port) {
              << SVAR(ec.message());
     return false;
   }
+  if (!addr.is_loopback() && !allowPublic) {
+    LOGERROR << "web dashboard bind address is NOT loopback and the dashboard "
+                "has NO authentication; refusing to expose a no-auth credit/"
+                "debit surface. Bind to loopback (SSH-tunnel to reach it) or set "
+                "web_allow_public = true to override deliberately"
+             << SVAR(bindAddr);
+    return false;
+  }
   if (!addr.is_loopback()) {
     LOGWARNING << "web dashboard bind address is NOT loopback — the dashboard "
                   "has NO authentication; anyone who can reach this address "
-                  "controls the server" << SVAR(bindAddr);
+                  "controls the server (web_allow_public override in effect)"
+               << SVAR(bindAddr);
   }
   try {
     boost::asio::ip::tcp::endpoint ep(addr, port);

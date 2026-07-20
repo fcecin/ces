@@ -105,7 +105,7 @@ local function do_start()
   local V = parse_validators()
   if #V == 0 then return "no validators configured (set validators = <hex> <hex> ...)" end
 
-  -- The validator identity is the SERVER key (ces.server_secret), and consensus rides the CES
+  -- The validator identity is the SERVER key (net.start reads it in-process), and consensus rides the CES
   -- server peer mesh, so this node must already be a mutual CES peer of the other validators.
   -- Funding is per-block validator autofill (through consensus), not an alloc.
   local ok, err = ces.hyle.net.start{

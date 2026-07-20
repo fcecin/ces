@@ -138,8 +138,9 @@ This generalizes: **any CES ed25519 identity is already a hyle account at the sa
 no mapping table. The constraint: **signers must be ed25519.** The server key
 included -- `net.start` refuses a secp256k1 server key.
 
-The trusted `/s/` extension reads the server secret via `ces.server_secret()`
-(host-gated to a `/s/`-owned-by-server instance); the key never leaves the box.
+`net.start` uses the server secret IN-PROCESS to build the validator key (host-gated
+to a `/s/`-owned-by-server instance); the raw key is never surfaced to the Lua
+sandbox, so a program cannot exfiltrate the permanent server identity.
 
 ---
 

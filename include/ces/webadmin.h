@@ -146,8 +146,10 @@ public:
   ~WebAdmin();
 
   // Bind + start accepting. Returns true on success. Installs the log sink
-  // and registers as the server's extension-panel push sink.
-  bool listen(const std::string& bindAddr, uint16_t port);
+  // and registers as the server's extension-panel push sink. A non-loopback
+  // bindAddr is REFUSED (returns false) unless allowPublic is true: the
+  // dashboard has no auth, so exposing it must be an explicit operator choice.
+  bool listen(const std::string& bindAddr, uint16_t port, bool allowPublic = false);
 
   // Stop accepting, close the acceptor and any WebSocket sessions, remove
   // the log sink and the push sink.

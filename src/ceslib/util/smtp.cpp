@@ -163,6 +163,19 @@ bool deliver(Stream& s, boost::asio::streambuf& buf, const SmtpConfig& cfg,
 bool smtpSend(const SmtpConfig& cfg, const std::string& to,
               const std::string& subject, const std::string& body,
               const MailAttachment* attachment, std::string* err) {
+  // Envelope/header fields must not contain CR or LF: an embedded newline would
+  // inject an extra SMTP command (a second RCPT TO / BCC) or a forged header.
+  // `to` and `subject` are program-controlled (ces.mail_send validates only
+  // length), so reject a control char here rather than pass it into the dialog.
+  // `from` is operator config but checked for symmetry. Body is exempt: it is
+  // dot-stuffed and framed by the "." terminator, not by bare CRLF.
+  auto fieldSafe = [](const std::string& s) {
+    return s.find('\r') == std::string::npos && s.find('\n') == std::string::npos;
+  };
+  if (!fieldSafe(to) || !fieldSafe(subject) || !fieldSafe(cfg.from)) {
+    if (err) *err = "mail field contains a control character (CR/LF)";
+    return false;
+  }
   try {
     boost::asio::io_context io;
     ssl::context sslctx(ssl::context::tls_client);

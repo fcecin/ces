@@ -154,6 +154,35 @@ BOOST_AUTO_TEST_CASE(Submit_WithAttachment_SendsMimeMultipart) {
   BOOST_CHECK(mock.data.find("aGk=") != std::string::npos);   // base64("hi")
 }
 
+// Regression for review item 7 (SMTP injection). 'to' and 'subject' are
+// program-controlled via ces.mail_send (length-checked only), so a CRLF must not
+// smuggle a second SMTP command (RCPT TO / BCC) or a forged header. smtpSend
+// rejects a control char in the envelope/header fields BEFORE any network I/O.
+// No mock: the point is that nothing is sent. The "control character" error
+// discriminates the fix from an ordinary connect failure -- without the fix,
+// smtpSend would try to connect (and err would be a connect/resolve message)
+// while smuggling the injected RCPT into the dialog.
+BOOST_AUTO_TEST_CASE(RejectsCrlfInjectionInEnvelope) {
+  SmtpConfig cfg;
+  cfg.host = "127.0.0.1";
+  cfg.port = 1;   // nothing listening; the fix must reject before connecting
+  cfg.from = "relay@ces";
+
+  std::string err;
+  bool ok = smtpSend(cfg, "victim@example.com>\r\nRCPT TO:<attacker@evil.com",
+                     "Subj", "Body", nullptr, &err);
+  BOOST_CHECK(!ok);
+  BOOST_CHECK_MESSAGE(err.find("control character") != std::string::npos,
+                      "expected a CRLF rejection, got: " << err);
+
+  // A CRLF in the subject (which lands in a header) is refused the same way.
+  std::string err2;
+  bool ok2 = smtpSend(cfg, "ok@example.com", "Subj\r\nBcc: evil@evil.com",
+                      "Body", nullptr, &err2);
+  BOOST_CHECK(!ok2);
+  BOOST_CHECK(err2.find("control character") != std::string::npos);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 #endif  // CES_MAIL

@@ -1974,6 +1974,14 @@ CesServer::NoncelessResult CesServer::resolveNonceless(
   return NoncelessResult::Proceed;
 }
 
+void CesServer::onLogicHandlerThrew(const char* what) noexcept {
+  // Called from postLogic's catch. Must not re-throw (noexcept), so guard the
+  // log itself. A handler reaching here dropped its op; the strand keeps serving.
+  try {
+    LOGERROR << "logic handler threw; op dropped" << SVAR(what ? what : "(unknown)");
+  } catch (...) {}
+}
+
 // ----------------------------------------------------------------------------
 // DATA MODEL MUTATORS
 // ----------------------------------------------------------------------------
@@ -3853,8 +3861,7 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
       PublicKey pk(req.originId);
       if (!req.verifySignature(msg.data, pk)) {
         LOGDEBUG << "gossip: bad signature";
-        minx_->banAddress(addr.address());
-        return;
+        return;   // drop; see the catch below on why we do not banAddress
       }
       handleGossip(req, addr, msg);
       break;
@@ -3862,12 +3869,17 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
 
     default:
       LOGTRACE << "unknown opcode";
-      minx_->banAddress(addr.address());
-      return;
+      return;   // drop; see the catch below
     }
   } catch (const std::exception& e) {
+    // Drop the packet, do NOT banAddress. MINX delivers a MINX_MESSAGE to us once
+    // the sender spent a valid spassword, but that ticket is a GLOBAL anti-spam
+    // token (minx spendPassword is a set-erase, not address-bound), so the source
+    // address is NOT authenticated -- an attacker holding any ticket can spoof a
+    // victim's IP in a malformed packet and get the victim banned. Banning here is
+    // a spoofable censorship vector. Flood protection is MINX's job (spam filter,
+    // PoW gate, non-handshaked-packet limits); a single bad packet just drops.
     LOGTRACE << "malformed packet" << VAR(e.what());
-    minx_->banAddress(addr.address());
     return;
   }
 }
@@ -4681,8 +4693,10 @@ void CesServer::incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
 
 void CesServer::incomingInfo(const SockAddr& addr, const MinxInfo& /* msg */) {
   checkPause();
+  // A server does not expect to RECEIVE a MinxInfo (servers send them, clients
+  // receive them). Drop it; do NOT banAddress -- the source is not
+  // address-authenticated, so a ban is spoofable (see incomingMessage's catch).
   LOGTRACE << "got MinxInfo" << VAR(addr);
-  minx_->banAddress(addr.address());
 }
 
 bool CesServer::delegateProveWork(const SockAddr& addr,
@@ -4821,7 +4835,8 @@ void CesServer::incomingApplication(const SockAddr& addr, const uint8_t code,
     });
     return;
   }
-  minx_->banAddress(addr.address());
+  // Unknown application code: drop silently (per the app_code_t contract). No
+  // banAddress -- the source address is not authenticated (see incomingMessage).
 }
 
 void CesServer::reply(const SockAddr& addr, const MinxMessage& msg) {

@@ -138,6 +138,26 @@ struct WebAdminFix {
 
 BOOST_FIXTURE_TEST_SUITE(WebAdminTests, WebAdminFix)
 
+// Regression for review finding A9-1: the dashboard has NO auth, so a
+// non-loopback bind must be refused unless explicitly overridden. Before the
+// fix, listen() only warned and bound (returned true). The refusal returns
+// before installing any sinks, so it does not disturb the fixture's dashboard.
+// 0.0.0.0 is bindable, so a false result here can only come from the guard.
+BOOST_AUTO_TEST_CASE(RefusesNonLoopbackBindWithoutOverride) {
+  // Drive a live io so the WebAdmin destructor's posted teardown completes
+  // instead of blocking on its bounded 2 s wait. (Per-case fixture: this WebAdmin
+  // is on this case's own server, so it does not disturb other cases.)
+  boost::asio::io_context io2;
+  auto work = boost::asio::make_work_guard(io2);
+  std::thread t([&]{ io2.run(); });
+  {
+    ces::WebAdmin w(io2, *server);
+    BOOST_TEST(w.listen("0.0.0.0", 0, /*allowPublic=*/false) == false);
+  }
+  io2.stop();
+  t.join();
+}
+
 BOOST_AUTO_TEST_CASE(ServesDashboardHtml) {
   auto r = httpReq(port, "GET", "/");
   BOOST_CHECK_EQUAL(r.status, 200);

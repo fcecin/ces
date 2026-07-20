@@ -251,6 +251,10 @@ struct CesConfig {
   // proxy can repoint it, and gets a warning if it isn't a loopback IP.
   uint16_t webPort = 0;
   std::string webBind = DEFAULT_WEB_BIND;
+  // The web dashboard has NO authentication (see webadmin.h). Binding it to a
+  // non-loopback address is refused unless this is explicitly set true -- the
+  // operator must acknowledge exposing a no-auth credit/debit surface.
+  bool webAllowPublic = false;
 
   // Dedicated MINX/RUDP port for the SYS_RPC syscall. This is a SECOND
   // Minx instance bound to a separate UDP port, held
@@ -2036,12 +2040,28 @@ private:
   // Currently negligible (strand handlers do microseconds of real work). If a
   // profiler flags it, pool-allocate handler frames via
   // boost::asio::associated_allocator<Handler> rather than adding it now.
+  // Logs a logic-handler exception (definition in server.cpp, where the log
+  // macros live). noexcept: it is called from a catch and must not re-throw.
+  void onLogicHandlerThrew(const char* what) noexcept;
+
   template <class F>
   void postLogic(F&& f) {
     boost::asio::post(logicStrand_,
       [this, fn = std::forward<F>(f)]() mutable {
         auto t0 = std::chrono::steady_clock::now();
-        fn();
+        // A logic handler must never let an exception escape: it would unwind the
+        // strand out to runGuardedThread, which re-enters run() with no rollback
+        // and no context. Catch, log, and drop the op; the strand keeps serving.
+        // Ledger mutations are validate-then-mutate and the VM/hook path
+        // self-reverts via its undo log, so a caught throw does not leave the
+        // committed ledger inconsistent on the paths that mutate after validation.
+        try {
+          fn();
+        } catch (const std::exception& e) {
+          onLogicHandlerThrew(e.what());
+        } catch (...) {
+          onLogicHandlerThrew(nullptr);
+        }
         auto dt = std::chrono::steady_clock::now() - t0;
         l1cpuGauge_.record(static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count()));

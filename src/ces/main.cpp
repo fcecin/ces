@@ -411,6 +411,7 @@ int main(int argc, char* argv[]) {
   std::string optAdminSocket;
   uint16_t optWebPort = 0;
   std::string optWebBind = DEFAULT_WEB_BIND;
+  bool optWebAllowPublic = false;
   uint16_t optRpcPort = 0;
   uint32_t optRpcMaxPending        = DEFAULT_RPC_MAX_PENDING;
   uint64_t optRpcMaxRequestBytes   = DEFAULT_RPC_MAX_REQUEST_BYTES;
@@ -582,6 +583,9 @@ int main(int argc, char* argv[]) {
     app.add_option("--webbind", optWebBind,
       "Web dashboard bind address (loopback by design)")
       ->default_val(DEFAULT_WEB_BIND);
+    app.add_flag("--web-allow-public", optWebAllowPublic,
+      "Permit a non-loopback web_bind despite the dashboard having no auth "
+      "(exposes a credit/debit surface; off by default)");
     app.add_option("--rpcport", optRpcPort,
       "Dedicated MINX/RUDP UDP port for the SYS_RPC syscall "
       "(0 = disabled)")->default_val("0");
@@ -825,6 +829,7 @@ int main(int argc, char* argv[]) {
       applyIfDefault("admin_socket", optAdminSocket, "--adminsocket");
       applyIfDefault("web_port", optWebPort, "--webport");
       applyIfDefault("web_bind", optWebBind, "--webbind");
+      applyIfDefault("web_allow_public", optWebAllowPublic, "--web-allow-public");
       applyIfDefault("rpc_port", optRpcPort, "--rpcport");
       applyIfDefault("rpc_max_pending", optRpcMaxPending, "--rpcmaxpending");
       applyIfDefault("rpc_max_request_bytes", optRpcMaxRequestBytes, "--rpcmaxreqbytes");
@@ -1070,6 +1075,7 @@ int main(int argc, char* argv[]) {
   config.adminSocket = optAdminSocket;
   config.webPort = optWebPort;
   config.webBind = optWebBind;
+  config.webAllowPublic = optWebAllowPublic;
   config.rpcPort = optRpcPort;
   config.rpcMaxPending        = optRpcMaxPending;
   config.rpcMaxRequestBytes   = static_cast<size_t>(optRpcMaxRequestBytes);
@@ -1299,7 +1305,7 @@ int main(int argc, char* argv[]) {
   std::vector<std::thread> webThreads;
   if (config.webPort != 0) {
     webadmin = std::make_unique<ces::WebAdmin>(webIO, *server);
-    if (webadmin->listen(config.webBind, config.webPort)) {
+    if (webadmin->listen(config.webBind, config.webPort, config.webAllowPublic)) {
       // A small pool, not one thread: the dashboard's ledger reads block the
       // serving thread on a logicStrand_ hop, and a browser polls several
       // endpoints concurrently — a single thread stalls (dashboard "flicker")

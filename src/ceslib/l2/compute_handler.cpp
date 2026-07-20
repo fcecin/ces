@@ -939,9 +939,8 @@ void fundingWorker(std::shared_ptr<Instance> inst, uint16_t corr,
 //   [1B privileged][32B server_secret][8B start_time_us BE][u32 BE src_len][src bytes]
 // - server_secret: the server's own ed25519 private half, sent ONLY to a /s/
 //   (operator-write-only) instance on an ed25519 server; 32 zero bytes otherwise.
-//   Lets a trusted extension run as a hyle validator under the server identity
-//   (ces.server_secret()). /s/ already signs as the server via ces.serverSign, so
-//   this crosses no new trust boundary.
+//   Consumed in-process by ces.hyle.net.start to run as a hyle validator under
+//   the server identity; the raw key is never surfaced to the Lua sandbox.
 // - privileged: 1 for an operator /s/ program (server-deployed, runs under the
 //   server identity), 0 otherwise. Gates operator-only API like ces.log so an
 //   untrusted user program can't reach it.

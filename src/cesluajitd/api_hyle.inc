@@ -277,7 +277,7 @@ int lua_ces_hyle_running(lua_State* L) {
 
 // ---------------------------------------------------------------------------
 // Lifecycle (net): a real multi-node chain. The validator identity is the SERVER key
-// (ces.server_secret), and consensus rides the CES server peer mesh (ces.peer.*), addressed by
+// (read in-process from g_server_secret), and consensus rides the CES server peer mesh (ces.peer.*), addressed by
 // server pubkey. The driver mirrors morphe's Driver::tick (pump/advance/idle-debounced timeout);
 // the extension calls net.tick() on a fine ces.every. No dialing: the peer mesh is already there.
 // ---------------------------------------------------------------------------
