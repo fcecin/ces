@@ -120,6 +120,12 @@ std::deque<Frame> g_gossip_q;    // pending GOSSIP_IN frames (drained by run())
 std::deque<Frame> g_peer_q;      // pending PEER_MSG_IN frames (drained by run())
 std::deque<Frame> g_l2call_q;    // pending L2_CALL_IN frames (drained by run())
 
+// Optional C++ interceptor for inbound peer-mesh messages, set by the hyle net
+// lifecycle so its consensus frames feed the Runtime directly, not a Lua listener.
+// Returns true if it consumed the message. Null when no net chain runs.
+bool (*g_peer_msg_hook)(const uint8_t* from32, const std::string& service,
+                        const uint8_t* payload, size_t plen) = nullptr;
+
 // Cooperative I/O scheduler state (single-threaded: only the IPC thread that
 // runs run()/the main chunk touches these). A coroutine that calls a host
 // round-trip from inside the event loop parks here instead of spinning in

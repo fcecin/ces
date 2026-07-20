@@ -19,11 +19,11 @@
 // linked, so these calls drive a hyle::services::Runtime DIRECTLY, no host IPC. In-RAM only:
 // stop() (or the process dying) drops the chain.
 //
-// IDENTITY. The chain's sole validator is derived from this program's own 32-byte secret,
-// and both CES and hyle derive ed25519 the same way, so ces.hyle.self() == ces.program_pubkey():
-// one key, two ledgers. The program's CES account and its chain account are the same 32 bytes,
-// and so are any user's. That is what lets a payment on one side authorize a mint on the other
-// with no mapping table.
+// IDENTITY. A node's validator identity is its OWN CES ed25519 identity, chosen by topology: on
+// solo it is the program key, so ces.hyle.self() == ces.program_pubkey(); on net it is the SERVER
+// key (the peer-mesh identity). Both are one key across two ledgers -- the CES account and the
+// chain account are the same 32 bytes -- which lets a payment on one side authorize a mint on the
+// other with no mapping table. self()/self_secret()/op.* all report and sign as hyle_active_key().
 //
 // Surface (drives extensions/hylesolo.lua; see apps/hylesolo in cesdk for the source):
 //   solo lifecycle
@@ -146,6 +146,15 @@ static hyle::KeyPair hyle_program_key() {
   return hyle::KeyPair::from_secret(secret);
 }
 
+// The active node identity: the running chain's validator key -- the program key on solo, the
+// server key on net (both a node's own CES identity, per topology) -- or the program key before
+// any chain starts. self()/self_secret()/op.* sign and report as this, so the same code moves
+// from solo to net unchanged.
+static hyle::KeyPair hyle_active_key() {
+  if (g_hyle_key) return *g_hyle_key;
+  return hyle_program_key();
+}
+
 // Every interface call needs a chain. Returns false having pushed (nil, reason).
 static bool hyle_need_node(lua_State* L) {
   if (g_hyle_node) return true;
@@ -169,6 +178,31 @@ static hyle::wire::Bytes hyle_entry_dest(const hyle::wire::Bytes& name) {
   return b;
 }
 
+// The genesis economy + consensus-rule fields, read from the start{} table. Shared by the solo
+// and net lifecycles: the economy is part of the chain definition and must match across nodes.
+// Validators and allocations differ per lifecycle and are set by the caller.
+static void hyle_fill_config(lua_State* L, hyle::services::Config& c) {
+  // With rent on, hyle checks rip_bounty <= min(fee_transfer, fee_entry) -- a bounty worth more
+  // than the fee to create a rippable entry is a pump that mints money out of the cull.
+  c.fee_transfer = hyle_cfg_u64(L, "fee_transfer", 10);
+  c.fee_entry    = hyle_cfg_u64(L, "fee_entry", 10);
+  c.fee_sudo     = hyle_cfg_u64(L, "fee_sudo", 1);
+  // At rate 0 an entry is immortal: its balance buys nothing and nothing can cull it.
+  c.rent_rate    = hyle_cfg_u64(L, "rent_rate", 1);
+  c.rip_bounty   = hyle_cfg_u64(L, "rip_bounty", 10);
+  // A pending sudo proposal past this age cannot execute and is cleared. 0 = never expires.
+  c.sudo_ttl_secs = hyle_cfg_u64(L, "sudo_ttl_secs", 0);
+  // Consensus rules (validator-set bounds, max block payload): part of the chain definition.
+  c.member_cap      = static_cast<unsigned>(hyle_cfg_u64(L, "member_cap", 21));
+  c.member_floor    = static_cast<unsigned>(hyle_cfg_u64(L, "member_floor", 1));
+  c.max_value_bytes = hyle_cfg_u64(L, "max_value_bytes", 4u << 20);
+  // Hard cap on total state RAM in bytes (0 = unbounded).
+  c.max_state_bytes = hyle_cfg_u64(L, "max_state_bytes", 0);
+  // Per-block credit autofill: tops each validator toward the ceiling (0 = off).
+  c.credit_autofill_ceiling = hyle_cfg_u64(L, "credit_autofill_ceiling", 0);
+  c.refill_rate             = hyle_cfg_u64(L, "refill_rate", 0);
+}
+
 // ---------------------------------------------------------------------------
 // Lifecycle (solo)
 // ---------------------------------------------------------------------------
@@ -189,23 +223,7 @@ int lua_ces_hyle_start(lua_State* L) {
   g.chain_id = g_hyle_chain;
   g.validators = { g_hyle_key->pub };
   g.allocations = { { g_hyle_key->pub, hyle_cfg_u64(L, "alloc", 1000000000ull) } };
-  // With rent on, hyle checks rip_bounty <= min(fee_transfer, fee_entry) -- a bounty worth
-  // more than the fee to create a rippable entry is a pump that mints money out of the cull.
-  g.config.fee_transfer = hyle_cfg_u64(L, "fee_transfer", 10);
-  g.config.fee_entry    = hyle_cfg_u64(L, "fee_entry", 10);
-  g.config.fee_sudo     = hyle_cfg_u64(L, "fee_sudo", 1);
-  // At rate 0 an entry is immortal: its balance buys nothing and nothing can cull it.
-  g.config.rent_rate    = hyle_cfg_u64(L, "rent_rate", 1);
-  g.config.rip_bounty   = hyle_cfg_u64(L, "rip_bounty", 10);
-  // A pending sudo proposal past this age cannot execute and is cleared. 0 = never expires.
-  g.config.sudo_ttl_secs = hyle_cfg_u64(L, "sudo_ttl_secs", 0);
-  // Consensus rules (validator-set bounds, max block payload): part of the chain definition.
-  g.config.member_cap      = static_cast<unsigned>(hyle_cfg_u64(L, "member_cap", 21));
-  g.config.member_floor    = static_cast<unsigned>(hyle_cfg_u64(L, "member_floor", 1));
-  g.config.max_value_bytes = hyle_cfg_u64(L, "max_value_bytes", 4u << 20);
-  // Per-block credit autofill: tops each validator toward the ceiling (0 = off).
-  g.config.credit_autofill_ceiling = hyle_cfg_u64(L, "credit_autofill_ceiling", 0);
-  g.config.refill_rate             = hyle_cfg_u64(L, "refill_rate", 0);
+  hyle_fill_config(L, g.config);
 
   std::string err;
   if (!g.validate(err)) {
@@ -258,6 +276,274 @@ int lua_ces_hyle_running(lua_State* L) {
 }
 
 // ---------------------------------------------------------------------------
+// Lifecycle (net): a real multi-node chain. The validator identity is the SERVER key
+// (ces.server_secret), and consensus rides the CES server peer mesh (ces.peer.*), addressed by
+// server pubkey. The driver mirrors morphe's Driver::tick (pump/advance/idle-debounced timeout);
+// the extension calls net.tick() on a fine ces.every. No dialing: the peer mesh is already there.
+// ---------------------------------------------------------------------------
+
+// Bridges hyle's Transport to the CES peer mesh. send/broadcast frame [u8 type][u8 ch][payload]
+// into a ces.peer.send; inbound frames (via the drain_peer hook) feed on_recv and, for consensus,
+// re-flood one hop to defeat equivocation. Addresses peers by CES server pubkey.
+struct CesPeerTransport : hyle::services::Transport {
+  std::string service;                    // "hyle/" + chain_id
+  std::vector<hyle::PubKey> peers;        // the OTHER validators (server pubkeys)
+  std::deque<uint64_t> seenOrder;
+  std::unordered_set<uint64_t> seen;
+  static constexpr size_t kSeenCap = 8192;
+
+  void frameTo(const hyle::PubKey& dest, uint8_t type, uint8_t ch,
+               const uint8_t* payload, size_t plen) {
+    std::vector<uint8_t> body;
+    body.reserve(32 + 2 + service.size() + 2 + plen);
+    body.insert(body.end(), dest.begin(), dest.end());
+    put_u16(body, static_cast<uint16_t>(service.size()));
+    body.insert(body.end(), service.begin(), service.end());
+    body.push_back(type);
+    body.push_back(ch);
+    if (plen) body.insert(body.end(), payload, payload + plen);
+    write_frame(TAG_PEER_MSG_OUT, 0, body.data(), body.size());
+  }
+  void send(const hyle::PubKey& dest, hyle::services::MsgType type,
+            hyle::services::Channel ch, hyle::wire::View payload) override {
+    frameTo(dest, static_cast<uint8_t>(type), static_cast<uint8_t>(ch),
+            payload.data(), payload.size());
+  }
+  void broadcast(hyle::services::MsgType type, hyle::services::Channel ch,
+                 hyle::wire::View payload) override {
+    for (const auto& p : peers)
+      frameTo(p, static_cast<uint8_t>(type), static_cast<uint8_t>(ch),
+              payload.data(), payload.size());
+  }
+  size_t peer_count() const override { return peers.size(); }
+  // Bulk pieces are sized to this. Kept small (64 KiB): a small piece drains fast and backs up
+  // little in the send buffer, yet dwarfs the per-frame framing and 1241-byte RUDP packet overhead.
+  // The peer mesh size-routes anything this large onto its bulk channel, off the consensus one.
+  size_t max_message() const override { return 64 * 1024; }
+
+  bool markSeen(const uint8_t* inner, size_t len) {
+    const hyle::Hash h = hyle::sha256(hyle::wire::View(inner, len));
+    uint64_t k = 0;
+    for (int i = 0; i < 8; ++i) k = (k << 8) | h[i];
+    if (!seen.insert(k).second) return false;
+    seenOrder.push_back(k);
+    if (seenOrder.size() > kSeenCap) { seen.erase(seenOrder.front()); seenOrder.pop_front(); }
+    return true;
+  }
+
+  // Inbound from drain_peer; `data` = inner frame [u8 type][u8 ch][payload]. Returns true iff a
+  // FRESH consensus/prop message was delivered (drives the timeout clock; Tx and dups return false
+  // so a mempool stream or a re-flood storm cannot starve a needed timeout).
+  //
+  // Dedup gates the re-flood and the timeout clock, never local delivery of consensus or sync
+  // frames. The engine's liveness rebroadcasts are byte-identical, and a node whose engine lost
+  // its first copy (rebuilt by catch-up) can only recover the round's votes from a re-delivery;
+  // sync control and the streamed bulk pieces are point-to-point, never re-flooded, and retried.
+  bool onInbound(const hyle::PubKey& from, const uint8_t* data, size_t len) {
+    if (len < 2) return false;
+    const auto type = static_cast<hyle::services::MsgType>(data[0]);
+    using MT = hyle::services::MsgType;
+    const bool sync = (type == MT::ValueReq || type == MT::SnapReq || type == MT::SnapResp ||
+                       type == MT::BulkChunk);
+    const bool consensus = (type == MT::Consensus || type == MT::Prop);
+    const bool fresh = sync || markSeen(data, len);
+    if (!fresh && !consensus) return false;
+    hyle::wire::View pl(data + 2, len - 2);
+    if (on_recv) on_recv(from, type, pl);
+    if (consensus && fresh)
+      for (const auto& p : peers)
+        if (!(p == from)) frameTo(p, data[0], data[1], data + 2, len - 2);
+    return consensus && fresh;
+  }
+};
+
+static std::unique_ptr<CesPeerTransport> g_hyle_net_tp;
+static std::chrono::steady_clock::time_point g_hyle_net_last_commit{};
+static std::chrono::steady_clock::time_point g_hyle_net_last_progress{};
+static std::chrono::steady_clock::time_point g_hyle_net_last_regossip{};
+static std::chrono::steady_clock::time_point g_hyle_net_last_syncreq{};
+static uint64_t g_hyle_net_last_h = 0;
+static uint64_t g_hyle_net_pace_ms = 1000;
+// Deliver one pending consensus timeout after this many ms with NO consensus activity. Paced on
+// wall time, not tick count: net.tick rides a cooperative ces.every whose cadence sags under load,
+// so a tick-count debounce (morphe's) stretches to seconds and stalls rounds. The clock resets on
+// any fresh inbound consensus/prop message (see the peer hook), so an active round -- even below
+// quorum, votes still trickling -- never times out early; only a genuine stall (silent proposer)
+// fires it. Default is WAN-safe (sub-second RTT keeps the clock reset); tune via conf.
+static uint64_t g_hyle_net_timeout_ms = 1000;
+
+static bool hyleNetDeliverPeer(const uint8_t* from32, const std::string& service,
+                               const uint8_t* payload, size_t plen) {
+  if (!g_hyle_net_tp || service != g_hyle_net_tp->service) return false;
+  hyle::PubKey from{};
+  std::memcpy(from.data(), from32, 32);
+  const bool consensusProgress = g_hyle_net_tp->onInbound(from, payload, plen);
+  if (g_hyle_node) {
+    // Flush any consensus response this message produced right now, event-driven, rather than
+    // waiting for the next timer-due net.tick. drain_peer runs after net.tick in the main loop, so
+    // without this a vote/proposal reply sits in the outbox for up to a full (stretched) timer
+    // period. A fresh consensus message also resets the no-activity timeout clock.
+    g_hyle_node->pump();
+    if (consensusProgress) g_hyle_net_last_progress = std::chrono::steady_clock::now();
+  }
+  return true;
+}
+
+int lua_ces_hyle_net_start(lua_State* L) {
+  luaL_checktype(L, 1, LUA_TTABLE);
+  if (g_hyle_node) { lua_pushnil(L); lua_pushstring(L, "a hyle chain is already running"); return 2; }
+  if (!g_has_server_secret) {
+    lua_pushnil(L);
+    lua_pushstring(L, "server_secret unavailable (need a /s/ extension on an ed25519 server)");
+    return 2;
+  }
+  hyle::PrivKey secret{};
+  std::memcpy(secret.data(), g_server_secret, 32);
+  auto key = std::make_unique<hyle::KeyPair>(hyle::KeyPair::from_secret(secret));
+  // The derived ed25519 pubkey must equal the server's advertised pubkey (owner for /s/): this
+  // both authenticates the secret and rejects a non-ed25519 server key (which has no hyle identity).
+  if (std::memcmp(key->pub.data(), g_owner_pubkey, 32) != 0) {
+    lua_pushnil(L); lua_pushstring(L, "server key is not ed25519 (no hyle identity)"); return 2;
+  }
+
+  lua_getfield(L, 1, "chain_id");
+  g_hyle_chain = lua_isstring(L, -1) ? lua_tostring(L, -1) : "hylenet";
+  lua_pop(L, 1);
+
+  std::vector<hyle::PubKey> vals;
+  lua_getfield(L, 1, "validators");
+  if (lua_istable(L, -1)) {
+    const int n = static_cast<int>(lua_objlen(L, -1));
+    for (int i = 1; i <= n; ++i) {
+      lua_rawgeti(L, -1, i);
+      size_t klen = 0;
+      const char* k = lua_tolstring(L, -1, &klen);
+      if (k && klen == 32) { hyle::PubKey pk{}; std::memcpy(pk.data(), k, 32); vals.push_back(pk); }
+      lua_pop(L, 1);
+    }
+  }
+  lua_pop(L, 1);
+  if (vals.empty()) {
+    lua_pushnil(L); lua_pushstring(L, "validators: need a list of 32-byte server pubkeys"); return 2;
+  }
+  // A node not in the genesis validator set starts as a FOLLOWER: it syncs and awaits promotion
+  // by a governance vote_add. This is how a new validator joins a running chain.
+  hyle::services::Genesis g;
+  g.chain_id = g_hyle_chain;
+  g.validators = vals;
+  hyle_fill_config(L, g.config);
+  std::string err;
+  if (!g.validate(err)) {
+    lua_pushnil(L); lua_pushstring(L, ("hyle genesis invalid: " + err).c_str()); return 2;
+  }
+
+  auto tp = std::make_unique<CesPeerTransport>();
+  tp->service = "hyle/" + g_hyle_chain;
+  for (const auto& v : vals)
+    if (std::memcmp(v.data(), key->pub.data(), 32) != 0) tp->peers.push_back(v);
+  // Register the service so the server routes inbound mesh messages to us (mirrors ces.peer.listen).
+  {
+    std::vector<uint8_t> lb;
+    put_u16(lb, static_cast<uint16_t>(tp->service.size()));
+    lb.insert(lb.end(), tp->service.begin(), tp->service.end());
+    write_frame(TAG_PEER_LISTEN, 0, lb.data(), lb.size());
+  }
+  g_hyle_net_tp = std::move(tp);
+  g_peer_msg_hook = &hyleNetDeliverPeer;
+
+  hyle::services::NodeOptions opts;
+  opts.block_pace_ms     = hyle_cfg_u64(L, "block_pace_ms", 1000);
+  opts.block_retention   = hyle_cfg_u64(L, "block_retention", 1024);
+  opts.snapshot_interval = hyle_cfg_u64(L, "snapshot_interval", 0);
+  opts.mempool_capacity  = static_cast<std::size_t>(hyle_cfg_u64(L, "mempool_capacity", 8192));
+  g_hyle_net_pace_ms = opts.block_pace_ms;
+  g_hyle_net_timeout_ms = hyle_cfg_u64(L, "consensus_timeout_ms", 1000);  // no-activity round timeout
+
+  g_hyle_key = std::move(key);
+  g_hyle_node = std::make_unique<hyle::services::Runtime>(g, *g_hyle_key, opts, g_hyle_net_tp.get());
+  g_hyle_txs = 0;
+  g_hyle_queries = 0;
+  g_hyle_node->app().add_on_commit(
+      [](const hyle::services::CommitEvent& ev) { g_hyle_txs += ev.txs.size(); });
+  g_hyle_node->begin();
+  g_hyle_net_last_h = 0;
+  g_hyle_net_last_commit = std::chrono::steady_clock::now();
+  g_hyle_net_last_progress = g_hyle_net_last_commit;
+  g_hyle_net_last_regossip = g_hyle_net_last_commit;
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+int lua_ces_hyle_net_tick(lua_State* L) {
+  if (!g_hyle_node) { lua_pushnil(L); return 1; }
+  bool prog = g_hyle_node->pump();
+  const bool pending = g_hyle_node->app().mempool().size() > 0;
+  const auto now = std::chrono::steady_clock::now();
+  const bool paced =
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hyle_net_last_commit).count() >=
+      static_cast<long long>(g_hyle_net_pace_ms);
+  if ((pending || paced) && g_hyle_node->advance()) {
+    prog = true;
+    g_hyle_node->pump();  // flush the freshly-started height's proposal this tick, not the next
+  }
+  // Re-gossip pending mempool txs on a modest cadence. submit() broadcasts once and on_message
+  // re-floods a tx only on FRESH receipt, so a tx that missed a peer whose mesh channel was
+  // flapping under load never reaches it -- and unlike consensus (which the engine re-sends on
+  // timeout) tx delivery has no other self-heal. This is that self-heal.
+  if (pending &&
+      std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hyle_net_last_regossip).count() >=
+          1000) {
+    g_hyle_node->regossip();
+    g_hyle_net_last_regossip = now;
+  }
+  // Blocksync: if we have fallen behind the head observed from peers, ask for the missing blocks.
+  // request_sync no-ops at head, so this is cheap; pace it so a long catch-up pulls batch after
+  // batch without flooding.
+  if (std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hyle_net_last_syncreq).count() >=
+      250) {
+    g_hyle_node->request_sync();
+    g_hyle_net_last_syncreq = now;
+  }
+  if (g_hyle_node->height() != g_hyle_net_last_h) {
+    g_hyle_net_last_h = g_hyle_node->height();
+    g_hyle_net_last_commit = now;
+    // Refresh the transport peers from the LIVE validator set so membership changes (add/remove)
+    // route consensus correctly -- a newly added validator starts receiving, a removed one stops.
+    if (g_hyle_net_tp && g_hyle_key) {
+      const auto set = g_hyle_node->node().validators_for(g_hyle_node->height() + 1);
+      g_hyle_net_tp->peers.clear();
+      for (const auto& v : set) {
+        hyle::PubKey pk{};
+        std::memcpy(pk.data(), v.public_key.data(), 32);
+        if (std::memcmp(pk.data(), g_hyle_key->pub.data(), 32) != 0)
+          g_hyle_net_tp->peers.push_back(pk);
+      }
+    }
+  }
+  if (prog) {
+    g_hyle_net_last_progress = now;
+  } else if (std::chrono::duration_cast<std::chrono::milliseconds>(now - g_hyle_net_last_progress)
+                 .count() >= static_cast<long long>(g_hyle_net_timeout_ms)) {
+    g_hyle_node->fire_one_timeout();
+    g_hyle_net_last_progress = now;
+  }
+  lua_pushnumber(L, static_cast<lua_Number>(g_hyle_node->height()));
+  return 1;
+}
+
+int lua_ces_hyle_net_stop(lua_State* L) {
+  g_peer_msg_hook = nullptr;
+  g_hyle_node.reset();
+  g_hyle_key.reset();
+  g_hyle_net_tp.reset();
+  g_hyle_chain.clear();
+  g_hyle_txs = 0;
+  g_hyle_queries = 0;
+  lua_pushboolean(L, 1);
+  return 1;
+}
+
+// ---------------------------------------------------------------------------
 // Reads
 // ---------------------------------------------------------------------------
 
@@ -273,7 +559,7 @@ int lua_ces_hyle_chain_id(lua_State* L) {
 }
 
 int lua_ces_hyle_self(lua_State* L) {
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   lua_pushlstring(L, reinterpret_cast<const char*>(kp.pub.data()), kp.pub.size());
   return 1;
 }
@@ -282,7 +568,7 @@ int lua_ces_hyle_self(lua_State* L) {
 // program must only ever hand it to a caller it has authenticated as the owner. A caller
 // holding it can act as the node from cesh.
 int lua_ces_hyle_self_secret(lua_State* L) {
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   lua_pushlstring(L, reinterpret_cast<const char*>(kp.priv.data()), kp.priv.size());
   return 1;
 }
@@ -485,7 +771,7 @@ static uint64_t hyle_self_seq(lua_State* L, const hyle::PubKey& self) {
 
 static int hyle_push_transfer(lua_State* L, const hyle::wire::Bytes& to, uint64_t amount,
                               bool max) {
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const uint64_t seq = hyle_self_seq(L, kp.pub);
   hyle::services::Decoded d;
   d.transfers.push_back(
@@ -523,7 +809,7 @@ static int hyle_push_entry(lua_State* L, const hyle::services::EntryOp& op) {
 int lua_ces_hyle_op_entry_put(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (!hyle_need_node(L)) return 2;
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
   const hyle::wire::Bytes payload = hyle_fld_bytes(L, "payload");
   return hyle_push_entry(
@@ -535,7 +821,7 @@ int lua_ces_hyle_op_entry_put(lua_State* L) {
 int lua_ces_hyle_op_entry_del(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (!hyle_need_node(L)) return 2;
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
   return hyle_push_entry(L, hyle::services::make_entry_del(kp, hyle_view(name),
                                                          hyle_self_seq(L, kp.pub),
@@ -545,7 +831,7 @@ int lua_ces_hyle_op_entry_del(lua_State* L) {
 int lua_ces_hyle_op_entry_give(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   if (!hyle_need_node(L)) return 2;
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
   return hyle_push_entry(
       L, hyle::services::make_entry_give(kp, hyle_view(name), hyle_self_seq(L, kp.pub),
@@ -559,7 +845,7 @@ int lua_ces_hyle_op_entry_rip(lua_State* L) {
   if (!hyle_need_node(L)) return 2;
   const hyle::wire::Bytes name = hyle_fld_bytes(L, "name");
   hyle::PubKey culler = hyle_fld_key(L, "culler");
-  if (hyle::services::is_mint_sentinel(culler)) culler = hyle_program_key().pub;
+  if (hyle::services::is_mint_sentinel(culler)) culler = hyle_active_key().pub;
   return hyle_push_entry(L, hyle::services::make_entry_rip(hyle_view(name), culler));
 }
 
@@ -658,7 +944,7 @@ int lua_ces_hyle_sudo_propose(lua_State* L) {
   size_t n = 0;
   const char* s = luaL_checklstring(L, 1, &n);
   const hyle::wire::View inner(reinterpret_cast<const uint8_t*>(s), n);
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const uint64_t seq = g_hyle_node->app().sequence(kp.pub);
   const hyle::services::Admit a =
       g_hyle_node->submit(hyle::services::make_sudo_propose(kp, seq, inner, hyle_chain_view()));
@@ -680,7 +966,7 @@ int lua_ces_hyle_sudo_approve(lua_State* L) {
   const char* s = luaL_checklstring(L, 2, &n);
   const hyle::Hash inner_hash =
       hyle::sha256(hyle::wire::View(reinterpret_cast<const uint8_t*>(s), n));
-  const hyle::KeyPair kp = hyle_program_key();
+  const hyle::KeyPair kp = hyle_active_key();
   const uint64_t seq = g_hyle_node->app().sequence(kp.pub);
   const hyle::services::Admit a = g_hyle_node->submit(
       hyle::services::make_sudo_approve(kp, seq, proposer, inner_hash, hyle_chain_view()));
@@ -793,6 +1079,12 @@ void install_ces_hyle_api(lua_State* L) {
   hyle_fn(L, "tick",  guarded<lua_ces_hyle_tick>);
   hyle_fn(L, "stop",  guarded<lua_ces_hyle_stop>);
   lua_setfield(L, -2, "solo");
+
+  lua_newtable(L);  // ces.hyle.net
+  hyle_fn(L, "start", guarded<lua_ces_hyle_net_start>);
+  hyle_fn(L, "tick",  guarded<lua_ces_hyle_net_tick>);
+  hyle_fn(L, "stop",  guarded<lua_ces_hyle_net_stop>);
+  lua_setfield(L, -2, "net");
 
   lua_setfield(L, -2, "hyle");  // ces.hyle = <table>
 }

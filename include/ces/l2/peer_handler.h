@@ -87,6 +87,13 @@ public:
   // Framed [u16 service_len][service][payload]; the far side routes it by
   // service to the extension that registered. No-op if no established link.
   // Runs on rpcTaskIO_ (the compute handler relays a child's ces.peer.send).
+  //
+  // A link keeps two RUDP channels up: small frames ride the control channel,
+  // large ones the bulk channel, so a long download never head-of-line-blocks
+  // consensus. If only one channel is up (the other died or never opened)
+  // everything rides it -- a latency/QoS regression until reconcile regenerates
+  // the missing channel, never a loss of the link. The size split and the
+  // two-channel bookkeeping are internal here; a caller just sends a message.
   void sendMessage(const minx::Hash& destKey, const std::string& service,
                    const uint8_t* data, std::size_t len);
 
@@ -101,11 +108,14 @@ public:
   void reconcileNow();
 
 private:
+  // `bulk` selects which of a link's two channels a per-channel op acts on.
   void teardownLink(std::shared_ptr<PeerLink> link);
-  void establishLink(std::shared_ptr<PeerLink> link);
-  void peerReadLoop(std::shared_ptr<PeerLink> link);
-  void kickWrite(std::shared_ptr<PeerLink> link);
-  void readDialBindReply(std::shared_ptr<PeerLink> link);
+  void closeChannel(std::shared_ptr<PeerLink> link, bool bulk);
+  void establishChannel(std::shared_ptr<PeerLink> link, bool bulk);
+  void channelReadLoop(std::shared_ptr<PeerLink> link, bool bulk);
+  void kickWrite(std::shared_ptr<PeerLink> link, bool bulk);
+  void readDialBindReply(std::shared_ptr<PeerLink> link, bool bulk);
+  void dialChannel(std::shared_ptr<PeerLink> link, bool bulk);
   void dialPeer(const minx::Hash& ckey, const minx::SockAddr& endpoint);
   void reconcileOnce();
   void scheduleReconcile();

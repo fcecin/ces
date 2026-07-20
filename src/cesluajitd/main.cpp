@@ -64,6 +64,7 @@
 #include <map>
 #include <functional>
 #include <set>
+#include <unordered_set>
 #include <thread>
 #include <future>
 #include <memory>
@@ -189,7 +190,8 @@ int main(int argc, char** argv) {
   // Read bootstrap frame. Body layout (must match
   // compute_handler.cpp::sendBootstrapFrame):
   //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
-  //   [32B program_privkey][8B start_time_us BE][u32 BE src_len][src bytes]
+  //   [32B program_privkey][2B client_port][2B rpc_port][1B privileged]
+  //   [32B server_secret][8B start_time_us BE][u32 BE src_len][src bytes]
   Frame bs;
   if (!read_frame(bs) || bs.tag != TAG_BOOTSTRAP) {
     host_log(4, "bad bootstrap frame");
@@ -204,7 +206,8 @@ int main(int argc, char** argv) {
   constexpr size_t kOffPort    = kOffPrivkey + WIRE_KEY_LEN;
   constexpr size_t kOffRpcPort = kOffPort    + sizeof(uint16_t);
   constexpr size_t kOffPriv    = kOffRpcPort + sizeof(uint16_t);
-  constexpr size_t kOffStart   = kOffPriv    + 1;
+  constexpr size_t kOffSrvSec  = kOffPriv    + 1;
+  constexpr size_t kOffStart   = kOffSrvSec  + WIRE_KEY_LEN;
   constexpr size_t kOffSrcLen  = kOffStart   + sizeof(uint64_t);
   constexpr size_t BS_HEADER   = kOffSrcLen  + sizeof(uint32_t);
   if (bs.body.size() < BS_HEADER) {
@@ -218,6 +221,9 @@ int main(int argc, char** argv) {
   g_program_port  = get_u16(bs.body.data() + kOffPort);
   g_rpc_port      = get_u16(bs.body.data() + kOffRpcPort);
   g_privileged    = bs.body[kOffPriv] != 0;
+  std::memcpy(g_server_secret, bs.body.data() + kOffSrvSec, WIRE_KEY_LEN);
+  for (size_t i = 0; i < WIRE_KEY_LEN; ++i)
+    if (g_server_secret[i]) { g_has_server_secret = true; break; }
   g_start_time_us = get_u64(bs.body.data() + kOffStart);
   uint32_t src_len = get_u32(bs.body.data() + kOffSrcLen);
   if (bs.body.size() < BS_HEADER + src_len) {

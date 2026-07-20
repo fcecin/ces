@@ -2,12 +2,18 @@
 //
 // One PeerHandler per CesServer; no process-global state. Owns the link state
 // machine, the reconcile pass, and the service-tagged message bus extensions
-// ride. The lower-pubkey side dials, the higher accepts; on establish the
-// channel is marked persistent (RudpStream::setPersistent) so RUDP's idle GC
-// never closes it (no keepalive; liveness from the peer table). A fresh inbound
-// bind replaces a stale link. sendMessage() frames (service, payload) onto a
-// link; inbound frames route by service tag to the local compute instance
-// that registered for it (computeRoutePeerMsg).
+// ride. The lower-pubkey side dials, the higher accepts.
+//
+// A link keeps TWO RUDP channels to its peer: a control channel and a bulk
+// channel, both bound to /ces/peer/1 and both delivering identical frames to
+// the same service router. Outbound frames are split by SIZE -- small ones ride
+// control, large ones ride bulk -- so a long download never head-of-line-blocks
+// consensus. The two channels are independent RUDP streams, so this is a purely
+// local routing choice: the peers need not agree which channel is which. A link
+// needs only ONE channel up to work; if the other never opens or dies, every
+// frame rides the survivor (a latency/QoS regression, not a lost link) until the
+// reconcile pass regenerates it. On establish each channel is marked persistent
+// (RudpStream::setPersistent) so RUDP's idle GC never closes it.
 
 #include <ces/l2/peer_handler.h>
 #include <ces/buffer.h>
@@ -34,6 +40,7 @@
 #include <future>
 #include <random>
 #include <span>
+#include <vector>
 
 LOG_MODULE("plex");
 
@@ -41,14 +48,23 @@ namespace ces {
 
 namespace {
 
-// Reconcile cadence: dial missing links, drop links whose peer left the table
-// or went unreachable. No keepalive role (channels are persistent).
+// Reconcile cadence: dial missing links, regenerate a link's missing channel,
+// drop links whose peer left the table. No keepalive role (channels persistent).
 constexpr int kReconcileIntervalMs = 15000;
 // Bind-handshake deadline; a dial whose peer never replies is torn down and
 // retried on the next reconcile.
 constexpr int kDialTimeoutSec = 10;
-// Max bytes in one mesh-message frame (after the 4-byte length prefix).
-constexpr uint32_t kMaxPeerFrame = 64 * 1024;
+// Max bytes in one mesh-message frame (after the 4-byte length prefix). Large
+// enough for a bulk sync piece; a degraded single-channel link carries such a
+// piece on the control channel too. Kept well under the RUDP per-channel reorder
+// cap (1 MB) so a fully-reordered frame still reassembles. Server-to-server mesh
+// only, so a trusted bound.
+constexpr uint32_t kMaxPeerFrame = 256 * 1024;
+// Frames larger than this take the bulk channel, smaller ones the control channel.
+// Set just under a full bulk piece (max_message, 64 KiB) so only max-sized chunker
+// pieces leave the control lane; a consensus proposal, even a large one, stays on it.
+// Only a QoS choice: both lanes feed one handler and pieces reassemble by offset.
+constexpr uint32_t kBulkThreshold = 60 * 1024;
 
 uint64_t nowMicros() {
   return static_cast<uint64_t>(
@@ -58,14 +74,12 @@ uint64_t nowMicros() {
 
 }  // namespace
 
-struct PeerLink : std::enable_shared_from_this<PeerLink> {
-  minx::Hash ckey{};                       // remote peer identity
-  minx::SockAddr endpoint;                 // remote plex endpoint (dial only)
+// One physical RUDP channel of a link (control or bulk). A link holds two.
+struct PeerChannel {
   uint32_t channelId = 0;
   std::shared_ptr<minx::RudpStream> stream;
-  bool outbound = false;                   // true = we dialed
   bool established = false;
-  bool closed = false;
+  bool dialing = false;                    // a dial handshake is in flight
   std::array<uint8_t, 8 * 1024> readBuf{};
   ces::Bytes rxBuf;                        // inbound framing accumulator
   std::deque<std::shared_ptr<ces::Bytes>> writeQueue;
@@ -75,6 +89,18 @@ struct PeerLink : std::enable_shared_from_this<PeerLink> {
   std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE> bindReplyBuf{};
   std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> bindReqDigest{};
   std::shared_ptr<boost::asio::steady_timer> dialTimer;
+
+  bool up() const { return established && stream != nullptr; }
+};
+
+struct PeerLink : std::enable_shared_from_this<PeerLink> {
+  minx::Hash ckey{};                       // remote peer identity
+  minx::SockAddr endpoint;                 // remote plex endpoint (dial only)
+  bool outbound = false;                   // true = we dialed (we regenerate channels)
+  bool closed = false;
+  PeerChannel ctrl;                        // small frames
+  PeerChannel bulk;                        // large frames
+  bool anyUp() const { return ctrl.up() || bulk.up(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -111,9 +137,16 @@ PeerHandler::~PeerHandler() { stop(); }
 void PeerHandler::teardownLink(std::shared_ptr<PeerLink> link) {
   if (!link || link->closed) return;
   link->closed = true;
-  if (link->dialTimer) {
-    boost::system::error_code ec;
-    link->dialTimer->cancel(ec);
+  for (PeerChannel* ch : {&link->ctrl, &link->bulk}) {
+    if (ch->dialTimer) {
+      boost::system::error_code ec;
+      ch->dialTimer->cancel(ec);
+      ch->dialTimer.reset();
+    }
+    if (ch->stream) {
+      ch->stream->shutdown(kRudpStreamCloseTimeout);
+      ch->stream.reset();
+    }
   }
   {
     std::lock_guard<std::mutex> lk(linkMutex_);
@@ -121,54 +154,87 @@ void PeerHandler::teardownLink(std::shared_ptr<PeerLink> link) {
   }
   auto it = links_.find(link->ckey);
   if (it != links_.end() && it->second == link) links_.erase(it);
-  if (link->stream) {
-    link->stream->shutdown(kRudpStreamCloseTimeout);
-    link->stream.reset();
-  }
 }
 
-void PeerHandler::establishLink(std::shared_ptr<PeerLink> link) {
+// Close ONE channel of a link. The link survives on the other channel; only when
+// both are down does the link tear down. The dialer regenerates the gap on the
+// next reconcile.
+void PeerHandler::closeChannel(std::shared_ptr<PeerLink> link, bool bulk) {
+  if (!link || link->closed) return;
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  if (ch.dialTimer) {
+    boost::system::error_code ec;
+    ch.dialTimer->cancel(ec);
+    ch.dialTimer.reset();
+  }
+  if (ch.stream) {
+    ch.stream->shutdown(kRudpStreamCloseTimeout);
+    ch.stream.reset();
+  }
+  ch.established = false;
+  ch.dialing = false;
+  ch.writing = false;
+  ch.rxBuf.clear();
+  ch.writeQueue.clear();
+  if (!link->anyUp()) {
+    teardownLink(link);
+    return;
+  }
+  LOGDEBUG << "peer " << (bulk ? "bulk" : "control") << " channel down"
+           << SVAR(minx::hashToString(link->ckey));
+}
+
+void PeerHandler::establishChannel(std::shared_ptr<PeerLink> link, bool bulk) {
   if (link->closed) return;
-  link->established = true;
-  // Exempt from RUDP idle GC: a peer link is long-lived and may be quiet.
-  if (link->stream) link->stream->setPersistent();
-  {
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  const bool wasUp = link->anyUp();
+  ch.established = true;
+  ch.dialing = false;
+  if (ch.dialTimer) {
+    boost::system::error_code ec;
+    ch.dialTimer->cancel(ec);
+    ch.dialTimer.reset();
+  }
+  if (ch.stream) ch.stream->setPersistent();
+  if (!wasUp) {
     std::lock_guard<std::mutex> lk(linkMutex_);
     established_.insert(link->ckey);
   }
-  LOGINFO << "peer-link up" << VAR(link->outbound)
-          << SVAR(minx::hashToString(link->ckey));
-  peerReadLoop(link);
+  LOGINFO << (wasUp ? (bulk ? "peer bulk channel up" : "peer control channel up") : "peer-link up")
+          << VAR(link->outbound) << SVAR(minx::hashToString(link->ckey));
+  channelReadLoop(link, bulk);
 }
 
-void PeerHandler::peerReadLoop(std::shared_ptr<PeerLink> link) {
-  if (link->closed || !link->stream) return;
-  auto stream = link->stream;
+void PeerHandler::channelReadLoop(std::shared_ptr<PeerLink> link, bool bulk) {
+  if (link->closed) return;
+  PeerChannel& setup = bulk ? link->bulk : link->ctrl;
+  if (!setup.stream) return;
+  auto stream = setup.stream;
   stream->async_read_some(
-    boost::asio::buffer(link->readBuf),
-    [this, link](const boost::system::error_code& ec, std::size_t n) {
-      if (ec) { teardownLink(link); return; }
+    boost::asio::buffer(setup.readBuf),
+    [this, link, bulk](const boost::system::error_code& ec, std::size_t n) {
+      if (link->closed) return;
+      PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+      if (ec) { closeChannel(link, bulk); return; }
       if (n > 0) {
-        link->rxBuf.insert(link->rxBuf.end(),
-                           link->readBuf.data(), link->readBuf.data() + n);
+        ch.rxBuf.insert(ch.rxBuf.end(), ch.readBuf.data(), ch.readBuf.data() + n);
       }
       // Frames: [u32 total][u16 service_len][service][payload].
       size_t off = 0;
-      while (link->rxBuf.size() - off >= sizeof(uint32_t)) {
-        uint32_t total = ces::Buffer::peek<uint32_t>(link->rxBuf.data() + off);
+      while (ch.rxBuf.size() - off >= sizeof(uint32_t)) {
+        uint32_t total = ces::Buffer::peek<uint32_t>(ch.rxBuf.data() + off);
         if (total < sizeof(uint16_t) || total > kMaxPeerFrame) {
-          teardownLink(link);
+          closeChannel(link, bulk);
           return;
         }
-        if (link->rxBuf.size() - off < sizeof(uint32_t) + total) break;
-        const uint8_t* f = link->rxBuf.data() + off + sizeof(uint32_t);
+        if (ch.rxBuf.size() - off < sizeof(uint32_t) + total) break;
+        const uint8_t* f = ch.rxBuf.data() + off + sizeof(uint32_t);
         uint16_t slen = ces::Buffer::peek<uint16_t>(f);
         if (sizeof(uint16_t) + static_cast<uint32_t>(slen) > total) {
-          teardownLink(link);
+          closeChannel(link, bulk);
           return;
         }
-        std::string service(reinterpret_cast<const char*>(f + sizeof(uint16_t)),
-                            slen);
+        std::string service(reinterpret_cast<const char*>(f + sizeof(uint16_t)), slen);
         const uint8_t* payload = f + sizeof(uint16_t) + slen;
         size_t plen = total - sizeof(uint16_t) - slen;
         if (ComputeHandler* h = server_->computeHandler())
@@ -177,109 +243,124 @@ void PeerHandler::peerReadLoop(std::shared_ptr<PeerLink> link) {
         off += sizeof(uint32_t) + total;
       }
       if (off > 0) {
-        link->rxBuf.erase(link->rxBuf.begin(), link->rxBuf.begin() + off);
+        ch.rxBuf.erase(ch.rxBuf.begin(), ch.rxBuf.begin() + off);
       }
-      peerReadLoop(link);
+      channelReadLoop(link, bulk);
     });
 }
 
-void PeerHandler::kickWrite(std::shared_ptr<PeerLink> link) {
-  if (link->writing || link->writeQueue.empty() || link->closed
-      || !link->stream) {
-    return;
-  }
-  link->writing = true;
-  auto head = link->writeQueue.front();
-  auto stream = link->stream;
+void PeerHandler::kickWrite(std::shared_ptr<PeerLink> link, bool bulk) {
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  if (ch.writing || ch.writeQueue.empty() || link->closed || !ch.stream) return;
+  ch.writing = true;
+  auto head = ch.writeQueue.front();
+  auto stream = ch.stream;
   boost::asio::async_write(
     *stream, boost::asio::buffer(*head),
-    [this, link, head](const boost::system::error_code& ec, std::size_t) {
-      link->writing = false;
-      if (!link->writeQueue.empty()) link->writeQueue.pop_front();
-      if (ec) { teardownLink(link); return; }
-      kickWrite(link);
+    [this, link, bulk, head](const boost::system::error_code& ec, std::size_t) {
+      if (link->closed) return;
+      PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+      ch.writing = false;
+      if (!ch.writeQueue.empty()) ch.writeQueue.pop_front();
+      if (ec) { closeChannel(link, bulk); return; }
+      kickWrite(link, bulk);
     });
 }
 
-void PeerHandler::readDialBindReply(std::shared_ptr<PeerLink> link) {
-  auto stream = link->stream;
+void PeerHandler::readDialBindReply(std::shared_ptr<PeerLink> link, bool bulk) {
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  auto stream = ch.stream;
   boost::asio::async_read(
-    *stream, boost::asio::buffer(link->bindReplyBuf),
-    [this, link](const boost::system::error_code& ec, std::size_t) {
-      if (ec) { teardownLink(link); return; }
+    *stream, boost::asio::buffer(ch.bindReplyBuf),
+    [this, link, bulk](const boost::system::error_code& ec, std::size_t) {
+      if (link->closed) return;
+      PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+      if (ec) { closeChannel(link, bulk); return; }
       auto r = ces::parseBindReply(
         std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-          link->bindReplyBuf.data(), link->bindReplyBuf.size()));
-      if (r.status != ces::CES_PLEX_OK) { teardownLink(link); return; }
+          ch.bindReplyBuf.data(), ch.bindReplyBuf.size()));
+      if (r.status != ces::CES_PLEX_OK) { closeChannel(link, bulk); return; }
       if (!ces::verifyBindReply(
-            r, std::span<const uint8_t>(link->bindReqDigest.data(),
-                                        link->bindReqDigest.size()))) {
-        teardownLink(link);
+            r, std::span<const uint8_t>(ch.bindReqDigest.data(),
+                                        ch.bindReqDigest.size()))) {
+        closeChannel(link, bulk);
         return;
       }
       if (std::memcmp(r.serverPubkey.data(), link->ckey.data(),
                       link->ckey.size()) != 0) {
-        teardownLink(link);  // misroute / MITM
+        closeChannel(link, bulk);  // misroute / MITM
         return;
       }
-      if (link->dialTimer) {
-        boost::system::error_code ec2;
-        link->dialTimer->cancel(ec2);
-      }
-      establishLink(link);
+      establishChannel(link, bulk);
+      // Once control is up, open the bulk channel for QoS. Bulk failing later is
+      // harmless -- reconcile retries and the link runs degraded meanwhile.
+      if (!bulk && link->outbound && !link->bulk.up() && !link->bulk.dialing)
+        dialChannel(link, /*bulk=*/true);
     });
 }
 
-void PeerHandler::dialPeer(const minx::Hash& ckey,
-                           const minx::SockAddr& endpoint) {
-  if (links_.count(ckey)) return;  // already linked or dialing
+void PeerHandler::dialChannel(std::shared_ptr<PeerLink> link, bool bulk) {
+  if (link->closed) return;
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  if (ch.up() || ch.dialing) return;
   minx::Rudp* rudp = server_->_rpcRudp();
   if (!rudp) return;
   auto exec = server_->_rpcTaskIOExecutor();
   if (!exec) return;
 
-  auto link = std::make_shared<PeerLink>();
-  link->ckey = ckey;
-  link->endpoint = endpoint;
-  link->outbound = true;
+  ch.dialing = true;
   std::random_device rd;
-  link->channelId = static_cast<uint32_t>(rd());
-  link->stream = std::make_shared<minx::RudpStream>(exec);
-  links_[ckey] = link;  // reserve so reconcile won't redial
+  ch.channelId = static_cast<uint32_t>(rd());
+  ch.stream = std::make_shared<minx::RudpStream>(exec);
 
   rudp->tick(nowMicros());
-  if (!rudp->registerChannel(endpoint, link->channelId, link->stream)) {
-    teardownLink(link);
+  if (!rudp->registerChannel(link->endpoint, ch.channelId, ch.stream)) {
+    closeChannel(link, bulk);
     return;
   }
 
-  link->dialTimer = std::make_shared<boost::asio::steady_timer>(exec);
-  link->dialTimer->expires_after(std::chrono::seconds(kDialTimeoutSec));
+  ch.dialTimer = std::make_shared<boost::asio::steady_timer>(exec);
+  ch.dialTimer->expires_after(std::chrono::seconds(kDialTimeoutSec));
   std::weak_ptr<PeerLink> wl = link;
-  link->dialTimer->async_wait([this, wl](const boost::system::error_code& ec) {
+  ch.dialTimer->async_wait([this, wl, bulk](const boost::system::error_code& ec) {
     if (ec) return;
-    if (auto l = wl.lock()) if (!l->established) teardownLink(l);
+    if (auto l = wl.lock()) {
+      PeerChannel& c = bulk ? l->bulk : l->ctrl;
+      if (!c.up()) closeChannel(l, bulk);
+    }
   });
 
   const uint64_t now = nowMicros();
-  link->bindReqBuf = ces::buildBindRequest(
+  ch.bindReqBuf = ces::buildBindRequest(
     CES_PEER_PROTO, now, server_->_serverKeyPair());
   {
     const auto& pkArr = server_->_serverKeyPair().getPublicKeyAsHash();
     std::span<const uint8_t> nameSpan(
       reinterpret_cast<const uint8_t*>(CES_PEER_PROTO),
       std::strlen(CES_PEER_PROTO));
-    link->bindReqDigest = ces::computeBindRequestDigest(
+    ch.bindReqDigest = ces::computeBindRequestDigest(
       nameSpan, now,
       std::span<const uint8_t>(pkArr.data(), pkArr.size()));
   }
-  auto stream = link->stream;
+  auto stream = ch.stream;
   boost::asio::async_write(
-    *stream, boost::asio::buffer(link->bindReqBuf),
-    [this, link](const boost::system::error_code& ec, std::size_t) {
-      if (ec) { teardownLink(link); return; }
-      readDialBindReply(link);
+    *stream, boost::asio::buffer(ch.bindReqBuf),
+    [this, link, bulk](const boost::system::error_code& ec, std::size_t) {
+      if (link->closed) return;
+      if (ec) { closeChannel(link, bulk); return; }
+      readDialBindReply(link, bulk);
     });
+}
+
+void PeerHandler::dialPeer(const minx::Hash& ckey,
+                           const minx::SockAddr& endpoint) {
+  if (links_.count(ckey)) return;  // already linked or dialing
+  auto link = std::make_shared<PeerLink>();
+  link->ckey = ckey;
+  link->endpoint = endpoint;
+  link->outbound = true;
+  links_[ckey] = link;  // reserve so reconcile won't redial
+  dialChannel(link, /*bulk=*/false);  // control first; bulk follows on establish
 }
 
 void PeerHandler::reconcileOnce() {
@@ -297,6 +378,17 @@ void PeerHandler::reconcileOnce() {
     for (const auto& p : peers) {
       if (p.ckey == ck && p.dialable) { dialPeer(ck, p.endpoint); break; }
     }
+  }
+  // Regenerate a missing channel on our outbound links (control died, or the
+  // bulk channel never opened / dropped). Snapshot first: dialing can teardown.
+  std::vector<std::shared_ptr<PeerLink>> outbound;
+  for (const auto& [k, link] : links_)
+    if (!link->closed && link->outbound) outbound.push_back(link);
+  for (const auto& link : outbound) {
+    if (link->closed) continue;
+    if (!link->ctrl.up() && !link->ctrl.dialing) dialChannel(link, /*bulk=*/false);
+    if (link->anyUp() && !link->bulk.up() && !link->bulk.dialing)
+      dialChannel(link, /*bulk=*/true);
   }
 }
 
@@ -316,26 +408,43 @@ void PeerHandler::scheduleReconcile() {
 void PeerHandler::serve(std::shared_ptr<minx::RudpStream> stream,
                         BoundChannelContext bound) {
   minx::Hash ckey = bound.boundPubkey.getHash();
-  // Every server speaks /ces/peer/1 (it is a builtin), so the bind always
-  // succeeds; the mesh is peer-only, so a binder that is not in our peer
-  // table is refused HERE in the handler (accept, then close) rather than
-  // with a bind-handshake NACK.
+  // Every server speaks /ces/peer/1 (a builtin), so the bind always succeeds;
+  // the mesh is peer-only, so a binder not in our peer table is refused HERE.
   if (!server_->_isPeerByKey(ckey)) {
     stream->shutdown(kRudpStreamCloseTimeout);
     return;
   }
-  auto existing = links_.find(ckey);
-  if (existing != links_.end()) {
-    // Fresh inbound bind from a peer we hold a link to => that link is stale
-    // (the peer restarted / re-dialed). Replace it.
-    teardownLink(existing->second);
+  std::shared_ptr<PeerLink> link;
+  bool bulk = false;
+  auto it = links_.find(ckey);
+  if (it != links_.end() && !it->second->closed) {
+    link = it->second;
+    if (!link->ctrl.up()) {
+      bulk = false;             // (re)fill the control slot
+    } else if (!link->bulk.up()) {
+      bulk = true;              // fill the bulk slot
+    } else {
+      // Both channels already up: a fresh bind means the peer restarted /
+      // re-dialed. Replace the link and take this as its new control channel.
+      teardownLink(link);
+      link.reset();
+    }
   }
-  auto link = std::make_shared<PeerLink>();
-  link->ckey = ckey;
-  link->stream = std::move(stream);
-  link->outbound = false;
-  links_[ckey] = link;
-  establishLink(link);
+  if (!link) {
+    link = std::make_shared<PeerLink>();
+    link->ckey = ckey;
+    link->outbound = false;
+    links_[ckey] = link;
+    bulk = false;
+  }
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+  if (ch.stream) {  // drop a stale half-open stream in this slot
+    ch.stream->shutdown(kRudpStreamCloseTimeout);
+    ch.stream.reset();
+  }
+  ch.stream = std::move(stream);
+  ch.channelId = 0;  // inbound; the id is the dialer's, not tracked here
+  establishChannel(link, bulk);
 }
 
 void PeerHandler::start() {
@@ -344,7 +453,8 @@ void PeerHandler::start() {
   if (!exec) return;
   reconcileTimer_ = std::make_shared<boost::asio::steady_timer>(exec);
   boost::asio::post(exec, [this]() {
-    if (running_.load()) reconcileOnce();
+    if (!running_.load()) return;
+    reconcileOnce();
     scheduleReconcile();
   });
 }
@@ -358,13 +468,15 @@ void PeerHandler::stop() {
   }
   for (auto& [k, link] : links_) {
     link->closed = true;
-    if (link->dialTimer) {
-      boost::system::error_code ec;
-      link->dialTimer->cancel(ec);
-    }
-    if (link->stream) {
-      link->stream->shutdown(kRudpStreamCloseTimeout);
-      link->stream.reset();
+    for (PeerChannel* ch : {&link->ctrl, &link->bulk}) {
+      if (ch->dialTimer) {
+        boost::system::error_code ec;
+        ch->dialTimer->cancel(ec);
+      }
+      if (ch->stream) {
+        ch->stream->shutdown(kRudpStreamCloseTimeout);
+        ch->stream.reset();
+      }
     }
   }
   links_.clear();
@@ -381,7 +493,7 @@ bool PeerHandler::isLinked(const minx::Hash& ckey) {
 
 bool PeerHandler::hasLink(const minx::Hash& destKey) {
   auto it = links_.find(destKey);
-  return it != links_.end() && it->second->established && !it->second->closed;
+  return it != links_.end() && !it->second->closed && it->second->anyUp();
 }
 
 void PeerHandler::reconcileNow() {
@@ -401,19 +513,29 @@ void PeerHandler::sendMessage(const minx::Hash& destKey,
   auto it = links_.find(destKey);
   if (it == links_.end()) return;
   auto link = it->second;
-  if (!link->established || link->closed || !link->stream) return;
+  if (link->closed || !link->anyUp()) return;
   if (service.size() > 0xFFFF) return;
   uint32_t total =
     static_cast<uint32_t>(sizeof(uint16_t) + service.size() + len);
   if (total > kMaxPeerFrame) return;
+
+  // Prefer the size-appropriate channel; fall back to the survivor when only one
+  // is up (degraded latency, still delivered).
+  const bool big = total > kBulkThreshold;
+  bool bulk;
+  if ((big ? link->bulk : link->ctrl).up()) bulk = big;
+  else if ((big ? link->ctrl : link->bulk).up()) bulk = !big;
+  else return;
+
+  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
   auto frame = std::make_shared<ces::Bytes>();
   frame->reserve(sizeof(uint32_t) + total);
   ces::Buffer::put<uint32_t>(*frame, total);
   ces::Buffer::put<uint16_t>(*frame, static_cast<uint16_t>(service.size()));
   frame->insert(frame->end(), service.begin(), service.end());
   if (len > 0) frame->insert(frame->end(), data, data + len);
-  link->writeQueue.push_back(frame);
-  kickWrite(link);
+  ch.writeQueue.push_back(frame);
+  kickWrite(link, bulk);
 }
 
 } // namespace ces

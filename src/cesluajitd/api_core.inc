@@ -36,6 +36,14 @@ uint16_t g_rpc_port = 0;
 // it never re-derives privilege. Gates operator-only API such as ces.log.
 bool g_privileged = false;
 
+// The server's own ed25519 secret, delivered in the bootstrap ONLY to a /s/
+// (operator-write-only) instance on an ed25519 server; zero otherwise. Surfaced
+// via ces.server_secret() so a trusted extension can run as a hyle validator
+// signing with the server identity. /s/ already signs as the server via
+// ces.serverSign, so this exposes no capability the zone did not already have.
+uint8_t g_server_secret[32] = {0};
+bool g_has_server_secret = false;
+
 // ---------------------------------------------------------------------------
 // /ces/luarpc/1 — the protocol this lua host SERVES (and, later, dials) on
 // its rpc port. A raw, opaque byte pipe: whatever bytes arrive are handed to
@@ -644,6 +652,19 @@ int lua_ces_prog_prefix(lua_State* L) {
 // /s/ programs see the server's pubkey here (their "house key").
 int lua_ces_owner_pubkey(lua_State* L) {
   lua_pushlstring(L, reinterpret_cast<const char*>(g_owner_pubkey), 32);
+  return 1;
+}
+
+// ces.server_secret() → string(32) | nil,err — the server's ed25519 secret, only
+// on a /s/ extension whose server key is ed25519 (see g_server_secret). Lets the
+// extension run as a hyle validator under the server identity.
+int lua_ces_server_secret(lua_State* L) {
+  if (!g_privileged || !g_has_server_secret) {
+    lua_pushnil(L);
+    lua_pushstring(L, "server_secret: only a /s/ extension on an ed25519 server");
+    return 2;
+  }
+  lua_pushlstring(L, reinterpret_cast<const char*>(g_server_secret), 32);
   return 1;
 }
 

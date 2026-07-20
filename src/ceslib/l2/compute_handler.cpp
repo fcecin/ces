@@ -936,7 +936,12 @@ void fundingWorker(std::shared_ptr<Instance> inst, uint16_t corr,
 // Send the bootstrap frame at LAUNCH time. Body layout:
 //   [8B prog_prefix][32B owner_pubkey][32B program_pubkey]
 //   [32B program_privkey][2B client_port BE][2B rpc_port BE]
-//   [1B privileged][8B start_time_us BE][u32 BE src_len][src bytes]
+//   [1B privileged][32B server_secret][8B start_time_us BE][u32 BE src_len][src bytes]
+// - server_secret: the server's own ed25519 private half, sent ONLY to a /s/
+//   (operator-write-only) instance on an ed25519 server; 32 zero bytes otherwise.
+//   Lets a trusted extension run as a hyle validator under the server identity
+//   (ces.server_secret()). /s/ already signs as the server via ces.serverSign, so
+//   this crosses no new trust boundary.
 // - privileged: 1 for an operator /s/ program (server-deployed, runs under the
 //   server identity), 0 otherwise. Gates operator-only API like ces.log so an
 //   untrusted user program can't reach it.
@@ -967,7 +972,7 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
   ces::Bytes body;
   body.reserve(sizeof(inst->progPrefix) + sizeof(inst->ownerPk)
                + sizeof(inst->programPubkey) + sizeof(inst->programPrivkey)
-               + sizeof(uint16_t) + sizeof(uint16_t) + 1 + sizeof(uint64_t)
+               + sizeof(uint16_t) + sizeof(uint16_t) + 1 + 32 + sizeof(uint64_t)
                + sizeof(uint32_t) + srcLen);
   body.insert(body.end(),
               inst->progPrefix.begin(), inst->progPrefix.end());
@@ -980,6 +985,15 @@ void sendBootstrapFrame(std::shared_ptr<Instance> inst,
   ces::Buffer::put<uint16_t>(body, inst->clientPort);
   ces::Buffer::put<uint16_t>(body, inst->rpcPort);
   body.push_back(isServerZone(inst->sourceName) ? 1 : 0);
+  {
+    std::array<uint8_t, 32> ssec{};
+    if (isServerZone(inst->sourceName) && inst->owner->server_ &&
+        inst->owner->server_->_serverKeyPair().getAlgorithm() == ces::KeyAlgo::ED25519) {
+      const minx::Hash& sk = inst->owner->server_->_serverKeyPair().getPrivateKey();
+      std::memcpy(ssec.data(), sk.data(), 32);
+    }
+    body.insert(body.end(), ssec.begin(), ssec.end());
+  }
   ces::Buffer::put<uint64_t>(body, inst->startedAtUs);
   ces::Buffer::put<uint32_t>(body, static_cast<uint32_t>(srcLen));
   if (srcLen > 0)

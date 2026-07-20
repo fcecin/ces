@@ -135,7 +135,9 @@ constexpr size_t   DEFAULT_RPC_MAX_RESPONSE_BYTES    = 64 * 1024;
 constexpr uint32_t DEFAULT_RPC_RESPONSE_TIMEOUT_MS   = 30000;
 constexpr uint32_t DEFAULT_RPC_RUDP_BYTES_PER_SECOND = 0xFFFFFFFFu;
 constexpr uint32_t DEFAULT_RPC_RUDP_BURST_BYTES      = 0xFFFFFFFFu;
-constexpr size_t   DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER = 2;
+// builtin:peer keeps two channels per peer link (control + bulk); a reconnect
+// briefly overlaps old and new channels, so allow headroom above 2.
+constexpr size_t   DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER = 8;
 constexpr int64_t  DEFAULT_RPC_RUDP_MAX_REORDER_BYTES = -1;   // -1 = library default
 constexpr int64_t  DEFAULT_RPC_RUDP_MAX_REORDER_MSGS  = -1;   // -1 = library default
 constexpr uint32_t DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS = 60;

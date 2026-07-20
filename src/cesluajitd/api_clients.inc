@@ -715,6 +715,7 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_client_send>);   lua_setfield(L, -2, "client_send");
   lua_pushcfunction(L, guarded<lua_ces_prog_prefix>);   lua_setfield(L, -2, "prog_prefix");
   lua_pushcfunction(L, guarded<lua_ces_owner_pubkey>);  lua_setfield(L, -2, "owner_pubkey");
+  lua_pushcfunction(L, guarded<lua_ces_server_secret>); lua_setfield(L, -2, "server_secret");
   lua_pushcfunction(L, guarded<lua_ces_program_pubkey>);lua_setfield(L, -2, "program_pubkey");
   lua_pushcfunction(L, guarded<lua_ces_rpc_port>);      lua_setfield(L, -2, "rpc_port");
   lua_pushcfunction(L, guarded<lua_ces_start_time>);    lua_setfield(L, -2, "start_time");

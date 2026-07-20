@@ -485,6 +485,9 @@ static void drain_peer(lua_State* mainL) {
     if (f.body.size() < payOff + plen) continue;
     std::string service(reinterpret_cast<const char*>(b + svcOff), slen);
 
+    // A C++ rider (hyle net consensus) may claim this service and consume the frame.
+    if (g_peer_msg_hook && g_peer_msg_hook(b, service, b + payOff, plen)) continue;
+
     lua_getfield(mainL, LUA_REGISTRYINDEX, kRegPeerListeners);  // [tbl?]
     if (!lua_istable(mainL, -1)) { lua_pop(mainL, 1); continue; }
     lua_getfield(mainL, -1, service.c_str());                   // [tbl, fn?]
