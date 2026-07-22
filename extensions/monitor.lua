@@ -16,19 +16,18 @@ end
 __mods["cesdk.manifest"] = function() return { name = "monitor", version = "0.1.0", protocols = {  } } end
 
 __mods["main"] = function()
--- monitor - a public, read-only web dashboard for this CES server, served
--- through cesweb (the /i/ scope). Each HTTP GET renders a fresh snapshot: server
--- stats (when ces.server_info is available) plus the peer table. No WebSocket
--- and no polling; the browser refreshes to re-query. All data is public.
+-- monitor - a public, read-only web dashboard for this CES server. Each HTTP GET
+-- renders a fresh snapshot as static HTML: server stats (when ces.server_info is
+-- available) plus the peer table. No JavaScript, no CSS, no WebSocket, no polling.
+-- All data is public. Refresh to re-query.
 
 local web = require("web")
-local json = require("json")
 local snapshot = require("snapshot")
 local dash = require("dash")
 
 web.serve{
   on_request = function(_req)
-    return web.html(dash.page(json.encode(snapshot.gather())))
+    return web.html(dash.page(snapshot.gather()))
   end,
 }
 
@@ -232,58 +231,6 @@ return M
 
 end
 
-__mods["json"] = function()
--- json.lua - minimal JSON encoder. Encode only: a program builds tables and
--- ships them to a browser, which parses natively. No decoder (nothing on the
--- server needs to read JSON). Arrays are contiguous 1..n integer-keyed tables;
--- everything else is an object.
-
-local M = {}
-
-local ESC = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r',
-              ['\t'] = '\\t', ['\b'] = '\\b', ['\f'] = '\\f' }
-local function esc(s)
-  return (s:gsub('[%z\1-\31\\"]', function(c)
-    return ESC[c] or string.format('\\u%04x', c:byte())
-  end))
-end
-
-local function is_array(t)
-  local n = 0
-  for k in pairs(t) do
-    if type(k) ~= "number" then return false end
-    n = n + 1
-  end
-  return n == #t
-end
-
-local function encode(v)
-  local t = type(v)
-  if t == "nil" then return "null"
-  elseif t == "boolean" then return v and "true" or "false"
-  elseif t == "number" then
-    if v ~= v or v == math.huge or v == -math.huge then return "null" end
-    return string.format("%.14g", v)
-  elseif t == "string" then return '"' .. esc(v) .. '"'
-  elseif t == "table" then
-    local out = {}
-    if is_array(v) then
-      for i = 1, #v do out[i] = encode(v[i]) end
-      return "[" .. table.concat(out, ",") .. "]"
-    end
-    for k, val in pairs(v) do
-      out[#out + 1] = '"' .. esc(tostring(k)) .. '":' .. encode(val)
-    end
-    return "{" .. table.concat(out, ",") .. "}"
-  end
-  return "null"
-end
-
-M.encode = encode
-return M
-
-end
-
 __mods["snapshot"] = function()
 -- snapshot.lua - gather a public, read-only view of this CES server. Every field
 -- is already publicly readable: the peer table is an unsigned public read, the
@@ -332,89 +279,91 @@ return M
 end
 
 __mods["dash"] = function()
--- dash.lua - the snapshot dashboard page. The server embeds the current state as
--- a JS object and the script renders it once, on load: stat cards and a peer
--- table. No canvas, no WebSocket, no polling; the refresh button re-queries.
--- Wide/ultrawide cards give large counts room (like the web admin overview).
+-- dash.lua - the snapshot dashboard page, rendered server-side as static HTML.
+-- The server fills every value before sending: no embedded JSON, no script, no
+-- author CSS. A plain HTML table renders identically in any browser, including a
+-- no-JavaScript client. Refresh re-queries; the page holds no state.
 
 local M = {}
 
-function M.page(data_json)
-  data_json = (data_json or "{}"):gsub("</", "<\\/")   -- keep embedded data from closing the script
-  local out = ([==[<!doctype html>
-<html lang=en><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<title>CES server monitor</title>
-<style>
-  :root{color-scheme:dark}
-  html,body{margin:0;background:#0d0f14;color:#e6e9ef;font:14px/1.5 system-ui,sans-serif}
-  #wrap{max-width:900px;margin:0 auto;padding:1.2rem 1rem 3rem}
-  .bar{display:flex;align-items:center;justify-content:space-between}
-  h1{font-size:1.15rem;font-weight:650;margin:.2rem 0}
-  button{background:#1f6feb;color:#fff;border:0;border-radius:8px;padding:.45rem .9rem;font:inherit;cursor:pointer}
-  .sub{color:#8b93a3;font-size:.85rem;margin:.3rem 0;word-break:break-all}
-  .hello{color:#c9cedb;margin:.2rem 0 1rem}
-  .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));grid-auto-flow:dense;gap:.6rem;margin:1rem 0}
-  .card{background:#161a22;border:1px solid #232833;border-radius:10px;padding:.7rem .8rem;min-width:0}
-  .card.wide{grid-column:span 2}
-  .card.ultrawide{grid-column:span 4}
-  .card .v{font-size:1.4rem;font-weight:650;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-  .card .l{color:#8b93a3;font-size:.74rem;text-transform:uppercase;letter-spacing:.04em}
-  table.peers{width:100%;border-collapse:collapse;font-size:.82rem;margin-top:1rem}
-  table.peers th{text-align:left;color:#8b93a3;font-weight:600;padding:.3rem .5rem;border-bottom:1px solid #232833}
-  table.peers td{padding:.25rem .5rem;font-variant-numeric:tabular-nums}
-  table.peers .keyrow td{padding-top:.55rem;word-break:break-all}
-  table.peers .datarow td{color:#8b93a3;border-bottom:1px solid #1c2029;padding-bottom:.55rem}
-  .dot{display:inline-block;width:.6em;height:.6em;border-radius:50%;margin-right:.35em;vertical-align:middle}
-  code{background:#ffffff10;padding:.05em .3em;border-radius:4px}
-</style>
-<div id=wrap>
-  <div class=bar><h1>CES server monitor</h1><button onclick="location.reload()">refresh</button></div>
-  <div class=sub>server <code id=self></code></div>
-  <div class=sub id=ver></div>
-  <div class=hello id=hello></div>
-  <div class=cards id=cards></div>
-  <table class=peers id=peers></table>
-</div>
-<script>
-const D = __DATA__;
-const S = D.server || {}, MET = D.metrics || {};
-const $ = id => document.getElementById(id);
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-const fmtNum = n => Number(n).toLocaleString('en-US');
-function card(l, v, cls){ return '<div class="card'+(cls?' '+cls:'')+'"><div class=v>'+esc(v)+'</div><div class=l>'+esc(l)+'</div></div>'; }
+local ENT = { ['&'] = '&amp;', ['<'] = '&lt;', ['>'] = '&gt;' }
+local function esc(s) return (tostring(s or ""):gsub('[&<>]', ENT)) end
 
-$('self').textContent = D.self || '?';
-if (S.version) $('ver').textContent = 'version ' + S.version;
-if (S.hello) $('hello').textContent = S.hello;
+-- Group a whole number with thousands commas: 1234567 -> "1,234,567".
+local function commas(n)
+  local s = tostring(math.floor(tonumber(n) or 0))
+  local neg = s:sub(1, 1) == "-"
+  if neg then s = s:sub(2) end
+  local out, c = "", 0
+  for i = #s, 1, -1 do
+    out = s:sub(i, i) .. out
+    c = c + 1
+    if c % 3 == 0 and i > 1 then out = "," .. out end
+  end
+  return (neg and "-" or "") .. out
+end
 
-let c = '';
-if (S.circulating != null)    c += card('circulating (cr)', fmtNum(Math.floor(S.circulating/1e8)), 'ultrawide');
-if (S.accounts != null)       c += card('accounts', fmtNum(S.accounts), 'wide');
-if (S.assets != null)         c += card('assets', fmtNum(S.assets), 'wide');
-if (S.aliases != null)        c += card('aliases', fmtNum(S.aliases), 'wide');
-if (S.tx_count != null)       c += card('transactions', fmtNum(S.tx_count), 'wide');
-if (S.tps != null)            c += card('tps', fmtNum(S.tps));
-if (S.min_difficulty != null) c += card('min diff', S.min_difficulty);
-if (S.fee_tx != null)         c += card('fee tx', fmtNum(S.fee_tx), 'wide');
-if (S.fee_query != null)      c += card('fee query', fmtNum(S.fee_query), 'wide');
-c += card('peers', MET.peers||0) + card('reachable', MET.reachable||0) +
-     card('outbound', MET.outbound||0) + card('inbound', MET.inbound||0);
-$('cards').innerHTML = c;
+local function stat(label, value)
+  return "<tr><td>" .. esc(label) .. "</td><td>" .. esc(value) .. "</td></tr>\n"
+end
 
-const rows = (D.peers||[]).map(function(p){
-  const dir = (p.outbound&&p.inbound)?'both':p.outbound?'out':p.inbound?'in':'-';
-  return '<tr class=keyrow><td colspan=5><span class=dot style="background:'+
-    (p.reachable?'#39d98a':'#6b7280')+'"></span><code>'+esc(p.pubkey||'')+'</code></td></tr>'+
-    '<tr class=datarow><td>'+esc(p.addr||'-')+'</td><td>'+dir+'</td><td>'+esc(p.rpc_port||'-')+
-    '</td><td>'+fmtNum(p.pow_in||0)+'</td><td>'+fmtNum(p.pow_out||0)+'</td></tr>';
-}).join('');
-$('peers').innerHTML = rows
-  ? '<tr><th>address</th><th>dir</th><th>rpc</th><th>reserve in</th><th>reserve out</th></tr>' + rows
-  : '<tr><td class=datarow style="color:#6b7280">no peers</td></tr>';
-</script>
-]==]):gsub("__DATA__", function() return data_json end)
-  return out   -- gsub returns (string, count); return only the string
+function M.page(snap)
+  snap = snap or {}
+  local S = snap.server or {}
+  local MET = snap.metrics or {}
+  local o = {}
+
+  o[#o + 1] = "<!doctype html>\n<html><head><meta charset=utf-8>"
+  o[#o + 1] = "<title>CES server monitor</title></head>\n<body>\n"
+  o[#o + 1] = "<h1>CES server monitor</h1>\n"
+  o[#o + 1] = "<p>server <code>" .. esc(snap.self or "?") .. "</code>"
+  if S.version then o[#o + 1] = " &middot; version " .. esc(S.version) end
+  o[#o + 1] = "</p>\n"
+  if S.hello and S.hello ~= "" then o[#o + 1] = "<p>" .. esc(S.hello) .. "</p>\n" end
+
+  o[#o + 1] = "<h2>server</h2>\n<table border=1 cellpadding=6 cellspacing=0>\n"
+  if S.circulating ~= nil then
+    o[#o + 1] = stat("circulating (cr)", commas(math.floor((tonumber(S.circulating) or 0) / 1e8)))
+  end
+  if S.accounts ~= nil then o[#o + 1] = stat("accounts", commas(S.accounts)) end
+  if S.assets ~= nil then o[#o + 1] = stat("assets", commas(S.assets)) end
+  if S.aliases ~= nil then o[#o + 1] = stat("aliases", commas(S.aliases)) end
+  if S.tx_count ~= nil then o[#o + 1] = stat("transactions", commas(S.tx_count)) end
+  if S.tps ~= nil then o[#o + 1] = stat("tps", commas(S.tps)) end
+  if S.min_difficulty ~= nil then o[#o + 1] = stat("min difficulty", S.min_difficulty) end
+  if S.fee_tx ~= nil then o[#o + 1] = stat("fee tx", commas(S.fee_tx)) end
+  if S.fee_query ~= nil then o[#o + 1] = stat("fee query", commas(S.fee_query)) end
+  o[#o + 1] = stat("peers", commas(MET.peers or 0))
+  o[#o + 1] = stat("reachable", commas(MET.reachable or 0))
+  o[#o + 1] = stat("outbound", commas(MET.outbound or 0))
+  o[#o + 1] = stat("inbound", commas(MET.inbound or 0))
+  o[#o + 1] = "</table>\n"
+
+  o[#o + 1] = "<h2>peers</h2>\n"
+  local peers = snap.peers or {}
+  if #peers == 0 then
+    o[#o + 1] = "<p>no peers</p>\n"
+  else
+    -- Full 64-hex key on its own full-width row, then the data row: keeps the
+    -- key readable without forcing a very wide column.
+    o[#o + 1] = "<table border=1 cellpadding=6 cellspacing=0>\n"
+    o[#o + 1] = "<tr><th>address</th><th>dir</th><th>rpc</th>" ..
+                "<th>reachable</th><th>reserve in</th><th>reserve out</th></tr>\n"
+    for _, p in ipairs(peers) do
+      local dir = (p.outbound and p.inbound) and "both"
+        or (p.outbound and "out") or (p.inbound and "in") or "-"
+      local addr = (p.addr and p.addr ~= "") and p.addr or "-"
+      o[#o + 1] = "<tr><td colspan=6><code>" .. esc(p.pubkey or "") .. "</code></td></tr>\n"
+      o[#o + 1] = "<tr><td>" .. esc(addr) .. "</td><td>" .. dir .. "</td><td>" ..
+        esc(p.rpc_port or "-") .. "</td><td>" .. (p.reachable and "yes" or "no") ..
+        "</td><td>" .. commas(p.pow_in or 0) .. "</td><td>" ..
+        commas(p.pow_out or 0) .. "</td></tr>\n"
+    end
+    o[#o + 1] = "</table>\n"
+  end
+
+  o[#o + 1] = "</body></html>\n"
+  return table.concat(o)
 end
 
 return M
