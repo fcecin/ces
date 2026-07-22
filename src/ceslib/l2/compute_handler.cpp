@@ -242,6 +242,7 @@ constexpr uint16_t kApiMethodBucketGet    = 0x0212;
 // paid by the program's owner account.
 constexpr uint16_t kApiMethodAuthenticAssetCreate = 0x0220;
 constexpr uint16_t kApiMethodPeers        = 0x0230;
+constexpr uint16_t kApiMethodServerInfo   = 0x0239;
 constexpr uint16_t kApiMethodPeerAdd       = 0x0231;
 constexpr uint16_t kApiMethodPeerRemove    = 0x0232;
 constexpr uint16_t kApiMethodPeerTargetSet = 0x0233;
@@ -1804,6 +1805,43 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       // autopeering extension uses to tell a committed peering from a dead one.
       ces::Buffer::put<uint64_t>(body, p.totalInboundPoW);
       ces::Buffer::put<uint64_t>(body, p.totalOutboundPoW);
+    }
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
+  // ces.server_info() -> the server's public stats. A CES server is a public
+  // entity (only its private key is secret), so this is unguarded and read-only.
+  // Generic named-KV reply: u16 nInts, [u16 klen, key, u64 val]*; then u16 nStrs,
+  // [u16 klen, key, u16 vlen, val]*. Adding a stat never touches the Lua parser.
+  if (method == kApiMethodServerInfo) {
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    const CesConfig& c = server->_config();
+    auto st = server->_adminStats();
+    const std::pair<std::string, uint64_t> ints[] = {
+      {"accounts", st.accounts}, {"assets", st.assets}, {"aliases", st.aliases},
+      {"circulating", static_cast<uint64_t>(st.circulating)}, {"tx_count", st.txCount},
+      {"tps", server->getTps()}, {"min_difficulty", c.minDiff},
+      {"fee_tx", c.feeTx}, {"fee_query", c.feeQuery}, {"fee_account", c.feeAccount},
+      {"rpc_port", static_cast<uint64_t>(server->_rpcBoundPort())},
+    };
+    const std::pair<std::string, const std::string*> strs[] = {
+      {"version", &c.version}, {"server_name", &c.serverName},
+    };
+    ces::Bytes body;
+    ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(sizeof(ints) / sizeof(ints[0])));
+    for (const auto& kv : ints) {
+      ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(kv.first.size()));
+      body.insert(body.end(), kv.first.begin(), kv.first.end());
+      ces::Buffer::put<uint64_t>(body, kv.second);
+    }
+    ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(sizeof(strs) / sizeof(strs[0])));
+    for (const auto& kv : strs) {
+      ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(kv.first.size()));
+      body.insert(body.end(), kv.first.begin(), kv.first.end());
+      ces::Buffer::put<uint16_t>(body, static_cast<uint16_t>(kv.second->size()));
+      body.insert(body.end(), kv.second->begin(), kv.second->end());
     }
     sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
     return;

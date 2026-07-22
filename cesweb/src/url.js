@@ -78,3 +78,36 @@ export function parseRequestPath(pathname, defaultCesPort, defaultHost) {
 
   return { kind: 'file', host, cesPort, cesPath };
 }
+
+// Parse a program-browse path:
+//   /i/<host>[-<ces-port>]/<pid>[/<subpath...>]   or   /i/<pid>[/<subpath...>]
+// The second (host-less) form needs CESWEB_DEFAULT_HOST and a numeric first
+// segment. The gateway proxies an HTTP request into the running compute instance
+// <pid> on <host> over /ces/lua/1 (the Lua program speaks HTTP itself). The host
+// lives in the path so the route knows which server hosts the pid - this is the
+// gateway-paid scope (like files), not the user-key /dev scope. A numeric first
+// segment reads as the pid because CES hosts are DNS names, never bare numbers.
+// Returns { host, cesPort, pid, subPath } or null if it is not a prog path.
+// `pid` is a digit string; `subPath` keeps its leading '/' (default '/'), query
+// excluded (the caller appends it).
+export function parseProgPath(pathname, defaultCesPort, defaultHost) {
+  if (pathname !== '/i' && !pathname.startsWith('/i/')) return null;
+  const parts = pathname.slice('/i/'.length).split('/');
+
+  let host, cesPort = defaultCesPort, pid, subParts;
+  if (defaultHost && parts.length >= 1 && /^\d+$/.test(parts[0])) {
+    host = defaultHost; pid = parts[0]; subParts = parts.slice(1);
+  } else if (parts.length >= 2 && /^\d+$/.test(parts[1])) {
+    let selector = parts[0];
+    const m = selector.match(/^(.+)-(\d{1,5})$/);
+    if (m) { selector = m[1]; cesPort = parseInt(m[2], 10); }
+    try { host = decodeURIComponent(selector); } catch { host = selector; }
+    pid = parts[1]; subParts = parts.slice(2);
+  } else {
+    return null;
+  }
+
+  let subPath = '/' + subParts.join('/');
+  try { subPath = decodeURIComponent(subPath); } catch { /* keep raw */ }
+  return { host, cesPort, pid, subPath };
+}

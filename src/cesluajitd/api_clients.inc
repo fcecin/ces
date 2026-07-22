@@ -722,6 +722,7 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_random_bytes>);  lua_setfield(L, -2, "random_bytes");
   lua_pushcfunction(L, guarded<lua_ces_account_read>);  lua_setfield(L, -2, "account_read");
   lua_pushcfunction(L, guarded<lua_ces_peers>);         lua_setfield(L, -2, "peers");
+  lua_pushcfunction(L, guarded<lua_ces_server_info>);   lua_setfield(L, -2, "server_info");
   // Peering CONTROL is operator-only: present solely for privileged (/s/)
   // programs. The supervisor enforces the same gate, so the boundary holds even
   // if the sandbox were bypassed.

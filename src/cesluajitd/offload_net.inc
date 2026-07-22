@@ -900,6 +900,47 @@ int lua_ces_account_read(lua_State* L) {
 //   data the public CES_QUERY_PEER_INFO opcode exposes). This is the P2P
 //   overlay's bootstrap topology: a Lua node discovers its server's peers,
 //   then dials their instances over /ces/luarpc/1.
+// ces.server_info() -> a table of the server's public stats (accounts, assets,
+// aliases, circulating, tx_count, tps, min_difficulty, fee_*, rpc_port, version,
+// server_name). Everything a CES server holds is public except its private key.
+// The reply is a generic named-KV blob, so new stats appear here with no parser
+// change: u16 nInts, [u16 klen, key, u64]*; u16 nStrs, [u16 klen, key, u16 vlen,
+// val]*.
+int lua_ces_server_info(lua_State* L) {
+  std::vector<uint8_t> args;
+  return io_call(L, METHOD_SERVER_INFO, args, [](lua_State* L, const Frame& reply) -> int {
+    if (reply.body.empty() || reply.body[0] != STATUS_OK)
+      return push_file_err(L, reply.body.empty() ? STATUS_INTERNAL : reply.body[0]);
+    const uint8_t* p = reply.body.data() + 1;
+    const uint8_t* end = reply.body.data() + reply.body.size();
+    lua_newtable(L);
+    if (p + 2 > end) return 1;
+    uint16_t ni = get_u16(p); p += 2;
+    for (uint16_t i = 0; i < ni; ++i) {
+      if (p + 2 > end) break;
+      uint16_t kl = get_u16(p); p += 2;
+      if (p + size_t(kl) + 8 > end) break;
+      std::string k(reinterpret_cast<const char*>(p), kl); p += kl;
+      uint64_t v = get_u64(p); p += 8;
+      lua_pushnumber(L, static_cast<lua_Number>(v));
+      lua_setfield(L, -2, k.c_str());
+    }
+    if (p + 2 > end) return 1;
+    uint16_t ns = get_u16(p); p += 2;
+    for (uint16_t i = 0; i < ns; ++i) {
+      if (p + 2 > end) break;
+      uint16_t kl = get_u16(p); p += 2;
+      if (p + size_t(kl) + 2 > end) break;
+      std::string k(reinterpret_cast<const char*>(p), kl); p += kl;
+      uint16_t vl = get_u16(p); p += 2;
+      if (p + size_t(vl) > end) break;
+      lua_pushlstring(L, reinterpret_cast<const char*>(p), vl); p += vl;
+      lua_setfield(L, -2, k.c_str());
+    }
+    return 1;
+  });
+}
+
 int lua_ces_peers(lua_State* L) {
   std::vector<uint8_t> args;  // no arguments
   return io_call(L, METHOD_PEERS, args, [](lua_State* L, const Frame& reply) -> int {

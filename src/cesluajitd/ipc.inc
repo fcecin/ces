@@ -93,6 +93,7 @@ constexpr uint16_t METHOD_REQUEST_FUNDS    = 0x0235;
 constexpr uint16_t METHOD_PEER_GRIEF       = 0x0236;
 constexpr uint16_t METHOD_PEER_BAN         = 0x0237;
 constexpr uint16_t METHOD_SERVER_SIGN      = 0x0238;
+constexpr uint16_t METHOD_SERVER_INFO      = 0x0239;
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;

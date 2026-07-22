@@ -51,35 +51,71 @@ if (argv.includes('keys')) {                 // `keys list -p` -> <priv> (<pub>)
   const pid = [...argv].reverse().find((a) => /^\d+$/.test(a) && a !== '--pubkey') || '?';
   const d = fx.dial || {};
   if (d.fail) fail(d.fail === true ? 'COMPUTE_INSTANCE_NOT_FOUND' : d.fail);
-  const extsign = argv.includes('--extsign');
-  const greet = () => process.stdout.write((d.greeting || `fakecesh dial pid=${pid} ready`) + '\n');
-  let state = extsign ? 'bind' : 'repl';
-  if (!extsign) greet();
-  let buf = '';
-  process.stdin.on('data', (c) => {
-    buf += c.toString();
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).replace(/\r$/, '');
-      buf = buf.slice(nl + 1);
-      if (state === 'bind') {
-        if (!line.startsWith('BIND ')) { process.stdout.write('ERR expected BIND\n'); process.exit(1); }
-        process.stdout.write('TOKEN 12345\n');
-        state = 'attach';
-      } else if (state === 'attach') {
-        if (!line.startsWith('ATTACH ')) { process.stdout.write('ERR expected ATTACH\n'); process.exit(1); }
-        process.stdout.write('READY\n');
-        greet();
-        state = 'repl';
-      } else {
-        const cmd = line.trim();
-        if (cmd === 'help') process.stdout.write('commands: help, echo <x>, quit\n');
-        else if (cmd === 'quit') process.exit(0);
-        else process.stdout.write('echo: ' + cmd + '\n');
+  if (d.http != null) {
+    // HTTP web-server program stand-in: consume the request, answer once, then
+    // close (Connection: close -> the dialer sees EOF). Mirrors a Lua program
+    // that frames HTTP over ces.conn. No --extsign control lines on this path
+    // (the gateway's /i/ route dials on its own wallet, not the user's key).
+    let answered = false, rbuf = '';
+    const answer = () => {
+      if (answered) return; answered = true;
+      process.stdout.write(d.http); process.stdout.end(() => process.exit(0));
+    };
+    process.stdin.on('data', (c) => { rbuf += c.toString('latin1'); if (rbuf.includes('\r\n\r\n')) answer(); });
+    process.stdin.on('end', answer);
+  } else if (d.wsEcho) {
+    // WebSocket program stand-in: read [u32 len][payload] frames off the CesPlex
+    // stream; frame 0 is the handshake (reply hs:<request-line>), then echo each
+    // message as echo:<msg>. Proves framing + handshake context + round-trip.
+    let rx = Buffer.alloc(0), gotHs = false;
+    const send = (str) => {
+      const p = Buffer.from(str, 'utf8'); const h = Buffer.allocUnsafe(4);
+      h.writeUInt32BE(p.length, 0); process.stdout.write(Buffer.concat([h, p]));
+    };
+    process.stdin.on('data', (c) => {
+      rx = Buffer.concat([rx, c]);
+      for (;;) {
+        if (rx.length < 4) break;
+        const len = rx.readUInt32BE(0);
+        if (rx.length < 4 + len) break;
+        const payload = rx.subarray(4, 4 + len).toString('utf8');
+        rx = rx.subarray(4 + len);
+        if (!gotHs) { gotHs = true; send('hs:' + payload.split('\r\n')[0]); }
+        else send('echo:' + payload);
       }
-    }
-  });
-  process.stdin.on('end', () => process.exit(0));
+    });
+    process.stdin.on('end', () => process.exit(0));
+  } else {
+    const extsign = argv.includes('--extsign');
+    const greet = () => process.stdout.write((d.greeting || `fakecesh dial pid=${pid} ready`) + '\n');
+    let state = extsign ? 'bind' : 'repl';
+    if (!extsign) greet();
+    let buf = '';
+    process.stdin.on('data', (c) => {
+      buf += c.toString();
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (state === 'bind') {
+          if (!line.startsWith('BIND ')) { process.stdout.write('ERR expected BIND\n'); process.exit(1); }
+          process.stdout.write('TOKEN 12345\n');
+          state = 'attach';
+        } else if (state === 'attach') {
+          if (!line.startsWith('ATTACH ')) { process.stdout.write('ERR expected ATTACH\n'); process.exit(1); }
+          process.stdout.write('READY\n');
+          greet();
+          state = 'repl';
+        } else {
+          const cmd = line.trim();
+          if (cmd === 'help') process.stdout.write('commands: help, echo <x>, quit\n');
+          else if (cmd === 'quit') process.exit(0);
+          else process.stdout.write('echo: ' + cmd + '\n');
+        }
+      }
+    });
+    process.stdin.on('end', () => process.exit(0));
+  }
 } else if (argv.includes('file')) {
   const verb = argv[argv.indexOf('file') + 1];
   const cesPath = [...argv].reverse().find((a) => a.startsWith('/'));

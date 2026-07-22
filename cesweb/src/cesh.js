@@ -149,3 +149,55 @@ export async function gatewayPubkey(ceshBin, opts) {
   const m = r.stdout.toString('utf8').match(/\(([0-9a-fA-F]{64})\)/);
   return m ? m[1] : null;
 }
+
+// Proxy one HTTP exchange into a running compute instance over /ces/lua/1: spawn
+// `cesh dial <pid>` on the GATEWAY's own wallet (unlike /dev/dial, which uses the
+// user's key via --extsign), write the HTTP request bytes, half-close stdin, and
+// collect the program's HTTP response from stdout until EOF. The program answers
+// with `Connection: close`, so cesh sees the peer close and exits 0. The Lua
+// program IS the web server; cesweb only carries bytes and never parses the
+// grammar on the wire. Returns { ok, code, stdout: Buffer, stderr, truncated }.
+// ok is false on a non-zero exit or an over-cap (truncated) response.
+export function dialHttp(ceshBin, server, rpcPort, serverKey, pid, requestBytes,
+                         opts = {}) {
+  const { walletInline, walletFile, timeoutMs = 15000,
+          maxBytes = 8 * 1024 * 1024 } = opts;
+  return new Promise((resolve) => {
+    const env = { ...process.env };
+    if (walletInline) env.CESH_WALLET = walletInline;
+    const args = [];
+    if (walletFile) args.push('--wallet', walletFile);
+    args.push('dial', String(pid), '--server', server, '--rpc-port', String(rpcPort));
+    if (serverKey) args.push('--server-key', serverKey);
+
+    let child;
+    try { child = spawn(ceshBin, args, { env }); }
+    catch (e) { return resolve({ ok: false, code: -1, stdout: Buffer.alloc(0), stderr: String(e) }); }
+
+    const out = [];
+    let outLen = 0, truncated = false, err = '';
+    const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, timeoutMs);
+    child.stdout.on('data', (d) => {
+      if (truncated) return;
+      if (outLen + d.length > maxBytes) {
+        out.push(d.subarray(0, maxBytes - outLen));
+        outLen = maxBytes; truncated = true;
+        try { child.kill('SIGKILL'); } catch {}
+        return;
+      }
+      out.push(d); outLen += d.length;
+    });
+    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.on('error', (e) => {
+      clearTimeout(timer);
+      resolve({ ok: false, code: -1, stdout: Buffer.concat(out), stderr: String(e), truncated });
+    });
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ ok: code === 0 && !truncated, code: code ?? -1,
+                stdout: Buffer.concat(out), stderr: err, truncated });
+    });
+
+    try { child.stdin.write(requestBytes); child.stdin.end(); } catch {}
+  });
+}

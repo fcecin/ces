@@ -23,6 +23,7 @@ before(async () => {
       '/s/index.html': { bytes: 'catalog', modifiedUs: 1 },
       '/s/blog/index.html': { bytes: '<h1>blog</h1>', modifiedUs: 1 },
     },
+    dial: { http: 'HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nX-From: lua\r\nConnection: close\r\n\r\n<h1>hello from lua</h1>' },
   });
   child = spawn('node', [SERVER], {
     env: {
@@ -155,6 +156,37 @@ test('disallowed host → 403', async () => {
 test('non-zone path → 400', async () => {
   const r = await get('/localhost/notazone');
   assert.equal(r.status, 400);
+});
+
+// Program browse (/i/): the gateway dials the instance on its OWN wallet, sends
+// an HTTP request, and re-emits the program's HTTP response verbatim (minus
+// hop-by-hop headers), never cached. Both the explicit-host and default-host
+// (numeric-first-segment) forms reach the same instance; a disallowed host 403s.
+test('program browse proxies the program HTTP response, uncached', async () => {
+  const r = await fetch(base + '/i/localhost/12345/');
+  assert.equal(r.status, 200);
+  assert.match(r.headers.get('content-type') || '', /text\/html/);
+  assert.equal(r.headers.get('cache-control'), 'no-store');   // live proxy, never cached
+  assert.equal(r.headers.get('x-from'), 'lua');               // program headers pass through
+  assert.equal(await r.text(), '<h1>hello from lua</h1>');
+
+  const r2 = await fetch(base + '/i/12345');                  // default-host form
+  assert.equal(r2.status, 200);
+  assert.equal(await r2.text(), '<h1>hello from lua</h1>');
+
+  const bad = await fetch(base + '/i/evil.com/12345');        // not allow-listed
+  assert.equal(bad.status, 403);
+});
+
+// The /i/ program scope forwards any method + body (unlike the read-only file
+// scope, which is GET/HEAD). A POST reaches the program instead of a 405.
+test('program browse forwards POST with a body', async () => {
+  const r = await fetch(base + '/i/localhost/12345/submit', {
+    method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' },
+    body: 'name=ada&n=42',
+  });
+  assert.equal(r.status, 200);
+  assert.equal(await r.text(), '<h1>hello from lua</h1>');
 });
 
 // The open `/<ces-host>/<path>` form (a browser pointing the gateway at a CES

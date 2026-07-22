@@ -17,11 +17,12 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WebSocketServer } from 'ws';
-import { parseRequestPath, parseDialPath } from './url.js';
+import { parseRequestPath, parseDialPath, parseProgPath } from './url.js';
 import { contentTypeFor } from './mime.js';
-import { gatewayPubkey, queryBalance } from './cesh.js';
+import { gatewayPubkey, queryBalance, dialHttp } from './cesh.js';
 import { Engine, State, fmtBytes } from './engine.js';
 import { TerminalManager } from './term.js';
+import { ProgWsManager } from './progws.js';
 
 const PORT = parseInt(process.env.CESWEB_PORT || '8088', 10);
 const BIND = process.env.CESWEB_BIND || '127.0.0.1';
@@ -69,6 +70,12 @@ const engine = new Engine({
   allowPrivateHosts: process.env.CESWEB_ALLOW_PRIVATE_HOSTS === '1',
 }).start();
 
+// Program browse (/i/): proxy HTTP into a compute instance by pid, on the
+// gateway's own wallet, uncached. Off with CESWEB_PROG_ENABLED=0.
+const PROG_ENABLED = process.env.CESWEB_PROG_ENABLED !== '0';
+const PROG_TIMEOUT_MS = num(process.env.CESWEB_PROG_TIMEOUT_MS, 15000);
+const PROG_MAX_BYTES = num(process.env.CESWEB_PROG_MAX_MB, 8) * MB;
+
 const ZONES = ['/h/', '/f/', '/p/', '/s/'];
 
 // Web terminal: bridges a browser WebSocket to `cesh dial <pid>` into a running
@@ -79,13 +86,23 @@ const terminals = new TerminalManager({
   allowHost: (h) => !ALLOW.length || ALLOW.includes(h),
   log: (...a) => console.error('[term]', ...a),
 });
+
+// Program WebSocket bridge: browser WS <-> gateway-key `cesh dial` into an
+// instance, framed as messages. Same allow-check + resolve as the terminal.
+const progWs = new ProgWsManager({
+  cesh: CESH,
+  resolve: (target) => engine.resolve(target),
+  allowHost: (h) => !ALLOW.length || ALLOW.includes(h),
+  walletOpts,
+  log: (...a) => console.error('[ws]', ...a),
+});
 const wss = new WebSocketServer({ noServer: true });
 
 // A bad request or dropped socket must never take the gateway down.
 process.on('uncaughtException', (e) => console.error('uncaughtException:', e?.stack || e));
 process.on('unhandledRejection', (e) => console.error('unhandledRejection:', e));
-process.on('SIGTERM', () => { terminals.stop(); engine.stop(); process.exit(0); });
-process.on('SIGINT', () => { terminals.stop(); engine.stop(); process.exit(0); });
+process.on('SIGTERM', () => { terminals.stop(); progWs.stop(); engine.stop(); process.exit(0); });
+process.on('SIGINT', () => { terminals.stop(); progWs.stop(); engine.stop(); process.exit(0); });
 
 const clientIp = (req) => {
   const xff = req.headers['x-forwarded-for'];
@@ -477,12 +494,117 @@ at it like a shell &mdash; e.g. the <code>/s/dice</code> game.</p>
 <p class=muted><a href="/">&larr; home</a></p>`);
 }
 
+// --- Program browse (/i/): proxy one HTTP exchange into a compute instance ---
+
+// The HTTP/1.1 request the gateway sends into the instance. The /i/ scope is a
+// program, so any method is forwarded verbatim and a request body (POST/PUT/...)
+// is re-framed with its Content-Type and a trusted Content-Length. Connection:
+// close makes the Lua program answer once and close, giving cesh a clean EOF.
+function buildProgRequest(req, requestTarget, hostHeader, body) {
+  const lines = [
+    `${req.method || 'GET'} ${requestTarget || '/'} HTTP/1.1`,
+    `Host: ${hostHeader}`,
+    'Accept: */*',
+  ];
+  if (body && body.length) {
+    lines.push(`Content-Type: ${req.headers['content-type'] || 'application/octet-stream'}`);
+    lines.push(`Content-Length: ${body.length}`);
+  }
+  lines.push('Connection: close');
+  const head = Buffer.from(lines.join('\r\n') + '\r\n\r\n', 'utf8');
+  return (body && body.length) ? Buffer.concat([head, body]) : head;
+}
+
+// Collect a request body up to a cap. GET/HEAD carry none.
+function readBody(req, cap) {
+  return new Promise((resolve) => {
+    if (req.method === 'GET' || req.method === 'HEAD') return resolve(Buffer.alloc(0));
+    const chunks = []; let len = 0, settled = false;
+    const done = () => { if (!settled) { settled = true; resolve(Buffer.concat(chunks)); } };
+    req.on('data', (d) => {
+      if (len + d.length > cap) { chunks.push(d.subarray(0, cap - len)); len = cap; done(); try { req.destroy(); } catch {} return; }
+      chunks.push(d); len += d.length;
+    });
+    req.on('end', done);
+    req.on('error', done);
+  });
+}
+
+// Re-emit the program's HTTP/1.1 response through the Node response. Hop-by-hop
+// and framing headers are stripped (cesweb sets its own); the whole thing is
+// no-store - this scope is a live proxy, never cached.
+function emitProgResponse(req, res, buf) {
+  const sep = buf.indexOf('\r\n\r\n');
+  if (sep < 0) return sendHtml(res, 502, page('502',
+    '<h1>502</h1><p>the program did not return an HTTP response.</p>'));
+  const head = buf.subarray(0, sep).toString('latin1').split('\r\n');
+  const statusLine = head.shift() || '';
+  const m = statusLine.match(/^HTTP\/1\.[01] +(\d{3})\b/);
+  if (!m) return sendHtml(res, 502, page('502',
+    '<h1>502</h1><p>the program returned a malformed status line.</p>'));
+  const HOP = new Set(['connection', 'keep-alive', 'transfer-encoding',
+    'content-length', 'proxy-connection', 'upgrade', 'te', 'trailer']);
+  const headers = {};
+  for (const line of head) {
+    const i = line.indexOf(':');
+    if (i < 0) continue;
+    const name = line.slice(0, i).trim().toLowerCase();
+    if (!name || HOP.has(name)) continue;
+    headers[name] = line.slice(i + 1).trim();
+  }
+  const body = buf.subarray(sep + 4);
+  headers['content-length'] = String(body.length);
+  headers['cache-control'] = 'no-store';
+  res.writeHead(parseInt(m[1], 10), headers);
+  if (req.method === 'HEAD') return res.end();
+  res.end(body);
+}
+
+async function proxyProgram(req, res, u) {
+  try {
+    const parsed = parseProgPath(u.pathname, DEFAULT_CES_PORT, DEFAULT_HOST);
+    if (!parsed) return sendHtml(res, 404, page('404',
+      '<h1>404</h1><p>Usage: <code>/i/&lt;host&gt;[-port]/&lt;pid&gt;[/path]</code></p>'));
+    const { host, cesPort, pid, subPath } = parsed;
+    if (ALLOW.length && !ALLOW.includes(host)) return sendHtml(res, 403, page('403',
+      `<h1>403</h1><p><code>${esc(host)}</code> is not allowed by this gateway.</p>`));
+
+    const target = `${host}:${cesPort}`;
+    let info;
+    try { info = await engine.resolve(target); }
+    catch (e) { return sendHtml(res, 502, page('502',
+      `<h1>502</h1><p>${esc(String(e?.message || e))}</p>`)); }
+    if (!info || !info.rpcPort) return sendHtml(res, 502, page('502',
+      '<h1>502</h1><p>server has no compute/rpc service.</p>'));
+
+    const body = await readBody(req, PROG_MAX_BYTES);
+    const reqBytes = buildProgRequest(req, subPath + (u.search || ''), host, body);
+    const r = await dialHttp(CESH, target, info.rpcPort, info.serverKey, pid, reqBytes,
+      { ...walletOpts, timeoutMs: PROG_TIMEOUT_MS, maxBytes: PROG_MAX_BYTES });
+    if (!r.ok) return sendHtml(res, 502, page('502',
+      `<h1>502</h1><p>the program did not answer${r.truncated ? ' (response too large)' : ''}.</p>`));
+    return emitProgResponse(req, res, r.stdout);
+  } catch (e) {
+    console.error('proxyProgram error:', e?.stack || e);
+    try { sendHtml(res, 500, page('500', '<h1>500</h1>')); } catch {}
+  }
+}
+
 const httpd = http.createServer((req, res) => {
   try {
+    const u = new URL(req.url, 'http://gateway');
+
+    // The /i/ program scope forwards the whole request (any method, any body) to
+    // the compute instance -- it is a program, not a static file, so it is not
+    // limited to GET/HEAD like the read-only file/dev scopes below.
+    if (PROG_ENABLED && (u.pathname === '/i' || u.pathname.startsWith('/i/'))) {
+      proxyProgram(req, res, u);
+      return;
+    }
+
     if (req.method !== 'GET' && req.method !== 'HEAD') {
       return sendHtml(res, 405, page('405', '<h1>405</h1>'), { allow: 'GET, HEAD' });
     }
-    const u = new URL(req.url, 'http://gateway');
     if (u.pathname === '/status' || u.pathname === '/status/') return sendJson(res, 200, engine.stats());
 
     // Dev tools index.
@@ -537,10 +659,28 @@ const httpd = http.createServer((req, res) => {
 httpd.on('upgrade', (req, socket, head) => {
   let u;
   try { u = new URL(req.url, 'http://gateway'); } catch { return socket.destroy(); }
-  if (u.pathname !== '/dev/dial') return socket.destroy();
-  wss.handleUpgrade(req, socket, head, (ws) => {
-    terminals.handle(ws, { ip: clientIp(req) });
-  });
+
+  // /dev/dial: user-key terminal (target rides the hello frame).
+  if (u.pathname === '/dev/dial') {
+    return wss.handleUpgrade(req, socket, head, (ws) => terminals.handle(ws, { ip: clientIp(req) }));
+  }
+
+  // /i/<host>[-port]/<pid>[/sub]: gateway-key WebSocket into a compute instance.
+  // Same scope as the /i/ HTTP proxy; the program frames messages over CesPlex.
+  if (PROG_ENABLED && (u.pathname === '/i' || u.pathname.startsWith('/i/'))) {
+    const p = parseProgPath(u.pathname, DEFAULT_CES_PORT, DEFAULT_HOST);
+    if (!p) return socket.destroy();
+    if (ALLOW.length && !ALLOW.includes(p.host)) return socket.destroy();
+    const reqTarget = p.subPath + (u.search || '');
+    const hs = [`GET ${reqTarget} HTTP/1.1`, `Host: ${p.host}`];
+    if (req.headers['cookie']) hs.push(`Cookie: ${req.headers['cookie']}`);
+    if (req.headers['sec-websocket-protocol']) hs.push(`Sec-WebSocket-Protocol: ${req.headers['sec-websocket-protocol']}`);
+    const handshake = hs.join('\r\n') + '\r\n\r\n';
+    return wss.handleUpgrade(req, socket, head, (ws) =>
+      progWs.handle(ws, { host: p.host, cesPort: p.cesPort, pid: p.pid, handshake }, { ip: clientIp(req) }));
+  }
+
+  socket.destroy();
 });
 
 httpd.listen(PORT, BIND, async () => {
