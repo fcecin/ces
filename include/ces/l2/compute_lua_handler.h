@@ -56,7 +56,8 @@ private:
                     bool notifyChild);
   void kickConnWrite(std::shared_ptr<LuaConnCtx> ctx);
   void sendAttachReply(std::shared_ptr<LuaConnCtx> ctx, uint8_t status,
-                       uint64_t reqSigHash);
+                       uint64_t reqSigHash,
+                       const std::vector<uint8_t>& hello = {});
   void readAttachVerb(std::shared_ptr<LuaConnCtx> ctx);
   void dataReadLoop(std::shared_ptr<LuaConnCtx> ctx);
 

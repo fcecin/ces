@@ -378,23 +378,41 @@ public:
                 }
                 uint8_t status = (*stBuf)[0];
                 *statusOut = status;
-                const std::size_t okExtra =
-                  (status == CES_OK) ? sizeof(uint64_t) : 0;
-                const std::size_t tailLen =
-                  okExtra + ces::CES_PLEX_RESP_TRAILER_SIZE;
-                auto tail = std::make_shared<ces::Bytes>(tailLen);
+                if (status != CES_OK) {
+                  auto tr = std::make_shared<ces::Bytes>(
+                    ces::CES_PLEX_RESP_TRAILER_SIZE);
+                  boost::asio::async_read(
+                    *strm, boost::asio::buffer(*tr),
+                    [tr, run](const boost::system::error_code& ec3, std::size_t) {
+                      run->set_value(
+                        ec3 ? ("attach read tail: " + ec3.message()) : std::string());
+                    });
+                  return;
+                }
+                // OK preamble: [connId u64][helloLen u32], then [hello][trailer].
+                auto head = std::make_shared<std::array<uint8_t, 12>>();
                 boost::asio::async_read(
-                  *strm, boost::asio::buffer(*tail),
-                  [tail, status, connIdOut, run]
+                  *strm, boost::asio::buffer(*head),
+                  [strm, head, connIdOut, run]
                   (const boost::system::error_code& ec3, std::size_t) {
                     if (ec3) {
-                      run->set_value("attach read tail: " + ec3.message());
+                      run->set_value("attach read head: " + ec3.message());
                       return;
                     }
-                    if (status == CES_OK) {
-                      *connIdOut = ces::Buffer::peek<uint64_t>(tail->data());
-                    }
-                    run->set_value("");
+                    *connIdOut = ces::Buffer::peek<uint64_t>(head->data());
+                    uint32_t helloLen = ces::Buffer::peek<uint32_t>(
+                      std::span<const uint8_t>(head->data(), head->size()), 8);
+                    auto rest = std::make_shared<ces::Bytes>(
+                      static_cast<size_t>(helloLen) +
+                      ces::CES_PLEX_RESP_TRAILER_SIZE);
+                    boost::asio::async_read(
+                      *strm, boost::asio::buffer(*rest),
+                      [rest, run](const boost::system::error_code& ec4,
+                                  std::size_t) {
+                        run->set_value(
+                          ec4 ? ("attach read rest: " + ec4.message())
+                              : std::string());
+                      });
                   });
               });
           });
@@ -511,17 +529,34 @@ public:
               if (ec2) { run->set_value("attach read status: " + ec2.message()); return; }
               uint8_t status = (*stBuf)[0];
               *statusOut = status;
-              const std::size_t okExtra = (status == CES_OK) ? sizeof(uint64_t) : 0;
-              const std::size_t tailLen = okExtra + ces::CES_PLEX_RESP_TRAILER_SIZE;
-              auto tail = std::make_shared<ces::Bytes>(tailLen);
+              if (status != CES_OK) {
+                auto tr = std::make_shared<ces::Bytes>(
+                  ces::CES_PLEX_RESP_TRAILER_SIZE);
+                boost::asio::async_read(
+                  *strm, boost::asio::buffer(*tr),
+                  [tr, run](const boost::system::error_code& ec3, std::size_t) {
+                    run->set_value(
+                      ec3 ? ("attach read tail: " + ec3.message()) : std::string());
+                  });
+                return;
+              }
+              auto head = std::make_shared<std::array<uint8_t, 12>>();
               boost::asio::async_read(
-                *strm, boost::asio::buffer(*tail),
-                [tail, status, connIdOut, run]
+                *strm, boost::asio::buffer(*head),
+                [strm, head, connIdOut, run]
                 (const boost::system::error_code& ec3, std::size_t) {
-                  if (ec3) { run->set_value("attach read tail: " + ec3.message()); return; }
-                  if (status == CES_OK)
-                    *connIdOut = ces::Buffer::peek<uint64_t>(tail->data());
-                  run->set_value("");
+                  if (ec3) { run->set_value("attach read head: " + ec3.message()); return; }
+                  *connIdOut = ces::Buffer::peek<uint64_t>(head->data());
+                  uint32_t helloLen = ces::Buffer::peek<uint32_t>(
+                    std::span<const uint8_t>(head->data(), head->size()), 8);
+                  auto rest = std::make_shared<ces::Bytes>(
+                    static_cast<size_t>(helloLen) + ces::CES_PLEX_RESP_TRAILER_SIZE);
+                  boost::asio::async_read(
+                    *strm, boost::asio::buffer(*rest),
+                    [rest, run](const boost::system::error_code& ec4, std::size_t) {
+                      run->set_value(
+                        ec4 ? ("attach read rest: " + ec4.message()) : std::string());
+                    });
                 });
             });
         });

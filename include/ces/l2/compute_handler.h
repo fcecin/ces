@@ -192,6 +192,8 @@ public:
   bool instanceExists(uint64_t pid);
   // True iff the instance has its accept gate open (ces.conn.set_listener).
   bool instanceAcceptsConnections(uint64_t pid);
+  // The instance's declared greeting (empty if none / request-driven).
+  std::vector<uint8_t> instanceHello(uint64_t pid);
   // Allocate a fresh server-side conn_id and send TAG_CONN_OPENED to the child
   // (with the user's pubkey). Returns the new conn_id, or 0 if the instance
   // is gone before the allocation lands.

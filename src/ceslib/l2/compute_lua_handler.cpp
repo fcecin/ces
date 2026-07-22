@@ -122,10 +122,16 @@ void LuaHandler::kickConnWrite(std::shared_ptr<LuaConnCtx> ctx) {
 
 // Send the ATTACH reply (signed by server). On OK, hands off to DATA mode.
 void LuaHandler::sendAttachReply(std::shared_ptr<LuaConnCtx> ctx,
-                                 uint8_t status, uint64_t reqSigHash) {
+                                 uint8_t status, uint64_t reqSigHash,
+                                 const std::vector<uint8_t>& hello) {
   minx::Bytes preamble;
   if (status == CES_OK) {
     ces::Buffer::put<uint64_t>(preamble, ctx->connId);
+    // Optional server-declared greeting: [u32 len][bytes], inside the signed
+    // preamble. len 0 => request-driven (HTTP-style); len > 0 => the program
+    // speaks first (a terminal-style service), and these are its opening bytes.
+    ces::Buffer::put<uint32_t>(preamble, static_cast<uint32_t>(hello.size()));
+    preamble.insert(preamble.end(), hello.begin(), hello.end());
   }
   auto env = std::make_shared<ces::Bytes>(
     buildPerOpResponse(
@@ -231,7 +237,8 @@ void LuaHandler::readAttachVerb(std::shared_ptr<LuaConnCtx> ctx) {
                   conns_.emplace(ConnKey{pid, connId}, ctx);
                   LOGDEBUG << "builtin:lua attached"
                            << VAR(pid) << VAR(connId);
-                  sendAttachReply(ctx, CES_OK, sigHash);
+                  sendAttachReply(ctx, CES_OK, sigHash,
+                                  ch->instanceHello(pid));
                 });
             });
         });

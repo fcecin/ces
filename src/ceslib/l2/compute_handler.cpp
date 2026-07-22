@@ -427,6 +427,9 @@ struct Instance : std::enable_shared_from_this<Instance> {
   // supervisor calls into it via forward-declared dispatchers when
   // CONN_DATA_OUT / CONN_CLOSE frames arrive from the child.
   bool acceptsConnections = false;
+  // Optional greeting (opening bytes) declared via ces.conn.set_listener{hello};
+  // delivered atomically in each ATTACH reply. Empty = request-driven (HTTP-ish).
+  std::vector<uint8_t> hello;
   uint64_t nextConnId = 1;
 
   // Per-instance rotating bucket caches, surfaced to Lua as
@@ -1109,6 +1112,11 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   // is reserved zero by the child.
   if (tag == kIpcTagListenOn || tag == kIpcTagListenOff) {
     inst->acceptsConnections = (tag == kIpcTagListenOn);
+    // LISTEN_ON payload after the [u8 tag][u16 corr] header is the greeting.
+    if (tag == kIpcTagListenOn && body.size() > 3)
+      inst->hello.assign(body.begin() + 3, body.end());
+    else
+      inst->hello.clear();
     LOGDEBUG << "listener gate"
              << VAR(inst->pid) << VAR(inst->acceptsConnections);
     return;
@@ -3752,6 +3760,12 @@ bool ComputeHandler::instanceAcceptsConnections(uint64_t pid) {
   auto it = instances_.find(pid);
   if (it == instances_.end()) return false;
   return it->second->acceptsConnections;
+}
+
+std::vector<uint8_t> ComputeHandler::instanceHello(uint64_t pid) {
+  auto it = instances_.find(pid);
+  if (it == instances_.end()) return {};
+  return it->second->hello;
 }
 
 uint64_t ComputeHandler::openConnection(uint64_t pid,

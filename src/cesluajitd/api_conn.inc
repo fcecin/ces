@@ -188,8 +188,16 @@ int lua_ces_conn_set_listener(lua_State* L) {
   // Direct transport: flip the gate on + open the endpoint (no-op if no port).
   g_luarpc_listening.store(true, std::memory_order_relaxed);
   luarpc_ensure_endpoint();
-  // Relay transport: tell the supervisor to start accepting ATTACHes.
-  if (!write_frame(TAG_LISTEN_ON, 0, nullptr, 0)) {
+  // Relay transport: tell the supervisor to start accepting ATTACHes, carrying
+  // the optional greeting (table.hello) that rides each ATTACH reply.
+  size_t helloLen = 0;
+  const char* hello = nullptr;
+  lua_getfield(L, 1, "hello");
+  if (lua_isstring(L, -1)) hello = lua_tolstring(L, -1, &helloLen);
+  bool listenOk = write_frame(TAG_LISTEN_ON, 0,
+                              reinterpret_cast<const uint8_t*>(hello), helloLen);
+  lua_pop(L, 1);
+  if (!listenOk) {
     lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
   }
   lua_pushboolean(L, 1);

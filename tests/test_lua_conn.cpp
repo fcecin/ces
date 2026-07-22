@@ -66,6 +66,7 @@ BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
   auto r = peer.attach(userKey, sessionToken, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_CHECK(r.connId > 0);
+  BOOST_CHECK(r.hello.empty());   // request-driven program: no greeting
 
   // Channel is now in DATA mode. Send "ping", expect "ping" back.
   const std::string msg = "ping";
@@ -76,6 +77,33 @@ BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
                               std::chrono::seconds(5)));
   std::string got(echoed.begin(), echoed.end());
   BOOST_CHECK_EQUAL(got, msg);
+}
+
+// A terminal-style program declares a greeting via set_listener{hello}. It
+// rides the ATTACH reply atomically (helloLen > 0), so the client knows the
+// program speaks first without waiting on a timeout.
+BOOST_AUTO_TEST_CASE(HelloRidesAttachReply) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string scriptPath = "/h/" + ownerHex + "/greeter.lua";
+  const std::string src =
+    "ces.conn.set_listener({\n"
+    "  hello = 'CES TERMINAL v1\\n',\n"
+    "  on_data = function(conn, data) conn:write(data) end,\n"
+    "})\n"
+    "ces.conn.run()\n";
+  uploadScript(scriptPath, src);
+  uint64_t instId = launchScript(scriptPath);
+  BOOST_REQUIRE(instId > 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t sessionToken = 0;
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+
+  auto r = peer.attach(userKey, sessionToken, instId);
+  CES_REQUIRE_RC_EQ(r.status, CES_OK);
+  BOOST_CHECK_EQUAL(r.hello, "CES TERMINAL v1\n");
 }
 
 // on_open fires with the bound user pubkey on conn.pubkey. Program

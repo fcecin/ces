@@ -310,6 +310,10 @@ local function on_close(conn)
 end
 
 ces.conn.set_listener({
+  -- Greeting in the ATTACH reply: this program speaks first, so a native
+  -- browser can pick the terminal renderer with no probe/timeout. The full
+  -- banner still streams from on_open for raw (cesh dial) clients.
+  hello    = "  /s/dice: fair-coin double-or-nothing\n",
   on_open  = on_open,
   on_data  = on_data,
   on_close = on_close,

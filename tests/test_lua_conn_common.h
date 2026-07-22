@@ -231,6 +231,7 @@ public:
   struct AttachResult {
     uint8_t status = 0xFF;
     uint64_t connId = 0;
+    std::string hello;   // opening bytes from the ATTACH reply (empty = none)
   };
 
   AttachResult attach(const KeyPair& signer,
@@ -279,20 +280,42 @@ public:
               if (ec2) { finishAttach(done, mu, cv); return; }
               uint8_t status = (*stBuf)[0];
               result->status = status;
-              // Tail: [u64 time][u64 req_sig_hash][32 sha256][65 sig]
-              //       + (8 conn_id only on OK).
-              const std::size_t okExtra = (status == CES_OK) ? 8 : 0;
-              const std::size_t tailLen = okExtra + 8 + 8 + 32 + 65;
-              auto tail = std::make_shared<ces::Bytes>(tailLen);
+              // Trailer: [u64 time][u64 req_sig_hash][32 sha256][65 sig]. On OK
+              // the preamble is [connId u64][helloLen u32][hello]; read the fixed
+              // head, then the hello + trailer.
+              constexpr std::size_t kTrailer = 8 + 8 + 32 + 65;
+              if (status != CES_OK) {
+                auto tr = std::make_shared<ces::Bytes>(kTrailer);
+                boost::asio::async_read(
+                  *stream_, boost::asio::buffer(*tr),
+                  [tr, done, result, mu, cv]
+                  (const boost::system::error_code& ec3, std::size_t) {
+                    (void)tr; (void)result; (void)ec3;
+                    finishAttach(done, mu, cv);
+                  });
+                return;
+              }
+              auto head = std::make_shared<std::array<uint8_t, 12>>();
               boost::asio::async_read(
-                *stream_, boost::asio::buffer(*tail),
-                [tail, status, done, result, mu, cv]
+                *stream_, boost::asio::buffer(*head),
+                [this, head, done, result, mu, cv]
                 (const boost::system::error_code& ec3, std::size_t) {
                   if (ec3) { finishAttach(done, mu, cv); return; }
-                  if (status == CES_OK) {
-                    result->connId = ces::Buffer::peek<uint64_t>(tail->data());
-                  }
-                  finishAttach(done, mu, cv);
+                  result->connId = ces::Buffer::peek<uint64_t>(head->data());
+                  uint32_t helloLen = ces::Buffer::peek<uint32_t>(
+                    std::span<const uint8_t>(head->data(), head->size()), 8);
+                  auto rest = std::make_shared<ces::Bytes>(
+                    static_cast<size_t>(helloLen) + kTrailer);
+                  boost::asio::async_read(
+                    *stream_, boost::asio::buffer(*rest),
+                    [rest, helloLen, done, result, mu, cv]
+                    (const boost::system::error_code& ec4, std::size_t) {
+                      if (ec4) { finishAttach(done, mu, cv); return; }
+                      if (helloLen > 0)
+                        result->hello.assign(rest->begin(),
+                                             rest->begin() + helloLen);
+                      finishAttach(done, mu, cv);
+                    });
                 });
             });
         });
