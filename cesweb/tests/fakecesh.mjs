@@ -59,7 +59,8 @@ if (argv.includes('keys')) {                 // `keys list -p` -> <priv> (<pub>)
     let answered = false, rbuf = '';
     const answer = () => {
       if (answered) return; answered = true;
-      process.stdout.write(d.http); process.stdout.end(() => process.exit(0));
+      const respond = () => { process.stdout.write(d.http); process.stdout.end(() => process.exit(0)); };
+      if (d.httpDelayMs) setTimeout(respond, d.httpDelayMs); else respond();
     };
     process.stdin.on('data', (c) => { rbuf += c.toString('latin1'); if (rbuf.includes('\r\n\r\n')) answer(); });
     process.stdin.on('end', answer);

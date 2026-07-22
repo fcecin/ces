@@ -226,6 +226,19 @@ Dev terminal (`/dev/dial`) bounds:
 - `CESWEB_TERM_INPUT_BPS` (2048) / `CESWEB_TERM_MAX_MSG` (4096) — input rate + frame cap
 - `CESWEB_TERM_MAX_BYTES` (4 MiB) / `CESWEB_TERM_OUT_BUF` (1 MiB) — ceiling + backpressure
 
+Program scope (`/i/<host>/<pid>/...`, HTTP + WebSocket into a compute instance):
+- `CESWEB_PROG_ENABLED` (1): set 0 to disable the /i/ scope.
+- `CESWEB_PROG_TIMEOUT_MS` (15000) / `CESWEB_PROG_MAX_MB` (8): per-request dial
+  timeout and response cap.
+- `CESWEB_PROG_MAX_INFLIGHT` (64) / `CESWEB_PROG_MAX_PER_IP` (8): global and per-IP
+  HTTP concurrency caps. Over the cap: 503 (global) / 429 (per-IP). Each request
+  spawns a `cesh dial`, so this bounds process fan-out and gateway-wallet drain
+  under a flood.
+- `CESWEB_MAX_WS` (64) / `CESWEB_MAX_WS_PER_IP` (16): WebSocket pool caps.
+- `CESWEB_WS_IDLE_MS` (600000) / `CESWEB_WS_MAX_MS` (1800000): WS idle and lifetime.
+- `CESWEB_WS_INPUT_BPS` (65536) / `CESWEB_WS_MAX_MSG` (65536) / `CESWEB_WS_MAX_BYTES`
+  (64 MiB): WS rate and size caps.
+
 ## Layout
 
 ```

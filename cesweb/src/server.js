@@ -75,6 +75,13 @@ const engine = new Engine({
 const PROG_ENABLED = process.env.CESWEB_PROG_ENABLED !== '0';
 const PROG_TIMEOUT_MS = num(process.env.CESWEB_PROG_TIMEOUT_MS, 15000);
 const PROG_MAX_BYTES = num(process.env.CESWEB_PROG_MAX_MB, 8) * MB;
+// Entry-point caps for the /i/ HTTP path (each request spawns a cesh dial): a
+// global in-flight ceiling and a per-source-IP ceiling. A bot hits the per-IP
+// cap; aggregate load hits the global one. The WS path caps itself separately.
+const PROG_MAX_INFLIGHT = num(process.env.CESWEB_PROG_MAX_INFLIGHT, 64);
+const PROG_MAX_PER_IP = num(process.env.CESWEB_PROG_MAX_PER_IP, 8);
+let progInflight = 0;
+const progPerIp = new Map();
 
 const ZONES = ['/h/', '/f/', '/p/', '/s/'];
 
@@ -561,6 +568,13 @@ function emitProgResponse(req, res, buf) {
 }
 
 async function proxyProgram(req, res, u) {
+  const ip = clientIp(req);
+  if (progInflight >= PROG_MAX_INFLIGHT)
+    return sendHtml(res, 503, page('503', '<h1>503</h1><p>gateway busy, try again shortly.</p>'), { 'retry-after': '2' });
+  if ((progPerIp.get(ip) || 0) >= PROG_MAX_PER_IP)
+    return sendHtml(res, 429, page('429', '<h1>429</h1><p>too many requests from your address.</p>'), { 'retry-after': '2' });
+  progInflight++;
+  progPerIp.set(ip, (progPerIp.get(ip) || 0) + 1);
   try {
     const parsed = parseProgPath(u.pathname, DEFAULT_CES_PORT, DEFAULT_HOST);
     if (!parsed) return sendHtml(res, 404, page('404',
@@ -587,6 +601,10 @@ async function proxyProgram(req, res, u) {
   } catch (e) {
     console.error('proxyProgram error:', e?.stack || e);
     try { sendHtml(res, 500, page('500', '<h1>500</h1>')); } catch {}
+  } finally {
+    progInflight--;
+    const n = (progPerIp.get(ip) || 1) - 1;
+    if (n <= 0) progPerIp.delete(ip); else progPerIp.set(ip, n);
   }
 }
 

@@ -189,6 +189,34 @@ test('program browse forwards POST with a body', async () => {
   assert.equal(await r.text(), '<h1>hello from lua</h1>');
 });
 
+// The /i/ HTTP path caps concurrency so a bot cannot flood the gateway with
+// cesh-dial spawns. Per-IP cap of 1 + a slow dial: a second concurrent request
+// from the same address is turned away (429) while the first is in flight.
+test('program HTTP path caps concurrent requests per IP', async () => {
+  const cache = tmpDir();
+  const fx = writeFixture(cache, {
+    ping: { rpcPort: 40000, serverKey: 'ab'.repeat(32) },
+    dial: { http: 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok', httpDelayMs: 500 },
+  });
+  const child = spawn('node', [SERVER], { env: {
+    ...process.env, FAKECESH_FIXTURE: fx, CESWEB_PORT: '0', CESWEB_BIND: '127.0.0.1',
+    CESWEB_CESH: FAKECESH, CESWEB_CACHE_DIR: cache, CESWEB_DEFAULT_HOST: 'localhost',
+    CESWEB_ALLOW_HOSTS: 'localhost', CESWEB_ALLOW_PRIVATE_HOSTS: '1', CESWEB_PROG_MAX_PER_IP: '1',
+  } });
+  const port = await new Promise((resolve, reject) => {
+    let buf = ''; const to = setTimeout(() => reject(new Error('no start: ' + buf)), 5000);
+    child.stderr.on('data', (d) => { buf += d.toString(); const m = buf.match(/http:\/\/127\.0\.0\.1:(\d+)/); if (m) { clearTimeout(to); resolve(parseInt(m[1], 10)); } });
+  });
+  const b = `http://127.0.0.1:${port}`;
+  try {
+    const first = fetch(b + '/i/localhost/12345/').then((x) => x.status);
+    await sleep(80);                                     // first now holds the per-IP slot
+    const second = await fetch(b + '/i/localhost/12345/').then((x) => x.status);
+    assert.equal(second, 429);                           // capped while the first is in flight
+    assert.equal(await first, 200);                      // the first still completes
+  } finally { child.kill('SIGKILL'); }
+});
+
 // The open `/<ces-host>/<path>` form (a browser pointing the gateway at a CES
 // server named in the URL), with NO allowlist — proves the feature end to end:
 // a DNS-named server is fetched + served; an IP host is refused at the engine
