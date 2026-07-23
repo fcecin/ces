@@ -154,14 +154,17 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
   BOOST_REQUIRE(peer.start() != 0);
   uint64_t st = 0;
   BOOST_REQUIRE(peer.bind(fx.rpcPort, fx.userKey, st));
-  CES_REQUIRE_RC_EQ(peer.attach(fx.userKey, st, instId).status, CES_OK);
+  auto ar = peer.attach(fx.userKey, st, instId);
+  CES_REQUIRE_RC_EQ(ar.status, CES_OK);
 
-  // Greeting carries "  house pubkey: <64 hex>".
+  // The greeting rides the ATTACH accept (dice's set_listener hello), not the
+  // post-attach stream, so read the house pubkey out of the accept's opening
+  // bytes: "  house pubkey: <64 hex>".
   const std::string marker = "house pubkey:";
-  std::string line = rd.lineContaining(marker);
-  BOOST_REQUIRE_MESSAGE(!line.empty(), "no house pubkey in dice greeting");
+  const size_t mpos = ar.hello.find(marker);
+  BOOST_REQUIRE_MESSAGE(mpos != std::string::npos, "no house pubkey in dice greeting");
   std::string hex;
-  for (char c : line.substr(line.find(marker) + marker.size())) {
+  for (char c : ar.hello.substr(mpos + marker.size())) {
     if (std::isxdigit(static_cast<unsigned char>(c))) {
       hex.push_back(c);
       if (hex.size() == 64) break;
@@ -169,7 +172,7 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
   }
   minx::Hash house = hexToHash(hex);
 
-  drainQuiet(peer, rd);                       // swallow the rest of the greeting
+  drainQuiet(peer, rd);                       // no greeting streams now; clears rd
   fx.server->_brr(house, 1'000'000'000);      // bankroll for heads payouts
   std::this_thread::sleep_for(std::chrono::milliseconds(150));
   return house;
