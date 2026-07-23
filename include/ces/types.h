@@ -408,6 +408,13 @@ constexpr uint64_t PRICE_MAX = static_cast<uint64_t>(UINT32_MAX) * PRICE_UNIT;
 // Default CES server UDP port.
 constexpr uint16_t DEFAULT_PORT = 53830;
 
+// The conventional CesPlex rpc_port: the main port + 1. Not a compiled-in
+// default (rpc_port = 0 stays the master off-switch); this is the number
+// clients assume when an address names no port (cwb's file:// compute://
+// lua:// default here), and the one configs should serve on. Both ports sit
+// in the IANA dynamic range (49152-65535, RFC 6335), never assigned.
+constexpr uint16_t DEFAULT_RPC_PORT = 53831;
+
 // L2 call (SYS_L2_CALL and the builtin:compute CALL verb): a paid memo
 // delivered into a live L2 program, plus its reply. Both memo and reply ride
 // CesPlex/RUDP, so neither is packet-bounded; a client can send a large memo

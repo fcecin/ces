@@ -177,6 +177,11 @@ gossip_fanout_degree = )" << DEFAULT_GOSSIP_FANOUT_DEGREE << R"(
 # the firewall independently from the main port. When up, which protocols
 # are actually served is decided entirely by [cesplex_mounts] below -- nothing
 # auto-mounts.
+# The conventional CES rpc port is )" << DEFAULT_RPC_PORT << R"( (the main port + 1,
+# DEFAULT_RPC_PORT). Clients assume it when an address names no port (cwb's
+# file:// compute:// lua:// default here), so serve on it unless you have a
+# reason not to. Both ports sit in the IANA dynamic range (49152-65535,
+# RFC 6335), which is never assigned to protocols.
 rpc_port = 0
 
 # SYS_RPC outbound flow control (only relevant when rpc_port != 0).

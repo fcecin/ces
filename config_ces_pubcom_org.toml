@@ -59,8 +59,10 @@ settlement_max_retries = 7
 max_peer_reserve_disturbance = 100000
 gossip_fanout_degree = 6
 
-# Enable the CesPlex / L2 stack (file/lua/compute/peer) + SYS_RPC on this UDP port.
-rpc_port = 9999
+# Enable the CesPlex / L2 stack (file/lua/compute/peer) + SYS_RPC on this UDP
+# port. 53831 is the conventional CES rpc port (main + 1, DEFAULT_RPC_PORT);
+# clients assume it when an address names no port.
+rpc_port = 53831
 
 rpc_max_pending = 1000
 rpc_max_request_bytes = 65536
@@ -72,7 +74,8 @@ rpc_rudp_burst_bytes = 4294967295
 # 256 MiB metered user storage (/h/ /f/ /p/); /s/ is unmetered and always served.
 file_store_max_bytes = 268435456
 file_store_dir = ""
-extensions_dir = ""
+# Extension catalog for the dashboard's install button (deployed next to ces).
+extensions_dir = "./extensions"
 ext_funding_per_day = 500000000
 ext_local_budget = 100000000000
 fee_file_rent = -1
@@ -113,3 +116,4 @@ channel_idle_secs = 180
 dice = 1
 discovery = 1
 peerfunder = 1
+monitor = 1
