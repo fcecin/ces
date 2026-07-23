@@ -328,7 +328,8 @@ public:
                      uint64_t sessionToken,
                      uint64_t pid,
                      uint8_t& outStatus,
-                     uint64_t& outConnId) {
+                     uint64_t& outConnId,
+                     std::string& outHello) {
     ces::Bytes preamble;
     ces::Buffer::put<uint64_t>(preamble, pid);
 
@@ -357,12 +358,13 @@ public:
     // stack refs, so a late handler can't poke a freed frame on timeout.
     auto statusOut = std::make_shared<uint8_t>(0xFF);
     auto connIdOut = std::make_shared<uint64_t>(0);
+    auto helloOut = std::make_shared<std::string>();
 
     boost::asio::post(taskIO_,
-      [strm, wireBuf, statusOut, connIdOut, run]() {
+      [strm, wireBuf, statusOut, connIdOut, helloOut, run]() {
         boost::asio::async_write(
           *strm, boost::asio::buffer(*wireBuf),
-          [strm, wireBuf, statusOut, connIdOut, run]
+          [strm, wireBuf, statusOut, connIdOut, helloOut, run]
           (const boost::system::error_code& ec, std::size_t) {
             if (ec) {
               run->set_value("attach write: " + ec.message()); return;
@@ -370,7 +372,7 @@ public:
             auto stBuf = std::make_shared<std::array<uint8_t, 1>>();
             boost::asio::async_read(
               *strm, boost::asio::buffer(*stBuf),
-              [strm, stBuf, statusOut, connIdOut, run]
+              [strm, stBuf, statusOut, connIdOut, helloOut, run]
               (const boost::system::error_code& ec2, std::size_t) {
                 if (ec2) {
                   run->set_value("attach read status: " + ec2.message());
@@ -393,7 +395,7 @@ public:
                 auto head = std::make_shared<std::array<uint8_t, 12>>();
                 boost::asio::async_read(
                   *strm, boost::asio::buffer(*head),
-                  [strm, head, connIdOut, run]
+                  [strm, head, connIdOut, helloOut, run]
                   (const boost::system::error_code& ec3, std::size_t) {
                     if (ec3) {
                       run->set_value("attach read head: " + ec3.message());
@@ -407,8 +409,11 @@ public:
                       ces::CES_PLEX_RESP_TRAILER_SIZE);
                     boost::asio::async_read(
                       *strm, boost::asio::buffer(*rest),
-                      [rest, run](const boost::system::error_code& ec4,
-                                  std::size_t) {
+                      [rest, helloLen, helloOut, run](
+                        const boost::system::error_code& ec4, std::size_t) {
+                        if (!ec4 && helloLen > 0)
+                          helloOut->assign(
+                            reinterpret_cast<const char*>(rest->data()), helloLen);
                         run->set_value(
                           ec4 ? ("attach read rest: " + ec4.message())
                               : std::string());
@@ -423,6 +428,7 @@ public:
     if (err.empty()) {
       outStatus = *statusOut;
       outConnId = *connIdOut;
+      outHello = *helloOut;
     }
     return err;
   }
@@ -891,8 +897,9 @@ int runDial(const DialArgs& args) {
 
   uint8_t attachStatus = 0xFF;
   uint64_t connId = 0;
+  std::string hello;
   if (auto e = dialer.attach(args.signerKey, sessionToken,
-                             args.pid, attachStatus, connId);
+                             args.pid, attachStatus, connId, hello);
       !e.empty()) {
     std::cerr << "Error: attach: " << e << "\n";
     return 5;
@@ -904,6 +911,12 @@ int runDial(const DialArgs& args) {
   }
   if (args.verbose) {
     std::cerr << "ATTACH ok conn_id=" << connId << "\n";
+  }
+  // The greeting rode the accept: emit it as the first bytes of the stream,
+  // exactly as if the program had sent it on open.
+  if (!hello.empty()) {
+    std::cout.write(hello.data(), static_cast<std::streamsize>(hello.size()));
+    std::cout.flush();
   }
 
   return dialer.runDataPump();
@@ -933,7 +946,8 @@ std::string DialLineSession::open(const DialArgs& args) {
 
   uint8_t status = 0;
   uint64_t connId = 0;
-  e = impl_->dialer.attach(args.signerKey, impl_->token, args.pid, status, connId);
+  std::string hello;  // consumed from the accept; the line protocol ignores it
+  e = impl_->dialer.attach(args.signerKey, impl_->token, args.pid, status, connId, hello);
   if (!e.empty()) return "attach: " + e;
   if (status != CES_OK) return std::string("attach: ") + attachErrorName(status);
 

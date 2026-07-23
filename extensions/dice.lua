@@ -94,30 +94,38 @@ local function send_line(conn, msg)
   conn:write(msg .. "\n")
 end
 
+local HELP_LINES = {
+  "commands:",
+  "  play       play your deposited bet",
+  "  balance    credits deposited & available to play",
+  "  self       your pubkey + CES account balance",
+  "  help       this message",
+  "  quit       close the connection",
+}
+
 local function send_help(conn)
-  send_line(conn, "commands:")
-  send_line(conn, "  play       play your deposited bet")
-  send_line(conn, "  balance    credits deposited & available to play")
-  send_line(conn, "  self       your pubkey + CES account balance")
-  send_line(conn, "  help       this message")
-  send_line(conn, "  quit       close the connection")
+  for _, l in ipairs(HELP_LINES) do send_line(conn, l) end
 end
 
-local function send_greeting(conn)
-  send_line(conn, "")
-  send_line(conn, "  /s/dice — fair-coin double-or-nothing")
-  send_line(conn, "")
-  send_line(conn, "  house pubkey: " .. hex(HOUSE_PUBKEY))
-  send_line(conn, "")
-  send_line(conn,
-    "  to bet: transfer N credits to the house pubkey (e.g.")
-  send_line(conn,
-    "  `cesh transfer N <house-pubkey>`), then type `play` here.")
-  send_line(conn,
-    "  heads pays 2N, tails pays 0. each transfer is one bet.")
-  send_line(conn, "")
-  send_help(conn)
-  send_line(conn, "")
+-- The opening screen. It rides the ATTACH accept as `hello` (see set_listener),
+-- so it is delivered once and every client -- native browser and `cesh dial`
+-- alike -- prints it as the first bytes of the stream. on_open does not resend
+-- it. Built once at load: the house pubkey is fixed for the instance.
+local function greeting_text()
+  local lines = {
+    "",
+    "  /s/dice - fair-coin double-or-nothing",
+    "",
+    "  house pubkey: " .. hex(HOUSE_PUBKEY),
+    "",
+    "  to bet: transfer N credits to the house pubkey (e.g.",
+    "  `cesh transfer N <house-pubkey>`), then type `play` here.",
+    "  heads pays 2N, tails pays 0. each transfer is one bet.",
+    "",
+  }
+  for _, l in ipairs(HELP_LINES) do lines[#lines + 1] = l end
+  lines[#lines + 1] = ""
+  return table.concat(lines, "\n") .. "\n"
 end
 
 -- The credits this user has DEPOSITED on the contract and that are PLAYABLE
@@ -289,7 +297,6 @@ end
 
 local function on_open(conn)
   conn.buf = ""
-  send_greeting(conn)
 end
 
 local function on_data(conn, data)
@@ -310,10 +317,11 @@ local function on_close(conn)
 end
 
 ces.conn.set_listener({
-  -- Greeting in the ATTACH reply: this program speaks first, so a native
-  -- browser can pick the terminal renderer with no probe/timeout. The full
-  -- banner still streams from on_open for raw (cesh dial) clients.
-  hello    = "  /s/dice: fair-coin double-or-nothing\n",
+  -- The opening screen rides the ATTACH accept as `hello`: this program speaks
+  -- first, so a native browser picks the terminal renderer with no probe, and
+  -- every client (browser and `cesh dial`) prints it once as the head of the
+  -- stream. on_open does not resend it.
+  hello    = greeting_text(),
   on_open  = on_open,
   on_data  = on_data,
   on_close = on_close,
