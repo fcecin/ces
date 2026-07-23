@@ -79,12 +79,14 @@
 #include <errno.h>
 #include <fcntl.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <filesystem>
 #include <fstream>
@@ -726,6 +728,90 @@ void teardownInstance(Instance& inst) {
   }
 }
 
+// Public instance catalog (/s/instances.html): a pre-computed page listing
+// every live /s/-sourced instance with its pid, source, start time, and
+// endpoints. The /s/ pid set changes only at launch commit, kill/death, and
+// boot, so the catalog is regenerated at those boundaries and served as a
+// plain /s/ file -- readers (cwb's portless luarpc://) get static content,
+// never a per-hit query fan-out. Non-/s/ sources are capabilities and stay
+// unlisted by design; INSTANCES answers exact-source queries. Runs on the
+// rpcTaskIO strand (every call site already does).
+void regenerateInstanceCatalog(ComputeHandler& H) {
+  CesServer* server = H.server_;
+  if (!server) return;
+  FileHandler* fh = server->fileHandler();
+  if (!fh) return;
+  std::string host = server->_config().serverName;  // "host[:port]" or ""
+  if (auto c = host.find(':'); c != std::string::npos) host.resize(c);
+  const uint16_t plexPort = server->_config().rpcPort;
+
+  auto esc = [](const std::string& s) {
+    std::string o;
+    o.reserve(s.size());
+    for (char c : s) {
+      if (c == '&') o += "&amp;";
+      else if (c == '<') o += "&lt;";
+      else if (c == '>') o += "&gt;";
+      else if (c == '"') o += "&quot;";
+      else o += c;
+    }
+    return o;
+  };
+
+  std::vector<uint64_t> pids;
+  for (auto& [pid, inst] : H.instances_)
+    if (inst->sourceName.rfind("/s/", 0) == 0) pids.push_back(pid);
+  std::sort(pids.begin(), pids.end());
+
+  std::string html =
+    "<!doctype html><html lang=en><meta charset=utf-8>"
+    "<meta name=viewport content=\"width=device-width,initial-scale=1\">"
+    "<title>/s/ \xe2\x80\x94 public instances</title>"
+    "<style>body{font:16px/1.6 system-ui,sans-serif;max-width:48rem;"
+    "margin:2.5rem auto;padding:0 1rem;color:#1c1c1e}h1{font-size:1.4rem}"
+    "table{width:100%;border-collapse:collapse}"
+    "th{text-align:left;color:#888;font-weight:600;border-bottom:2px solid #ddd;"
+    "padding:.3em .6em .3em 0}td{padding:.3em .6em .3em 0;"
+    "border-bottom:1px solid #eee}.mono{font-family:monospace}"
+    "a{color:#0a7d33;text-decoration:none}a:hover{text-decoration:underline}"
+    "p{color:#666}footer{margin-top:1.5rem;color:#999;font-size:.85rem}</style>"
+    "<h1>/s/ \xe2\x80\x94 public instances</h1>";
+  if (pids.empty()) {
+    html += "<p>No public instances running.</p>";
+  } else {
+    html += "<table><tr><th>pid</th><th>source</th><th>started</th>"
+            "<th>open</th></tr>";
+    for (uint64_t pid : pids) {
+      auto& inst = H.instances_[pid];
+      char when[40] = "";
+      std::time_t t = static_cast<std::time_t>(inst->startedAtUs / 1000000ULL);
+      std::tm tmv{};
+      gmtime_r(&t, &tmv);
+      std::strftime(when, sizeof when, "%Y-%m-%d %H:%M UTC", &tmv);
+      html += "<tr><td class=mono>" + std::to_string(pid) + "</td><td><a href=\"" +
+              esc(inst->sourceName) + "\">" + esc(inst->sourceName) +
+              "</a></td><td>" + when + "</td><td>";
+      if (!host.empty()) {
+        html += "<a href=\"lua://" + std::to_string(pid) + "@" + esc(host) + ":" +
+                std::to_string(plexPort) + "/\">relay</a>";
+        if (inst->rpcPort)
+          html += " <a href=\"luarpc://" + esc(host) + ":" +
+                  std::to_string(inst->rpcPort) + "/\">direct</a>";
+      } else {
+        html += "relay via /ces/lua/1";
+        if (inst->rpcPort)
+          html += ", rpc port " + std::to_string(inst->rpcPort);
+      }
+      html += "</td></tr>";
+    }
+    html += "</table>";
+  }
+  html += "<footer>auto-generated catalog of running /s/ instances (" +
+          std::to_string(pids.size()) +
+          "); regenerated on instance start/stop</footer></html>\n";
+  fh->writeServerFile("/s/instances.html", html);
+}
+
 // Kill an instance by pid, remove from registries, clean up resources.
 // No fee refund on kill: the upfront slot-fee paid for a commitment the
 // host already honored by running.
@@ -765,6 +851,7 @@ void killByPid(ComputeHandler& H, uint64_t pid) {
   }
   LOGDEBUG << "instance terminated"
            << VAR(pid) << SVAR(inst->sourceName);
+  if (inst->sourceName.rfind("/s/", 0) == 0) regenerateInstanceCatalog(H);
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,6 +2746,7 @@ void allocateAndSpawnInstance(
       LOGINFO << "launched"
               << VAR(inst->pid) << SVAR(inst->sourceName)
               << VAR(inst->ospid) << VAR(st->upfront);
+      if (inst->sourceName.rfind("/s/", 0) == 0) regenerateInstanceCatalog(H);
       st->done(inst->pid);
     });
 }
@@ -3655,6 +3743,10 @@ uint16_t ComputeHandler::testInstanceRpcPort(uint64_t pid) {
 
 bool ComputeHandler::instanceExists(uint64_t pid) {
   return instances_.find(pid) != instances_.end();
+}
+
+void ComputeHandler::regenerateInstanceCatalogNow() {
+  regenerateInstanceCatalog(*this);
 }
 
 std::vector<ComputeInstanceStat> ComputeHandler::snapshot() {

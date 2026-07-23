@@ -125,6 +125,13 @@ public:
   // started," not "child connected."
   uint8_t launchInternal(const std::string& name);
 
+  // Rebuild the public /s/instances.html catalog from the live instance
+  // table (the pre-computed page portless luarpc:// readers land on). Fires
+  // automatically at every /s/ pid-set change (launch commit, kill/death);
+  // this entry point covers boot so the file exists even with zero
+  // extensions. Must be called from rpcTaskIO_'s strand (launchExtensions is).
+  void regenerateInstanceCatalogNow();
+
   // Enable an extension by source path: idempotent, singleton, thread-safe. Marshals
   // onto rpcTaskIO_ (blocking post+wait) so the launch is serialized with the IPC
   // readers/kills, and refuses a duplicate if the source already has a live instance

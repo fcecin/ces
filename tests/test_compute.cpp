@@ -20,7 +20,9 @@
 #include <ces/server.h>
 
 #include <chrono>
+#include <fstream>
 #include <set>
+#include <sstream>
 #include <thread>
 
 using namespace ces;
@@ -479,6 +481,58 @@ BOOST_AUTO_TEST_CASE(StatByUnfundedSignerIsPublic) {
   CES_REQUIRE_OK(ccOwner.kill(id));
   ccOwner.disconnect();
   ccUnfunded.disconnect();
+}
+
+// /s/instances.html: the pre-computed public catalog of /s/-sourced
+// instances, regenerated at every /s/ pid-set change. Boot writes it (empty
+// here: no [extension] entries), an extension launch adds its row, killing
+// the instance removes it. Non-/s/ instances never appear.
+BOOST_AUTO_TEST_CASE(InstanceCatalogTracksServerZonePidSet) {
+  const fs::path catalog =
+    fs::path(server->_config().cesFileStoreDir) / "s" / "instances.html";
+  auto readCatalog = [&]() -> std::string {
+    std::ifstream f(catalog, std::ios::binary);
+    std::ostringstream ss;
+    ss << f.rdbuf();
+    return ss.str();
+  };
+  auto waitFor = [&](auto pred) {
+    for (int i = 0; i < 100; ++i) {
+      if (pred()) return true;
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return false;
+  };
+
+  // Boot generated the empty catalog.
+  BOOST_REQUIRE(waitFor([&]() { return fs::exists(catalog); }));
+  BOOST_CHECK(readCatalog().find("No public instances") != std::string::npos);
+
+  // A non-/s/ instance must not appear.
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  uint64_t homePid = 0, s = 0;
+  CES_REQUIRE_OK(cc.launch(ownerPath, homePid, s));
+  BOOST_CHECK(readCatalog().find("/h/") == std::string::npos);
+
+  // An /s/ extension launch adds its row.
+  BOOST_REQUIRE(server->fileHandler()->writeServerFile("/s/cat.lua", "-- x"));
+  std::string err;
+  BOOST_REQUIRE_MESSAGE(server->computeHandler()->enableExtension("/s/cat.lua", err),
+                        "enableExtension: " << err);
+  BOOST_REQUIRE(waitFor(
+    [&]() { return readCatalog().find("/s/cat.lua") != std::string::npos; }));
+  BOOST_CHECK(readCatalog().find("/h/") == std::string::npos);
+
+  // Killing it removes the row.
+  server->computeHandler()->killBySource("/s/cat.lua");
+  BOOST_REQUIRE(waitFor(
+    [&]() { return readCatalog().find("/s/cat.lua") == std::string::npos; }));
+  BOOST_CHECK(readCatalog().find("No public instances") != std::string::npos);
+
+  cc.disconnect();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

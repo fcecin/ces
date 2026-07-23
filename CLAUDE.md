@@ -225,6 +225,8 @@ Master switch: `cesFileStoreMaxBytes = 0` disables the feature; `> 0` enables it
 
 Hosts user programs. LAUNCH spawns a child process (default `cesluajitd`) with Unix-domain-socket IPC. The supervisor tick (default 60s) samples /proc CPU+RSS and debits the source file's `file_balance` for slot-seconds, cpu-seconds, and rss-byte-days. Out of funds means SIGKILL; a deleted source file SIGKILLs all its instances.
 
+The handler keeps a pre-computed public catalog at `/s/instances.html` (`regenerateInstanceCatalog`): one row per live `/s/`-sourced instance (pid, source link, started UTC, relay/direct links built from `server_name`), regenerated at every `/s/` pid-set change (boot via `launchExtensions`, launch commit, kill/death) and served as a plain `/s/` file, so directory readers (cwb's portless `luarpc://`) hit static content, never a query fan-out. Non-`/s/` sources are capabilities and stay unlisted; INSTANCES answers exact-source queries.
+
 Five verbs, keyed three ways: LAUNCH and KILL (owner-gated, they mutate); LIST (by signer; your own instances, incl. `file_balance`); STAT (by pid; public to any signer; pid/uptime/cpu/rss/ports/name); INSTANCES (by source path; public; one record per live instance incl. ports). STAT and INSTANCES expose each instance's leased ports (outbound CES-client and inbound `/ces/luarpc/1` host; 0 = no lease) so anyone can find a running service and reach it, relayed via the server's rpc port (`/ces/lua/1`) or direct to the instance's own port. LAUNCH mints a fresh `pid` (multiple per source up to `computeMaxInstances`) and requires 15 min upfront slot+rss rent in `file_balance` or fails `COMPUTE_FUND_TOO_LOW`.
 
 Bind prereqs: `computeMaxInstances > 0`, `builtin:file` registered, `computeUser` resolvable.

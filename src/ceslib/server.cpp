@@ -5323,6 +5323,9 @@ void CesServer::launchExtensions() {
     LOGINFO << "extension launched"
             << SVAR(name) << SVAR(path);
   }
+  // Ensure /s/instances.html exists from boot (launch commits rewrite it as
+  // each child registers; this covers the zero-extension case too).
+  computeHandler_->regenerateInstanceCatalogNow();
 }
 
 // Resets the server's own account to exactly TARGET, at boot and on every
