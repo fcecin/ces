@@ -1164,16 +1164,21 @@ protected:
         round++;
         emit mineStatus(QString("Round %1: computing proof of work...").arg(round));
 
-        // Always mine in batches so stop_ is checked frequently.
-        // Each RandomX hash takes ~1ms, so BATCH_SIZE hashes ≈ BATCH_SIZE ms
-        // between stop checks. With throttle, use batch of 1 for fine control.
-        const uint64_t batchSize = (throttleUs_ > 0) ? 1 : 64;
+        // Mine in batches so stop_ is checked between them. maxIters (batchSize)
+        // is the TOTAL nonce span the worker threads share (one atomic counter),
+        // not a per-thread count, and mine() re-acquires the ticket and rebuilds
+        // the hash setup on every call -- so size the batch per thread to
+        // amortize that overhead, and advance the nonce by exactly the span
+        // tested (advancing by batchSize*threads would skip untested nonces).
+        const int nThreads = std::max(numThreads_, 1);
+        const uint64_t batchSize =
+            static_cast<uint64_t>(throttleUs_ > 0 ? 8 : 256) * nThreads;
         uint64_t nonce = 0;
         auto w = [&]() -> std::optional<minx::MinxProveWork> {
           while (!stop_.load()) {
             auto r = client.mine(extraDiff_, {}, numThreads_, nonce, batchSize);
             if (r) return r;
-            nonce += batchSize * static_cast<uint64_t>(std::max(numThreads_, 1));
+            nonce += batchSize;
             if (throttleUs_ > 0)
               std::this_thread::sleep_for(std::chrono::microseconds(throttleUs_));
           }
