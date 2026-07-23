@@ -164,6 +164,7 @@ int lua_ces_conn_set_listener(lua_State* L) {
     lua_pushnil(L);
     lua_setfield(L, LUA_REGISTRYINDEX, kRegListenerTable);
     g_luarpc_listening.store(false, std::memory_order_relaxed);   // direct gate off
+    { std::lock_guard<std::mutex> lk(g_luarpc_hello_mx); g_luarpc_hello.clear(); }
     if (!write_frame(TAG_LISTEN_OFF, 0, nullptr, 0)) {            // relay gate off
       lua_pushnil(L); lua_pushstring(L, "ipc write failed"); return 2;
     }
@@ -185,15 +186,24 @@ int lua_ces_conn_set_listener(lua_State* L) {
   } else {
     lua_pop(L, 1);
   }
-  // Direct transport: flip the gate on + open the endpoint (no-op if no port).
-  g_luarpc_listening.store(true, std::memory_order_relaxed);
-  luarpc_ensure_endpoint();
-  // Relay transport: tell the supervisor to start accepting ATTACHes, carrying
-  // the optional greeting (table.hello) that rides each ATTACH reply.
+  // The optional greeting (table.hello), read once and used by BOTH transports:
+  // it rides the relay's ATTACH reply (TAG_LISTEN_ON below) and is stashed for
+  // the direct luarpc handler to send on conn-open, so the program's on_open
+  // never needs per-transport code. Stashed before the endpoint opens, so it is
+  // ready before any inbound direct channel can be served.
   size_t helloLen = 0;
   const char* hello = nullptr;
   lua_getfield(L, 1, "hello");
   if (lua_isstring(L, -1)) hello = lua_tolstring(L, -1, &helloLen);
+  {
+    std::lock_guard<std::mutex> lk(g_luarpc_hello_mx);
+    g_luarpc_hello.assign(hello ? hello : "", helloLen);
+  }
+  // Direct transport: flip the gate on + open the endpoint (no-op if no port).
+  g_luarpc_listening.store(true, std::memory_order_relaxed);
+  luarpc_ensure_endpoint();
+  // Relay transport: tell the supervisor to start accepting ATTACHes, carrying
+  // the same greeting in each ATTACH reply.
   bool listenOk = write_frame(TAG_LISTEN_ON, 0,
                               reinterpret_cast<const uint8_t*>(hello), helloLen);
   lua_pop(L, 1);

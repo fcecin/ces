@@ -87,16 +87,27 @@ std::deque<uint64_t>           g_luarpc_advance;  // direct conns with an event 
 // Accept gate: set by ces.conn.set_listener (Lua), read by serve()
 // (endpoint). No listener → close-on-connect.
 std::atomic<bool> g_luarpc_listening{false};
+// The program's set_listener greeting, delivered by the direct luarpc handler on
+// conn-open (symmetric with the relay's ATTACH accept). Guarded: written on the
+// Lua thread in set_listener, read on the endpoint strand in serve().
+std::mutex  g_luarpc_hello_mx;
+std::string g_luarpc_hello;
 
 // The endpoint's task strand, armed in main once the endpoint is up. Null
 // until then (and forever if this instance got no rpc port).
 boost::asio::io_context* g_luarpc_io = nullptr;
+
+// Cap on bytes queued but not yet flushed to a direct conn. A peer that stops
+// reading cannot grow the instance's memory without bound: past this the conn is
+// closed (mirrors CesPlex evicting a channel that can't keep up).
+constexpr size_t kLuaRpcMaxQueuedBytes = 8 * 1024 * 1024;
 
 struct LuaRpcConn {
   std::shared_ptr<minx::RudpStream> stream;
   std::deque<std::string> writeQ;   // RudpStream forbids overlapping writes,
   bool writing = false;             //   so we serialize: one in flight.
   bool closing = false;
+  size_t queuedBytes = 0;           // sum of writeQ payloads; bounded by the cap
   std::array<uint8_t, 4096> readBuf{};
 };
 std::map<uint64_t, std::shared_ptr<LuaRpcConn>> g_luarpc_conns;  // strand-only
@@ -137,6 +148,7 @@ void luarpc_drain_writes(uint64_t id, std::shared_ptr<LuaRpcConn> c) {
   c->writing = true;
   auto buf = std::make_shared<std::string>(std::move(c->writeQ.front()));
   c->writeQ.pop_front();
+  c->queuedBytes -= buf->size();
   boost::asio::async_write(*c->stream, boost::asio::buffer(*buf),
     [id, c, buf](const boost::system::error_code& ec, std::size_t) {
       c->writing = false;
@@ -174,8 +186,17 @@ void luarpc_conn_write(uint64_t id, std::string bytes) {
     [id, bytes = std::move(bytes)]() mutable {
       auto it = g_luarpc_conns.find(id);
       if (it == g_luarpc_conns.end() || it->second->closing) return;
-      it->second->writeQ.push_back(std::move(bytes));
-      luarpc_drain_writes(id, it->second);
+      auto& c = it->second;
+      // Backpressure: a peer that stopped reading must not grow us without
+      // bound. Past the cap, close the conn instead of queueing more.
+      if (c->queuedBytes + bytes.size() > kLuaRpcMaxQueuedBytes) {
+        c->closing = true;
+        c->stream->shutdown(ces::kRudpStreamCloseTimeout);
+        return;
+      }
+      c->queuedBytes += bytes.size();
+      c->writeQ.push_back(std::move(bytes));
+      luarpc_drain_writes(id, c);
     });
 }
 
@@ -322,6 +343,21 @@ public:
     const ces::Hash& pk = bound.boundPubkey.getHash();
     std::memcpy(opened.peer.data(), pk.data(), opened.peer.size());
     g_luarpc_conns[id] = c;
+    // Deliver the program's set_listener greeting as the opening bytes, the same
+    // way the relay's ATTACH accept does, so a program's on_open never needs to
+    // know which transport a conn arrived on.
+    {
+      std::string hello;
+      {
+        std::lock_guard<std::mutex> lk(g_luarpc_hello_mx);
+        hello = g_luarpc_hello;
+      }
+      if (!hello.empty()) {
+        c->queuedBytes += hello.size();
+        c->writeQ.push_back(std::move(hello));
+        luarpc_drain_writes(id, c);
+      }
+    }
     luarpc_push(std::move(opened));
     luarpc_start_read(id, c);
   }

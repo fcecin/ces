@@ -12,6 +12,11 @@ int lua_ces_luarpc_conn_write(lua_State* L) {
   luaL_checktype(L, 1, LUA_TTABLE);
   size_t n = 0;
   const char* s = luaL_checklstring(L, 2, &n);
+  if (n > 1024 * 1024) {   // parity with the relay conn:write cap
+    lua_pushnil(L);
+    lua_pushstring(L, "payload too large (max 1 MB per write)");
+    return 2;
+  }
   lua_getfield(L, 1, "closed");
   bool closed = lua_toboolean(L, -1);
   lua_pop(L, 1);
