@@ -6,8 +6,12 @@ on:
   pull_request:
 
 jobs:
-  # The full truth: server + client, every optional feature on, the whole
-  # test suite. Linux is the server's home platform.
+  # The full truth: server + client, every optional feature on. Linux is the
+  # server's home platform. Runs the unit + L2 integration suites; the E2E
+  # suites are excluded (they shell out to the Qt cesqt binary, which is not
+  # built here, or spawn processes under tight timeouts that are flaky on a
+  # shared runner). E2E is a local pre-release gate; run ./build.sh debug
+  # --test with no filter to include it.
   linux-full:
     name: linux full stack + tests
     runs-on: ubuntu-latest
@@ -18,8 +22,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y pkg-config libboost-all-dev \
             libluajit-5.1-dev libssl-dev
-      - name: Build (debug, --hyle --mail) + full test suite
-        run: ./build.sh debug --test --hyle --mail
+      - name: Build (debug, --hyle --mail) + unit + integration tests
+        run: >
+          ./build.sh debug --hyle --mail --test
+          '!CesqtApi:!CeshE2E:!CeshProxyE2E:!CeshDialE2E:!SigtermPersistence'
 
   # The portable contract: CES_CLIENT_ONLY builds ceslib alone (keys/protocol/
   # client, CesPlexClient, L2 file+compute clients, utils) with no LuaJIT, Qt,
