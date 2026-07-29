@@ -58,7 +58,8 @@ inline void writeFile(const fs::path& p, const std::string& content) {
 // computePorts > 0 leases the instance a UDP port range so it can do outbound
 // client networking (ces.ping / ces.file_client); 0 = local-only (no ports).
 inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
-                         const std::string& name, const std::string& conf,
+                         const std::vector<std::string>& names,
+                         const std::string& conf,
                          uint16_t computePorts = 0, uint16_t mainPort = 0) {
   n.dir = makeUniqueTempDir("ext_" + std::to_string(idx));
   minx::Hash priv;
@@ -68,6 +69,7 @@ inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
     makeTestConfig(n.dir, priv, std::numeric_limits<uint64_t>::max());
   cfg.rpcPort = 0;
   cfg.rpcAutoPort = true;
+  cfg.serverName = "127.0.0.1";
   cfg.cesplexMounts = {
     {"/ces/file/1",    "builtin:file"},
     {"/ces/compute/1", "builtin:compute"},
@@ -93,8 +95,9 @@ inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
   cfg.cesComputeChildBinary = childBin;
   cfg.cesComputeWorkDir = (n.dir / "cescompute").string();
 
-  if (!name.empty()) {
-    cfg.extensions = { name };
+  for (const std::string& name : names) {
+    if (name.empty()) continue;
+    cfg.extensions.insert(name);
     writeFile(fs::path(cfg.cesFileStoreDir) / "s" / (name + ".lua"),
               readExtSource(name));
     writeFile(fs::path(cfg.cesFileStoreDir) / "s" / (name + ".conf"), conf);
@@ -106,6 +109,13 @@ inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
   n.rpcPort = n.server->_rpcBoundPort();
   BOOST_REQUIRE_MESSAGE(n.rpcPort > 0, "node " << idx << " rpc bind failed");
   n.pub = n.server->_serverKeyPair().getPublicKeyAsHash();
+}
+
+inline void startExtNode(ExtNode& n, int idx, const std::string& childBin,
+                         const std::string& name, const std::string& conf,
+                         uint16_t computePorts = 0, uint16_t mainPort = 0) {
+  startExtNode(n, idx, childBin, std::vector<std::string>{name}, conf,
+               computePorts, mainPort);
 }
 
 inline std::set<minx::Hash> peerSet(CesServer* s) {

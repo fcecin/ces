@@ -114,7 +114,7 @@ CesPlexEndpoint::~CesPlexEndpoint() {
 
   if (tickTimer_) {
     boost::system::error_code ec;
-    tickTimer_->cancel(ec);
+    tickTimer_->cancel();
   }
   minx_->closeSocket(false);
   netIO_.stop();

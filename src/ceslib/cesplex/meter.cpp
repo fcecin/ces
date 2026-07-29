@@ -72,8 +72,7 @@ ChannelMeter::~ChannelMeter() {
   // (ec != 0) and return without rearming. The chain dies when the
   // last shared_ptr<timer> ref drops.
   if (timer_) {
-    boost::system::error_code ec;
-    timer_->cancel(ec);
+    timer_->cancel();
   }
   // No logging here. This destructor can run during static destruction (its owner
   // is a file-scope global in cesluajitd's luarpc endpoint), after Boost.Log's core

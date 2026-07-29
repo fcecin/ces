@@ -221,6 +221,7 @@ constexpr uint16_t kApiMethodTransfer     = 0x0200;
 constexpr uint16_t kApiMethodCrossTransfer = 0x0201;
 constexpr uint16_t kApiMethodRandomBytes  = 0x0202;
 constexpr uint16_t kApiMethodAccountRead  = 0x0203;
+constexpr uint16_t kApiMethodKeyName      = 0x0204;
 // Per-instance rotating bucket cache (minx::BucketCache wrapper):
 //   BUCKET_NEW — allocate a bucket with TTL + size cap; returns u32 id
 //   BUCKET_PUT — set k → v in the bucket
@@ -810,6 +811,18 @@ void regenerateInstanceCatalog(ComputeHandler& H) {
           std::to_string(pids.size()) +
           "); regenerated on instance start/stop</footer></html>\n";
   fh->writeServerFile("/s/instances.html", html);
+
+  // Machine-readable sidecar: one "pid<TAB>source<TAB>rpc_port" line per live
+  // /s/ instance, regenerated in lockstep with the HTML. A directory service
+  // reads this to resolve a source to its live instance without parsing HTML
+  // or querying the network.
+  std::string idx;
+  for (uint64_t pid : pids) {
+    auto& inst = H.instances_[pid];
+    idx += std::to_string(pid) + "\t" + inst->sourceName + "\t" +
+           std::to_string(inst->rpcPort) + "\n";
+  }
+  fh->writeServerFile("/s/instances.idx", idx);
 }
 
 // Kill an instance by pid, remove from registries, clean up resources.
@@ -851,7 +864,12 @@ void killByPid(ComputeHandler& H, uint64_t pid) {
   }
   LOGDEBUG << "instance terminated"
            << VAR(pid) << SVAR(inst->sourceName);
-  if (inst->sourceName.rfind("/s/", 0) == 0) regenerateInstanceCatalog(H);
+  // Not during handler teardown: the reconcile inside the regen sync-hops to
+  // logicStrand_, whose io threads are already joined by the time
+  // ComputeHandler::stop() kills instances -- the hop would wait forever
+  // (shutdown deadlock). A dying server serves no catalog; boot rebuilds it.
+  if (!H.stopped_.load() && inst->sourceName.rfind("/s/", 0) == 0)
+    regenerateInstanceCatalog(H);
 }
 
 // ---------------------------------------------------------------------------
@@ -1857,6 +1875,25 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
         tail.insert(tail.end(), lastDest.begin(), lastDest.end());
         ces::Buffer::put<uint64_t>(tail, lastAmount);
         ces::Buffer::put<uint32_t>(tail, lastTime);
+        sendApiReplyWithBody(inst_cap, corr_id, kApiStatusOk, tail);
+      },
+      inst->peer->get_executor());
+    return;
+  }
+
+  // ---- ces.keyname(pubkey) → the key_name registered to that key on THIS
+  // server ("" if none). Reply: [u8 status][name bytes]. Read-only, no fee.
+  // Lets a program gate on whether the caller holds a name.
+  if (method == kApiMethodKeyName) {
+    if (mlen < 32) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    minx::Hash key{};
+    std::memcpy(key.data(), mbody, 32);
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    auto inst_cap = inst;
+    server->_l2QueryKeyName(key,
+      [inst_cap, corr_id](const std::string& name) {
+        ces::Bytes tail(name.begin(), name.end());
         sendApiReplyWithBody(inst_cap, corr_id, kApiStatusOk, tail);
       },
       inst->peer->get_executor());
@@ -3544,7 +3581,7 @@ void ComputeHandler::stop() {
   tickRunning_.store(false);
   if (tickTimer_) {
     boost::system::error_code ec;
-    tickTimer_->cancel(ec);
+    tickTimer_->cancel();
   }
   // Kill all instances. Iterate over a snapshot since killByPid erases.
   std::vector<uint64_t> ids;

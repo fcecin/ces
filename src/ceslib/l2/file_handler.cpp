@@ -1100,13 +1100,11 @@ void checkZoneOwnership(
     }
     return;
   }
-  // zone == 'f': async asset ownership check.
-  std::string canonical = "/f/" + second;
-  minx::Hash assetId = ces::sha256(
-    reinterpret_cast<const uint8_t*>(canonical.data()), canonical.size());
+  // zone == 'f': async ownership check. /f/<name>/ is owned SOLELY by the
+  // key_name holder (crypto-owned, unsquattable); there is no asset gate.
   ces::PublicKey signer(signerKey);
-  server->_l2CheckAssetOwner(
-    assetId, signer,
+  server->_l2CheckFZoneOwner(
+    second, signer,
     [onDone](bool isOwner) {
       onDone(isOwner ? CES_OK : CES_ERROR_NOT_OWNER);
     },

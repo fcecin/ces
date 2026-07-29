@@ -80,6 +80,7 @@ constexpr uint16_t METHOD_TRANSFER         = 0x0200;
 constexpr uint16_t METHOD_CROSS_TRANSFER   = 0x0201;
 constexpr uint16_t METHOD_RANDOM_BYTES     = 0x0202;
 constexpr uint16_t METHOD_ACCOUNT_READ     = 0x0203;
+constexpr uint16_t METHOD_KEYNAME          = 0x0204;
 constexpr uint16_t METHOD_BUCKET_NEW       = 0x0210;
 constexpr uint16_t METHOD_BUCKET_PUT       = 0x0211;
 constexpr uint16_t METHOD_BUCKET_GET       = 0x0212;

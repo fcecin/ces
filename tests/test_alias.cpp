@@ -30,8 +30,7 @@ struct AliasFixtureBase {
     serverPriv.fill(0xEE);
     CesConfig cfg =
       makeTestConfig(tempDir, serverPriv, std::numeric_limits<uint64_t>::max());
-    cfg.feeAccount = feeAccount;
-    cfg.feeAlias = feeAccount;
+    cfg.feeAccount = feeAccount;   // alias rent derives from this (x16)
     cfg.feeQuery = feeQuery;
     cfg.feeTx = 0;
     cfg.feeAsset = 0;
@@ -268,7 +267,8 @@ BOOST_FIXTURE_TEST_CASE(SetChargesOneDay, AliasRentFixture) {
   int64_t before = bal(a.getPublicKeyAsHash());
   uint32_t id = 0;
   CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, str("x"), id));
-  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 1000);   // one day = feeAlias
+  // one day of alias rent = feeAccount(1000) x ALIAS_BYTES/ACCOUNT_BYTES(16).
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 16000);
 }
 
 BOOST_FIXTURE_TEST_CASE(DailyRentChargesOwner, AliasRentFixture) {
@@ -279,8 +279,8 @@ BOOST_FIXTURE_TEST_CASE(DailyRentChargesOwner, AliasRentFixture) {
   int64_t before = bal(a.getPublicKeyAsHash());
   server->_runDailyMaintenance();
   server->_drainLogic();
-  // account rent (1000) + alias rent (1000) = 2000.
-  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 2000);
+  // account rent (1000) + alias rent (16000) = 17000.
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), before - 17000);
   ces::Alias out;
   BOOST_CHECK(server->queryAlias(id, out));   // still alive
   BOOST_CHECK_EQUAL(aliasIdOf(a.getPublicKeyAsHash()), id);
@@ -288,13 +288,13 @@ BOOST_FIXTURE_TEST_CASE(DailyRentChargesOwner, AliasRentFixture) {
 
 BOOST_FIXTURE_TEST_CASE(DailyRentReclaimsWhenOwnerCannotPay, AliasRentFixture) {
   KeyPair a;
-  fund(a.getPublicKeyAsHash(), 2500);
+  fund(a.getPublicKeyAsHash(), 17500);
   uint32_t id = 0;
   CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, str("x"), id));
-  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 1500);   // set charged 1000
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 1500);   // set charged 16000
   server->_runDailyMaintenance();
   server->_drainLogic();
-  // account rent 1000 -> 500 (survives); alias rent 1000 > 500 -> reclaimed.
+  // account rent 1000 -> 500 (survives); alias rent 16000 > 500 -> reclaimed.
   BOOST_CHECK(server->_accountExists(a.getPublicKeyAsHash()));
   BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 500);
   ces::Alias out;
@@ -307,10 +307,10 @@ BOOST_FIXTURE_TEST_CASE(DailyRentReclaimsWhenOwnerCannotPay, AliasRentFixture) {
 // orphan via the owner-gone branch (distinct from the cannot-pay branch above).
 BOOST_FIXTURE_TEST_CASE(DailyRentReclaimsWhenOwnerAccountGone, AliasRentFixture) {
   KeyPair a;
-  fund(a.getPublicKeyAsHash(), 1500);
+  fund(a.getPublicKeyAsHash(), 16500);
   uint32_t id = 0;
   CES_CHECK_OK(setAlias(a.getPublicKeyAsHash(), ces::ALIAS_OP_STRING, str("x"), id));
-  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 500);   // set charged 1000
+  BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 500);   // set charged 16000
   server->_runDailyMaintenance();
   server->_drainLogic();
   // Account rent 1000 > A's 500 -> A deleted in the account sweep; the later

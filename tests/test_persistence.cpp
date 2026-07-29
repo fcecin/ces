@@ -1548,8 +1548,7 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
   // a VM run (the re-journal durability path), clean stop, snapshot ---
   {
     CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
-    cfg.feeAccount = 0;   // isolate persistence from rent
-    cfg.feeAlias = 0;
+    cfg.feeAccount = 0;   // isolate persistence from rent (alias rent derives -> 0)
     cfg.feeAsset = 0;
     cfg.feeQuery = 0;
     cfg.maxAlias = 1000;
@@ -1608,7 +1607,6 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
   {
     CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
     cfg.feeAccount = 0;
-    cfg.feeAlias = 0;
     cfg.feeQuery = 0;
     cfg.maxAlias = 1000;
     CesServer srv2(cfg);

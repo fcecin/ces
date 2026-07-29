@@ -715,6 +715,105 @@ uint8_t CesClient::readAlias(uint32_t aliasId, uint16_t offset,
   return CES_ERROR_TIMEOUT;
 }
 
+uint8_t CesClient::registerKeyName(const ces::Bytes& name) {
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesRegisterKeyName req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.name = name;
+  return sendSigned(req, registerKeyNameGen_, registerKeyNameResultCode_, [&] {
+    return registerKeyNameResultNonce_ == reqNonce &&
+           registerKeyNameResultOriginId_ == myId;
+  });
+}
+
+uint8_t CesClient::clearKeyName() {
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+  CesClearKeyName req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  return sendSigned(req, clearKeyNameGen_, clearKeyNameResultCode_, [&] {
+    return clearKeyNameResultNonce_ == reqNonce &&
+           clearKeyNameResultOriginId_ == myId;
+  });
+}
+
+uint8_t CesClient::queryKeyName(const Hash& key, ces::Bytes& outName,
+                                bool& outFound) {
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+  CesQueryKeyName req;
+  req.key = key;
+  minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
+                        req.toBytes()};
+  uint64_t g = queryKeyNameGen_;
+  int staleCount = 0;
+  for (int i = 0; i < tries_; ++i) {
+    transport_->sendMessage(msg);
+    auto res = ces::waitFor(retryIntervalMs_,
+                            [&]() { return g < queryKeyNameGen_; });
+    switch (res) {
+    case ces::WaitResult::Success:
+      if (queryKeyNameResultKey_ != key) {
+        g = queryKeyNameGen_;
+        if (++staleCount < tries_) { --i; }
+        continue;
+      }
+      outFound = queryKeyNameResultFound_ != 0;
+      outName = queryKeyNameResultName_;
+      return CES_OK;
+    case ces::WaitResult::Interrupted:
+      return CES_ERROR_INTERNAL;
+    case ces::WaitResult::Timeout:
+      break;
+    }
+  }
+  return CES_ERROR_TIMEOUT;
+}
+
+uint8_t CesClient::queryKeyNameByName(const ces::Bytes& name, Hash& outKey,
+                                      bool& outFound) {
+  if (!ensureServerTicket())
+    return CES_ERROR_INTERNAL;
+  CesQueryKeyNameByName req;
+  req.name = name;
+  minx::MinxMessage msg{0, transport_->generatePassword(), serverTicket_,
+                        req.toBytes()};
+  uint64_t g = qknByNameGen_;
+  int staleCount = 0;
+  for (int i = 0; i < tries_; ++i) {
+    transport_->sendMessage(msg);
+    auto res = ces::waitFor(retryIntervalMs_,
+                            [&]() { return g < qknByNameGen_; });
+    switch (res) {
+    case ces::WaitResult::Success:
+      if (qknByNameResultName_ != name) {  // stale reply from a prior lookup
+        g = qknByNameGen_;
+        if (++staleCount < tries_) { --i; }
+        continue;
+      }
+      outFound = qknByNameResultFound_ != 0;
+      outKey = qknByNameResultKey_;
+      return CES_OK;
+    case ces::WaitResult::Interrupted:
+      return CES_ERROR_INTERNAL;
+    case ces::WaitResult::Timeout:
+      break;
+    }
+  }
+  return CES_ERROR_TIMEOUT;
+}
+
 uint8_t CesClient::updateAsset(const Hash& assetId, const HashPrefix& newOwner,
                                const AssetData& content, uint32_t price) {
   LOGTRACE << "updateAsset";
@@ -1296,6 +1395,41 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         queryAliasResultOffset_ = r.offset;
         queryAliasResultBytes_ = r.bytes;
         queryAliasResultFound_ = r.found;
+      });
+      break;
+
+    case CES_REGISTER_KEYNAME_RESULT:
+      handleSigned(CesRegisterKeyNameResult{}, "register keyname",
+                   registerKeyNameGen_, [&](auto& r) {
+        registerKeyNameResultOriginId_ = r.originId;
+        registerKeyNameResultNonce_ = r.reqNonce;
+        registerKeyNameResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_CLEAR_KEYNAME_RESULT:
+      handleSigned(CesClearKeyNameResult{}, "clear keyname", clearKeyNameGen_,
+                   [&](auto& r) {
+        clearKeyNameResultOriginId_ = r.originId;
+        clearKeyNameResultNonce_ = r.reqNonce;
+        clearKeyNameResultCode_ = r.rcode;
+      });
+      break;
+
+    case CES_QUERY_KEYNAME_RESULT:
+      handleUnsigned(CesQueryKeyNameResult{}, queryKeyNameGen_, [&](auto& r) {
+        queryKeyNameResultKey_ = r.key;
+        queryKeyNameResultName_ = r.name;
+        queryKeyNameResultFound_ = r.found;
+      });
+      break;
+
+    case CES_QUERY_KEYNAME_BY_NAME_RESULT:
+      handleUnsigned(CesQueryKeyNameByNameResult{}, qknByNameGen_,
+                     [&](auto& r) {
+        qknByNameResultName_ = r.name;
+        qknByNameResultFound_ = r.found;
+        qknByNameResultKey_ = r.key;
       });
       break;
 

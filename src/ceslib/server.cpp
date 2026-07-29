@@ -109,6 +109,7 @@ constexpr uint8_t PEER_MINER_MAX_DIFF_ABOVE = 5;
 constexpr const char* ACCOUNTS_DATA_SUBDIRECTORY = "accounts";
 constexpr const char* ASSETS_DATA_SUBDIRECTORY = "assets";
 constexpr const char* ALIASES_DATA_SUBDIRECTORY = "aliases";
+constexpr const char* KEYNAMES_DATA_SUBDIRECTORY = "keynames";
 
 // Asset-range cell conventions, shared by the VM syscall host and the
 // CES_CREATE_ASSET_RANGE handler: cell i's key is prefix||i with a native index
@@ -456,7 +457,7 @@ private:
     if (finished_) return;
     finished_ = true;
     boost::system::error_code ec;
-    timeoutTimer_.cancel(ec);
+    timeoutTimer_.cancel();
     if (stream_) stream_->close();
     if (cb_) {
       cb_(rc, std::move(body));
@@ -500,7 +501,8 @@ public:
     this->feeTx      = server_.discountFee(FeeKind::Tx,          server_.cfg_.feeTx);
     this->feeAsset   = server_.discountFee(FeeKind::AssetRent,   server_.cfg_.feeAsset);
     this->feeAccount = server_.discountFee(FeeKind::AccountRent, server_.cfg_.feeAccount);
-    this->feeAlias   = server_.discountFee(FeeKind::AccountRent, server_.cfg_.feeAlias);
+    this->feeAlias   = server_.discountFee(FeeKind::AccountRent,
+        server_.cfg_.feeAccount * ALIAS_BYTES / ACCOUNT_BYTES);
     // SYS_SEND_CLIENT has no UDP equivalent; pick a placeholder bounded by
     // existing fees. TODO: resolve this fee/cost properly — outbound push
     // is its own resource (presence cache + UDP bandwidth) and probably
@@ -1108,6 +1110,8 @@ CesServer::CesServer(const CesConfig& config)
               config.minAsset, config.flushValue, config.assetStoreBufferSize),
       aliases_((config.dataDir / ALIASES_DATA_SUBDIRECTORY).string(),
                config.minAlias, config.flushValue),
+      keyNames_((config.dataDir / KEYNAMES_DATA_SUBDIRECTORY).string(),
+                config.minKeyName, config.flushValue),
       presence_(config.presenceCacheSize) {
   // Default every fee multiplier to full price (10000 bp). The metrics
   // pulse overwrites these once a tick from the gauge each kind is
@@ -1659,19 +1663,19 @@ void CesServer::stop(bool flushEvents) {
   LOGDEBUG << "stop stopping task timers";
   if (metricsTimer_) {
     boost::system::error_code ec;
-    metricsTimer_->cancel(ec);
+    metricsTimer_->cancel();
   }
   if (dailyTimer_) {
     boost::system::error_code ec;
-    dailyTimer_->cancel(ec);
+    dailyTimer_->cancel();
   }
   if (replyTimer_) {
     boost::system::error_code ec;
-    replyTimer_->cancel(ec);
+    replyTimer_->cancel();
   }
   if (cronTimer_) {
     boost::system::error_code ec;
-    cronTimer_->cancel(ec);
+    cronTimer_->cancel();
   }
   LOGDEBUG << "stop stopping IO contexts";
   netIO_.stop();
@@ -1715,7 +1719,7 @@ void CesServer::stop(bool flushEvents) {
     LOGDEBUG << "rpc: closing dedicated MINX socket";
     if (rpcTickTimer_) {
       boost::system::error_code ec;
-      rpcTickTimer_->cancel(ec);
+      rpcTickTimer_->cancel();
     }
     rpcMinx_->closeSocket(false);
     rpcNetIO_.stop();
@@ -1859,6 +1863,8 @@ bool CesServer::doSnapshot(const char* reason) {
   accounts_->flush(true);
   accounts_->save(logkv::StoreSaveMode::forkSave);
   aliases_->save(logkv::StoreSaveMode::forkSave);
+  keyNames_->flush(true);
+  keyNames_->save(logkv::StoreSaveMode::forkSave);
   assets_->flush(true);
   assets_->save(logkv::StoreSaveMode::forkSave);
   return true;
@@ -2969,7 +2975,8 @@ uint8_t CesServer::setAlias(const minx::Hash& originKey, uint32_t aliasId,
                             uint16_t offset, const ces::Bytes& bytes,
                             uint32_t providedNonce, uint32_t& outAliasId,
                             int64_t fee, int64_t errFee) {
-  fee = discountedFlatFee(fee, cfg_.feeAlias, FeeKind::AccountRent);
+  fee = discountedFlatFee(fee, cfg_.feeAccount * ALIAS_BYTES / ACCOUNT_BYTES,
+                          FeeKind::AccountRent);
   errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
   outAliasId = 0;
 
@@ -3116,6 +3123,88 @@ bool CesServer::queryAlias(uint32_t aliasId, Alias& out) {
     return false;
   out = a.data();
   return true;
+}
+
+// key_names ---------------------------------------------------------------
+// The signer's key IS the entry owner: originKey is the 32-byte public key
+// whose signature the dispatch already verified, so binding it to a name can
+// never impersonate. Fee + nonce charged to the key's account, like an alias.
+uint8_t CesServer::registerKeyName(const minx::Hash& originKey,
+                                   const ces::Bytes& name,
+                                   uint32_t providedNonce, int64_t errFee) {
+  // Byte-proportional rent, derived from the account fee at the byte ratio
+  // (128/64 = 2x), the same base the daily maintenance charges. No independent
+  // knob: it tracks feeAccount.
+  int64_t fee = discountedFlatFee(
+      -1, cfg_.feeAccount * KEYNAME_BYTES / ACCOUNT_BYTES, FeeKind::AccountRent);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  uint8_t rc = origin.validateSpend(0, static_cast<uint64_t>(fee),
+                                    providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  KeyNameData nm{};
+  std::memcpy(nm.data(), name.data(),
+              std::min<size_t>(name.size(), nm.size()));
+
+  KeyNames::RegisterResult res =
+      keyNames_.registerName(originKey, nm, cfg_.maxKeyName);
+  if (res != KeyNames::RegisterResult::Ok) {
+    origin.chargeError(errFee);
+    switch (res) {
+      case KeyNames::RegisterResult::NameTaken:    return CES_ERROR_KEYNAME_TAKEN;
+      case KeyNames::RegisterResult::CapacityFull: return CES_ERROR_STORE_FULL;
+      default:                                     return CES_ERROR_BAD_INPUT;
+    }
+  }
+
+  origin.debit(static_cast<uint64_t>(fee));
+  accounts_.checkFlush(static_cast<uint64_t>(fee));
+  keyNames_.checkFlush(1);
+  checkAutoSnapshot();
+  LOGTRACE << "registerKeyName ok";
+  return CES_OK;
+}
+
+uint8_t CesServer::clearKeyName(const minx::Hash& originKey,
+                                uint32_t providedNonce, int64_t errFee) {
+  int64_t fee = discountedFlatFee(-1, cfg_.feeQuery, FeeKind::Query);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  if (!origin.exists())
+    return CES_ERROR_ORIGIN_NOT_FOUND;
+
+  uint8_t rc = origin.validateSpend(0, static_cast<uint64_t>(fee),
+                                    providedNonce, errFee);
+  if (rc != CES_OK)
+    return rc;
+
+  if (!keyNames_.clearName(originKey)) {
+    origin.chargeError(errFee);
+    return CES_ERROR_KEYNAME_NOT_FOUND;
+  }
+  origin.debit(static_cast<uint64_t>(fee));
+  accounts_.checkFlush(static_cast<uint64_t>(fee));
+  keyNames_.checkFlush(1);
+  checkAutoSnapshot();
+  return CES_OK;
+}
+
+bool CesServer::queryKeyName(const minx::Hash& key, KeyNameData& outName) {
+  return keyNames_.nameForKey(key, outName);
+}
+
+bool CesServer::queryKeyNameByName(const ces::Bytes& name, minx::Hash& outKey) {
+  KeyNameData nm{};
+  std::memcpy(nm.data(), name.data(),
+              std::min<size_t>(name.size(), nm.size()));
+  return keyNames_.keyForName(KeyNames::normalize(nm), outKey);
 }
 
 uint8_t CesServer::giveAsset(const minx::Hash& originKey,
@@ -3689,6 +3778,78 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
           res.found = 1;
         } else {
           res.found = 0;   // unknown id or out-of-bounds window
+        }
+        sendUnsignedReply(addr, msg, std::move(res));
+      });
+      break;
+    }
+
+    case CES_REGISTER_KEYNAME: {
+      CesRegisterKeyName req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesRegisterKeyName& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint8_t rc = registerKeyName(req.originId, req.name, req.reqNonce);
+          CesRegisterKeyNameResult res;
+          res.originId = originPrefix;
+          res.reqNonce = req.reqNonce;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_CLEAR_KEYNAME: {
+      CesClearKeyName req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesClearKeyName& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          uint8_t rc = clearKeyName(req.originId, req.reqNonce);
+          CesClearKeyNameResult res;
+          res.originId = originPrefix;
+          res.reqNonce = req.reqNonce;
+          res.rcode = rc;
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_QUERY_KEYNAME: {
+      CesQueryKeyName req;
+      req.fromBytes(msg.data);
+      postLogic( [this, addr, msg, req]() {
+        KeyNameData nm{};
+        CesQueryKeyNameResult res;
+        res.key = req.key;
+        if (queryKeyName(req.key, nm)) {
+          size_t len = 0;
+          while (len < nm.size() && nm[len] != 0) ++len;
+          res.name.assign(nm.data(), nm.data() + len);
+          res.found = 1;
+        } else {
+          res.found = 0;
+        }
+        sendUnsignedReply(addr, msg, std::move(res));
+      });
+      break;
+    }
+
+    case CES_QUERY_KEYNAME_BY_NAME: {
+      CesQueryKeyNameByName req;
+      req.fromBytes(msg.data);
+      postLogic( [this, addr, msg, req]() {
+        Hash key{};
+        CesQueryKeyNameByNameResult res;
+        res.name = req.name;  // echo for the client's stale-reply guard
+        if (queryKeyNameByName(req.name, key)) {
+          res.found = 1;
+          res.key = key;
+        } else {
+          res.found = 0;
         }
         sendUnsignedReply(addr, msg, std::move(res));
       });
@@ -5208,15 +5369,16 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
       });
       accounts_.adjustTotalCredits(astCreditsDelta);
     }
-    // Alias rent: sized by the alias's byte footprint (feeAlias =
-    // ALIAS_BYTES x MEMORY_PRICE), charged to the owner in RAM like account/
-    // asset rent (the snapshot below captures it). Owner gone or unable to pay
-    // -> erase the alias and clear its aliasId. The id-generator cell (id 0) is
-    // never billed.
+    // Alias rent: sized by the alias's byte footprint (derived from feeAccount
+    // at ALIAS_BYTES/ACCOUNT_BYTES = 16x), charged to the owner in RAM like
+    // account/asset rent (the snapshot below captures it). Owner gone or unable
+    // to pay -> erase the alias and clear its aliasId. The id-generator cell
+    // (id 0) is never billed.
     size_t aliasBefore = 0, aliasReclaimed = 0;
     {
       uint64_t dailyAliasFee =
-        discountFee(FeeKind::AccountRent, cfg_.feeAlias);
+        discountFee(FeeKind::AccountRent,
+                    cfg_.feeAccount * ALIAS_BYTES / ACCOUNT_BYTES);
       auto& map = aliases_->getObjects();
       aliasBefore = map.size();
       int64_t aliasCreditsDelta = 0;
@@ -5242,12 +5404,44 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
       });
       accounts_.adjustTotalCredits(aliasCreditsDelta);
     }
+    // key_name rent: charged to the KEY's account (getMapKey of the 32-byte
+    // key). Account gone or unable to pay -> reclaim the entry. Erasing on the
+    // store bypasses the wrapper's reverse index, so rebuild it after (once a
+    // day, O(n), fine).
+    size_t knBefore = 0, knReclaimed = 0;
+    {
+      uint64_t dailyKnFee = discountFee(
+          FeeKind::AccountRent, cfg_.feeAccount * KEYNAME_BYTES / ACCOUNT_BYTES);
+      auto& map = keyNames_->getObjects();
+      knBefore = map.size();
+      int64_t knCreditsDelta = 0;
+      boost::unordered::erase_if(map, [&](auto& pair) {
+        if (pair.second.getName() == KeyNameData{})
+          return true;  // already-empty tombstone
+        ActiveAccount owner = accounts_.get(Account::getMapKey(pair.first));
+        if (!owner.exists()) {
+          ++knReclaimed;
+          return true;
+        }
+        int64_t bal = owner.balance();
+        if (bal <= static_cast<int64_t>(dailyKnFee)) {
+          ++knReclaimed;
+          return true;
+        }
+        owner.data().setBalance(bal - static_cast<int64_t>(dailyKnFee));
+        knCreditsDelta -= static_cast<int64_t>(dailyKnFee);
+        return false;
+      });
+      accounts_.adjustTotalCredits(knCreditsDelta);
+      if (knReclaimed > 0) keyNames_.rebuildReverse();  // resync the reverse map
+    }
     LOGINFO << "daily maintenance"
             << VAR(accBefore) << VAR(accPayExpired)
             << VAR(accFeeDeleted) << VAR(accFeeDebited)
             << VAR(creditsDelta)
             << VAR(astBefore) << VAR(astExpired) << VAR(astAutoFunded)
-            << VAR(aliasBefore) << VAR(aliasReclaimed);
+            << VAR(aliasBefore) << VAR(aliasReclaimed)
+            << VAR(knBefore) << VAR(knReclaimed);
     // Re-clamp the server's own account so incoming transfers can't drift its
     // 48-bit balance toward the cap between reboots.
     topUpServerAccount();
@@ -5280,7 +5474,7 @@ void CesServer::dailyTaskStartTimer() {
     secondsToWait = targetSeconds - secondsIntoDay;
   else
     secondsToWait = (SECS_PER_DAY - secondsIntoDay) + targetSeconds;
-  dailyTimer_->expires_from_now(std::chrono::seconds(secondsToWait));
+  dailyTimer_->expires_after(std::chrono::seconds(secondsToWait));
   dailyTimer_->async_wait(
     [this](const boost::system::error_code& ec) { dailyTaskTick(ec); });
 }
@@ -5298,6 +5492,20 @@ void CesServer::_brr(const minx::Hash& accountKey, int64_t amount) {
   } else {
     _brrInner(accountKey, amount);
   }
+}
+
+bool CesServer::_registerKeyName(const minx::Hash& key, const std::string& name) {
+  KeyNameData nm{};
+  std::memcpy(nm.data(), name.data(), std::min(name.size(), nm.size()));
+  auto doIt = [&]() {
+    return keyNames_.registerName(key, nm, cfg_.maxKeyName) ==
+           KeyNames::RegisterResult::Ok;
+  };
+  if (!running_) return doIt();
+  std::promise<bool> p;
+  auto f = p.get_future();
+  postLogic([&p, &doIt]() { p.set_value(doIt()); });
+  return f.get();
 }
 
 // Boot-time autolaunch of /s/ extensions. For each name in
@@ -5851,6 +6059,23 @@ void CesServer::_l2QueryAccount(
     });
 }
 
+void CesServer::_l2QueryKeyName(
+    const minx::Hash& key,
+    std::function<void(const std::string&)> cb,
+    boost::asio::any_io_executor cbExecutor) {
+  auto self = this;
+  postLogic([self, key, cb, cbExecutor]() {
+    KeyNameData nm{};
+    std::string name;
+    if (self->keyNames_.nameForKey(key, nm)) {
+      size_t len = 0;
+      while (len < nm.size() && nm[len] != 0) ++len;
+      name.assign(reinterpret_cast<const char*>(nm.data()), len);
+    }
+    boost::asio::post(cbExecutor, [cb, name]() { cb(name); });
+  });
+}
+
 uint64_t CesServer::priceNetUsage(const CesPlexUsage& usage) const {
   // Price a channel's measured resource usage in credits at the live discounted
   // feeNet* rates. mem-byte-seconds → the per-byte-DAY rate (divide by
@@ -5943,6 +6168,31 @@ void CesServer::_l2CheckAssetOwner(
     });
 }
 
+void CesServer::_l2CheckFZoneOwner(
+    const std::string& fname,
+    const ces::PublicKey& signer,
+    std::function<void(bool)> cb,
+    boost::asio::any_io_executor cbExecutor) {
+  auto self = this;
+  minx::Hash signerKey = signer.getHash();
+  postLogic([self, fname, signerKey, cb, cbExecutor]() {
+    bool ok = false;
+    // The /f/<name>/ zone is owned SOLELY by the key_name holder: one source of
+    // truth, unsquattable, no asset gate (an asset gate would be a second,
+    // racing source of truth for the same zone). The path segment is already
+    // the normalized (underscore) form; normalize is idempotent on it. A name
+    // that cannot be a key_name (empty or >32 bytes) has no owner and no zone.
+    if (!fname.empty() && fname.size() <= KEYNAME_NAME_BYTES) {
+      KeyNameData nm{};
+      std::memcpy(nm.data(), fname.data(), fname.size());
+      Hash knKey{};
+      if (self->keyNames_.keyForName(KeyNames::normalize(nm), knKey))
+        ok = (knKey == signerKey);
+    }
+    boost::asio::post(cbExecutor, [cb, ok]() { cb(ok); });
+  });
+}
+
 void CesServer::liveSnapshot(std::function<void(bool ok, std::string msg)> cb) {
   postLogic( [this, cb]() {
     try {
@@ -5964,6 +6214,8 @@ void CesServer::_save() {
   accounts_->flush(true);
   accounts_->save(logkv::StoreSaveMode::syncSave);
   aliases_->save(logkv::StoreSaveMode::syncSave);
+  keyNames_->flush(true);
+  keyNames_->save(logkv::StoreSaveMode::syncSave);
   assets_->flush(true);
   assets_->save(logkv::StoreSaveMode::syncSave);
 }

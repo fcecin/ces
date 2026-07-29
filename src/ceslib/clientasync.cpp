@@ -35,7 +35,7 @@ CesClientAsync::~CesClientAsync() { close(); }
 void CesClientAsync::close() {
   if (closed_) return;
   closed_ = true;
-  { boost::system::error_code ec; sweepTimer_.cancel(ec); }
+  { boost::system::error_code ec; sweepTimer_.cancel(); }
   { boost::system::error_code ec; socket_.close(ec); }
   failAll(CES_ERROR_INTERNAL);
 }

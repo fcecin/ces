@@ -9,9 +9,12 @@ set(CMAKE_CXX_STANDARD_REQUIRED True)
 # 1. EXPLICIT COMPILER CONFIGURATION
 # -----------------------------------------------------------------------------
 
-# Apply hardware optimizations globally to all C and C++ targets
+# Apply hardware optimizations globally to all C and C++ targets (x86 only;
+# e.g. Apple Silicon rejects x86-64-v3).
 set(CES_MARCH "x86-64-v3" CACHE STRING "Target -march; 'native' = local-only")
-add_compile_options(-march=${CES_MARCH})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+  add_compile_options(-march=${CES_MARCH})
+endif()
 
 # Force -O3 for pure Release builds (Overrides secp256k1's -O2 fallback)
 add_compile_options("$<$<CONFIG:Release>:-O3>")
@@ -38,7 +41,14 @@ if(POLICY CMP0167)
   cmake_policy(SET CMP0167 NEW)
 endif()
 set(Boost_USE_STATIC_LIBS ON)
-find_package(Boost 1.83.0 REQUIRED COMPONENTS system log log_setup stacktrace_addr2line)
+# Boost.System is header-only since 1.69 and its component config vanished in
+# 1.90, so never request it. The addr2line stacktrace backend (plus
+# libbacktrace below) is a Linux nicety; other platforms get a plain handler.
+set(CES_BOOST_COMPONENTS log log_setup)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  list(APPEND CES_BOOST_COMPONENTS stacktrace_addr2line)
+endif()
+find_package(Boost 1.83.0 REQUIRED COMPONENTS ${CES_BOOST_COMPONENTS})
 
 # -----------------------------------------------------------------------------
 # 3. FETCH CONTENT DEPENDENCIES
@@ -77,6 +87,8 @@ FetchContent_Declare(
     minx
     GIT_REPOSITORY https://github.com/fcecin/minx.git
     GIT_TAG        main
+    PATCH_COMMAND  ${CMAKE_COMMAND} -P
+                   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-minx-boost187.cmake
 )
 set(MINX_BUILD_EXAMPLES OFF CACHE BOOL "Disable building MINX examples" FORCE)
 FetchContent_MakeAvailable(minx)
@@ -107,29 +119,37 @@ FetchContent_MakeAvailable(mene)
 
 include(ExternalProject)
 
-set(LIBBACKTRACE_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libbacktrace_install)
-set(LIBBACKTRACE_INCLUDE_DIR ${LIBBACKTRACE_PREFIX}/include)
-set(LIBBACKTRACE_LIB ${LIBBACKTRACE_PREFIX}/lib/libbacktrace.a)
+# Linux-only (see the Boost components note above). BYPRODUCTS is required
+# for Ninja to know the imported .a comes from the external project.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(LIBBACKTRACE_PREFIX ${CMAKE_CURRENT_BINARY_DIR}/libbacktrace_install)
+  set(LIBBACKTRACE_INCLUDE_DIR ${LIBBACKTRACE_PREFIX}/include)
+  set(LIBBACKTRACE_LIB ${LIBBACKTRACE_PREFIX}/lib/libbacktrace.a)
 
-ExternalProject_Add(libbacktrace_ext
-    GIT_REPOSITORY    https://github.com/ianlancetaylor/libbacktrace.git
-    GIT_TAG           master
-    PREFIX            ${LIBBACKTRACE_PREFIX}
-    CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${LIBBACKTRACE_PREFIX} --enable-shared=OFF --enable-static=ON --with-pic
-    BUILD_COMMAND     make
-    INSTALL_COMMAND   make install
-    UPDATE_COMMAND    ""
-    LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON
-)
+  ExternalProject_Add(libbacktrace_ext
+      GIT_REPOSITORY    https://github.com/ianlancetaylor/libbacktrace.git
+      GIT_TAG           master
+      PREFIX            ${LIBBACKTRACE_PREFIX}
+      CONFIGURE_COMMAND <SOURCE_DIR>/configure --prefix=${LIBBACKTRACE_PREFIX} --enable-shared=OFF --enable-static=ON --with-pic
+      BUILD_COMMAND     make
+      INSTALL_COMMAND   make install
+      UPDATE_COMMAND    ""
+      BUILD_BYPRODUCTS  ${LIBBACKTRACE_LIB}
+      LOG_DOWNLOAD ON LOG_CONFIGURE ON LOG_BUILD ON
+  )
 
-file(MAKE_DIRECTORY ${LIBBACKTRACE_INCLUDE_DIR})
+  file(MAKE_DIRECTORY ${LIBBACKTRACE_INCLUDE_DIR})
 
-add_library(libbacktrace STATIC IMPORTED GLOBAL)
-add_dependencies(libbacktrace libbacktrace_ext)
-set_target_properties(libbacktrace PROPERTIES
-    IMPORTED_LOCATION "${LIBBACKTRACE_LIB}"
-    INTERFACE_INCLUDE_DIRECTORIES "${LIBBACKTRACE_INCLUDE_DIR}"
-)
+  add_library(libbacktrace STATIC IMPORTED GLOBAL)
+  add_dependencies(libbacktrace libbacktrace_ext)
+  set_target_properties(libbacktrace PROPERTIES
+      IMPORTED_LOCATION "${LIBBACKTRACE_LIB}"
+      INTERFACE_INCLUDE_DIRECTORIES "${LIBBACKTRACE_INCLUDE_DIR}"
+  )
+  set(CES_STACKTRACE_LIBS Boost::stacktrace_addr2line libbacktrace)
+else()
+  set(CES_STACKTRACE_LIBS "")
+endif()
 
 # -----------------------------------------------------------------------------
 # 5. TARGETS
@@ -138,9 +158,39 @@ set_target_properties(libbacktrace PROPERTIES
 # Recursive so ceslib's source tree mirrors the include tree: every
 # include/ces/<group>/<name>.h has its src/ceslib/<group>/<name>.cpp.
 file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
+
+# The portable client subset: keys/protocol/client, CesPlexClient, the L2
+# file/compute clients, and utils. The server half (ledger tables, VM, L2
+# handlers, CesPlex bus, webadmin) is POSIX and stays off non-POSIX hosts.
+# A pure client links the same subset everywhere.
+# Default: full stack on Linux (the server's home), client subset elsewhere.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(CES_CLIENT_ONLY_DEFAULT OFF)
+else()
+  set(CES_CLIENT_ONLY_DEFAULT ON)
+endif()
+option(CES_CLIENT_ONLY "ceslib = client-side engine only"
+       ${CES_CLIENT_ONLY_DEFAULT})
+if(CES_CLIENT_ONLY)
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/(server|webadmin|extension_manager|cesco|clientasync|ramfilestore|cesvm|accounts|aliases|assets|keynames)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/l2/.*(handler|site)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/cesplex/(mux|meter|endpoint)\\.cpp$")
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/(lang/.*|util/(smtp|vmprogram|kvcount))\\.cpp$")
+else()
+  list(FILTER CESLIB_SOURCES EXCLUDE REGEX
+       "src/ceslib/client_only_compat\\.cpp$")
+endif()
 add_library(ceslib STATIC ${CESLIB_SOURCES})
 
-target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY BOOST_STACKTRACE_USE_BACKTRACE)
+target_compile_definitions(ceslib PUBLIC BOOST_ASIO_HEADER_ONLY)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(ceslib PUBLIC BOOST_STACKTRACE_USE_BACKTRACE
+                                           CES_HAVE_STACKTRACE)
+endif()
 
 target_compile_options(ceslib PRIVATE -Wall -Wextra -Wpedantic)
 
@@ -154,13 +204,12 @@ PUBLIC
 target_link_libraries(ceslib
 PUBLIC
   ${Boost_LIBRARIES}
-  Boost::stacktrace_addr2line
+  ${CES_STACKTRACE_LIBS}
   cryptopp::cryptopp
   secp256k1
   minxlib
   mene::assets
   Threads::Threads
-  libbacktrace
   ${CMAKE_DL_LIBS}
   tomlplusplus::tomlplusplus
 )
@@ -184,6 +233,9 @@ if(NOT GIT_COMMIT_DATE)
   set(GIT_COMMIT_DATE "unknown")
 endif()
 
+# Every executable needs the full ceslib; a client-only build ships only the
+# library for a downstream to link.
+if(NOT CES_CLIENT_ONLY)
 file(GLOB CES_CPP "src/ces/*.cpp")
 add_executable(ces ${CES_CPP})
 target_link_libraries(ces PRIVATE ceslib CLI11::CLI11)
@@ -224,6 +276,8 @@ add_executable(cescompmockd src/cescompmockd/main.cpp)
 target_link_options(cescompmockd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cescompmockd PROPERTIES OUTPUT_NAME "cescompmockd")
 
+# The compute child; also the only LuaJIT consumer, so the pkg-config
+# requirement lives with it.
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LUAJIT REQUIRED luajit)
 add_executable(cesluajitd
@@ -235,6 +289,7 @@ target_link_libraries(cesluajitd PRIVATE ${LUAJIT_LIBRARIES} ceslib)
 target_link_directories(cesluajitd PRIVATE ${LUAJIT_LIBRARY_DIRS})
 target_link_options(cesluajitd PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesluajitd PROPERTIES OUTPUT_NAME "cesluajitd")
+endif()  # NOT CES_CLIENT_ONLY: tools, cesluajitd, and LuaJIT all skipped
 
 # -----------------------------------------------------------------------------
 # 6. OPTIONAL: the hyle consensus engine (core + services) for cesluajitd
@@ -247,7 +302,7 @@ set_target_properties(cesluajitd PROPERTIES OUTPUT_NAME "cesluajitd")
 # PUBLIC-links core), so the C++ side can drive a blockchain node over its own
 # transport. Wired now; unused (no #include) until cesluajitd starts using it.
 option(CES_HYLE "Fetch + link the hyle consensus engine (core + services) into cesluajitd" OFF)
-if(CES_HYLE)
+if(CES_HYLE AND NOT CES_CLIENT_ONLY)
   FetchContent_Declare(
     hyle
     GIT_REPOSITORY https://github.com/fcecin/hyle.git
@@ -267,7 +322,7 @@ endif()
 # Outbound mail: builtin:mail + the SMTP/TLS client. Off by default; build.sh
 # --mail. Needs system OpenSSL.
 option(CES_MAIL "Enable outbound mail (builtin:mail + SMTP with TLS)" OFF)
-if(CES_MAIL)
+if(CES_MAIL AND NOT CES_CLIENT_ONLY)
   find_package(OpenSSL REQUIRED)
   target_link_libraries(ceslib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
   target_compile_definitions(ceslib PUBLIC CES_MAIL=1)
@@ -277,7 +332,7 @@ endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)
 find_package(Qt6 QUIET COMPONENTS Widgets Network)
-if(Qt6_FOUND)
+if(Qt6_FOUND AND NOT CES_CLIENT_ONLY)
   set(CMAKE_AUTOMOC ON)
   add_executable(cesqt
     src/cesqt/main.cpp
@@ -299,7 +354,7 @@ else()
 endif()
 
 option(CES_BUILD_TESTS "Build unit tests" ON)
-if(CES_BUILD_TESTS)
+if(CES_BUILD_TESTS AND NOT CES_CLIENT_ONLY)
   enable_testing()
   add_subdirectory(tests)
 endif()

@@ -235,6 +235,14 @@ public:
   uint8_t readAlias(uint32_t aliasId, uint16_t offset, uint16_t length,
                     ces::Bytes& outBytes, bool& outFound);
 
+  // key_names: bind THIS client's key to `name` (the signer is the owner);
+  // clear it; and unsigned lookups both ways. `name` is <= 32 bytes.
+  uint8_t registerKeyName(const ces::Bytes& name);
+  uint8_t clearKeyName();
+  uint8_t queryKeyName(const Hash& key, ces::Bytes& outName, bool& outFound);
+  uint8_t queryKeyNameByName(const ces::Bytes& name, Hash& outKey,
+                             bool& outFound);
+
   /**
    * Query a peer-table slot (Unsigned/Public) for discovery.
    * @return CES_OK (outFound says whether the slot held a peer) or
@@ -407,6 +415,24 @@ private:
   ces::Bytes queryAliasResultBytes_;
   uint8_t queryAliasResultFound_ = 0;
   std::atomic<uint64_t> queryAliasGen_ = 0;
+
+  // key_name results
+  HashPrefix registerKeyNameResultOriginId_{};
+  uint32_t registerKeyNameResultNonce_ = 0;
+  uint8_t registerKeyNameResultCode_ = 0;
+  std::atomic<uint64_t> registerKeyNameGen_ = 0;
+  HashPrefix clearKeyNameResultOriginId_{};
+  uint32_t clearKeyNameResultNonce_ = 0;
+  uint8_t clearKeyNameResultCode_ = 0;
+  std::atomic<uint64_t> clearKeyNameGen_ = 0;
+  Hash queryKeyNameResultKey_{};
+  ces::Bytes queryKeyNameResultName_;
+  uint8_t queryKeyNameResultFound_ = 0;
+  std::atomic<uint64_t> queryKeyNameGen_ = 0;
+  ces::Bytes qknByNameResultName_;  // echoed query name (stale-reply guard)
+  uint8_t qknByNameResultFound_ = 0;
+  Hash qknByNameResultKey_{};
+  std::atomic<uint64_t> qknByNameGen_ = 0;
 
   // Asset Results
   HashPrefix createAssetResultOriginId_;

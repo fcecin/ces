@@ -96,9 +96,9 @@ cesweb/             L3 HTTP gateway (Node) serving CES files plus a /dev
                     terminal via the cesh CLI; self-contained, own CLAUDE.md
 ```
 
-## Data model: the three-type ledger
+## Data model: the ledger tables
 
-CES has exactly three ledger types: Account, Asset, and Alias. Files, programs, schedules, namespaces, autoexec, and the market all compose out of those; no separate file/program/namespace tables.
+CES has four ledger tables: Account, Asset, Alias, and KeyName. Files, programs, schedules, namespaces, autoexec, and the market all compose out of the first three; no separate file/program/namespace tables.
 
 Account (map key = first 8 bytes of the raw pubkey, not a hash of it; a key-tail disambiguates prefix collisions):
 - `balance` is sign-overloaded: positive = ordinary account, negative = unsettled payment account.
@@ -113,12 +113,17 @@ Asset (map key = full 32-byte hash):
 - `price` non-zero means any signer can `CES_BUY_ASSET` for that amount.
 - `content` is ~210 bytes of arbitrary user bytes.
 
-The asset is the generative primitive. Files are chains of assets; VM programs are assets (`CES_RUN_ASSET`); autoexec and scheduled runs are key-patterns on assets; `/f/<name>` namespaces are gated by who owns the asset at `sha256("/f/<name>")` (transferable via `CES_GIVE_ASSET`).
+The asset is the generative primitive. Files are chains of assets; VM programs are assets (`CES_RUN_ASSET`); autoexec and scheduled runs are key-patterns on assets; `/f/<name>` namespaces are gated SOLELY by who owns the name in `key_names` (one source of truth; no asset gate).
 
 Alias (map key = server-allocated uint32, never reused; full reference: docs/aliases.md):
 - a 1024-byte account-bound memory cell: owner(8) | editor(8) | op(2) | content(1002), patch-written (`CES_SET_ALIAS` offset+bytes; owner floor 8, editor floor 18), window-read (`CES_QUERY_ALIAS`), rent paid by the owner account.
 - `editor` is a single granted co-writer (content only): the shared-memory/mailbox primitive. One writer per trust domain; untrusted duplex = a pair of cells.
 - executable: account hooks (pointer or inline GATE/WATCH fired by transfers) and `ALIAS_OP_INLINE_PROGRAM` cells run via `CES_RUN_ALIAS`/`SYS_SCHEDULE_ALIAS`. VM runs carry three identities: caller (pays gas, allowance-bounded), self (the boot asset; 0 = alias program, asset-custody syscalls disabled), programOwner (the consenting principal: the account the run ACTS AS for alias writes and the allowance-exempt syscalls; derived from the cell or asset that carries the code, never from the invoker; 0 = none). Alias syscalls: SYS_READ/WRITE_ALIAS, SYS_LOAD_CODE_ALIAS, SYS_SCHEDULE_ALIAS.
+
+KeyName (map key = full 32-byte pubkey; `keyname.h`/`keynames.h`, table `keyNames_`):
+- a 32-byte name cell keyed BY the pubkey: "the key IS the owner", no owner field. To register/update/delete (`CES_REGISTER_KEYNAME`/`CES_CLEAR_KEYNAME`), the signer must BE that key (crypto-enforced, no impersonation). Queries `CES_QUERY_KEYNAME` (key->name) and `CES_QUERY_KEYNAME_BY_NAME` (name->key).
+- the STORED name is the normalized form: `normalize` maps spaces AND underscores to `_` and strips leading/trailing `_` (a name cannot begin/end with one), so "Ada Lovelace" and "Ada_Lovelace" are ONE name. Unique both ways: a derived reverse index (`byName_`, normalized-name -> key) is REBUILT from the forward store on load, so snapshot == replay. Pretty renderers turn `_` back into space; the underscore form is used verbatim in paths/URLs.
+- rent-paid daily from the key's account at a rate DERIVED from `feeAccount` (byte ratio 128/64 = x2; no independent knob); the cell dies if the account cannot pay, and the reverse index is rebuilt after a sweep reclaims. The name IS the `/f/<name>/` file zone: `_l2CheckFZoneOwner` gates that zone SOLELY on key_name ownership (no asset gate, no second source of truth).
 
 Asset day-counter is rent. Daily maintenance decrements every asset's balance by 1; assets at <= 1 die. Keep alive via `CES_FUND_ASSET`.
 
@@ -200,7 +205,7 @@ Verbs: CREATE (any) / WRITE (owner) / READ (any signer) / STAT (any signer; meta
 
 Four-zone naming (mandatory):
 - `/h/<64-hex-pubkey>/...` auto home dir; signer must match the hex.
-- `/f/<name>/...` asset-gated; signer must own the asset at `sha256("/f/<name>")`. Transferable via `CES_GIVE_ASSET`.
+- `/f/<name>/...` key_name gated: signer must own the name `<name>` in `key_names` (`_l2CheckFZoneOwner`), and that is the ONLY gate (crypto-owned, unsquattable, one source of truth; no asset gate). `<name>` is already the normalized underscore form.
 - `/p/...` public; first-come-first-served on the exact path.
 - `/s/...` server-deployed, unmetered, outside the cap. Only the server's own private key may CREATE/WRITE; reads are operator-donated. The handler keeps a generated `/s/index.html` catalog (`regenerateServerIndex`, on the file strand, never `logicStrand_`). `/s/` is the only enumerable zone, and safely so since it is operator-write-only. Every other zone is non-enumerable (no LIST verb exists): the path is the capability.
 
@@ -289,6 +294,7 @@ Created via `CES_CREATE_PAYMENT`. Cost = `(2 + days) * feeAccount`. New account:
 - Payment accounts (balance < 0): decrement nonce; delete if nonce <= 1.
 - Regular accounts (balance >= 0): deduct `feeAccount`; delete if balance <= fee.
 - Assets: decrement balance by 1; delete if balance <= 1.
+- KeyNames: charge each name's key account the derived key_name rent (`feeAccount` x 2); reclaim the cell if the account is gone or cannot pay. A reclaim rebuilds the reverse index.
 
 Logs a per-pass summary and triggers an auto-snapshot. Flat files have no periodic rent pass: rent is lazy (every non-DEPOSIT op rolls it forward; JIT GC fires on CREATE if the cap is exceeded). KV-file cells, by contrast, ARE swept on this daily pass: `sweepKvRent` charges each cell its per-byte rent and erases zero-balance keys (the daily tick is the only place kv-cell rent is charged; kv ops do not roll rent per-touch like flat files do). Compute instances are billed on the supervisor tick, not maintenance.
 

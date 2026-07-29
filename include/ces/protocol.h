@@ -1112,6 +1112,143 @@ struct CesRunAliasResult {
   CES_INJECT_SIGNED_METHODS(CES_RUN_ALIAS_RESULT)
 };
 
+// --- CES_REGISTER_KEYNAME (bind the signer's key to a name) ---
+// The signer IS the entry owner: originId is the 32-byte public key, and the
+// signature proves control of it, so no one can bind a name to a key they do
+// not hold. `name` is 32 bytes (UTF-8, zero-padded); the server enforces name
+// uniqueness (on the spaces->underscore normalized form) and validity.
+struct CesRegisterKeyName {
+  Hash originId;
+  HashPrefix serverId{};
+  uint32_t reqNonce = 0;
+  ces::Bytes name;   // the name bytes; <= 32
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(serverId) + sizeof(reqNonce) +
+           sizeof(uint16_t) + name.size();
+  }
+  void writePayload(minx::Buffer& buf) {
+    buf.put(originId);
+    buf.put(serverId);
+    buf.put(reqNonce);
+    buf.put(static_cast<uint16_t>(name.size()));
+    buf.putBytes(name);
+  }
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<Hash>();
+    serverId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 32) len = 32;
+    name = buf.getBytes<ces::Bytes>(len);
+  }
+
+  Signature sig{};
+  CES_INJECT_SIGNED_METHODS(CES_REGISTER_KEYNAME)
+};
+
+#define CES_REGISTER_KEYNAME_RESULT_FIELDS(X)                                  \
+  X(HashPrefix, originId) X(uint32_t, reqNonce) X(uint8_t, rcode)
+struct CesRegisterKeyNameResult {
+  CES_DECLARE_FIELDS(CES_REGISTER_KEYNAME_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_REGISTER_KEYNAME_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_REGISTER_KEYNAME_RESULT)
+};
+
+// --- CES_CLEAR_KEYNAME (erase the signer's own key_name) ---
+#define CES_CLEAR_KEYNAME_FIELDS(X)                                            \
+  X(Hash, originId) X(HashPrefix, serverId) X(uint32_t, reqNonce)
+struct CesClearKeyName {
+  CES_DECLARE_FIELDS(CES_CLEAR_KEYNAME_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_CLEAR_KEYNAME_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_CLEAR_KEYNAME)
+};
+
+#define CES_CLEAR_KEYNAME_RESULT_FIELDS(X)                                     \
+  X(HashPrefix, originId) X(uint32_t, reqNonce) X(uint8_t, rcode)
+struct CesClearKeyNameResult {
+  CES_DECLARE_FIELDS(CES_CLEAR_KEYNAME_RESULT_FIELDS)
+  Signature sig{};
+  CES_INJECT_FIXED_SIGNED_PAYLOAD(CES_CLEAR_KEYNAME_RESULT_FIELDS)
+  CES_INJECT_SIGNED_METHODS(CES_CLEAR_KEYNAME_RESULT)
+};
+
+// --- CES_QUERY_KEYNAME (unsigned: pubkey -> name) ---
+#define CES_QUERY_KEYNAME_FIELDS(X) X(Hash, key)
+struct CesQueryKeyName {
+  CES_DECLARE_FIELDS(CES_QUERY_KEYNAME_FIELDS)
+  CES_INJECT_FIXED_UNSIGNED_PAYLOAD(CES_QUERY_KEYNAME_FIELDS)
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_KEYNAME)
+};
+
+struct CesQueryKeyNameResult {
+  Hash key{};
+  uint8_t found = 0;
+  ces::Bytes name;   // the name bytes if found
+
+  size_t getPayloadSize() const {
+    return sizeof(key) + sizeof(found) + sizeof(uint16_t) + name.size();
+  }
+  void writePayload(minx::Buffer& buf) const {
+    buf.put(key);
+    buf.put(found);
+    buf.put(static_cast<uint16_t>(name.size()));
+    buf.putBytes(name);
+  }
+  void readPayload(minx::ConstBuffer& buf) {
+    key = buf.get<Hash>();
+    found = buf.get<uint8_t>();
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 32) len = 32;
+    name = buf.getBytes<ces::Bytes>(len);
+  }
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_KEYNAME_RESULT)
+};
+
+// --- CES_QUERY_KEYNAME_BY_NAME (unsigned: name -> pubkey) ---
+struct CesQueryKeyNameByName {
+  ces::Bytes name;   // the name to look up (<= 32)
+
+  size_t getPayloadSize() const { return sizeof(uint16_t) + name.size(); }
+  void writePayload(minx::Buffer& buf) const {
+    buf.put(static_cast<uint16_t>(name.size()));
+    buf.putBytes(name);
+  }
+  void readPayload(minx::ConstBuffer& buf) {
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 32) len = 32;
+    name = buf.getBytes<ces::Bytes>(len);
+  }
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_KEYNAME_BY_NAME)
+};
+
+struct CesQueryKeyNameByNameResult {
+  ces::Bytes name;   // echo of the queried name: lets the client drop a stale/
+                     // reordered reply from a prior lookup (<= 32)
+  uint8_t found = 0;
+  Hash key{};
+
+  size_t getPayloadSize() const {
+    return sizeof(uint16_t) + name.size() + sizeof(found) + sizeof(key);
+  }
+  void writePayload(minx::Buffer& buf) const {
+    buf.put(static_cast<uint16_t>(name.size()));
+    buf.putBytes(name);
+    buf.put(found);
+    buf.put(key);
+  }
+  void readPayload(minx::ConstBuffer& buf) {
+    uint16_t len = buf.get<uint16_t>();
+    if (len > 32) len = 32;
+    name = buf.getBytes<ces::Bytes>(len);
+    found = buf.get<uint8_t>();
+    key = buf.get<Hash>();
+  }
+  CES_INJECT_UNSIGNED_METHODS(CES_QUERY_KEYNAME_BY_NAME_RESULT)
+};
+
 // --- UNSIGNED ASSET QUERIES & SERVER INFO ---
 #define CES_UNSIGNED_QUERY_ASSET_FIELDS(X) X(Hash, assetId)
 struct CesUnsignedQueryAsset {

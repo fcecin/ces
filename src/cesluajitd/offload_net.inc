@@ -895,6 +895,30 @@ int lua_ces_account_read(lua_State* L) {
   });
 }
 
+// ces.keyname(pubkey:string(32)) -> name:string | nil
+//   The key_name registered to that pubkey on THIS server (the stored,
+//   normalized underscore form), or nil if the key has no name. Read-only,
+//   no fee. Lets an app gate entry on the caller's identity (conn.pubkey).
+int lua_ces_keyname(lua_State* L) {
+  size_t pk_len = 0;
+  const char* pk = luaL_checklstring(L, 1, &pk_len);
+  if (pk_len != 32) {
+    lua_pushnil(L);
+    lua_pushstring(L, "pubkey must be 32 bytes");
+    return 2;
+  }
+  std::vector<uint8_t> args;
+  put_bytes(args, pk, 32);
+  return io_call(L, METHOD_KEYNAME, args, [](lua_State* L, const Frame& reply) -> int {
+    uint8_t st = reply.body[0];
+    if (st != STATUS_OK) return push_file_err(L, st);
+    if (reply.body.size() <= 1) { lua_pushnil(L); return 1; }  // no name
+    lua_pushlstring(L, reinterpret_cast<const char*>(reply.body.data() + 1),
+                    reply.body.size() - 1);
+    return 1;
+  });
+}
+
 // ces.peers() → array of {pubkey(32), address, reachable, verified,
 //   outbound, inbound}. The local server's peer table snapshot (the same
 //   data the public CES_QUERY_PEER_INFO opcode exposes). This is the P2P
@@ -1126,4 +1150,3 @@ int lua_ces_peer_target(lua_State* L) {
   return 1;
   });
 }
-

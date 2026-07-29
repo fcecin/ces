@@ -46,7 +46,11 @@ enum op_code_t : uint8_t {
   CES_QUERY_ALIAS = 0x18,              // unsigned: read an alias by id
   CES_SET_ASSET_OWNER_PAYS = 0x19,     // signed: toggle an asset's owner-pays (auto-fund) bit
   CES_CREATE_ASSET_RANGE = 0x1a,       // signed: atomically create N account-owned cells at a prefix
-  CES_RUN_ALIAS = 0x1b                 // signed: execute an alias's inline program (CesVM)
+  CES_RUN_ALIAS = 0x1b,                // signed: execute an alias's inline program (CesVM)
+  CES_REGISTER_KEYNAME = 0x1c,         // signed: bind the signer's key to a name (key IS the owner)
+  CES_CLEAR_KEYNAME = 0x1d,            // signed: erase the signer's key_name
+  CES_QUERY_KEYNAME = 0x1e,            // unsigned: pubkey -> name
+  CES_QUERY_KEYNAME_BY_NAME = 0x1f     // unsigned: name -> pubkey
 };
 
 /**
@@ -96,6 +100,10 @@ enum result_code_t : uint8_t {
   CES_SET_ASSET_OWNER_PAYS_RESULT = 0x19,
   CES_CREATE_ASSET_RANGE_RESULT = 0x1a,
   CES_RUN_ALIAS_RESULT = 0x1b,
+  CES_REGISTER_KEYNAME_RESULT = 0x1c,
+  CES_CLEAR_KEYNAME_RESULT = 0x1d,
+  CES_QUERY_KEYNAME_RESULT = 0x1e,
+  CES_QUERY_KEYNAME_BY_NAME_RESULT = 0x1f,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };
@@ -185,7 +193,9 @@ enum error_code_t : uint8_t {
   // SYS_L2_CALL — the 8-byte discriminator names no built-in mounted on this
   // server, or the target built-in does not implement the L2-call handler.
   CES_ERROR_UNSUPPORTED = 0x27,
-  CES_ERROR_LAST = CES_ERROR_UNSUPPORTED
+  CES_ERROR_KEYNAME_TAKEN = 0x28,    // the name is already bound to another key
+  CES_ERROR_KEYNAME_NOT_FOUND = 0x29,  // no key_name for this key
+  CES_ERROR_LAST = CES_ERROR_KEYNAME_NOT_FOUND
 };
 
 /// reqNonce value meaning "server assigns nonce, use time-based dedup."
@@ -358,6 +368,8 @@ inline const char* errorString(uint8_t code) {
   case CES_ERROR_BAD_INPUT:                        return "CES_ERROR_BAD_INPUT";
   case CES_ERROR_BALANCE_OVERFLOW:                 return "CES_ERROR_BALANCE_OVERFLOW";
   case CES_ERROR_ALIAS_NOT_FOUND:                  return "CES_ERROR_ALIAS_NOT_FOUND";
+  case CES_ERROR_KEYNAME_TAKEN:                    return "CES_ERROR_KEYNAME_TAKEN";
+  case CES_ERROR_KEYNAME_NOT_FOUND:                return "CES_ERROR_KEYNAME_NOT_FOUND";
   case CES_ERROR_HOOK_REJECTED:                    return "CES_ERROR_HOOK_REJECTED";
   case CES_ERROR_HOOK_TARGET:                      return "CES_ERROR_HOOK_TARGET";
   case CES_ERROR_UNSUPPORTED:                      return "CES_ERROR_UNSUPPORTED";

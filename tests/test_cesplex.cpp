@@ -1634,13 +1634,10 @@ BOOST_AUTO_TEST_CASE(FileHomeDirWrongSignerRejected) {
   CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
 }
 
-BOOST_AUTO_TEST_CASE(FileNamespaceRequiresAsset) {
-  // /f/myns/... CREATEs fail when the namespace asset doesn't exist.
-  // (We don't exercise the positive case here because the test
-  // harness doesn't go through the CES_CREATE_ASSET wire — that's a
-  // separate opcode on the main port. The negative path is the
-  // security-relevant one; positive /f/ usage is exercised by
-  // integration tests elsewhere once cesh learns the verbs.)
+BOOST_AUTO_TEST_CASE(FileNamespaceUnownedRejected) {
+  // /f/<name>/ CREATEs fail when nobody owns the name (no key_name). The
+  // key_name is the SOLE gate; there is no asset gate. Positive ownership is
+  // exercised by FileNamespaceKeyNameGated.
   CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
   PlexTestPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -1659,6 +1656,57 @@ BOOST_AUTO_TEST_CASE(FileNamespaceRequiresAsset) {
                       /*initialDeposit=*/1'000'000,
                       name);
   CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
+}
+
+BOOST_AUTO_TEST_CASE(FileNamespaceKeyNameGated) {
+  // The /f/ gate: whoever owns the key_name owns /f/<name>/, and that is the
+  // ONLY gate (no asset). The key_name holder can CREATE there; a non-holder
+  // cannot. One peer per channel (the per-peer channel cap).
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+
+  minx::Hash privA; privA.fill(0xD1);
+  minx::Hash privB; privB.fill(0xD2);
+  ces::KeyPair owner(privA);
+  ces::KeyPair other(privB);
+  fx.server->_brr(owner.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_brr(other.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  // owner registers the name "myzone"; other registers "My Zone" (no assets).
+  BOOST_REQUIRE(fx.server->_registerKeyName(owner.getPublicKeyAsHash(), "myzone"));
+  BOOST_REQUIRE(
+      fx.server->_registerKeyName(other.getPublicKeyAsHash(), "My Zone"));
+
+  // The key_name holder CREATEs under /f/myzone/ -- allowed by the name gate.
+  {
+    PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
+    auto sel = peer.select(fx.rpcPort, "/ces/file/1", owner);
+    BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+    auto c = fileCreate(peer.taskIO(), sel.stream, owner, sel.sessionToken,
+                        CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
+                        /*initialDeposit=*/1'000'000, "/f/myzone/hello.txt");
+    CES_CHECK_RC_EQ(c.status, CES_OK);
+  }
+  // A different signer cannot: not the name holder, and no asset gate either.
+  {
+    PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
+    auto sel = peer.select(fx.rpcPort, "/ces/file/1", other);
+    BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.sessionToken,
+                        CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
+                        /*initialDeposit=*/1'000'000, "/f/myzone/evil.txt");
+    CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
+  }
+  // The handle is normalized: "My Zone" -> /f/My_Zone/ is writable by other.
+  {
+    PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
+    auto sel = peer.select(fx.rpcPort, "/ces/file/1", other);
+    BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
+    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.sessionToken,
+                        CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
+                        /*initialDeposit=*/1'000'000, "/f/My_Zone/note.txt");
+    CES_CHECK_RC_EQ(c.status, CES_OK);
+  }
 }
 
 BOOST_AUTO_TEST_CASE(FileBadZoneRejected) {

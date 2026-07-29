@@ -16,6 +16,8 @@
 #include <ces/assets.h>
 #include <ces/alias.h>
 #include <ces/aliases.h>
+#include <ces/keyname.h>
+#include <ces/keynames.h>
 #include <ces/cesvm.h>
 #include <ces/client.h>
 #include <ces/clientasync.h>
@@ -60,7 +62,12 @@ constexpr uint64_t ALIAS_BYTES   = ALIAS_ENTRY_BYTES;
 
 constexpr uint64_t BASE_FEE_ACCOUNT = ACCOUNT_BYTES * MEMORY_PRICE;   // 640,000
 constexpr uint64_t BASE_FEE_ASSET   = ASSET_BYTES   * MEMORY_PRICE;   // 2,560,000
-constexpr uint64_t BASE_FEE_ALIAS   = ALIAS_BYTES   * MEMORY_PRICE;   // 10,240,000
+// Alias and key_name rent derive from feeAccount at their byte ratios
+// (ALIAS_BYTES/ACCOUNT_BYTES = 16x, KEYNAME_BYTES/ACCOUNT_BYTES = 2x); neither
+// is an independent price, so neither has a BASE_FEE_* constant or config
+// knob. KEYNAME_BYTES: 32-byte key + 32-byte name in the forward store,
+// doubled by the derived reverse index (normalized-name -> key).
+constexpr uint64_t KEYNAME_BYTES = 128;
 constexpr uint64_t BASE_FEE_TRANSACTION = 32'000;
 // Query fee covers dedup + state write. The network share is billed
 // separately (feeNetKiB*) and the bind contract removed the per-op
@@ -93,6 +100,8 @@ constexpr uint64_t DEFAULT_MIN_ASSET       = 131072;
 constexpr uint64_t DEFAULT_MAX_ASSET       = 16777216;
 constexpr uint64_t DEFAULT_MIN_ALIAS       = 131072;
 constexpr uint64_t DEFAULT_MAX_ALIAS       = 16777216;
+constexpr uint64_t DEFAULT_MIN_KEYNAME     = 131072;
+constexpr uint64_t DEFAULT_MAX_KEYNAME     = 16777216;
 constexpr uint8_t  DEFAULT_MIN_DIFF        = 10;
 constexpr uint64_t DEFAULT_POW_DELAY       = 0;
 constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
@@ -164,6 +173,8 @@ struct CesConfig {
   uint64_t maxAsset = DEFAULT_MAX_ASSET;
   uint64_t minAlias = DEFAULT_MIN_ALIAS;
   uint64_t maxAlias = DEFAULT_MAX_ALIAS;
+  uint64_t minKeyName = DEFAULT_MIN_KEYNAME;
+  uint64_t maxKeyName = DEFAULT_MAX_KEYNAME;
 
   // Runtime default is hardware_concurrency/2 - 2 (computed in main.cpp); this
   // is the floor used by direct construction (tests override it).
@@ -175,7 +186,8 @@ struct CesConfig {
 
   uint64_t feeAccount = BASE_FEE_ACCOUNT;
   uint64_t feeAsset = BASE_FEE_ASSET;
-  uint64_t feeAlias = BASE_FEE_ALIAS;   // sized rent: ALIAS_BYTES x MEMORY_PRICE
+  // (no feeAlias/feeKeyName knobs: alias + key_name rent derive from feeAccount
+  // at their byte ratios -- see the BASE_FEE_* note above)
   uint64_t feeTx = BASE_FEE_TRANSACTION;
   uint64_t feeQuery = BASE_FEE_QUERY;
   uint64_t feeVmMult = BASE_FEE_VM_MULT;
@@ -806,6 +818,14 @@ public:
 
   bool queryAlias(uint32_t aliasId, Alias& out);
 
+  // key_names: the signer's own key IS the entry owner (originKey == the key).
+  uint8_t registerKeyName(const minx::Hash& originKey, const ces::Bytes& name,
+                          uint32_t providedNonce, int64_t errFee = -1);
+  uint8_t clearKeyName(const minx::Hash& originKey, uint32_t providedNonce,
+                       int64_t errFee = -1);
+  bool queryKeyName(const minx::Hash& key, KeyNameData& outName);
+  bool queryKeyNameByName(const ces::Bytes& name, minx::Hash& outKey);
+
   uint8_t giveAsset(const minx::Hash& originKey, const minx::Hash& assetId,
                     const HashPrefix& newOwnerId, uint32_t providedNonce,
                     int64_t giveFee = -1, int64_t errFee = -1);
@@ -828,6 +848,9 @@ public:
 
   void _brr(const minx::Hash& accountKey, int64_t amount);
   void _burn(const minx::Hash& accountKey, int64_t amount);
+  // Register a key_name for `key` directly (test hook; bypasses the signed op
+  // and fee). Returns true on success.
+  bool _registerKeyName(const minx::Hash& key, const std::string& name);
   // Operator wallet send: transfer `amount` from the server's own (bottomless)
   // account to `destKey`, creating dest if missing. Debits the server exactly
   // and credits dest — net totalCredits unchanged. Returns false if the server
@@ -1237,6 +1260,15 @@ public:
       std::function<void(bool isOwner)> cb,
       boost::asio::any_io_executor cbExecutor);
 
+  // The /f/<fname>/ zone owner check: the signer owns the zone iff they own the
+  // NAME `fname` in key_names (crypto-owned, unsquattable). This is the SOLE
+  // gate -- no asset gate, so there is never a second, racing source of truth.
+  void _l2CheckFZoneOwner(
+      const std::string& fname,
+      const ces::PublicKey& signer,
+      std::function<void(bool isOwner)> cb,
+      boost::asio::any_io_executor cbExecutor);
+
   // ---------------------------------------------------------------------------
   // Program-account primitives
   // ---------------------------------------------------------------------------
@@ -1369,6 +1401,13 @@ public:
                          HashPrefix lastXferDest,
                          uint64_t lastXferAmount,
                          uint32_t lastXferTime)> cb,
+      boost::asio::any_io_executor cbExecutor);
+
+  // Resolve a pubkey to its key_name (the stored normalized/underscore form),
+  // off the logic strand via the executor. Empty string if the key has none.
+  void _l2QueryKeyName(
+      const minx::Hash& key,
+      std::function<void(const std::string& name)> cb,
       boost::asio::any_io_executor cbExecutor);
 
   // ---- Extension funding rate gate. A token
@@ -1926,6 +1965,7 @@ private:
   Accounts accounts_;
   Assets assets_;
   Aliases aliases_;
+  KeyNames keyNames_;
 
   // Scheduled (delayed) runAsset entries — RAM only, not persisted.
   struct ScheduledRun {
