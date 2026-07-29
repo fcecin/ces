@@ -87,8 +87,6 @@ FetchContent_Declare(
     minx
     GIT_REPOSITORY https://github.com/fcecin/minx.git
     GIT_TAG        main
-    PATCH_COMMAND  ${CMAKE_COMMAND} -P
-                   ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-minx-boost187.cmake
 )
 set(MINX_BUILD_EXAMPLES OFF CACHE BOOL "Disable building MINX examples" FORCE)
 set(MINX_BUILD_TESTS OFF CACHE BOOL "Disable building MINX tests" FORCE)
