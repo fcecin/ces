@@ -91,6 +91,7 @@ FetchContent_Declare(
                    ${CMAKE_CURRENT_SOURCE_DIR}/cmake/patch-minx-boost187.cmake
 )
 set(MINX_BUILD_EXAMPLES OFF CACHE BOOL "Disable building MINX examples" FORCE)
+set(MINX_BUILD_TESTS OFF CACHE BOOL "Disable building MINX tests" FORCE)
 FetchContent_MakeAvailable(minx)
 
 FetchContent_Declare(
