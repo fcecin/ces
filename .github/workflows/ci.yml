@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  # The full truth: server + client, every optional feature on, the whole
+  # test suite. Linux is the server's home platform.
+  linux-full:
+    name: linux full stack + tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libboost-all-dev \
+            libluajit-5.1-dev libssl-dev
+      - name: Build (debug, --hyle --mail) + full test suite
+        run: ./build.sh debug --test --hyle --mail
+
+  # The portable contract: CES_CLIENT_ONLY builds ceslib alone (keys/protocol/
+  # client, CesPlexClient, L2 file+compute clients, utils) with no LuaJIT, Qt,
+  # tools, or tests. This is the subset a pure client links.
+  macos-client:
+    name: macos client engine
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: System deps
+        run: brew install ninja boost
+      - name: Configure
+        run: >
+          cmake -S . -B build/client -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCES_CLIENT_ONLY=ON
+      - name: Build
+        run: cmake --build build/client
+
+  windows-client:
+    name: windows client engine
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - name: MSYS2 / MinGW64 toolchain + deps
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-boost
+      - name: Configure
+        run: >
+          cmake -S . -B build/client -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCES_CLIENT_ONLY=ON
+      - name: Build
+        run: cmake --build build/client
