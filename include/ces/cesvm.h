@@ -201,6 +201,28 @@ enum CesVMError : uint64_t {
   CESVM_OVERFLOW   = 15,  // checked arithmetic (ADDX/SUBX/MULX) wrapped
 };
 
+inline const char* vmErrorString(uint64_t e) {
+  switch (e) {
+  case CESVM_OK:        return "OK";
+  case CESVM_OPCODE:    return "OPCODE (invalid opcode)";
+  case CESVM_CODESIZE:  return "CODESIZE (PC out of code)";
+  case CESVM_DIVZERO:   return "DIVZERO (division by zero)";
+  case CESVM_OPLIMIT:   return "OPLIMIT (op count limit)";
+  case CESVM_UNDERFLOW: return "UNDERFLOW (stack underflow)";
+  case CESVM_RET:       return "RET (return without call)";
+  case CESVM_SEGFAULT:  return "SEGFAULT (io access out of bounds)";
+  case CESVM_NEGNUM:    return "NEGNUM (tombstoned)";
+  case CESVM_BUDGET:    return "BUDGET (gas budget exhausted)";
+  case CESVM_SYSCALL:   return "SYSCALL (invalid syscall number)";
+  case CESVM_AUTH:      return "AUTH (not authorized)";
+  case CESVM_CODEFULL:  return "CODEFULL (code space exhausted)";
+  case CESVM_ABORT:     return "ABORT (program aborted)";
+  case CESVM_HOST:      return "HOST (host callback failed)";
+  case CESVM_OVERFLOW:  return "OVERFLOW (checked arithmetic wrapped)";
+  }
+  return "UNKNOWN";
+}
+
 // Syscall numbers, dense range 0..22.
 enum CesVMSyscall : uint64_t {
   SYS_NOP            = 0,

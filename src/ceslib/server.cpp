@@ -1625,8 +1625,24 @@ void CesServer::stop(bool flushEvents) {
   LOGDEBUG << "stop flagging server for termination";
   receiving_ = false;
   const int maxCtrlCCount = 5;
+  // Without a usable PoW engine verifyPoWs() bails before popping work, so
+  // the queue can never drain; waiting on it would hang shutdown forever
+  // (SIGTERM/SIGINT appear ignored). Queued solutions are in-memory only;
+  // drop them.
+  bool powEngineUsable = false;
+  try {
+    powEngineUsable = isPoWEngineReady();
+  } catch (...) {
+  }
+  if (!powEngineUsable) {
+    size_t powQueueSize = minx_->getVerifyPoWQueueSize();
+    if (powQueueSize) {
+      LOGINFO << "stop dropping unverifiable PoW queue (no usable PoW engine)"
+              << VAR(powQueueSize);
+    }
+  }
   LOGDEBUG << "stop checking that PoW queue is empty";
-  while (true) {
+  while (powEngineUsable) {
     size_t powQueueSize = minx_->getVerifyPoWQueueSize();
     if (!powQueueSize)
       break;
@@ -4838,14 +4854,19 @@ void CesServer::incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
   uint16_t pendingPoWs = powQueueSize_.load(std::memory_order_relaxed);
   uint16_t tps = tpsCurrent_.load(std::memory_order_relaxed);
   uint16_t rpcPort = rpcBoundPort_;
+  // bit 0: a PoW engine exists (mining submissions can be verified).
+  // Appended after the original 7 bytes; older clients read only those.
+  uint8_t powFlags =
+    minx_->getPoWEngine(serverKeyPair_.getPublicKeyAsHash()) ? 0x01 : 0x00;
 
   minx::Bytes rdata(sizeof(minSecsPoW) + sizeof(pendingPoWs) + sizeof(tps) +
-              sizeof(rpcPort));
+              sizeof(rpcPort) + sizeof(powFlags));
   minx::Buffer rces(rdata);
   rces.put(minSecsPoW);
   rces.put(pendingPoWs);
   rces.put(tps);
   rces.put(rpcPort);
+  rces.put(powFlags);
   auto rmsg =
     MinxInfo{msg.version,  minx_->generatePassword(),     msg.gpassword,
              cfg_.minDiff, serverKeyPair_.getPublicKeyAsHash(), std::move(rdata)};
@@ -4864,6 +4885,10 @@ bool CesServer::delegateProveWork(const SockAddr& addr,
                                   const MinxProveWork& /* msg */) {
   checkPause();
   if (!receiving_ || !running_)
+    return false;
+  // No PoW engine (no_pow_engine): drop at the door. Queued submissions
+  // could never be verified and would sit in pending_pows forever.
+  if (!minx_->getPoWEngine(serverKeyPair_.getPublicKeyAsHash()))
     return false;
   if (minx_->checkSpam(addr.address()))
     return false;
@@ -7815,7 +7840,10 @@ void CesServer::peerMinerLoop() {
           uint8_t peerDiff = client.getMinDifficulty();
           uint8_t maxDiff = std::max<uint8_t>(
             cfg_.minDiff + PEER_MINER_DIFF_MARGIN, PEER_MINER_DIFF_MAX);
-          if (peerDiff > maxDiff) {
+          if (client.getServerPowEngine() == 0) {
+            LOGDEBUG << "peer miner: skipping " << peer.declaredAddress
+                     << " (peer has no PoW engine)";
+          } else if (peerDiff > maxDiff) {
             LOGDEBUG << "peer miner: skipping " << peer.declaredAddress
                      << " (diff " << (int)peerDiff << " > max " << (int)maxDiff << ")";
           } else {

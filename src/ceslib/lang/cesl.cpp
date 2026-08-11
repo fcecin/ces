@@ -59,6 +59,10 @@ const std::unordered_map<std::string, SysCall>& sysTable() {
     {"withdraw",             {SYS_WITHDRAW, 1}},
     {"update_asset_meta",    {SYS_UPDATE_ASSET_META, 3}},
     {"refill",               {SYS_REFILL, 1}},
+    {"read_alias",           {SYS_READ_ALIAS, 4}},
+    {"write_alias",          {SYS_WRITE_ALIAS, 4}},
+    {"load_code_alias",      {SYS_LOAD_CODE_ALIAS, 1}},
+    {"schedule_alias",       {SYS_SCHEDULE_ALIAS, 6}},
   };
   return t;
 }

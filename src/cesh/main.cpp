@@ -14,6 +14,7 @@
 
 #include <ces/account.h>
 #include <ces/autoexec.h>
+#include <ces/cesvm.h>
 #include <ces/l2/compute_client.h>
 #include <ces/l2/file_client.h>
 #include <ces/l2/mail_client.h>
@@ -225,10 +226,13 @@ int main(int argc, char* argv[]) {
     ->expected(0, 1);
 
   bool keys_show_public = false;
+  bool keys_show_secrets = false;
   auto* cmd_keys_list =
     cmd_keys->add_subcommand("list", "List wallet keys");
   cmd_keys_list->add_flag("-p,--public", keys_show_public,
                           "Include public keys");
+  cmd_keys_list->add_flag("-s,--secrets", keys_show_secrets,
+                          "Print full private keys (masked by default)");
 
   std::string keys_add_arg;
   auto* cmd_keys_add =
@@ -264,7 +268,9 @@ int main(int argc, char* argv[]) {
   auto* cmd_transfer = app.add_subcommand("transfer", "Transfer funds (safe: fails if dest not found)");
   cmd_transfer->add_option("dest", transfer_dest_arg, "Destination key or @index")
     ->required();
-  cmd_transfer->add_option("amount", transfer_amount_arg, "Amount")->required();
+  cmd_transfer->add_option("amount", transfer_amount_arg,
+                           "Amount in raw units (1 credit = 100000000 raw)")
+    ->required();
   cmd_transfer->add_flag("--open", transfer_open,
                          "Auto-create destination account if not found");
 
@@ -274,7 +280,9 @@ int main(int argc, char* argv[]) {
   auto* cmd_payment = app.add_subcommand("payment", "Create payment account");
   cmd_payment->add_option("dest", payment_dest_arg, "Destination key or @index")
     ->required();
-  cmd_payment->add_option("amount", payment_amount_arg, "Amount")->required();
+  cmd_payment->add_option("amount", payment_amount_arg,
+                          "Amount in raw units (1 credit = 100000000 raw)")
+    ->required();
   cmd_payment->add_option("--days", payment_days_arg, "Payment days")
     ->default_val(1);
 
@@ -284,9 +292,32 @@ int main(int argc, char* argv[]) {
     "Cross-server transfer (send to a key on a peer server)");
   cmd_cross->add_option("dest", cross_dest_arg, "Destination key or @index")
     ->required();
-  cmd_cross->add_option("amount", cross_amount_arg, "Amount")->required();
+  cmd_cross->add_option("amount", cross_amount_arg,
+                        "Amount in raw units (1 credit = 100000000 raw)")
+    ->required();
   cmd_cross->add_option("server", cross_server_arg,
     "Destination server address (host:port)")->required();
+
+  // ---- Subcommand: keyname ----
+
+  std::string keyname_name_arg, keyname_key_arg;
+  auto* cmd_keyname = app.add_subcommand(
+    "keyname", "Key name registry (a registered name gates /f/<name>/)");
+  cmd_keyname->require_subcommand(0, 1);
+  cmd_keyname->fallthrough();
+  auto* cmd_kn_register = cmd_keyname->add_subcommand(
+    "register", "Bind the actor key to a name (signed; spaces=underscores)");
+  cmd_kn_register->add_option("name", keyname_name_arg,
+                              "Name (1..32 bytes, UTF-8)")->required();
+  auto* cmd_kn_clear = cmd_keyname->add_subcommand(
+    "clear", "Erase the actor key's name (signed)");
+  auto* cmd_kn_query = cmd_keyname->add_subcommand(
+    "query", "Name bound to a key (unsigned/free)");
+  cmd_kn_query->add_option("key", keyname_key_arg, "Account key or @index")
+    ->required();
+  auto* cmd_kn_resolve = cmd_keyname->add_subcommand(
+    "resolve", "Key bound to a name (unsigned/free)");
+  cmd_kn_resolve->add_option("name", keyname_name_arg, "Name")->required();
 
   // ---- Subcommand: gossip ----
 
@@ -402,7 +433,9 @@ int main(int argc, char* argv[]) {
   bool asset_run_nonceless = false;
   auto* cmd_ar = cmd_asset->add_subcommand("run", "Execute asset bytecode (VM)");
   cmd_ar->add_option("id", asset_id_arg, "Asset ID or name")->required();
-  cmd_ar->add_option("--budget", asset_run_budget_arg, "Gas budget in credits")->required();
+  cmd_ar->add_option("--budget", asset_run_budget_arg,
+                     "Gas budget in raw units (1 credit = 100000000 raw)")
+    ->required();
   cmd_ar->add_option("--allowance", asset_run_allowance_arg,
                     "Per-run cap on caller-account debits inside the VM "
                     "(default: unlimited). Programs read this as their "
@@ -467,7 +500,8 @@ int main(int argc, char* argv[]) {
       "run", "Execute an alias's inline program (op = INLINE_PROGRAM)");
   cmd_alias_run->add_option("id", alias_id_arg, "Alias id")->required();
   cmd_alias_run->add_option("--budget", alias_run_budget_arg,
-                            "Gas budget in credits")->required();
+                            "Gas budget in raw units (1 credit = 100000000"
+                            " raw)")->required();
   cmd_alias_run->add_option("--allowance", alias_run_allowance_arg,
                             "Per-run cap on caller-account debits inside the "
                             "VM (default: unlimited)");
@@ -771,7 +805,9 @@ int main(int argc, char* argv[]) {
   uint16_t autoexec_days_arg = 30;
   auto* cmd_axi = cmd_autoexec->add_subcommand("install", "Install autoexec program");
   cmd_axi->add_option("program", autoexec_program_arg, "Program asset ID or name")->required();
-  cmd_axi->add_option("--budget", autoexec_budget_arg, "Gas budget per boot execution");
+  cmd_axi->add_option("--budget", autoexec_budget_arg,
+                      "Gas budget per boot execution, in raw units"
+                      " (1 credit = 100000000 raw)");
   cmd_axi->add_option("--input", autoexec_input_arg,
     "Input data (hex string; <= ~40 bytes - must fit in the autoexec asset cell)");
   cmd_axi->add_option("--days", autoexec_days_arg, "Days to fund autoexec asset (default 30)");
@@ -903,17 +939,27 @@ int main(int argc, char* argv[]) {
     return p;
   };
 
+  // Whether the resident wallet was loaded because the user asked for it
+  // (-r/--wallet) or implicitly (env var / default file), and from which
+  // file. Drives the `keys gen/add -w` save policy: an implicitly loaded
+  // wallet must not be silently copied into a different file.
+  const bool walletExplicit = app.count("-r") || app.count("--wallet");
+  std::filesystem::path walletLoadedPath;
   try {
-    if (app.count("-r") || app.count("--wallet")) {
+    if (walletExplicit) {
       auto wp = cesh_resolve_path(wallet_read_arg);
-      if (std::filesystem::exists(wp))
+      if (std::filesystem::exists(wp)) {
         wallet.loadFromFile(wp);
+        walletLoadedPath = wp;
+      }
     } else if (const char* envVal = std::getenv("CESH_WALLET")) {
       wallet.loadFromString(envVal);
     } else {
       auto wp = cesh_resolve_path("");
-      if (std::filesystem::exists(wp))
+      if (std::filesystem::exists(wp)) {
         wallet.loadFromFile(wp);
+        walletLoadedPath = wp;
+      }
     }
   } catch (const std::exception& e) {
     std::cerr << "Error: " << e.what() << "\n";
@@ -924,6 +970,7 @@ int main(int argc, char* argv[]) {
     }
     return 1;
   }
+  const int walletPreloaded = wallet.size();
 
   // ---- Subcommand: keys ----
 
@@ -945,6 +992,10 @@ int main(int argc, char* argv[]) {
                   << wallet.keyHex(i) << " (" << kp.getPublicKeyHexStr()
                   << ")\n";
       }
+      if (!cmd_keys_gen->count("-w"))
+        std::cerr << "WARNING: generated keys were NOT saved anywhere; "
+                     "re-run with -w [path], or persist the printed key "
+                     "with 'keys add <key> -w'.\n";
     }
 
     if (cmd_keys_add->parsed()) {
@@ -962,12 +1013,18 @@ int main(int argc, char* argv[]) {
     if (cmd_keys_list->parsed()) {
       for (int i = 0; i < wallet.size(); ++i) {
         KeyPair kp = wallet.keyPair(i);
+        const std::string& priv = wallet.keyHex(i);
+        std::string shown = keys_show_secrets
+          ? priv
+          : priv.substr(0, 6) + "..." + priv.substr(priv.size() - 4);
         std::cout << "[@" << i << "] " << Wallet::algoLabel(kp) << " "
-                  << wallet.keyHex(i)
+                  << shown
                   << (keys_show_public ? (" (" + kp.getPublicKeyHexStr() + ")")
                                        : "")
                   << "\n";
       }
+      if (!keys_show_secrets && wallet.size() > 0)
+        std::cerr << "(private keys masked; --secrets prints them)\n";
     }
 
     if (cmd_keys->get_subcommand("export")->parsed()) {
@@ -984,8 +1041,36 @@ int main(int argc, char* argv[]) {
 
     if (cmd_keys_gen->count("-w") || cmd_keys_add->count("-w")) {
       auto savePath = cesh_resolve_path(wallet_save_arg);
-      wallet.saveToFile(savePath);
-      std::cout << "Saved wallet to " << savePath.string() << "\n";
+      // Saving back into the file the wallet was loaded from is an append;
+      // saving an implicitly loaded wallet into a DIFFERENT file would
+      // silently copy the resident private keys into it. In that case save
+      // only the new keys; an explicit -r means the user chose the merge.
+      bool samePath = false;
+      if (!walletLoadedPath.empty()) {
+        std::error_code ec;
+        samePath = std::filesystem::weakly_canonical(savePath, ec) ==
+                   std::filesystem::weakly_canonical(walletLoadedPath, ec);
+      }
+      if (walletExplicit || samePath || walletPreloaded == 0) {
+        wallet.saveToFile(savePath);
+        std::cout << "Saved wallet to " << savePath.string() << "\n";
+        if (walletPreloaded > 0 && !samePath)
+          std::cout << "Note: " << walletPreloaded
+                    << " pre-existing key(s) from the -r wallet were saved"
+                       " too.\n";
+      } else if (wallet.size() > walletPreloaded) {
+        Wallet fresh;
+        for (int i = walletPreloaded; i < wallet.size(); ++i)
+          fresh.addKey(wallet.keyHex(i));
+        fresh.saveToFile(savePath);
+        std::cout << "Saved " << fresh.size() << " new key(s) to "
+                  << savePath.string() << " (" << walletPreloaded
+                  << " resident wallet key(s) NOT copied; use -r to"
+                     " merge them explicitly)\n";
+      } else {
+        std::cout << "No new keys; nothing saved to " << savePath.string()
+                  << "\n";
+      }
     }
 
     return 0;
@@ -1051,7 +1136,9 @@ int main(int argc, char* argv[]) {
                   << static_cast<unsigned>(cc.getMinSecsPoW())
                   << ",\"pendingPoWs\":" << cc.getPendingPoWs()
                   << ",\"tps\":" << cc.getTps()
-                  << ",\"rpcPort\":" << cc.getServerRpcPort() << "}\n";
+                  << ",\"rpcPort\":" << cc.getServerRpcPort()
+                  << ",\"powEngine\":"
+                  << static_cast<int>(cc.getServerPowEngine()) << "}\n";
       } else {
         std::cout << "status=ok\n"
                   << "server_key=" << minx::hashToString(cc.getServerKey())
@@ -1063,7 +1150,12 @@ int main(int argc, char* argv[]) {
                   << static_cast<unsigned>(cc.getMinSecsPoW()) << "\n"
                   << "pending_pows=" << cc.getPendingPoWs() << "\n"
                   << "tps=" << cc.getTps() << "\n"
-                  << "rpc_port=" << cc.getServerRpcPort() << "\n";
+                  << "rpc_port=" << cc.getServerRpcPort() << "\n"
+                  << "pow_engine="
+                  << (cc.getServerPowEngine() < 0
+                        ? "unknown"
+                        : (cc.getServerPowEngine() ? "yes" : "no"))
+                  << "\n";
       }
     } catch (std::exception& e) {
       if (g_quiet)
@@ -1181,6 +1273,67 @@ int main(int argc, char* argv[]) {
     return 0;
   }
 
+  // ---- Subcommand: keyname query/resolve (unsigned, no actor needed) ----
+
+  if (cmd_keyname->parsed() && cmd_keyname->get_subcommands().empty()) {
+    std::cout << cmd_keyname->help() << "\n";
+    return 0;
+  }
+
+  if (cmd_kn_query->parsed() || cmd_kn_resolve->parsed()) {
+    try {
+      auto sess = makeSession();
+      auto& cc = sess->client();
+      bool found = false;
+      if (cmd_kn_query->parsed()) {
+        minx::Hash key;
+        minx::stringToHash(key, wallet.resolveKey(keyname_key_arg));
+        ces::Bytes name;
+        uint8_t rc = cc.queryKeyName(key, name, found);
+        if (rc != CES_OK) {
+          std::cerr << "Keyname query failed: " << errorString(rc) << "\n";
+          return 1;
+        }
+        std::string nameStr(name.begin(), name.end());
+        if (g_quiet) {
+          std::cout << "{\"key\":\"" << jesc(minx::hashToString(key))
+                    << "\",\"found\":" << (found ? "true" : "false")
+                    << ",\"name\":\"" << jesc(nameStr) << "\"}\n";
+        } else if (found) {
+          print_header("Keyname");
+          print_field("Key", minx::hashToString(key));
+          print_field("Name", nameStr);
+        } else {
+          std::cout << "No name registered for this key.\n";
+        }
+      } else {
+        ces::Bytes name(keyname_name_arg.begin(), keyname_name_arg.end());
+        minx::Hash key{};
+        uint8_t rc = cc.queryKeyNameByName(name, key, found);
+        if (rc != CES_OK) {
+          std::cerr << "Keyname resolve failed: " << errorString(rc) << "\n";
+          return 1;
+        }
+        if (g_quiet) {
+          std::cout << "{\"name\":\"" << jesc(keyname_name_arg)
+                    << "\",\"found\":" << (found ? "true" : "false")
+                    << ",\"key\":\""
+                    << jesc(found ? minx::hashToString(key) : "") << "\"}\n";
+        } else if (found) {
+          print_header("Keyname");
+          print_field("Name", keyname_name_arg);
+          print_field("Key", minx::hashToString(key));
+        } else {
+          std::cout << "No key registered for this name.\n";
+        }
+      }
+      return found ? 0 : 1;
+    } catch (std::exception& e) {
+      std::cerr << "Error: " << e.what() << "\n";
+      return 1;
+    }
+  }
+
   // ---- All remaining subcommands need an actor key ----
 
   if (cmd_asset->parsed() && cmd_asset->get_subcommands().empty()) {
@@ -1220,7 +1373,8 @@ int main(int argc, char* argv[]) {
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
      cmd_mail->parsed() || cmd_gossip->parsed() || cmd_alias_write->parsed() ||
-     cmd_alias_rm->parsed() || cmd_alias_run->parsed());
+     cmd_alias_rm->parsed() || cmd_alias_run->parsed() ||
+     cmd_keyname->parsed());
 
 #ifdef CES_HYLE
   needs_actor = needs_actor || cmd_hyle->parsed();
@@ -1330,8 +1484,12 @@ int main(int argc, char* argv[]) {
         } else {
           print_header("Alias Executed");
           print_field("Alias ID", std::to_string(alias_id_arg));
-          print_field("VM Error", std::to_string(vmError));
+          print_field("VM Error", std::to_string(vmError) + " (" +
+                                    vmErrorString(vmError) + ")");
           print_field("Budget Used", std::to_string(budgetUsed));
+          if (vmError == CESVM_BUDGET && budgetUsed == 0)
+            std::cout << "Note: the gas reservation itself failed, so Budget"
+                         " Used reads 0; the run needs a larger --budget.\n";
           if (!output.empty())
             print_field("Output", ces::bytesToHex(output));
           std::cout << "Success.\n";
@@ -1339,7 +1497,8 @@ int main(int argc, char* argv[]) {
         return 0;
       }
       std::cerr << "Alias run failed: " << errorString(rc)
-                << " (vmError " << vmError << ")\n";
+                << " (vmError " << vmError << " " << vmErrorString(vmError)
+                << ")\n";
       return 1;
     }
     if (cmd_alias_rm->parsed()) {
@@ -1541,18 +1700,26 @@ int main(int argc, char* argv[]) {
       if (rc == CES_OK) {
         print_header("Asset Executed");
         print_field("Asset", asset_id_arg);
-        print_field("VM Error", std::to_string(vmError));
+        print_field("VM Error", std::to_string(vmError) + " (" +
+                                  vmErrorString(vmError) + ")");
         print_field("Budget Used", std::to_string(budgetUsed));
         print_field("Allowance Used", std::to_string(allowanceUsed));
+        if (vmError == CESVM_BUDGET && budgetUsed == 0)
+          std::cout << "Note: the gas reservation itself failed, so Budget"
+                       " Used reads 0; the run needs a larger --budget.\n";
         if (!output.empty())
           print_field("Output", ces::bytesToHex(output));
         std::cout << "Success.\n";
       } else {
         print_header("Asset Execution Failed");
         print_field("Error", errorString(rc));
-        print_field("VM Error", std::to_string(vmError));
+        print_field("VM Error", std::to_string(vmError) + " (" +
+                                  vmErrorString(vmError) + ")");
         print_field("Budget Used", std::to_string(budgetUsed));
         print_field("Allowance Used", std::to_string(allowanceUsed));
+        if (vmError == CESVM_BUDGET && budgetUsed == 0)
+          std::cout << "Note: the gas reservation itself failed, so Budget"
+                       " Used reads 0; the run needs a larger --budget.\n";
         return 1;
       }
 
@@ -2712,6 +2879,36 @@ int main(int argc, char* argv[]) {
       }
     }
 
+    else if (cmd_kn_register->parsed()) {
+      if (keyname_name_arg.empty() || keyname_name_arg.size() > 32) {
+        std::cerr << "Keyname register failed: name must be 1..32 bytes\n";
+        return 1;
+      }
+      ces::Bytes name(keyname_name_arg.begin(), keyname_name_arg.end());
+      uint8_t rc = cc.registerKeyName(name);
+      if (rc == CES_OK) {
+        print_header("Keyname Registered");
+        print_field("Name", keyname_name_arg);
+        print_field("Key", actorKey.getPublicKeyHexStr());
+        std::cout << "Success.\n";
+      } else {
+        std::cerr << "Keyname register failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+    }
+
+    else if (cmd_kn_clear->parsed()) {
+      uint8_t rc = cc.clearKeyName();
+      if (rc == CES_OK) {
+        print_header("Keyname Cleared");
+        print_field("Key", actorKey.getPublicKeyHexStr());
+        std::cout << "Success.\n";
+      } else {
+        std::cerr << "Keyname clear failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+    }
+
     else if (cmd_gossip->parsed()) {
       minx::Hash dest{};  // all-zero = broadcast
       if (!gossip_dest_arg.empty())
@@ -2768,9 +2965,24 @@ int main(int argc, char* argv[]) {
       uint32_t n = mine_threads_arg;
       if (n < 1) n = 1;
       if (n > hw) n = hw;
+      if (cc.getServerPowEngine() == 0) {
+        std::cerr << "Mining unavailable: server has no PoW engine"
+                     " (submissions would be dropped)\n";
+        return 1;
+      }
       std::cout << "Mining... (threads=" << n << ")\n";
-      auto result = mineOnce(cc, 1, {}, static_cast<int>(n), [](int r) {
-        std::cout << "Status: " << r << "\r" << std::flush;
+      auto solStatus = [](int r) -> const char* {
+        switch (r) {
+        case minx::MINX_SOLUTION_UNSPENT: return "unspent";
+        case minx::MINX_SOLUTION_SPENT: return "accepted";
+        case minx::MINX_SOLUTION_UNTIMELY: return "untimely";
+        case minx::MINX_SOLUTION_UNKNOWN: return "pending verification";
+        default: return "?";
+        }
+      };
+      auto result = mineOnce(cc, 1, {}, static_cast<int>(n), [&](int r) {
+        std::cout << "Status: " << r << " (" << solStatus(r) << ")   \r"
+                  << std::flush;
       });
       if (result.success) {
         std::cout << "\nSuccess! Credit: " << result.credit << "\n";
@@ -2779,8 +2991,13 @@ int main(int argc, char* argv[]) {
       } else if (result.status < 0) {
         std::cerr << "Mining failed to init\n";
         return 1;
+      } else if (result.status == minx::MINX_SOLUTION_UNKNOWN) {
+        std::cerr << "\nSubmission not verified: the server responded but"
+                     " never verified the solution (still pending or"
+                     " dropped; the server may have mining disabled)\n";
+        return 1;
       } else {
-        std::cerr << "\nSubmission failed (server unresponsive)\n";
+        std::cerr << "\nSubmission failed (interrupted or no response)\n";
         return 1;
       }
     }

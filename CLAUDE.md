@@ -7,10 +7,11 @@ CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind 
 ## Coding practices
 
 - Always use `build.sh` to build and run tests. Do not invoke `cmake --build` or `cestests` directly; go through `./build.sh debug --test`. The full run includes the E2E suites (CeshE2E, CesnetBotE2E, ...); filter by suite name to skip them.
+- RUN THE FULL SUITE IN A BACKGROUND SHELL, ALWAYS. A foreground tool call dies at the 10-minute limit and takes the run with it; the full `./build.sh debug --test` (E2E included) can exceed that. Background the job, redirect to a file, grep the file when it finishes. Only quick single-suite filtered runs (`./build.sh debug --test CasmTests`) may run in the foreground.
 - Always redirect `build.sh` output to a file, then grep/tail it. Do not tail the live pipe: direct pipes lose buffered stdio output, and reading live output races the test harness for ephemeral ports.
 
   ```bash
-  ./build.sh debug --test 2>&1 > /tmp/ces-build.log
+  ./build.sh debug --test > /tmp/ces-build.log 2>&1   # background this job
   grep -E 'error:|FAILED|No errors|All Tests passed' /tmp/ces-build.log | tail -5
   ```
 
@@ -136,7 +137,7 @@ Two algorithms behind a 1-byte decorator: ED25519 (CryptoPP) and secp256k1 (libs
 Wallet format: one key per line, `"00" + 64-hex` or `"01" + 64-hex`. Wallets validate keys at insertion.
 
 Private vs public key (easy to get wrong when scripting cesh/ces):
-- A wallet line or `cesh keys list` entry is the decorated PRIVATE key: a leading byte (`00`=ed25519, `01`=secp256k1) that is part of the key, not padding, so `"00"+64-hex` is 66 hex chars total. `keys list` is private-key-prioritized and does NOT print the public key.
+- A wallet line is the decorated PRIVATE key: a leading byte (`00`=ed25519, `01`=secp256k1) that is part of the key, not padding, so `"00"+64-hex` is 66 hex chars total. `keys list` masks private keys by default (`-s/--secrets` prints them; `keys export` always emits full keys) and does NOT print the public key without `-p`.
 - The public key is the account identity: what you credit, query, and what the ledger keys accounts by (map key = first 8 bytes of the raw pubkey). It is 64 hex chars, no decorator. `cesh keys gen` shows it in parentheses after the private key; `ces --genkeypair` labels `Private Key:` / `Public Key:`.
 - Do NOT `grep -oE '[0-9a-fA-F]{64}'` a `keys list` line to get an account key: that grabs the decorator byte plus the first 31 bytes of the private key (a mangled value). Use `ces --genkeypair`'s `Public Key:` line, or the parenthesized value from `cesh keys gen`.
 - Funding the wrong hex is silently self-consistent: `ces credit <wrong>` and `cesh query <wrong>` agree (both key by the same wrong prefix), but every signed/L2 op rejects it as `CES_ERROR_ORIGIN_NOT_FOUND`. If a funded account works for `query` but signed ops say ORIGIN_NOT_FOUND, you funded the wrong key.
@@ -389,7 +390,7 @@ Offline ledger ops (no networking). Load stores, mutate, `_save()`, exit. Used b
 
 ## Client tools
 
-cesh: CLI client. Subcommands: `keys`, `query`/`squery`, `transfer`/`payment`/`cross`, `server-info`/`ping`, `peer-info <id> <server>` (unsigned peer-table slot read), `mine [-t N]` (clamped to `hardware_concurrency`), `asset` (create/update/meta/fast/fund/buy/give/query/squery/run/deploy-bundle), `ramfile` (L1; put/touch/get/info/scan/read/write/append/resize/rehash/fund; `--in text:|hex:|file:`), `file` (L2 disk; put/get/stat/rm/deposit/withdraw/set-price; needs `--rpc-port`), `compute` (L2; launch/kill/ps/stat/instances; needs `--rpc-port`), `dial <pid>` (bidirectional bytes over /ces/lua/1; stdin EOF half-closes; SIGINT/SIGTERM to 130/143; `-v` prints ATTACH-ok), `gossip`, `autoexec install`.
+cesh: CLI client. Subcommands: `keys`, `query`/`squery`, `transfer`/`payment`/`cross`, `server-info`/`ping`, `peer-info <id> <server>` (unsigned peer-table slot read), `mine [-t N]` (clamped to `hardware_concurrency`), `asset` (create/update/meta/fast/fund/buy/give/query/squery/run/deploy-bundle), `ramfile` (L1; put/touch/get/info/scan/read/write/append/resize/rehash/fund; `--in text:|hex:|file:`), `file` (L2 disk; put/get/stat/rm/deposit/withdraw/set-price; needs `--rpc-port`), `compute` (L2; launch/kill/ps/stat/instances; needs `--rpc-port`), `dial <pid>` (bidirectional bytes over /ces/lua/1; stdin EOF half-closes; SIGINT/SIGTERM to 130/143; `-v` prints ATTACH-ok), `keyname` (register/clear signed, query/resolve unsigned), `gossip`, `autoexec install`.
 
 Two output modes: default is human (headers plus aligned fields). Global `-q`/`--quiet` is silent/pipe mode: stdout is data only (raw bytes for content; JSON for structured results), all human chrome suppressed, errors to stderr with a nonzero exit. The server's rpc port is discoverable without `--rpc-port`: free `ces ping` and the paid `server-info` advertise `rpcPort`.
 

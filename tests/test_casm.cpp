@@ -153,6 +153,16 @@ BOOST_AUTO_TEST_CASE(SyscallByName) {
   BOOST_CHECK_EQUAL(host.deposited, 100u);
 }
 
+// The alias syscalls (25-28) and REFILL assemble by name.
+BOOST_AUTO_TEST_CASE(AliasSyscallNames) {
+  BOOST_CHECK_NO_THROW(casmAssemble("hostv READ_ALIAS, 0, 0, 0, 0\nterm\n"));
+  BOOST_CHECK_NO_THROW(casmAssemble("hostv WRITE_ALIAS, 0, 0, 0, 0\nterm\n"));
+  BOOST_CHECK_NO_THROW(casmAssemble("hostv LOAD_CODE_ALIAS, 0\nterm\n"));
+  BOOST_CHECK_NO_THROW(
+    casmAssemble("hostv SCHEDULE_ALIAS, 0, 0, 0, 0, 0, 0\nterm\n"));
+  BOOST_CHECK_NO_THROW(casmAssemble("hostv REFILL, 0\nterm\n"));
+}
+
 BOOST_AUTO_TEST_CASE(ErrorsCarryLineNumbers) {
   BOOST_CHECK_THROW(casmAssemble("nop\nfrobnicate 1\n"), CasmError);
   try {

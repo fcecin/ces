@@ -71,6 +71,10 @@ const std::unordered_map<std::string, uint64_t>& syscallTable() {
     {"RPC", SYS_RPC}, {"OWNER_TRANSFER", SYS_OWNER_TRANSFER},
     {"DEPOSIT", SYS_DEPOSIT}, {"WITHDRAW", SYS_WITHDRAW},
     {"UPDATE_ASSET_META", SYS_UPDATE_ASSET_META},
+    {"REFILL", SYS_REFILL},
+    {"READ_ALIAS", SYS_READ_ALIAS}, {"WRITE_ALIAS", SYS_WRITE_ALIAS},
+    {"LOAD_CODE_ALIAS", SYS_LOAD_CODE_ALIAS},
+    {"SCHEDULE_ALIAS", SYS_SCHEDULE_ALIAS},
   };
   return t;
 }

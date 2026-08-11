@@ -253,6 +253,10 @@ value-typed parameters take any expression.
 | `schedule(key, budget, allowance, in_ptr, in_len, time_us)` | future run |
 | `rpc(host, hostlen, port, filehead, followup, budget, tag)` | |
 | `refill(n)` | account hooks: draw up to `n` more gas from the account (sidecar-capped); yields the amount granted |
+| `read_alias(id, off, len, dest)` | windowed read of an alias's value image into cells at `dest`; yields `len` |
+| `write_alias(id, off, len, src)` | patch bytes into an alias as the run's programOwner principal |
+| `load_code_alias(id)` | append an alias's inline code area to the code space; yields the code offset |
+| `schedule_alias(id, budget, allowance, in_ptr, in_len, time_us)` | future run of an alias's inline program |
 
 Each builtin dispatches with abort-on-error semantics: a failing
 syscall halts the run (`CESVM_ABORT`) and rolls back. Each also has a

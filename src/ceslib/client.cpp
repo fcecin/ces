@@ -128,6 +128,7 @@ bool CesClient::disconnect() {
   serverMinPoWTimestamp_ = 0;
   serverTicket_ = 0;
   serverTicketLastTime_ = 0;
+  serverPowEngine_ = -1;
   connected_ = false;
   return true;
 }
@@ -1261,6 +1262,10 @@ void CesClient::incomingInfo(const minx::SockAddr& addr,
   serverPendingPoWs_ = buf.get<uint16_t>();
   serverTps_ = buf.get<uint16_t>();
   serverRpcPort_ = buf.get<uint16_t>();
+  if (msg.data.size() >= 8)
+    serverPowEngine_ = (buf.get<uint8_t>() & 0x01) ? 1 : 0;
+  else
+    serverPowEngine_ = -1;
   serverMinPoWTimestamp_ =
     minx::getSecsSinceEpoch() + serverMinSecsPoW_ * SECS_PER_MIN;
   ++serverInfoGen_;

@@ -233,6 +233,62 @@ BOOST_AUTO_TEST_CASE(KeysGenSaveAndLoad) {
   assertContains(r2.out, "[@0]");
 }
 
+BOOST_AUTO_TEST_CASE(KeysGenNoSaveWarns) {
+  auto r = run(cmd("keys gen"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "NOT saved");
+}
+
+BOOST_AUTO_TEST_CASE(KeysGenSaveDoesNotCopyResidentKeys) {
+  // Resident wallet loaded implicitly (env); -w to a different file must
+  // save only the newly generated key, not export the resident identity.
+  fs::path walletFile = tempDir / "fresh_wallet.dat";
+  auto r = run(cmd("keys gen -w " + walletFile.string()));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "NOT copied");
+  auto r2 = run(cmdNoWallet("-r " + walletFile.string() + " keys list -p"));
+  BOOST_CHECK_EQUAL(r2.exitCode, 0);
+  assertContains(r2.out, "[@0]");
+  assertNotContains(r2.out, "[@1]", "resident key must not be copied");
+  assertNotContains(r2.out, fundedPubHex(), "resident key must not be copied");
+}
+
+BOOST_AUTO_TEST_CASE(KeysListMasksPrivateKeys) {
+  auto r = run(cmd("keys list"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertNotContains(r.out, fundedWalletHex, "private key must be masked");
+  assertContains(r.out, "masked");
+  auto r2 = run(cmd("keys list --secrets"));
+  BOOST_CHECK_EQUAL(r2.exitCode, 0);
+  assertContains(r2.out, fundedWalletHex);
+}
+
+// ===========================================================================
+// Keyname registry
+// ===========================================================================
+
+BOOST_AUTO_TEST_CASE(KeynameRegisterQueryResolveClear) {
+  auto r = run(cmd("keyname register Ada_Lovelace"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "Keyname Registered");
+
+  auto rq = run(cmd("keyname query " + fundedPubHex()));
+  BOOST_CHECK_EQUAL(rq.exitCode, 0);
+  assertContains(rq.out, "Ada_Lovelace");
+
+  auto rr = run(cmd("keyname resolve Ada_Lovelace"));
+  BOOST_CHECK_EQUAL(rr.exitCode, 0);
+  assertContains(rr.out, fundedPubHex());
+
+  auto rc = run(cmd("keyname clear"));
+  BOOST_CHECK_EQUAL(rc.exitCode, 0);
+  assertContains(rc.out, "Keyname Cleared");
+
+  auto rq2 = run(cmd("keyname query " + fundedPubHex()));
+  BOOST_CHECK_NE(rq2.exitCode, 0);
+  assertContains(rq2.out, "No name registered");
+}
+
 // ===========================================================================
 // Ping (unsigned handshake info)
 // ===========================================================================

@@ -265,6 +265,9 @@ public:
   uint16_t getPendingPoWs() const { return serverPendingPoWs_; }
   uint16_t getTps() const { return serverTps_; }
   uint16_t getServerRpcPort() const { return serverRpcPort_; }
+  // Server PoW engine presence: 1 = present, 0 = absent (mining submissions
+  // are dropped), -1 = unknown (server predates the INFO flags byte).
+  int8_t getServerPowEngine() const { return serverPowEngine_; }
   const minx::Hash& getServerKey() const { return serverKey_; }
   HashPrefix getServerId() const { return Account::getMapKey(serverKey_); }
 
@@ -344,6 +347,7 @@ private:
   uint16_t serverPendingPoWs_ = 0;
   uint16_t serverTps_ = 0;
   uint16_t serverRpcPort_ = 0;
+  int8_t serverPowEngine_ = -1;
   std::atomic<uint64_t> serverInfoGen_ = 0;
 
   // Tracking vars

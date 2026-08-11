@@ -338,6 +338,8 @@ BOOST_AUTO_TEST_CASE(AllSyscallsCompile) {
       "send_client(0,0,0)", "schedule(0,0,0,0,0,0)", "create_asset_managed(0,0,0)",
       "rpc(0,0,0,0,0,0,0)", "owner_transfer(0,0)", "deposit(0)", "withdraw(0)",
       "update_asset_meta(0,0,0)", "refill(0)",
+      "read_alias(0,0,0,0)", "write_alias(0,0,0,0)", "load_code_alias(0)",
+      "schedule_alias(0,0,0,0,0,0)",
   };
   for (const char* c : calls) {
     std::string src = std::string(c) + "; return 0;";

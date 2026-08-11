@@ -67,6 +67,9 @@
  *   load_code(key) send_client(id, ptr, len)
  *   schedule(key, budget, allowance, in_ptr, in_len, time_us)
  *   rpc(host, hostlen, port, filehead, followup, budget, tag)
+ *   refill(n) read_alias(id, off, len, dest)
+ *   write_alias(id, off, len, src) load_code_alias(id)
+ *   schedule_alias(id, budget, allowance, in_ptr, in_len, time_us)
  * Each also has a try_ variant (try_transfer, ...) that dispatches via
  * hostv and yields S (the CES error code) instead of aborting.
  *
