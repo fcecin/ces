@@ -1299,7 +1299,10 @@ void CesVM::hostCall(CesVMHost& host) {
     uint16_t days = static_cast<uint16_t>(io_[5]);
     uint64_t per = computePrepayCost(host.feeAssetRaw, host.assetRentMultBp,
                                      2u + assetDays(days), 0);
-    if (!billCredits(per * n)) return;
+    // per*n can overflow uint64 under an extreme fee; saturate so an unpayable
+    // cost halts on budget rather than wrapping to an undercharge.
+    uint64_t cost = (per != 0 && n > UINT64_MAX / per) ? UINT64_MAX : per * n;
+    if (!billCredits(cost)) return;
     // Fresh 24-byte entropy prefix, index suffix zeroed (cell 0). Retry a new
     // prefix on the astronomically rare collision; the host creates nothing on
     // collision so the retry is clean.

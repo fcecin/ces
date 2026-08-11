@@ -638,4 +638,67 @@ BOOST_AUTO_TEST_CASE(SignedQueryAccountThroughProxy) {
   client.close();
 }
 
+// ---------------------------------------------------------------------------
+// keyname + gossip opcodes were missing from the filter switch (hit default ->
+// dropped). The proxy must validate + forward them like every other CES op.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(UnsignedQueryKeyNameThroughProxy) {
+  asio::io_context io;
+  TcpTestClient client(io);
+  client.connect(proxyPort);
+
+  client.sendGetInfo(0x9111);
+  auto infoRaw = client.recvMsg();
+  BOOST_REQUIRE(!infoRaw.empty());
+  auto info = parseInfo(infoRaw);
+
+  ces::CesQueryKeyName req;
+  req.key = fundedKey.getPublicKeyAsHash();
+  auto cesBytes = req.toBytes();
+  ces::Bytes payload(cesBytes.begin(), cesBytes.end());
+  client.sendMessage(0x9222, info.gpassword, payload);
+
+  auto resp = client.recvMsg();
+  BOOST_REQUIRE(!resp.empty());
+  BOOST_CHECK_EQUAL(resp[0], minx::MINX_MESSAGE);
+  BOOST_REQUIRE(resp.size() > 18);
+  BOOST_CHECK_EQUAL(resp[18], ces::CES_QUERY_KEYNAME_RESULT);
+
+  client.close();
+}
+
+BOOST_AUTO_TEST_CASE(SignedGossipThroughProxy) {
+  asio::io_context io;
+  TcpTestClient client(io);
+  client.connect(proxyPort);
+
+  client.sendGetInfo(0x9333);
+  auto infoRaw = client.recvMsg();
+  BOOST_REQUIRE(!infoRaw.empty());
+  auto info = parseInfo(infoRaw);
+
+  // Mirror CesClient::gossip: NONCELESS, time-stamped, deduped by msgId.
+  ces::CesGossip req;
+  req.originId = fundedKey.getPublicKeyAsHash();
+  req.serverId = ces::Account::getMapKey(info.skey);
+  req.reqNonce = ces::CES_NONCELESS;
+  req.authorId = fundedKey.getPublicKeyAsHash();
+  req.msgId    = fundedKey.getPublicKeyAsHash();  // any fresh id (dedup empty on a fresh server)
+  req.dest     = ces::Hash{};                     // all-zero = broadcast
+  req.budget   = 1000;
+  req.time     = ces::getMicrosSinceEpoch();
+  req.msg      = ces::Bytes{'h', 'i'};
+  auto cesBytes = req.toBytes(fundedKey);
+  ces::Bytes payload(cesBytes.begin(), cesBytes.end());
+  client.sendMessage(0x9444, info.gpassword, payload);
+
+  auto resp = client.recvMsg();
+  BOOST_REQUIRE(!resp.empty());
+  BOOST_CHECK_EQUAL(resp[0], minx::MINX_MESSAGE);
+  BOOST_REQUIRE(resp.size() > 18);
+  BOOST_CHECK_EQUAL(resp[18], ces::CES_GOSSIP_RESULT);
+
+  client.close();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

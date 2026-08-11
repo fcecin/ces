@@ -99,6 +99,18 @@ protected:
       ces::CesQueryServerInfo req;
       return verifySigned(msg.data, req, req.originId);
     }
+    case ces::CES_GOSSIP: {
+      ces::CesGossip req;
+      return verifySigned(msg.data, req, req.originId);
+    }
+    case ces::CES_REGISTER_KEYNAME: {
+      ces::CesRegisterKeyName req;
+      return verifySigned(msg.data, req, req.originId);
+    }
+    case ces::CES_CLEAR_KEYNAME: {
+      ces::CesClearKeyName req;
+      return verifySigned(msg.data, req, req.originId);
+    }
 
       // --- Unsigned messages: validate structure only ---
 
@@ -112,6 +124,14 @@ protected:
     }
     case ces::CES_UNSIGNED_QUERY_ASSET: {
       ces::CesUnsignedQueryAsset req;
+      return verifyUnsigned(msg.data, req);
+    }
+    case ces::CES_QUERY_KEYNAME: {
+      ces::CesQueryKeyName req;
+      return verifyUnsigned(msg.data, req);
+    }
+    case ces::CES_QUERY_KEYNAME_BY_NAME: {
+      ces::CesQueryKeyNameByName req;
       return verifyUnsigned(msg.data, req);
     }
 

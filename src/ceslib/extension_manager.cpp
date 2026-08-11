@@ -338,8 +338,7 @@ void applyExtConfig(CesServer* server, const std::string& name) {
   if (h->extInfo(pid, info) && (info.caps & kComputeExtCapOnConfig)) {
     h->extConfig(pid, fhReadServerFile(server, "/s/" + name + ".conf"));  // hot-reload
   } else {
-    h->killBySource(srcName(name));                     // relaunch:
-    h->launchInternal(srcName(name));                   // re-read at launch
+    h->reloadBySource(srcName(name));   // relaunch on the rpc strand; re-read conf
   }
 }
 

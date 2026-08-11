@@ -462,7 +462,7 @@ Network simulator:
 - File paths must start with `/h/<64-hex>/`, `/f/<name>/`, `/p/`, or `/s/`; anything else returns `BAD_NAME`.
 - `/s/` requires the server's own private key as signer. Only the operator deploys; reads are unmetered. `fileHandlerDebitBalance`/`CreditBalance` no-op on `/s/`.
 - Compute fees come out of the source file's `file_balance`, not the launcher's account. Refunds land back there.
-- The server's own account is uncounted and bottomless. Force-reset to exactly `2^50` every boot (below `INT64_MAX`, so incoming transfers cannot overflow); excluded from `totalCredits_` and from cesnetbot's conservation sum (server-self cells skipped, vostro/reserve cells on peers still count).
+- The server's own account is uncounted and bottomless. Force-reset to exactly `2^46` every boot (half the `2^47-1` Int48 balance cap, so incoming transfers saturate rather than wrap); excluded from `totalCredits_` and from cesnetbot's conservation sum (server-self cells skipped, vostro/reserve cells on peers still count).
 
 ## RandomX (via MINX)
 

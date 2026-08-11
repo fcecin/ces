@@ -101,6 +101,7 @@ export class ProgWsManager {
     try { child = spawn(this.cesh, args, { env }); }
     catch { return this._teardown(s, 'failed to start cesh'); }
     s.child = child;
+    child.stdin.on('error', () => {});  // contain async EPIPE if the child exits mid-write
     child.stdout.on('data', (d) => this._fromProgram(s, d));
     child.stderr.on('data', () => {});
     child.on('close', () => this._teardown(s, 'session ended'));

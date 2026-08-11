@@ -754,8 +754,9 @@ public:
     if (storedPrice == 0) return CES_ERROR_NOT_FOR_SALE;
     uint64_t realPrice = storedToRealPrice(storedPrice);
     if (realPrice > maxPrice) return CES_ERROR_INSUFFICIENT_PAYMENT;
-    if (uint8_t rc = debitCaller(realPrice); rc != CES_OK) return rc;
     HashPrefix sellerId = it->second.getOwnerId();
+    if (uint8_t rc = checkCredit(sellerId, realPrice); rc != CES_OK) return rc;
+    if (uint8_t rc = debitCaller(realPrice); rc != CES_OK) return rc;
     auto sellerIt = server_.accounts_->find(sellerId);
     if (sellerIt != server_.accounts_->end()) {
       maybeSaveAccount(sellerId);
@@ -827,11 +828,12 @@ public:
       LOGDEBUG << "VM cross-transfer: settlement queue full" << SVAR(server);
       return CES_ERROR_QUEUE_FULL;
     }
+    HashPrefix peerPrefix = Account::getMapKey(peerKey);
+    if (uint8_t rc = checkCredit(peerPrefix, amount); rc != CES_OK) return rc;
     if (uint8_t rc = debitCaller(amount); rc != CES_OK) {
       LOGDEBUG << "VM cross-transfer: debit failed" << VAR(amount) << VAR(rc);
       return rc;
     }
-    HashPrefix peerPrefix = Account::getMapKey(peerKey);
     maybeSaveAccount(peerPrefix);
     auto peerIt = server_.accounts_->find(peerPrefix);
     if (peerIt != server_.accounts_->end()) {

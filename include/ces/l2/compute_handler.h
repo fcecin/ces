@@ -169,6 +169,9 @@ public:
   // Kill every running instance of `sourceName` (e.g. "/s/discovery.lua").
   // Async (hops onto the CesPlex strand). The ExtensionManager's Disable.
   void killBySource(const std::string& sourceName);
+  // Relaunch every instance of `sourceName` (kill + launchInternal) as one task
+  // on the rpcTaskIO strand, so the launch's map mutations never race the tick.
+  void reloadBySource(const std::string& sourceName);
 
   // Deliver a flooded gossip message to EVERY local compute instance (each
   // child calls its program's on_gossip handler if defined). Must run on the

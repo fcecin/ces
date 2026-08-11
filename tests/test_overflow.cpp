@@ -10,7 +10,9 @@
 
 #include <ces/account.h>
 #include <ces/types.h>
+#include <ces/util/vmprogram.h>
 
+#include <limits>
 #include <vector>
 
 BOOST_AUTO_TEST_SUITE(LedgerOverflowTests)
@@ -280,10 +282,10 @@ BOOST_FIXTURE_TEST_CASE(ConservationWithRepeatedOverflowReverts, OverflowFixture
   BOOST_CHECK_EQUAL(circ(), total);
 }
 
-// The buy-asset, cross-transfer, and VM (transfer/ownerTransfer/deposit/
-// withdraw) paths use the identical creditWouldOverflow guard before any debit,
-// exercised structurally above; their per-op reverts live in the respective
-// handler tests.
+// Every value-move path -- wire and VM (transfer/ownerTransfer/deposit/withdraw/
+// buyAsset/crossTransfer) -- runs checkCredit (creditWouldOverflow) before any
+// debit, so a move never saturate-burns. The VM buyAsset path is exercised by
+// VmBuyAssetNearCapSellerNoBurn below; the wire paths by the handler tests.
 
 // Mint/admin credit (_brr) saturates at the cap instead of feeding a
 // >2^47 value into the int48 balance (which would wrap NEGATIVE).
@@ -314,6 +316,56 @@ BOOST_FIXTURE_TEST_CASE(BrrCredit_NonPositiveIsNoop, OverflowFixture) {
   server->_drainLogic();
   BOOST_CHECK(!server->_accountExists(a.getPublicKeyAsHash()));
   BOOST_CHECK_EQUAL(bal(a.getPublicKeyAsHash()), 0);
+}
+
+// A VM program that buys `assetId` for up to `maxPrice` (raw internal units).
+static AssetData buildBuyProgram(const minx::Hash& assetId, uint64_t maxPrice) {
+  VmProgram pgm;
+  Region keyReg = pgm.allocHash();                     // 32-byte asset key
+  pgm.writeBytesToIo(keyReg.cell, assetId.data(), 32);
+  pgm.sysBuyAsset({keyReg, Imm(maxPrice)});
+  pgm.term();
+  return pgm.buildBootBlock();
+}
+
+// The VM-host buyAsset syscall must checkCredit the seller BEFORE debiting the
+// buyer, so buying from a near-cap seller never destroys credit (mirrors the
+// wire buyAsset). Pre-fix: the buyer was debited the full price while the
+// seller's credit saturated at the cap, vanishing the difference.
+BOOST_FIXTURE_TEST_CASE(VmBuyAssetNearCapSellerNoBurn, OverflowFixture) {
+  KeyPair seller, buyer;
+  const int64_t headroom = 1000;
+  fund(seller.getPublicKeyAsHash(), ces::BALANCE_MAX - headroom);
+  fund(buyer.getPublicKeyAsHash(),  ces::BALANCE_MAX);
+  const HashPrefix sellerPfx = Account::getMapKey(seller.getPublicKeyAsHash());
+  const HashPrefix buyerPfx  = Account::getMapKey(buyer.getPublicKeyAsHash());
+
+  // Seller owns a for-sale asset priced far above the seller's headroom.
+  minx::Hash assetId; assetId.fill(0xB7);
+  AssetData content; content.fill(0);
+  CES_REQUIRE_OK(server->createAsset(seller.getPublicKeyAsHash(), sellerPfx,
+                                     assetId, content, /*days=*/100, 0));
+  const uint32_t priceWhole = 500;
+  CES_REQUIRE_OK(server->updateAssetMeta(seller.getPublicKeyAsHash(), assetId,
+                                         sellerPfx, priceWhole, 0));
+
+  // A program the buyer runs that buys the asset.
+  minx::Hash progId; progId.fill(0xB8);
+  const uint64_t maxPrice = static_cast<uint64_t>(priceWhole) * ces::PRICE_UNIT;
+  CES_REQUIRE_OK(server->createAsset(buyer.getPublicKeyAsHash(), buyerPfx, progId,
+                                     buildBuyProgram(assetId, maxPrice),
+                                     /*days=*/100, 0));
+  server->_drainLogic();
+
+  server->_executeScheduledRunSync(buyerPfx, progId, 100'000'000,
+                                   std::numeric_limits<uint64_t>::max(), {});
+  server->_drainLogic();
+
+  // Seller unchanged (no saturating credit); buyer keeps the price (only VM gas
+  // spent). Pre-fix: seller == BALANCE_MAX, buyer down by the full price.
+  BOOST_CHECK_EQUAL(bal(seller.getPublicKeyAsHash()), ces::BALANCE_MAX - headroom);
+  BOOST_CHECK_GT(bal(buyer.getPublicKeyAsHash()),
+                 ces::BALANCE_MAX - static_cast<int64_t>(maxPrice));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -713,7 +713,7 @@ httpd.listen(PORT, BIND, async () => {
   const s = engine.stats();
   console.error(
     `cesweb on http://${BIND}:${realPort}  cesh=${CESH}  defaultHost=${DEFAULT_HOST || '(none)'}` +
-    `  cache=${CACHE_DIR} (${fmtBytes(s.totalBytes)}/${fmtBytes(s.maxCacheBytes)}, ${s.entries} files)` +
+    `  cache=${CACHE_DIR} (${fmtBytes(s.freeBytes)} free)` +
     `  account=${GATEWAY_PUBKEY || '(none)'}`
   );
 });

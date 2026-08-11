@@ -173,6 +173,7 @@ export function dialHttp(ceshBin, server, rpcPort, serverKey, pid, requestBytes,
     let child;
     try { child = spawn(ceshBin, args, { env }); }
     catch (e) { return resolve({ ok: false, code: -1, stdout: Buffer.alloc(0), stderr: String(e) }); }
+    child.stdin.on('error', () => {});  // contain async EPIPE if the child exits mid-write
 
     const out = [];
     let outLen = 0, truncated = false, err = '';

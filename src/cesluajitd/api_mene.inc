@@ -98,13 +98,41 @@ std::string mene_toast_frame(const std::string& msg) {
 // into its own envelope JSON, so an arbitrary program string could otherwise
 // spoof other message types (JSON duplicate-key semantics). mene only ever
 // produces these two shapes.
+// True iff [p,n) is exactly ONE balanced JSON object: it starts with '{' and the
+// brace matching it is the last non-whitespace byte. The host splices the frame
+// into its envelope verbatim, so this rejects a crafted breakout like
+// `{"type":"render"},"type":"status"` that a prefix match alone would pass.
+static bool mene_is_single_json_object(const char* p, size_t n) {
+  auto ws = [](char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; };
+  size_t i = 0;
+  while (i < n && ws(p[i])) ++i;
+  if (i >= n || p[i] != '{') return false;
+  int depth = 0;
+  bool inStr = false, esc = false, closed = false;
+  for (; i < n; ++i) {
+    char c = p[i];
+    if (inStr) {
+      if (esc) esc = false;
+      else if (c == '\\') esc = true;
+      else if (c == '"') inStr = false;
+    } else if (c == '"') inStr = true;
+    else if (c == '{') ++depth;
+    else if (c == '}') { if (--depth == 0) { ++i; closed = true; break; } }
+  }
+  if (!closed) return false;
+  for (; i < n; ++i) if (!ws(p[i])) return false;
+  return true;
+}
+
 bool mene_is_wire_frame(const char* p, size_t n) {
   static const char kRender[] = "{\"type\":\"render\"";
   static const char kToast[]  = "{\"type\":\"toast\"";
-  return (n >= sizeof(kRender) - 1 &&
-          std::memcmp(p, kRender, sizeof(kRender) - 1) == 0) ||
-         (n >= sizeof(kToast) - 1 &&
-          std::memcmp(p, kToast, sizeof(kToast) - 1) == 0);
+  bool typedOk =
+    (n >= sizeof(kRender) - 1 &&
+     std::memcmp(p, kRender, sizeof(kRender) - 1) == 0) ||
+    (n >= sizeof(kToast) - 1 &&
+     std::memcmp(p, kToast, sizeof(kToast) - 1) == 0);
+  return typedOk && mene_is_single_json_object(p, n);
 }
 
 // Call app:render_frame() on the registry-pinned panel app; returns a render

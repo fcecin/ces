@@ -64,6 +64,12 @@ if not consumed then
   error("/s/dice.lua: failed to allocate bucket cache")
 end
 
+-- Plays are serialized through one worker so the single-use check-and-set
+-- (consumed:get in pending_bet, consumed:put in handle_play) cannot interleave
+-- across the yielding account_read/transfer calls between them. Two dials on one
+-- deposit would otherwise both pass the get and both put, double-spending it.
+local play_q = ces.chan()
+
 -- MIN_BET keeps "0-credit transfers" from being interpreted as a
 -- bet. There is deliberately NO upper cap: the user already paid
 -- the transfer fee and moved real credits to the house when they
@@ -288,7 +294,7 @@ local function handle_line(conn, line)
   end
 
   if line == "play" then
-    handle_play(conn)
+    play_q:send({ conn = conn })
     return
   end
 
@@ -315,6 +321,17 @@ local function on_close(conn)
   -- and reconnect, their last-played transfer time still counts
   -- until the bucket ages it out (BUCKET_TTL_S).
 end
+
+-- The sole caller of handle_play: one play at a time, so no two plays' consume
+-- windows overlap. A queued play still resolves if its dial has since closed
+-- (conn:write no-ops; the deposit settles fairly either way).
+ces.spawn(function()
+  while true do
+    local req, err = play_q:recv(60000)
+    if err == "closed" then return end
+    if req then handle_play(req.conn) end
+  end
+end)
 
 ces.conn.set_listener({
   -- The opening screen rides the ATTACH accept as `hello`: this program speaks

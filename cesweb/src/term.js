@@ -151,6 +151,7 @@ export class TerminalManager {
     try { child = spawn(this.cesh, args); }   // no key anywhere near this process
     catch { return this._teardown(s, 'failed to start cesh'); }
     s.child = child;
+    child.stdin.on('error', () => {});  // contain async EPIPE if the child exits mid-write
     s.phase = 'token';
     child.stdout.on('data', (d) => this._onCeshStdout(s, d));
     child.stderr.on('data', (d) => this._status(s, d.toString().trim()));

@@ -3529,6 +3529,25 @@ void ComputeHandler::killBySource(const std::string& sourceName) {
   });
 }
 
+void ComputeHandler::reloadBySource(const std::string& sourceName) {
+  CesServer* server = server_;
+  if (!server) return;
+  auto io = server->_rpcTaskIOExecutor();
+  if (!io) return;
+  // Kill then relaunch as ONE strand task: launchInternal mutates byName_/
+  // instances_/port-leases and MUST run on this strand, never the caller's
+  // thread. Kill precedes launch in program order, so the fresh pid is not yet
+  // in byName_ when the kill loop reads it (no self-kill).
+  boost::asio::post(io, [this, sourceName]() {
+    auto it = byName_.find(sourceName);
+    if (it != byName_.end()) {
+      std::vector<uint64_t> ids(it->second.begin(), it->second.end());
+      for (uint64_t pid : ids) killByPid(*this, pid);
+    }
+    launchInternal(sourceName);
+  });
+}
+
 uint8_t ComputeHandler::start() {
   CesServer* server = server_;
   const auto& cfg = server->_config();
