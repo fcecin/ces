@@ -130,9 +130,9 @@ var t=setInterval(function(){n--;if(e)e.textContent=n;if(n<=0){clearInterval(t);
 <meta name=viewport content="width=device-width,initial-scale=1">${meta}
 <title>${esc(title)}</title>
 <style>
-:root{color-scheme:light dark}
+:root{color-scheme:light}
 body{font:16px/1.6 system-ui,-apple-system,sans-serif;max-width:44rem;
-margin:3rem auto;padding:0 1.2rem;color:#1b1b1f}
+margin:3rem auto;padding:0 1.2rem;background:#fff;color:#1b1b1f}
 h1{font-size:1.6rem;margin:.2em 0 .6em}h2{font-size:1.05rem;margin:1.6em 0 .4em;color:#555}
 code,pre{background:#00000010;border-radius:5px;font-size:.92em}
 code{padding:.12em .4em}pre{padding:.7em .9em;overflow:auto}
@@ -362,7 +362,7 @@ function termPage(pre) {
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>cesweb terminal</title>
 <style>
-:root{color-scheme:dark light}
+:root{color-scheme:dark}
 body{font:14px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
 margin:0;background:#0d0f12;color:#cdd3da;height:100vh;display:flex;flex-direction:column}
 header{padding:.5rem .8rem;background:#15181d;border-bottom:1px solid #ffffff14;

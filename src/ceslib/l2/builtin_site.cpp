@@ -45,10 +45,10 @@ serving. Files, pages, and programs are all just entries in the same ledger.</p>
 </html>
 )HTML";
 
-const char* kStyleCss = R"CSS(:root{color-scheme:light dark}
+const char* kStyleCss = R"CSS(:root{color-scheme:light}
 *{box-sizing:border-box}
 body{font:17px/1.65 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-  max-width:42rem;margin:0 auto;padding:3rem 1.2rem;color:#1c1c1e}
+  max-width:42rem;margin:0 auto;padding:3rem 1.2rem;background:#fff;color:#1c1c1e}
 header{display:flex;align-items:center;gap:1.1rem;margin-bottom:1.6rem}
 header h1{font-size:1.8rem;margin:0;line-height:1.1}
 .sub{margin:.35rem 0 0;color:#666}
