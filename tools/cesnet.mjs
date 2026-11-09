@@ -126,7 +126,6 @@ fee_tx = 0
 fee_query = 0
 peer_target = 0
 peer_miner_interval = 2
-settlement_max_retries = 1
 
 ${peers}
 `.trim();

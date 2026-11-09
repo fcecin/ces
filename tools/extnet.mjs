@@ -137,7 +137,6 @@ function buildConfig(node, i) {
     `fee_query = 0`,
     `peer_target = 0`,
     `peer_miner_interval = 5`,
-    `settlement_max_retries = 3`,
     `rpc_port = ${node.rpc}`,
     `file_store_max_bytes = 67108864`,
     `ext_local_budget = 100000000000`,

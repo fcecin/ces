@@ -1856,10 +1856,10 @@ bool CesServer::isPoWEngineReady() {
 }
 
 bool CesServer::isConnected(const SockAddr& addr) {
-  auto ip = addr.address();
+  auto ip = Resolver::unmapV4(addr.address());
   std::lock_guard lock(peerTableMutex_);
   for (const auto& p : peerTable_) {
-    if (p.resolvedIP == ip) return true;
+    if (Resolver::unmapV4(p.resolvedIP) == ip) return true;
   }
   return false;
 }
@@ -6607,8 +6607,7 @@ CesClientAsync* CesServer::getOrCreateSettlementClient(
     }
     if (!haveEp) ep = Resolver::resolveUdp(address);
     auto client = std::make_unique<CesClientAsync>(
-      settlementIO_, ep, serverKeyPair_, peerKey,
-      CesClientAsync::DEFAULT_CHANNELS, cfg_.settlementMaxRetries);
+      settlementIO_, ep, serverKeyPair_, peerKey);
     auto* ptr = client.get();
     settlementClients_[address] = std::move(client);
     return ptr;
@@ -7359,7 +7358,6 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "peer_pow_inbound_reciprocation_bps = "
       << cfg_.peerPowInboundReciprocationBps << "\n";
     o << "max_peers = " << maxPeers_.load() << "\n";
-    o << "settlement_max_retries = " << cfg_.settlementMaxRetries << "\n";
     o << "max_peer_reserve_disturbance = "
       << cfg_.maxPeerReserveDisturbance << "\n";
     o << "gossip_fanout_degree = " << cfg_.gossipFanoutDegree << "\n\n";

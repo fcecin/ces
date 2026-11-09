@@ -73,6 +73,14 @@ Resolver::parseIp(const std::string& ip, boost::system::error_code& ec) {
   return boost::asio::ip::make_address(ip, ec);
 }
 
+boost::asio::ip::address
+Resolver::unmapV4(const boost::asio::ip::address& a) {
+  if (a.is_v6() && a.to_v6().is_v4_mapped())
+    return boost::asio::ip::make_address_v4(boost::asio::ip::v4_mapped,
+                                            a.to_v6());
+  return a;
+}
+
 std::string Resolver::fillHost(const std::string& advertised,
                                const boost::asio::ip::address& srcIp) {
   auto pos = advertised.find_last_of(':');

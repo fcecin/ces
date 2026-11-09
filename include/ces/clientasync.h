@@ -36,8 +36,7 @@ public:
                  const boost::asio::ip::udp::endpoint& serverEndpoint,
                  const KeyPair& keyPair,
                  const Hash& peerServerKey,
-                 size_t numChannels = DEFAULT_CHANNELS,
-                 int maxRetries = DEFAULT_MAX_RETRIES);
+                 size_t numChannels = DEFAULT_CHANNELS);
 
   ~CesClientAsync();
 
@@ -60,8 +59,13 @@ public:
 
   void close();
 
+  // Test hooks. Each posts to the io_context. `_testForgetTickets` replaces
+  // every held ticket with a value the server never issued. `_testAgeTickets`
+  // moves the time each held ticket was received back by `age`.
+  void _testForgetTickets();
+  void _testAgeTickets(std::chrono::steady_clock::duration age);
+
   static constexpr size_t DEFAULT_CHANNELS = 16;
-  static constexpr int DEFAULT_MAX_RETRIES = 7;
 
 private:
   enum class OpKind { OpenTransfer, Gossip };
@@ -92,12 +96,18 @@ private:
   struct Channel {
     ChState state = ChState::Idle;
     uint64_t ticket = 0;       // server's gpassword to spend next
+    std::chrono::steady_clock::time_point ticketAt{};  // when `ticket` arrived
     uint64_t sentGPass = 0;    // our gpassword on the in-flight packet
     minx::Hash serverKey{};    // server pubkey from INFO
     QueuedOp currentOp;        // the op we're working on (valid when Busy)
-    int retries = 0;
     std::chrono::steady_clock::time_point sentAt;
   };
+
+  static bool ticketExpired(const Channel& ch,
+                            std::chrono::steady_clock::time_point now) {
+    return now - ch.ticketAt >
+           std::chrono::seconds(CES_SERVER_TICKET_REFRESH_SECS);
+  }
 
   void dispatch();
   void handshake(Channel& ch);
@@ -143,7 +153,6 @@ private:
 
   bool closed_ = false;
 
-  int maxRetries_;
   static constexpr int RETRY_MS = 3000;
   static constexpr int HANDSHAKE_RETRY_MS = 2000;
   static constexpr size_t MAX_QUEUE = 50000;

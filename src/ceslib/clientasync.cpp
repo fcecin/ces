@@ -8,11 +8,10 @@ CesClientAsync::CesClientAsync(boost::asio::io_context& io,
                                const boost::asio::ip::udp::endpoint& serverEndpoint,
                                const KeyPair& keyPair,
                                const Hash& peerServerKey,
-                               size_t numChannels,
-                               int maxRetries)
+                               size_t numChannels)
     : io_(io), socket_(io, boost::asio::ip::udp::v6()),
       serverEp_(serverEndpoint), sweepTimer_(io), keyPair_(keyPair),
-      peerServerKey_(peerServerKey), maxRetries_(maxRetries) {
+      peerServerKey_(peerServerKey) {
   boost::system::error_code ec;
   socket_.set_option(boost::asio::ip::v6_only(false), ec);
   // The socket is v6 dual-stack; a plain-IPv4 destination endpoint can't be sent
@@ -119,9 +118,11 @@ void CesClientAsync::gossip(const Hash& authorId, const Hash& msgId,
 void CesClientAsync::dispatch() {
   if (closed_ || queue_.empty()) return;
 
+  auto now = std::chrono::steady_clock::now();
   for (auto& ch : channels_) {
     if (queue_.empty()) break;
-    if (ch.state == ChState::Idle) {
+    if (ch.state == ChState::Idle || (ch.state == ChState::Ready &&
+                                      ticketExpired(ch, now))) {
       handshake(ch);
     } else if (ch.state == ChState::Ready) {
       ch.currentOp = std::move(queue_.front());
@@ -139,7 +140,6 @@ void CesClientAsync::dispatch() {
 void CesClientAsync::handshake(Channel& ch) {
   ch.state = ChState::Handshaking;
   ch.sentGPass = genPassword();
-  ch.retries = 0;
   ch.sentAt = std::chrono::steady_clock::now();
   sendGetInfo(ch);
   startSweepTimer();
@@ -156,7 +156,6 @@ void CesClientAsync::sendGetInfo(Channel& ch) {
 void CesClientAsync::sendOp(Channel& ch) {
   ch.state = ChState::Busy;
   ch.sentGPass = genPassword();
-  ch.retries = 0;
   ch.sentAt = std::chrono::steady_clock::now();
 
   minx::ArrayBuffer<512> buf;
@@ -236,6 +235,7 @@ void CesClientAsync::handleInfo(const uint8_t* data, size_t len) {
   for (auto& ch : channels_) {
     if (ch.state == ChState::Handshaking && ch.sentGPass == spass) {
       ch.ticket = gpass;
+      ch.ticketAt = std::chrono::steady_clock::now();
       ch.serverKey = skey;
       ch.state = ChState::Ready;
       dispatch();
@@ -289,6 +289,7 @@ void CesClientAsync::handleMessage(const uint8_t* data, size_t len) {
     }
 
     ch.ticket = gpass;
+    ch.ticketAt = std::chrono::steady_clock::now();
     ch.state = ChState::Ready;
     --pendingCount_;
     QueuedOp done = std::move(ch.currentOp);
@@ -312,7 +313,7 @@ void CesClientAsync::sweep() {
       anyActive = true;
       if (now - ch.sentAt <= std::chrono::milliseconds(HANDSHAKE_RETRY_MS))
         continue;
-      if (++ch.retries >= maxRetries_) {
+      if (queue_.empty()) {
         ch.state = ChState::Idle;
       } else {
         ch.sentGPass = genPassword();
@@ -338,17 +339,9 @@ void CesClientAsync::sweep() {
       int retryMs = isGossip ? GOSSIP_RETRY_MS : RETRY_MS;
       if (now - ch.sentAt <= std::chrono::milliseconds(retryMs))
         continue;
-      if (++ch.retries >= maxRetries_) {
-        --pendingCount_;
-        QueuedOp done = std::move(ch.currentOp);
-        ch.currentOp = {};
-        ch.state = ChState::Idle;
-        fireOpCallback(done, CES_ERROR_TIMEOUT, 0);
-      } else {
-        queue_.push_front(std::move(ch.currentOp));
-        ch.currentOp = {};
-        handshake(ch);
-      }
+      queue_.push_front(std::move(ch.currentOp));
+      ch.currentOp = {};
+      handshake(ch);
     }
   }
 
@@ -385,6 +378,20 @@ void CesClientAsync::failAll(uint8_t rc) {
 // ---- Helpers ----
 
 uint64_t CesClientAsync::genPassword() { return rngDist_(rng_); }
+
+void CesClientAsync::_testForgetTickets() {
+  boost::asio::post(io_, [this]() {
+    for (auto& ch : channels_)
+      if (ch.ticket != 0) ch.ticket = genPassword();
+  });
+}
+
+void CesClientAsync::_testAgeTickets(std::chrono::steady_clock::duration age) {
+  boost::asio::post(io_, [this, age]() {
+    for (auto& ch : channels_)
+      if (ch.ticket != 0) ch.ticketAt -= age;
+  });
+}
 
 template <size_t N>
 void CesClientAsync::sendBuf(minx::ArrayBuffer<N>& buf) {

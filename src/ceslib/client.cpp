@@ -22,10 +22,6 @@ namespace ces {
 // accepting-PoW in minutes and we need an absolute UTC-seconds deadline.
 static constexpr uint64_t SECS_PER_MIN = 60;
 
-// After this many seconds without a fresh INFO, `ensureServerTicket()` forces
-// a new handshake — otherwise the cached `serverTicket_` goes stale.
-static constexpr uint64_t SERVER_TICKET_REFRESH_SECS = 15;
-
 // Polling interval while waiting for the RandomX VM/dataset to finish
 // initializing before `mine()` can call `proveWork()`.
 static constexpr int POW_INIT_POLL_MS = 1000;
@@ -1636,7 +1632,7 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
 bool CesClient::ensureServerTicket() {
   if ((serverTicket_ == 0) ||
       (minx::getSecsSinceEpoch() >
-       serverTicketLastTime_ + SERVER_TICKET_REFRESH_SECS)) {
+       serverTicketLastTime_ + CES_SERVER_TICKET_REFRESH_SECS)) {
     if (!getInfo()) {
       LOGTRACE << "ensureServerTicket can't refresh ticket";
       return false;

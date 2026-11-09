@@ -55,7 +55,6 @@ peer_target = 0
 # Reciprocate inbound peer PoW 1:1 (mine back as much as a peer mines on us).
 peer_pow_inbound_reciprocation_bps = 10000
 
-settlement_max_retries = 7
 max_peer_reserve_disturbance = 100000
 gossip_fanout_degree = 6
 

@@ -228,7 +228,6 @@ struct CesConfig {
   // candidate view, which is what makes larger-scale formation testable.
   size_t maxPeers = DEFAULT_MAX_PEERS;
   std::vector<PeerConfig> peers;
-  int settlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
 
   // Max reserve (raw) one operation may spend at one peer. It caps each gossip
   // fan-out leg (each peer at min(our reserve there, this)); the unallocated

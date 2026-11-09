@@ -43,6 +43,9 @@ public:
   // Non-throwing variant for hot paths that want to handle the failure.
   static boost::asio::ip::address parseIp(const std::string& ip,
                                            boost::system::error_code& ec);
+  // The plain v4 form of a v4-mapped v6 address (::ffff:a.b.c.d); any other
+  // address unchanged. A dual-stack socket reports v4 senders v4-mapped.
+  static boost::asio::ip::address unmapV4(const boost::asio::ip::address& a);
 
   // Give an advertised peer address a routable host. A node with no serverName
   // can't name its own external address, so it advertises only its listen port

@@ -10,11 +10,13 @@
 #include "test_common.h"
 
 #include <ces/buffer.h>
+#include <ces/clientasync.h>
 #include <ces/util/resolver.h>
 #include <ces/util/wallet.h>
 #include <toml++/toml.hpp>
 #include <boost/asio/ip/address.hpp>
 #include <filesystem>
+#include <future>
 
 // ces/wallet.h declares ces::fs = std::filesystem, which collides with
 // the boost::filesystem `fs` from test_common.h (via `using namespace ces`).
@@ -1151,6 +1153,150 @@ BOOST_AUTO_TEST_CASE(PeerReachabilityDetection) {
   boost::system::error_code ec;
   bfs::remove_all(dirA, ec);
   bfs::remove_all(dirB, ec);
+}
+
+// Drives one CesClientAsync with one channel on its own io thread.
+struct SettlementSender {
+  boost::asio::io_context io;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
+    work{io.get_executor()};
+  std::unique_ptr<CesClientAsync> client;
+  std::thread th;
+
+  SettlementSender(uint16_t port, const ces::KeyPair& kp, const minx::Hash& peer)
+      : client(std::make_unique<CesClientAsync>(
+          io,
+          boost::asio::ip::udp::endpoint(
+            boost::asio::ip::make_address("127.0.0.1"), port),
+          kp, peer, 1)),
+        th([this]() { io.run(); }) {}
+
+  ~SettlementSender() {
+    boost::asio::post(io, [this]() { client->close(); });
+    work.reset();
+    th.join();
+    client.reset();
+  }
+
+  uint8_t transfer(const minx::Hash& dest, uint64_t amount) {
+    auto p = std::make_shared<std::promise<uint8_t>>();
+    auto f = p->get_future();
+    client->openTransfer(dest, amount, [p](uint8_t rc) { p->set_value(rc); });
+    if (f.wait_for(std::chrono::seconds(15)) != std::future_status::ready)
+      return CES_ERROR_INTERNAL;
+    return f.get();
+  }
+};
+
+// A settlement receiver that does not trust loopback, so MINX enforces the
+// ticket on every op. It answers GET_INFO and confirms each op it receives.
+struct TicketCheckingPeer : minx::MinxListener {
+  ces::KeyPair kp;
+  boost::asio::io_context netIO, taskIO;
+  boost::asio::executor_work_guard<boost::asio::io_context::executor_type>
+    netWork{netIO.get_executor()}, taskWork{taskIO.get_executor()};
+  std::unique_ptr<minx::Minx> minx;
+  std::thread netTh, taskTh;
+  std::atomic<int> ops{0};
+  uint16_t port = 0;
+
+  TicketCheckingPeer() {
+    minx = std::make_unique<minx::Minx>(
+      this, minx::MinxConfig{
+              .instanceName = "tkt",
+              .spamThreshold = minx::MinxConfig::MAX_SPAM_THRESHOLD,
+              .trustLoopback = false});
+    port = minx->openSocket(
+      minx::SockAddr(boost::asio::ip::address_v6::any(), 0), netIO, taskIO);
+    netTh = std::thread([this]() { netIO.run(); });
+    taskTh = std::thread([this]() { taskIO.run(); });
+  }
+
+  ~TicketCheckingPeer() {
+    minx->closeSocket();
+    netWork.reset();
+    taskWork.reset();
+    netIO.stop();
+    taskIO.stop();
+    netTh.join();
+    taskTh.join();
+  }
+
+  void incomingGetInfo(const minx::SockAddr& addr,
+                       const minx::MinxGetInfo& msg) override {
+    minx->sendInfo(addr, minx::MinxInfo{msg.version, minx->generatePassword(),
+                                        msg.gpassword, 1,
+                                        kp.getPublicKeyAsHash(), {}});
+  }
+
+  void incomingMessage(const minx::SockAddr& addr,
+                       const minx::MinxMessage& msg) override {
+    CesOpenTransfer req;
+    try {
+      req.fromBytes(msg.data);
+    } catch (...) {
+      return;
+    }
+    ++ops;
+    CesOpenTransferResult res;
+    res.originId = Account::getMapKey(req.originId);
+    res.reqNonce = req.reqNonce;
+    res.destId = Account::getMapKey(req.destKey);
+    res.amount = req.amount;
+    res.rcode = CES_OK;
+    minx->sendMessage(addr, minx::MinxMessage{msg.version,
+                                              minx->generatePassword(),
+                                              msg.gpassword, res.toBytes(kp)});
+  }
+};
+
+BOOST_AUTO_TEST_CASE(IsConnectedMatchesV4MappedSource) {
+  bfs::path dir = makeUniqueTempDir("ces_isconn");
+  minx::Hash priv; priv.fill(0xA1);
+  auto srv = std::make_unique<CesServer>(makePeeringConfig(dir, priv));
+
+  minx::Hash k4; k4.fill(0x44);
+  minx::Hash k6; k6.fill(0x66);
+  auto v4 = boost::asio::ip::make_address("10.20.30.40");
+  auto v4b = boost::asio::ip::make_address("10.20.30.41");
+  auto mapped = [](const boost::asio::ip::address& a) {
+    return boost::asio::ip::address(boost::asio::ip::make_address_v6(
+      boost::asio::ip::v4_mapped, a.to_v4()));
+  };
+  srv->_testAddPeerWithRpc(k4, "10.20.30.40:7000", v4, 0);
+  srv->_testAddPeerWithRpc(k6, "10.20.30.41:7000", mapped(v4b), 0);
+
+  BOOST_CHECK(srv->isConnected(minx::SockAddr(v4, 7000)));
+  BOOST_CHECK(srv->isConnected(minx::SockAddr(mapped(v4), 7000)));
+  BOOST_CHECK(srv->isConnected(minx::SockAddr(v4b, 7000)));
+  BOOST_CHECK(srv->isConnected(minx::SockAddr(mapped(v4b), 7000)));
+  BOOST_CHECK(!srv->isConnected(minx::SockAddr(
+    boost::asio::ip::make_address("10.20.30.42"), 7000)));
+  BOOST_CHECK(!srv->isConnected(minx::SockAddr(
+    mapped(boost::asio::ip::make_address("10.20.30.42")), 7000)));
+
+  srv.reset();
+  boost::system::error_code ec;
+  bfs::remove_all(dir, ec);
+}
+
+// The sender idles past the ticket refresh age and the receiver forgets the
+// ticket. The sender must get a new ticket before it sends, so the receiver
+// drops no op.
+BOOST_AUTO_TEST_CASE(SettlementReHandshakesAfterTicketRefreshAge) {
+  TicketCheckingPeer peer;
+  ces::KeyPair kpA;
+  ces::KeyPair bob;
+  {
+    SettlementSender a(peer.port, kpA, peer.kp.getPublicKeyAsHash());
+    CES_CHECK_OK(a.transfer(bob.getPublicKeyAsHash(), 1000));
+    a.client->_testAgeTickets(
+      std::chrono::seconds(CES_SERVER_TICKET_REFRESH_SECS + 1));
+    a.client->_testForgetTickets();
+    CES_CHECK_OK(a.transfer(bob.getPublicKeyAsHash(), 1000));
+  }
+  BOOST_CHECK_EQUAL(peer.ops.load(), 2);
+  BOOST_CHECK_NE(peer.minx->getLastError(), minx::MINX_ERROR_NOT_CONNECTED);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

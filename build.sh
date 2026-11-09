@@ -23,6 +23,7 @@ print_help() {
     echo "                  into cesluajitd. Pulls Rust/malachite-cpp; first build is slow."
     echo "  --hyle-src PATH Build --hyle against a local hyle checkout instead of the"
     echo "                  published one. Implies --hyle."
+    echo "  --minx-src PATH Build against a local MINX checkout instead of the published one."
     echo "  --mail          Enable outbound mail (builtin:mail + SMTP with TLS). Needs"
     echo "                  system OpenSSL. Gated behind CES_MAIL; off by default."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
@@ -88,6 +89,7 @@ build_one_config() {
     # An empty FETCHCONTENT_SOURCE_DIR_HYLE means "download it", so passing this every run
     # keeps a once-used local checkout from sticking in the cache.
     local HYLE_SRC_ARG="-DFETCHCONTENT_SOURCE_DIR_HYLE=${HYLE_SRC}"
+    local MINX_SRC_ARG="-DFETCHCONTENT_SOURCE_DIR_MINX=${MINX_SRC}"
 
     # mail feature on/off (builtin:mail + SMTP/TLS).
     local MAIL_ARG="-DCES_MAIL=OFF"
@@ -106,6 +108,7 @@ build_one_config() {
         -DCES_MARCH="${MARCH}" \
         $HYLE_ARG \
         "$HYLE_SRC_ARG" \
+        "$MINX_SRC_ARG" \
         $MAIL_ARG \
         $EXTRA_ARGS
 
@@ -124,6 +127,7 @@ ENABLE_ASAN=false
 ENABLE_NATIVE=false
 ENABLE_HYLE=false
 HYLE_SRC=""
+MINX_SRC=""
 ENABLE_MAIL=false
 DO_DEEP_CLEAN=false
 
@@ -172,6 +176,15 @@ while [ $i -lt ${#ARGS[@]} ]; do
                 exit 1
             fi
             HYLE_SRC="$(cd "${ARGS[$next_i]}" && pwd)"
+            i=$next_i
+            ;;
+        --minx-src)
+            next_i=$((i + 1))
+            if [ $next_i -ge ${#ARGS[@]} ]; then
+                echo "Error: --minx-src needs a path" >&2
+                exit 1
+            fi
+            MINX_SRC="$(cd "${ARGS[$next_i]}" && pwd)"
             i=$next_i
             ;;
         --mail)

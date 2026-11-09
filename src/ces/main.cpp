@@ -148,9 +148,6 @@ peer_pow_inbound_reciprocation_bps = )" << DEFAULT_PEER_POW_INBOUND_RECIPROCATIO
 # peers). Small values bound each node's candidate view; raise for larger meshes.
 max_peers = )" << DEFAULT_MAX_PEERS << R"(
 
-# Async settlement max retries per operation (1 = no retries, for testing)
-settlement_max_retries = )" << CesClientAsync::DEFAULT_MAX_RETRIES << R"(
-
 # Max reserve (raw) one operation may spend at one peer. Caps each gossip
 # fan-out leg; the unallocated remainder reverts to the originator.
 # 0 = uncapped (only the reserve on hand bounds a leg).
@@ -410,7 +407,6 @@ int main(int argc, char* argv[]) {
   uint64_t optPeerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
   int optPeerMinerInterval = DEFAULT_PEER_MINER_INTERVAL_SECS;
   uint64_t optMaxPeers = DEFAULT_MAX_PEERS;
-  int optSettlementMaxRetries = CesClientAsync::DEFAULT_MAX_RETRIES;
   uint64_t optMaxPeerReserveDisturbance = DEFAULT_MAX_PEER_RESERVE_DISTURBANCE;
   uint32_t optGossipFanoutDegree = DEFAULT_GOSSIP_FANOUT_DEGREE;
   std::string optAdminSocket;
@@ -569,9 +565,6 @@ int main(int argc, char* argv[]) {
     app.add_option("--maxpeers", optMaxPeers,
       "Peer-table size (persisted/exposed; RAM holds 3x). Small bounds the view")
       ->default_val(std::to_string(DEFAULT_MAX_PEERS));
-    app.add_option("--settlementretries", optSettlementMaxRetries,
-      "Async settlement max retries (1 = no retries)")
-      ->default_val(std::to_string(CesClientAsync::DEFAULT_MAX_RETRIES));
     app.add_option("--maxpeerreservedisturbance", optMaxPeerReserveDisturbance,
       "Max reserve (raw) one op may spend at one peer; caps each gossip "
       "fan-out leg, remainder refunds the originator (0 = uncapped)")
@@ -826,7 +819,6 @@ int main(int argc, char* argv[]) {
       applyIfDefault("peer_miner_interval", optPeerMinerInterval,
                      "--peerminerinterval");
       applyIfDefault("max_peers", optMaxPeers, "--maxpeers");
-      applyIfDefault("settlement_max_retries", optSettlementMaxRetries, "--settlementretries");
       applyIfDefault("max_peer_reserve_disturbance", optMaxPeerReserveDisturbance,
                      "--maxpeerreservedisturbance");
       applyIfDefault("gossip_fanout_degree", optGossipFanoutDegree,
@@ -1074,7 +1066,6 @@ int main(int argc, char* argv[]) {
   config.peerPowInboundReciprocationBps = optPeerPowInboundReciprocationBps;
   config.peerMinerIntervalSecs = optPeerMinerInterval;
   config.maxPeers = static_cast<size_t>(optMaxPeers < 1 ? 1 : optMaxPeers);
-  config.settlementMaxRetries = optSettlementMaxRetries;
   config.maxPeerReserveDisturbance = optMaxPeerReserveDisturbance;
   config.gossipFanoutDegree = optGossipFanoutDegree;
   config.adminSocket = optAdminSocket;
@@ -1189,7 +1180,6 @@ int main(int argc, char* argv[]) {
           << VAR(config.flushValue) << VAR(config.maxLogBytes)
           << VAR(config.serverName) << VAR(config.peerTarget)
           << VAR(config.peerPowInboundReciprocationBps)
-          << VAR(config.settlementMaxRetries)
           << VAR(config.rpcPort)
           << VAR(config.cesFileStoreMaxBytes)
           << VAR(optNoPowEngine);
