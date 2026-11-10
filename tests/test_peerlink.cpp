@@ -191,6 +191,24 @@ BOOST_AUTO_TEST_CASE(GateRejectsNonPeer) {
   c.disconnect();
 }
 
+// An entry that only an inbound PoW made is not a mesh peer: the PoW sender
+// chose its key, and no one added or verified it.
+BOOST_AUTO_TEST_CASE(GateRejectsInboundOnlyEntry) {
+  KeyPair minerKey;
+  minx::Hash minerHash = minerKey.getPublicKeyAsHash();
+  server->_upsertPeerForTest(minerHash,
+                             "127.0.0.1:" + std::to_string(rpcPort), 100);
+  BOOST_REQUIRE(server->_setPeerVerifiedForTest(minerHash, false));
+  CesPlexClient c;
+  c.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  uint8_t rc = c.connect("localhost", rpcPort, ces::CES_PEER_PROTO, minerKey);
+  CES_CHECK_OK(rc);
+  wait_net();
+  BOOST_CHECK(server->peerHandler() &&
+              !server->peerHandler()->isLinked(minerHash));
+  c.disconnect();
+}
+
 // A peer pubkey binds OK, the link registers, and the channel is never
 // metered. Added with rpcPort 0 (member but non-dialable) so the server's
 // own reconcile cannot race an outbound dial against this inbound bind.

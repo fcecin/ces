@@ -6746,8 +6746,10 @@ bool CesServer::_isPeerByKey(const minx::Hash& ckey) {
   std::lock_guard lock(peerTableMutex_);
   for (const auto& p : peerTable_) {
     if (p.ckey == ckey)
-      // A banned peer is not a peer: the bind gate rejects it.
-      return !(p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil);
+      // A banned peer is not a peer: the bind gate rejects it. An entry that
+      // only an inbound PoW made (its sender chose the key) is not one either.
+      return (p.outbound || p.verified) &&
+             !(p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil);
   }
   return false;
 }
