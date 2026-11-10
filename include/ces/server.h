@@ -930,7 +930,7 @@ public:
   void _testAddPeerWithRpc(const minx::Hash& ckey,
                            const std::string& declaredAddr,
                            const boost::asio::ip::address& ip,
-                           uint16_t rpcPort);
+                           uint16_t rpcPort, bool outbound = true);
 
   // TEST-ONLY (`_`-prefixed). Marks an existing peer as fully reciprocated
   // (reserve held, inbound PoW proved, verified), as a completed mining cycle

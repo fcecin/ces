@@ -209,6 +209,23 @@ BOOST_AUTO_TEST_CASE(GateRejectsInboundOnlyEntry) {
   c.disconnect();
 }
 
+// An entry that only an inbound PoW made is not a dial target either.
+BOOST_AUTO_TEST_CASE(InboundOnlyEntryIsNotALinkTarget) {
+  KeyPair minerKey;
+  minx::Hash minerHash = minerKey.getPublicKeyAsHash();
+  server->_testAddPeerWithRpc(minerHash, "127.0.0.1:" + std::to_string(rpcPort),
+                              boost::asio::ip::make_address("127.0.0.1"),
+                              rpcPort, /*outbound=*/false);
+  auto isTarget = [&]() {
+    for (const auto& t : server->_peerLinkTargets())
+      if (t.ckey == minerHash) return true;
+    return false;
+  };
+  BOOST_CHECK(!isTarget());
+  server->_setPeerVerifiedForTest(minerHash, true);
+  BOOST_CHECK(isTarget());
+}
+
 // A peer pubkey binds OK, the link registers, and the channel is never
 // metered. Added with rpcPort 0 (member but non-dialable) so the server's
 // own reconcile cannot race an outbound dial against this inbound bind.

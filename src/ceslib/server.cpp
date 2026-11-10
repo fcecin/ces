@@ -6765,6 +6765,7 @@ std::vector<PeerLinkTarget> CesServer::_peerLinkTargets() {
     // This is the liveness signal that replaces a channel keepalive.
     if (!p.reachable) continue;
     if (p.bannedUntil != 0 && minx::getSecsSinceEpoch() < p.bannedUntil) continue;
+    if (!p.outbound && !p.verified) continue;
     PeerLinkTarget t;
     t.ckey = p.ckey;
     t.dialable = (p.rpcPort != 0) && !p.resolvedIP.is_unspecified();
@@ -6795,7 +6796,7 @@ bool CesServer::cesplexChannelMetered(const std::string& proto) {
 void CesServer::_testAddPeerWithRpc(const minx::Hash& ckey,
                                     const std::string& declaredAddr,
                                     const boost::asio::ip::address& ip,
-                                    uint16_t rpcPort) {
+                                    uint16_t rpcPort, bool outbound) {
   std::lock_guard lock(peerTableMutex_);
   for (auto& p : peerTable_) {
     if (p.ckey == ckey) {
@@ -6805,7 +6806,7 @@ void CesServer::_testAddPeerWithRpc(const minx::Hash& ckey,
       p.resolvedEndpointValid = true;
       p.rpcPort = rpcPort;
       p.reachable = true;
-      p.outbound = true;
+      p.outbound = outbound;
       return;
     }
   }
@@ -6817,7 +6818,7 @@ void CesServer::_testAddPeerWithRpc(const minx::Hash& ckey,
   pe.resolvedEndpointValid = true;
   pe.rpcPort = rpcPort;
   pe.reachable = true;
-  pe.outbound = true;
+  pe.outbound = outbound;
   peerTable_.push_back(pe);
 }
 
