@@ -596,9 +596,11 @@ pid_t spawnChild(const std::string& binary,
   pid_t pid = ::fork();
   if (pid < 0) return -errno;
   if (pid == 0) {
-    // Child. Close stdin; leave stdout/stderr for the runtime's
-    // panic messages (which should only ever fire on host bugs).
+    // Child. Close stdin and every descriptor above stderr; leave
+    // stdout/stderr for the runtime's panic messages (which should only
+    // ever fire on host bugs).
     ::close(STDIN_FILENO);
+    ::close_range(3, ~0U, 0);
     const char* arg0 = binary.c_str();
     const char* arg1 = sockPath.c_str();
     const char* arg2 = dropUser.c_str();   // "" = no privilege drop

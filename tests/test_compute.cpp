@@ -19,11 +19,14 @@
 #include <ces/l2/file_handler.h>
 #include <ces/server.h>
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <set>
 #include <sstream>
 #include <thread>
+
+#include <unistd.h>
 
 using namespace ces;
 
@@ -163,6 +166,67 @@ BOOST_AUTO_TEST_CASE(LaunchKillRoundTrip) {
   CES_REQUIRE_OK(cc.list(list));
   BOOST_CHECK_EQUAL(list.size(), 0u);
 
+  cc.disconnect();
+}
+
+// A compute child gets none of the server's descriptors: no socket that the
+// server holds and no file under the server's data directory.
+BOOST_AUTO_TEST_CASE(ChildInheritsNoServerDescriptors) {
+  CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  uint64_t instId = 0, startedAt = 0;
+  CES_REQUIRE_OK(cc.launch(ownerPath, instId, startedAt));
+
+  auto fdTargets = [](const fs::path& fdDir) {
+    std::vector<std::pair<int, std::string>> out;
+    boost::system::error_code ec;
+    for (const auto& e : fs::directory_iterator(fdDir, ec)) {
+      boost::system::error_code lec;
+      auto target = fs::read_symlink(e.path(), lec);
+      if (lec) continue;
+      out.emplace_back(std::stoi(e.path().filename().string()),
+                       target.string());
+    }
+    return out;
+  };
+  std::set<std::string> serverSockets;
+  for (const auto& [fd, target] : fdTargets("/proc/self/fd"))
+    if (target.rfind("socket:", 0) == 0) serverSockets.insert(target);
+
+  std::vector<pid_t> children;
+  for (const auto& e : fs::directory_iterator("/proc")) {
+    const std::string name = e.path().filename().string();
+    if (name.empty() || !std::all_of(name.begin(), name.end(), ::isdigit))
+      continue;
+    std::ifstream st(e.path() / "stat");
+    std::string line;
+    if (!std::getline(st, line)) continue;
+    auto rp = line.rfind(')');
+    if (rp == std::string::npos) continue;
+    std::istringstream rest(line.substr(rp + 2));
+    std::string state;
+    pid_t ppid = 0;
+    rest >> state >> ppid;
+    boost::system::error_code ec;
+    auto exe = fs::read_symlink(e.path() / "exe", ec);
+    if (ppid == ::getpid() && !ec &&
+        exe.filename().string() == fs::path(childBin).filename().string())
+      children.push_back(static_cast<pid_t>(std::stoi(name)));
+  }
+  BOOST_REQUIRE_EQUAL(children.size(), 1u);
+
+  const std::string dataDir = fs::weakly_canonical(tempDir).string();
+  for (const auto& [fd, target] : fdTargets(
+         fs::path("/proc") / std::to_string(children[0]) / "fd")) {
+    if (fd <= 2) continue;
+    BOOST_TEST_INFO("child fd " << fd << " -> " << target);
+    BOOST_CHECK(!serverSockets.count(target));
+    BOOST_CHECK(target.rfind(dataDir, 0) != 0);
+  }
+
+  CES_REQUIRE_OK(cc.kill(instId));
   cc.disconnect();
 }
 
