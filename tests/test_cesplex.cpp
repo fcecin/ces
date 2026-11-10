@@ -156,10 +156,7 @@ public:
 
   void stop() {
     if (!minx_) return;
-    if (tickTimer_) {
-      boost::system::error_code ec;
-      tickTimer_->cancel(ec);
-    }
+    if (tickTimer_) tickTimer_->cancel();
     minx_->closeSocket(false);
     // Release the work guards so run() can return once socket close
     // drains the outstanding async ops.

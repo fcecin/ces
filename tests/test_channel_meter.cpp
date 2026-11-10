@@ -114,10 +114,7 @@ public:
 
   void stop() {
     if (!minx_) return;
-    if (tickTimer_) {
-      boost::system::error_code ec;
-      tickTimer_->cancel(ec);
-    }
+    if (tickTimer_) tickTimer_->cancel();
     minx_->closeSocket(false);
     if (netGuard_) netGuard_->reset();
     if (taskGuard_) taskGuard_->reset();

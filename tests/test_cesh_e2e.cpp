@@ -1173,7 +1173,7 @@ struct ProxyE2EFixture : public E2EServerFixture {
   ProxyE2EFixture() : E2EServerFixture("cesh_proxy_e2e") {
     // Start proxy
     boost::asio::ip::tcp::endpoint listenEp(
-      boost::asio::ip::address::from_string("127.0.0.1"), 0);
+      boost::asio::ip::make_address("127.0.0.1"), 0);
     boost::asio::ip::udp::endpoint upstreamEp(
       boost::asio::ip::address_v6::loopback(), serverPort);
 

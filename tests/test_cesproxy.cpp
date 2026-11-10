@@ -27,7 +27,7 @@ public:
 
   void connect(uint16_t port) {
     sock_.connect(
-      tcp::endpoint(asio::ip::address::from_string("127.0.0.1"), port));
+      tcp::endpoint(asio::ip::make_address("127.0.0.1"), port));
   }
 
   void sendRaw(const uint8_t* data, size_t len) {
@@ -150,7 +150,7 @@ struct ProxyFixture {
     server->_drainLogic();
 
     // Start CesProxy (owns its own io_context and thread)
-    tcp::endpoint listenEp(asio::ip::address::from_string("127.0.0.1"), 0);
+    tcp::endpoint listenEp(asio::ip::make_address("127.0.0.1"), 0);
     boost::asio::ip::udp::endpoint upstreamEp(
       boost::asio::ip::address_v6::loopback(), serverPort);
 

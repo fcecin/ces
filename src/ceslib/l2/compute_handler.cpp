@@ -2739,7 +2739,7 @@ void allocateAndSpawnInstance(
       if (st->finished) return;
       st->finished = true;
       boost::system::error_code ig;
-      st->timer->cancel(ig);
+      st->timer->cancel();
       st->acceptor->close(ig);
       auto inst = st->inst;
       if (cec) {
