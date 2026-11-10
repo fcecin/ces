@@ -63,6 +63,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -407,7 +408,7 @@ struct LuaConnFixture {
   KeyPair ownerKey;
   KeyPair userKey;
 
-  LuaConnFixture() {
+  explicit LuaConnFixture(std::function<void(CesConfig&)> tweak = {}) {
     blog::init();
     blog::set_level(blog::fatal);
     blog::set_level("plex", blog::fatal);
@@ -436,6 +437,7 @@ struct LuaConnFixture {
     cfg.cesComputeChildBinary = luajitBin;
     cfg.cesComputeUser = "";
     cfg.cesComputeWorkDir = (tempDir / "cescompute").string();
+    if (tweak) tweak(cfg);
 
     server = std::make_unique<CesServer>(cfg);
     serverPort = server->start(0);

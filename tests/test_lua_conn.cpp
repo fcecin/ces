@@ -208,6 +208,47 @@ BOOST_AUTO_TEST_CASE(ProgramCloseTearsDownUserChannel) {
   BOOST_CHECK(!peerReadExact(peer, after, 1, std::chrono::seconds(2)));
 }
 
+struct SmallWindowLuaConnFixture : LuaConnFixture {
+  SmallWindowLuaConnFixture()
+      : LuaConnFixture([](CesConfig& c) {
+          c.rpcRudpMaxReorderMsgsPerChannel = 32;
+          c.rpcRudpMaxReorderBytesPerChannel = 32 * minx::Rudp::MAX_MESSAGE_SIZE;
+        }) {}
+};
+
+BOOST_FIXTURE_TEST_CASE(ProgramCloseDeliversEveryQueuedWrite, SmallWindowLuaConnFixture) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string scriptPath = "/h/" + ownerHex + "/prog_close_many.lua";
+  const std::string src =
+    "ces.conn.set_listener({\n"
+    "  on_data = function(conn, _)\n"
+    "    conn:write(string.rep('a', 30000))\n"
+    "    conn:write(string.rep('b', 60000))\n"
+    "    conn:write('END')\n"
+    "    conn:close()\n"
+    "  end,\n"
+    "})\n"
+    "ces.conn.run()\n";
+  uploadScript(scriptPath, src);
+  uint64_t instId = launchScript(scriptPath);
+  BOOST_REQUIRE(instId > 0);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t sessionToken = 0;
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+  auto r = peer.attach(userKey, sessionToken, instId);
+  CES_REQUIRE_RC_EQ(r.status, CES_OK);
+
+  BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
+  const std::size_t total = 30000 + 60000 + 3;
+  ces::Bytes got;
+  BOOST_REQUIRE(peerReadExact(peer, got, total, std::chrono::seconds(10)));
+  BOOST_CHECK(got[0] == 'a' && got[29999] == 'a' && got[30000] == 'b' && got[89999] == 'b');
+  BOOST_CHECK_EQUAL(std::string(got.end() - 3, got.end()), "END");
+}
+
 // Helper: poll a file's content via the file-handler client until it
 // reaches `expectedBytes` (up to `timeout`). Returns the final content.
 inline ces::Bytes pollFileContent(

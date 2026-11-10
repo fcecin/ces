@@ -67,6 +67,7 @@ struct LuaConnCtx : std::enable_shared_from_this<LuaConnCtx> {
   // async_write completes.
   std::deque<std::shared_ptr<ces::Bytes>> writeQueue;
   bool writing = false;
+  bool closeAfterWrites = false;
 };
 
 // ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ void LuaHandler::teardownConn(std::shared_ptr<LuaConnCtx> ctx, uint8_t reason,
                               bool notifyChild) {
   if (ctx->closed) return;
   ctx->closed = true;
-  if (ctx->attached && notifyChild) {
+  if (ctx->attached && notifyChild && !ctx->closeAfterWrites) {
     if (ComputeHandler* h = server_->computeHandler())
       h->sendConnClosed(ctx->pid, ctx->connId, reason);
   }
@@ -100,8 +101,10 @@ void LuaHandler::teardownConn(std::shared_ptr<LuaConnCtx> ctx, uint8_t reason,
 
 // Drain the per-conn writeQueue onto the stream, one async_write at a time.
 void LuaHandler::kickConnWrite(std::shared_ptr<LuaConnCtx> ctx) {
-  if (ctx->writing || ctx->writeQueue.empty()
-      || ctx->closed || !ctx->stream) {
+  if (ctx->writing || ctx->closed || !ctx->stream) return;
+  if (ctx->writeQueue.empty()) {
+    if (ctx->closeAfterWrites)
+      teardownConn(ctx, kCloseReasonProgram, /*notifyChild=*/false);
     return;
   }
   ctx->writing = true;
@@ -298,7 +301,7 @@ void LuaHandler::handleConnDataOut(uint64_t pid, uint64_t connId,
   auto it = conns_.find({pid, connId});
   if (it == conns_.end()) return;
   auto ctx = it->second;
-  if (ctx->closed || !ctx->stream || len == 0) return;
+  if (ctx->closed || ctx->closeAfterWrites || !ctx->stream || len == 0) return;
   ctx->writeQueue.push_back(std::make_shared<ces::Bytes>(data, data + len));
   kickConnWrite(ctx);
 }
@@ -307,7 +310,8 @@ void LuaHandler::handleConnClose(uint64_t pid, uint64_t connId) {
   auto it = conns_.find({pid, connId});
   if (it == conns_.end()) return;
   // Program asked us to close. Don't echo CONN_CLOSED back to it.
-  teardownConn(it->second, kCloseReasonProgram, /*notifyChild=*/false);
+  it->second->closeAfterWrites = true;
+  kickConnWrite(it->second);
 }
 
 void LuaHandler::onInstanceDying(uint64_t pid) {
