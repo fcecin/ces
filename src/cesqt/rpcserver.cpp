@@ -179,8 +179,12 @@ void RpcServer::sendCorsHeaders(QTcpSocket* socket, const QString& origin) {
   socket->disconnectFromHost();
 }
 
+static bool isOriginLabel(const std::string& label) {
+  return label == "null" || label.find("://") != std::string::npos;
+}
+
 int RpcServer::resolveOrigin(const QString& origin) {
-  if (origin.isEmpty())
+  if (origin.isEmpty() || origin == QLatin1String("null"))
     return -1;
 
   std::string label = origin.toStdString();
@@ -535,7 +539,8 @@ void RpcServer::tryAutoFund(int newKeyIndex) {
 
   int sourceIndex = -1;
   for (auto& a : accounts) {
-    if (a.exists && a.balance >= MIN_SOURCE && a.index != newKeyIndex) {
+    if (a.exists && a.balance >= MIN_SOURCE && a.index != newKeyIndex &&
+        !isOriginLabel(bridge_.label(a.index))) {
       sourceIndex = a.index;
       break;
     }

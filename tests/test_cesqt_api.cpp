@@ -66,7 +66,8 @@ struct CesqtApiFixture {
   KeyPair originKey;  // pre-approved origin account
   std::string testOrigin = "https://test.example.com";
 
-  CesqtApiFixture() {
+  explicit CesqtApiFixture(int64_t fundedAmount = 10'000'000'000,
+                           int64_t originAmount = 1'000'000'000) {
     blog::init();
     blog::set_level(blog::fatal);
 
@@ -89,8 +90,8 @@ struct CesqtApiFixture {
     BOOST_REQUIRE(serverPort > 0);
 
     // Fund accounts
-    server->_brr(fundedKey.getPublicKeyAsHash(), 10'000'000'000);
-    server->_brr(originKey.getPublicKeyAsHash(), 1'000'000'000);
+    server->_brr(fundedKey.getPublicKeyAsHash(), fundedAmount);
+    server->_brr(originKey.getPublicKeyAsHash(), originAmount);
     server->_drainLogic();
 
     // Create sandboxed datadir
@@ -159,11 +160,33 @@ struct CesqtApiFixture {
   }
 };
 
+struct PoorOwnerCesqtFixture : CesqtApiFixture {
+  PoorOwnerCesqtFixture() : CesqtApiFixture(100'000'000, 1'000'000'000) {}
+};
+
 // ============================================================================
 // Tests
 // ============================================================================
 
 BOOST_FIXTURE_TEST_SUITE(CesqtApi, CesqtApiFixture)
+
+BOOST_FIXTURE_TEST_CASE(NewOriginNeverFundedFromAnotherSandbox, PoorOwnerCesqtFixture) {
+  BOOST_REQUIRE(rpcCall(rpcPort, "https://warmup.example", "ping").find("pong") != std::string::npos);
+  std::this_thread::sleep_for(std::chrono::milliseconds(2000));
+  server->_drainLogic();
+  const int64_t before = server->_balanceOf(originKey.getPublicKeyAsHash());
+  auto resp = rpcCall(rpcPort, "https://intruder.example", "ping");
+  BOOST_TEST(resp.find("pong") != std::string::npos);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  server->_drainLogic();
+  BOOST_TEST(server->_balanceOf(originKey.getPublicKeyAsHash()) == before);
+}
+
+BOOST_AUTO_TEST_CASE(OpaqueNullOriginDenied) {
+  auto resp = rpcCall(rpcPort, "null", "ping");
+  BOOST_TEST(resp.find("pong") == std::string::npos);
+  BOOST_TEST(resp.find("denied") != std::string::npos);
+}
 
 BOOST_AUTO_TEST_CASE(Ping) {
   auto resp = rpcCall(rpcPort, testOrigin, "ping");
