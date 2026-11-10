@@ -54,19 +54,34 @@ function on_l2call(payload, ctx)
   bets:send({ payer = ctx.payer, bet = ctx.value })
 end
 
+local function refund(payer, bet)
+  for _ = 1, 25 do
+    if ces.transfer(payer, bet) then return true end
+    ces.sleep(200)
+  end
+  return false
+end
+
 local function play(payer, bet)
   if bet < MIN_BET then return end
 
   local payout = bet * 2
+  local who = hex(payer):sub(1, 12)
   -- The bet mints into the house only after its on_l2call returned, and may or
   -- may not have settled by now; the check spends standing bankroll only, so
   -- the house needs standing funds >= 2x the largest bet either way.
   local house = ces.account_read(HOUSE)
-  if not house or house.balance < payout then return end  -- house must cover 2x
+  if not house or house.balance < payout then
+    if refund(payer, bet) then
+      note(who .. " bet " .. bet .. " -> refused, refunded")
+    else
+      note(who .. " bet " .. bet .. " -> refused, REFUND FAILED")
+    end
+    return
+  end
 
   stats.plays = stats.plays + 1
   stats.wagered = stats.wagered + bet
-  local who = hex(payer):sub(1, 12)
   if flip() then
     if ces.transfer(payer, payout) then
       stats.heads = stats.heads + 1

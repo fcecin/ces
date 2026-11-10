@@ -134,12 +134,13 @@ struct Dice2Fixture {
   }
 
   std::array<uint8_t, 32> deploy(const std::string& path,
-                                 const std::string& src) {
+                                 const std::string& src,
+                                 uint64_t deposit = 10'000'000'000) {
     CesFileClient fc;
     fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
     CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
     uint64_t fb = 0, cost = 0;
-    CES_REQUIRE_OK(fc.create(path, src.size(), 0, 10'000'000'000, fb, cost));
+    CES_REQUIRE_OK(fc.create(path, src.size(), 0, deposit, fb, cost));
     ces::Bytes content(src.begin(), src.end());
     CES_REQUIRE_OK(fc.write(path, 0, content, fb));
     fc.disconnect();
@@ -244,6 +245,45 @@ BOOST_AUTO_TEST_CASE(PaysBothOutcomesAndConserves) {
   // down N*bet; heads payouts put money back, so the net loss is strictly less.
   int64_t betterNet = balanceOf(betterH) - betterStart;
   BOOST_CHECK_GT(betterNet, -(int64_t)N * (int64_t)BET);
+}
+
+BOOST_AUTO_TEST_CASE(RefusedBetIsRefunded) {
+  std::string path = "/h/" + hexOf(ownerKey.getPublicKeyAsHash()) + "/dice2.lua";
+  auto housePk = deploy(path, slurpDice2(), BET / 2);
+  uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+
+  minx::Hash houseH;
+  std::memcpy(houseH.data(), housePk.data(), 32);
+  const int64_t houseStart = balanceOf(houseH);
+  BOOST_REQUIRE_LT(houseStart, (int64_t)BET);
+
+  minx::Hash gwKey;
+  gwKey.fill(0);
+  gwKey[0] = 0xD2;
+  gwKey[1] = 0xCF;
+  CES_REQUIRE_OK(client->createAsset(gwKey, buildDiceGateway(BET), 1));
+  ces::Bytes input(8, 0);
+  for (int i = 0; i < 8; ++i) input[i] = uint8_t((pid >> (56 - 8 * i)) & 0xFF);
+
+  uint64_t vmErr = 0, used = 0;
+  ces::Bytes out;
+  BOOST_REQUIRE_EQUAL(client->runAsset(gwKey, 10'000'000, input, vmErr, used, out), CES_OK);
+  BOOST_REQUIRE_EQUAL(vmErr, CESVM_OK);
+  BOOST_REQUIRE(!out.empty());
+  BOOST_REQUIRE_EQUAL(out[0], CES_OK);
+
+  int64_t last = houseStart, stable = 0;
+  bool moved = false;
+  for (int i = 0; i < 200; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    int64_t cur = balanceOf(houseH);
+    if (cur != houseStart) moved = true;
+    if (cur == last) ++stable; else { stable = 0; last = cur; }
+    if (moved && stable >= 40) break;
+  }
+  BOOST_REQUIRE(moved);
+  BOOST_CHECK_LE(last, houseStart);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
