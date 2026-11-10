@@ -1859,7 +1859,7 @@ bool CesServer::isConnected(const SockAddr& addr) {
   auto ip = Resolver::unmapV4(addr.address());
   std::lock_guard lock(peerTableMutex_);
   for (const auto& p : peerTable_) {
-    if (Resolver::unmapV4(p.resolvedIP) == ip) return true;
+    if (p.verified && Resolver::unmapV4(p.resolvedIP) == ip) return true;
   }
   return false;
 }

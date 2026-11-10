@@ -1265,6 +1265,8 @@ BOOST_AUTO_TEST_CASE(IsConnectedMatchesV4MappedSource) {
   };
   srv->_testAddPeerWithRpc(k4, "10.20.30.40:7000", v4, 0);
   srv->_testAddPeerWithRpc(k6, "10.20.30.41:7000", mapped(v4b), 0);
+  srv->_setPeerVerifiedForTest(k4, true);
+  srv->_setPeerVerifiedForTest(k6, true);
 
   BOOST_CHECK(srv->isConnected(minx::SockAddr(v4, 7000)));
   BOOST_CHECK(srv->isConnected(minx::SockAddr(mapped(v4), 7000)));
@@ -1275,6 +1277,23 @@ BOOST_AUTO_TEST_CASE(IsConnectedMatchesV4MappedSource) {
   BOOST_CHECK(!srv->isConnected(minx::SockAddr(
     mapped(boost::asio::ip::make_address("10.20.30.42")), 7000)));
 
+  srv.reset();
+  boost::system::error_code ec;
+  bfs::remove_all(dir, ec);
+}
+
+// isConnected trusts only a verified peer. The peer miner resolves every
+// entry's address, also one that an inbound PoW named, before it verifies.
+BOOST_AUTO_TEST_CASE(IsConnectedRequiresVerifiedPeer) {
+  bfs::path dir = makeUniqueTempDir("ces_isconn_verified");
+  minx::Hash priv; priv.fill(0xA2);
+  auto srv = std::make_unique<CesServer>(makePeeringConfig(dir, priv));
+  minx::Hash k; k.fill(0x45);
+  auto ip = boost::asio::ip::make_address("10.20.30.50");
+  srv->_testAddPeerWithRpc(k, "10.20.30.50:7000", ip, 0);
+  BOOST_CHECK(!srv->isConnected(minx::SockAddr(ip, 7000)));
+  srv->_setPeerVerifiedForTest(k, true);
+  BOOST_CHECK(srv->isConnected(minx::SockAddr(ip, 7000)));
   srv.reset();
   boost::system::error_code ec;
   bfs::remove_all(dir, ec);
