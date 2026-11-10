@@ -875,13 +875,18 @@ bool isLocalHostValue(std::string host) {
          host == "::1";
 }
 
-// Is an Origin header value a local page? Browsers attach Origin to
-// cross-site POSTs and every WebSocket upgrade; non-browser clients (cesh
-// scripts, curl, tests) send none, which is allowed.
-bool isLocalOrigin(const std::string& origin) {
+// Is an Origin header value this dashboard's own origin? Browsers attach
+// Origin to cross-site POSTs and every WebSocket upgrade; non-browser clients
+// (cesh scripts, curl, tests) send none, which is allowed. A page on another
+// loopback port is a different origin, so the whole authority must match Host.
+bool isSameOrigin(const std::string& origin, const std::string& host) {
   auto sep = origin.find("://");
-  if (sep == std::string::npos) return false;
-  return isLocalHostValue(origin.substr(sep + 3));
+  if (sep == std::string::npos || host.empty()) return false;
+  std::string authority = origin.substr(sep + 3);
+  std::string h = host;
+  for (auto& ch : authority) ch = static_cast<char>(::tolower(ch));
+  for (auto& ch : h) ch = static_cast<char>(::tolower(ch));
+  return authority == h;
 }
 
 extern const char* kDashboardHtml;  // defined at the bottom of this file
@@ -967,8 +972,8 @@ void WebAdminSession::handleRequest() {
   //   * Host must be a loopback name — a public name resolving here means a
   //     hostile page steered the browser via DNS rebinding.
   //   * Origin, when a browser attaches one (cross-site POSTs, every WS
-  //     upgrade), must be a local page — rejects CSRF and cross-origin
-  //     sockets. Non-browser clients send no Origin and are unaffected.
+  //     upgrade), must be this page's own origin — rejects CSRF and
+  //     cross-origin sockets. Non-browser clients send no Origin.
   {
     std::string head = request_.substr(0, headerEnd_);
     std::string host = headerValue(head, "host");
@@ -977,7 +982,7 @@ void WebAdminSession::handleRequest() {
       return;
     }
     std::string origin = headerValue(head, "origin");
-    if (!origin.empty() && !isLocalOrigin(origin) &&
+    if (!origin.empty() && !isSameOrigin(origin, host) &&
         (method == "POST" || path == "/ws")) {
       respond(403, "text/plain", "forbidden: cross-origin request");
       return;

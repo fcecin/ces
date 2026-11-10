@@ -50,12 +50,14 @@ std::string form(
 }
 
 HttpResp httpReq(uint16_t port, const std::string& method,
-                 const std::string& target, const std::string& body = "") {
+                 const std::string& target, const std::string& body = "",
+                 const std::string& host = "localhost",
+                 const std::string& extraHeaders = "") {
   boost::asio::io_context io;
   boost::asio::ip::tcp::socket sock(io);
   sock.connect({boost::asio::ip::make_address("127.0.0.1"), port});
-  std::string req = method + " " + target +
-    " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n";
+  std::string req = method + " " + target + " HTTP/1.1\r\nHost: " + host +
+    "\r\nConnection: close\r\n" + extraHeaders;
   if (method == "POST") {
     req += "Content-Type: application/x-www-form-urlencoded\r\n";
     req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
@@ -196,6 +198,37 @@ BOOST_AUTO_TEST_CASE(CreditAndDebit) {
   auto r2 = httpReq(port, "POST", "/api/debit",
                     form({{"pubkey", key}, {"amount", "500000"}}));
   BOOST_CHECK(has(r2.body, "\"ok\":true"));
+}
+
+// A browser POST must come from the dashboard's own origin. A page on another
+// loopback port is a different origin.
+BOOST_AUTO_TEST_CASE(PostFromOtherLoopbackOriginRejected) {
+  std::string key = clientHex();
+  std::string self = "localhost:" + std::to_string(port);
+  std::string other =
+    "localhost:" + std::to_string(port == 65535 ? 1024 : port + 1);
+  auto before =
+    jnum(httpReq(port, "GET", "/api/account?key=" + key).body, "balance");
+
+  auto r = httpReq(port, "POST", "/api/credit",
+                   form({{"pubkey", key}, {"amount", "1000000"}}), self,
+                   "Origin: http://" + other + "\r\n");
+  BOOST_CHECK_EQUAL(r.status, 403);
+  auto ws = httpReq(port, "GET", "/ws", "", self,
+                    "Origin: http://" + other + "\r\n");
+  BOOST_CHECK_EQUAL(ws.status, 403);
+  auto after =
+    jnum(httpReq(port, "GET", "/api/account?key=" + key).body, "balance");
+  BOOST_CHECK_EQUAL(after, before);
+
+  auto ok = httpReq(port, "POST", "/api/credit",
+                    form({{"pubkey", key}, {"amount", "1000000"}}), self,
+                    "Origin: http://" + self + "\r\n");
+  BOOST_CHECK_EQUAL(ok.status, 200);
+  BOOST_CHECK(has(ok.body, "\"ok\":true"));
+
+  auto rebound = httpReq(port, "GET", "/api/status", "", "evil.example");
+  BOOST_CHECK_EQUAL(rebound.status, 403);
 }
 
 BOOST_AUTO_TEST_CASE(CreditRejectsBadInput) {
