@@ -3596,7 +3596,7 @@ std::string FileHandler::readServerFile(const std::string& name) {
 
 bool FileHandler::attachmentSize(const std::string& name, uint64_t& outSize) {
   CesServer* server = server_;
-  if (!server) return false;
+  if (!server || validateCesFileName(name) != CES_OK) return false;
   std::error_code ec;
   auto sz = std::filesystem::file_size(
       resolveContentPath(server->_config().cesFileStoreDir, name), ec);
@@ -3609,6 +3609,7 @@ uint8_t FileHandler::readAttachment(const std::string& name, uint64_t maxBytes,
                                     ces::Bytes& out) {
   CesServer* server = server_;
   if (!server) return CES_ERROR_INTERNAL;
+  if (uint8_t rc = validateCesFileName(name); rc != CES_OK) return rc;
   auto cPath = resolveContentPath(server->_config().cesFileStoreDir, name);
   std::error_code ec;
   auto sz = std::filesystem::file_size(cPath, ec);

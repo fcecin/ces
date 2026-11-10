@@ -157,6 +157,15 @@ BOOST_AUTO_TEST_CASE(Submit_MailZone_OwnerGated) {
   BOOST_CHECK(!rec.got);
 }
 
+BOOST_AUTO_TEST_CASE(Submit_AttachmentNameIsValidated) {
+  putFile("/p/att/real.bin", "DATA");
+  uint8_t rc = mail()->mailSubmit(me(), "u@example.com", "Hi", "Body",
+                                  "/p/att/./real.bin");
+  BOOST_CHECK(rc != CES_OK);
+  std::lock_guard<std::mutex> lk(rec.mu);
+  BOOST_CHECK(!rec.got);
+}
+
 // The /m/ zone is not readable over the wire -- even by its owner.
 BOOST_AUTO_TEST_CASE(MailZone_NotWireReadable) {
   const std::string path = "/m/" + myHex() + "/secret.bin";
