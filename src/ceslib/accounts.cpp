@@ -120,7 +120,9 @@ void Accounts::ActiveAccount::debit(uint64_t totalAmount) {
     return;
 
   int64_t oldBal = balance();
-  int64_t newBal = oldBal - static_cast<int64_t>(totalAmount);
+  int64_t newBal = balanceCovers(oldBal, totalAmount)
+                     ? oldBal - static_cast<int64_t>(totalAmount)
+                     : 0;
 
   if (newBal <= 0) {
     parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
@@ -144,7 +146,9 @@ void Accounts::ActiveAccount::debitTransfer(uint64_t totalAmount,
     return;
 
   int64_t oldBal = balance();
-  int64_t newBal = oldBal - static_cast<int64_t>(totalAmount);
+  int64_t newBal = balanceCovers(oldBal, totalAmount)
+                     ? oldBal - static_cast<int64_t>(totalAmount)
+                     : 0;
 
   if (newBal <= 0) {
     parent.totalCredits_ -= std::max<int64_t>(0, oldBal);

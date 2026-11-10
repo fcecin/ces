@@ -260,7 +260,8 @@ int lua_ces_file_create(lua_State* L) {
   lua_Number sz_n = luaL_checknumber(L, 2);
   lua_Number ppk_n = luaL_optnumber(L, 3, 0);
   lua_Number dep_n = luaL_optnumber(L, 4, 0);
-  if (sz_n <= 0 || ppk_n < 0 || dep_n < 0) {
+  if (sz_n <= 0 || ppk_n < 0 || dep_n < 0 || sz_n > 9.2233720368547e18 ||
+      ppk_n > 9.2233720368547e18 || dep_n > 9.2233720368547e18) {
     lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
   }
   std::vector<uint8_t> args;
@@ -284,7 +285,9 @@ int lua_ces_file_deposit(lua_State* L) {
   size_t nlen = 0;
   const char* name = luaL_checklstring(L, 1, &nlen);
   lua_Number amt_n = luaL_checknumber(L, 2);
-  if (amt_n < 0) { lua_pushnil(L); lua_pushstring(L, "bad args"); return 2; }
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
+  }
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(amt_n));
   put_name(args, name, nlen);
@@ -304,7 +307,9 @@ int lua_ces_file_withdraw(lua_State* L) {
   size_t nlen = 0;
   const char* name = luaL_checklstring(L, 1, &nlen);
   lua_Number amt_n = luaL_checknumber(L, 2);
-  if (amt_n < 0) { lua_pushnil(L); lua_pushstring(L, "bad args"); return 2; }
+  if (amt_n < 0 || amt_n > 9.2233720368547e18) {
+    lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
+  }
   std::vector<uint8_t> args;
   put_u64(args, uint64_t(amt_n));
   put_name(args, name, nlen);

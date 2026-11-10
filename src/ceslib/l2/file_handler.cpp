@@ -1707,7 +1707,7 @@ WithdrawOutcome withdrawCore(CesServer* server, const std::string& name,
   uint64_t bal = 0;
   bool mutated = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    if (t.balance(prog) < static_cast<int64_t>(amount)) {
+    if (!balanceCovers(t.balance(prog), amount)) {
       status = CES_ERROR_INSUFFICIENT_BALANCE; return;          // before fee
     }
     L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));

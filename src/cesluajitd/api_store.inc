@@ -30,7 +30,7 @@ int lua_ces_store_create(lua_State* L) {
   }
   lua_Number dep_n = luaL_optnumber(L, 2, 0);
   lua_Number ppk_n = luaL_optnumber(L, 3, 0);
-  if (dep_n < 0 || ppk_n < 0) {
+  if (dep_n < 0 || ppk_n < 0 || dep_n > 9.2233720368547e18 || ppk_n > 9.2233720368547e18) {
     lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
   }
   std::vector<uint8_t> args;
@@ -61,7 +61,8 @@ int lua_ces_store_put(lua_State* L) {
   const char* key = luaL_checklstring(L, 2, &klen);
   const char* val = luaL_checklstring(L, 3, &vlen);
   lua_Number dep_n = luaL_optnumber(L, 4, 0);
-  if (klen == 0 || klen > 256 || vlen == 0 || vlen > (1024 * 1024) || dep_n < 0) {
+  if (klen == 0 || klen > 256 || vlen == 0 || vlen > (1024 * 1024) || dep_n < 0 ||
+      dep_n > 9.2233720368547e18) {
     lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
   }
   std::vector<uint8_t> args;
@@ -234,7 +235,7 @@ int lua_ces_store_deposit(lua_State* L) {
   size_t klen = 0;
   const char* key = luaL_checklstring(L, 2, &klen);
   lua_Number amt_n = luaL_checknumber(L, 3);
-  if (klen == 0 || klen > 256 || amt_n <= 0) {
+  if (klen == 0 || klen > 256 || amt_n <= 0 || amt_n > 9.2233720368547e18) {
     lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
   }
   std::vector<uint8_t> args;

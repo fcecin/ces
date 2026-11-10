@@ -332,6 +332,37 @@ BOOST_FIXTURE_TEST_CASE(RequestFundsDeniedForUserProgram, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 4);
 }
 
+BOOST_FIXTURE_TEST_CASE(GossipBudgetBeyondInt64NeverMints, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string b = luaBytes(beaconPk.data(), 32);
+
+  const std::string path = "/h/" + ownerHex + "/gossipmint.bin";
+  const std::string src =
+    "local me = ces.program_pubkey()\n"
+    "local before = ces.account_read(me).balance\n"
+    "local gap = (2^47 - 1) - before - 65536\n"
+    "pcall(ces.gossip.send, 'x', 2^64 - gap)\n"
+    "ces.spawn(function()\n"
+    "  ces.sleep(1000)\n"
+    "  local acc = ces.account_read(me)\n"
+    "  if acc and acc.balance > before then ces.transfer('" + b + "', 7)\n"
+    "  else ces.transfer('" + b + "', 3) end\n"
+    "end)\n"
+    "ces.run()\n";
+  deploy(path, src);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 100 && bal < 4; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK(bal != 8);
+}
+
 // serverSign is /s/-gated: a NON-/s/ user program (here under /h/) must be DENIED, so a
 // malicious user program cannot forge a server-key attestation (the coalition's accountable
 // formation relies on this gate). The probe proves it both RAN and was denied: it transfers

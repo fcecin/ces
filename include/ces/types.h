@@ -295,6 +295,10 @@ inline bool creditWouldOverflow(int64_t balance, uint64_t amount) {
   return balance >= 0 && amount > static_cast<uint64_t>(BALANCE_MAX - balance);
 }
 
+inline bool balanceCovers(int64_t balance, uint64_t amount) {
+  return balance >= 0 && static_cast<uint64_t>(balance) >= amount;
+}
+
 inline HashPrefix getHashPrefix(const Hash& full_hash) {
   HashPrefix prefix;
   std::copy(full_hash.begin(), full_hash.begin() + 8, prefix.begin());

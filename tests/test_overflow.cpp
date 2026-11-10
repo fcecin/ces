@@ -368,4 +368,22 @@ BOOST_FIXTURE_TEST_CASE(VmBuyAssetNearCapSellerNoBurn, OverflowFixture) {
                  ces::BALANCE_MAX - static_cast<int64_t>(maxPrice));
 }
 
+BOOST_FIXTURE_TEST_CASE(NetworkBillBeyondInt64NeverMints, OverflowFixture) {
+  KeyPair payer;
+  const minx::Hash k = payer.getPublicKeyAsHash();
+  fund(k, 1000);
+  const int64_t before = bal(k);
+  const int64_t circBefore = circ();
+
+  server->debitNetworkBill(Account::getMapKey(k), std::numeric_limits<uint64_t>::max());
+  server->_drainLogic();
+  BOOST_TEST(bal(k) == before);
+  BOOST_TEST(circ() == circBefore);
+
+  server->debitNetworkBill(Account::getMapKey(k), (uint64_t(1) << 63) + 5);
+  server->_drainLogic();
+  BOOST_TEST(bal(k) == before);
+  BOOST_TEST(circ() == circBefore);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

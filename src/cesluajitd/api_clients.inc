@@ -41,7 +41,9 @@ uint64_t client_handle_id(lua_State* L, int idx) {
   return id;
 }
 uint64_t client_arg_u64(lua_State* L, int idx) {
-  return static_cast<uint64_t>(luaL_checknumber(L, idx));
+  const lua_Number v = luaL_checknumber(L, idx);
+  if (v < 0 || v > 9.2233720368547e18) luaL_argerror(L, idx, "out of range");
+  return static_cast<uint64_t>(v);
 }
 int client_push_closed(lua_State* L) {
   lua_pushnil(L);

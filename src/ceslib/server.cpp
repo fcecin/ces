@@ -563,7 +563,7 @@ public:
     if (amount > this->allowance) return CES_ERROR_ALLOWANCE_EXCEEDED;
     auto callerIt = server_.accounts_->find(caller_);
     if (callerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
-    if (callerIt->second.getBalance() < static_cast<int64_t>(amount))
+    if (!balanceCovers(callerIt->second.getBalance(), amount))
       return CES_ERROR_INSUFFICIENT_BALANCE;
     maybeSaveAccount(caller_);
     callerIt->second.setBalance(callerIt->second.getBalance() -
@@ -1048,7 +1048,7 @@ private:
     if (amount == 0) return CES_OK;
     auto ownerIt = server_.accounts_->find(programOwnerPrefix_);
     if (ownerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
-    if (ownerIt->second.getBalance() < static_cast<int64_t>(amount))
+    if (!balanceCovers(ownerIt->second.getBalance(), amount))
       return CES_ERROR_INSUFFICIENT_BALANCE;
     maybeSaveAccount(programOwnerPrefix_);
     ownerIt->second.setBalance(ownerIt->second.getBalance() -
@@ -5778,7 +5778,7 @@ struct ServerLedgerTxn : ces::LedgerTxn {
   }
   bool debitAccount(const minx::Hash& pubkey, uint64_t amount) override {
     auto acc = s->accounts_.get(Account::getMapKey(pubkey));
-    if (!acc.exists() || acc.balance() < static_cast<int64_t>(amount))
+    if (!acc.exists() || !balanceCovers(acc.balance(), amount))
       return false;
     acc.debit(amount);
     return true;
@@ -5825,7 +5825,7 @@ void CesServer::_l2DebitProgramAccount(
         return;
       }
       int64_t bal = acc.balance();
-      if (bal < amount) {
+      if (amount < 0 || bal < amount) {
         if (cb)
           boost::asio::post(cbExecutor,
             [cb, bal]() { cb(false, bal); });
@@ -5853,7 +5853,7 @@ CesServer::_l2DebitProgramAccountSync(
         return;
       }
       int64_t bal = acc.balance();
-      if (bal < amount) {
+      if (amount < 0 || bal < amount) {
         p.set_value({false, bal});
         return;
       }
@@ -6165,7 +6165,7 @@ void CesServer::_l2DebitNetworkBill(
     [self, payerPfx, amount, cb, cbExecutor]() {
       bool ok = false;
       ActiveAccount acc = self->accounts_.get(payerPfx);
-      if (acc.exists() && acc.balance() >= amount) {
+      if (amount >= 0 && acc.exists() && acc.balance() >= amount) {
         acc.debit(static_cast<uint64_t>(amount));
         ok = true;
       }

@@ -1381,6 +1381,40 @@ BOOST_AUTO_TEST_CASE(FileCrossSignerEconomics) {
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(w.preamble.data()), 0u);
 }
 
+BOOST_AUTO_TEST_CASE(FileWithdrawBeyondInt64NeverMints) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peerA, peerB;
+  BOOST_REQUIRE(peerA.start() != 0);
+  BOOST_REQUIRE(peerB.start() != 0);
+  minx::Hash privA; privA.fill(0xA9);
+  minx::Hash privB; privB.fill(0xB9);
+  ces::KeyPair a(privA), b(privB);
+  fx.server->_brr(a.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_brr(b.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  auto selA = peerA.select(fx.rpcPort, "/ces/file/1", a);
+  BOOST_REQUIRE_EQUAL(int(selA.status), 0x01);
+  auto selB = peerB.select(fx.rpcPort, "/ces/file/1", b);
+  BOOST_REQUIRE_EQUAL(int(selB.status), 0x01);
+
+  const std::string name = "/p/withdraw/huge";
+  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+                      CES_NONCELESS, 1024, 0, /*initialDeposit=*/500'000, name);
+  CES_REQUIRE_RC_EQ(c.status, CES_OK);
+  auto s0 = fileStat(peerB.taskIO(), selB.stream, b, selB.sessionToken, name);
+  CES_REQUIRE_RC_EQ(s0.status, CES_OK);
+  const int64_t circBefore = fx.server->_getTotalCredits();
+
+  auto w = fileWithdraw(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+                        CES_NONCELESS, ~uint64_t(0) - 999'999, name);
+  BOOST_CHECK(w.status != CES_OK);
+
+  auto s1 = fileStat(peerB.taskIO(), selB.stream, b, selB.sessionToken, name);
+  CES_REQUIRE_RC_EQ(s1.status, CES_OK);
+  BOOST_CHECK_LE(s1.fileBalance, s0.fileBalance);
+  BOOST_CHECK_LE(fx.server->_getTotalCredits(), circBefore);
+}
+
 BOOST_AUTO_TEST_CASE(FileNonOwnerWriteRejected) {
   CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
   PlexTestPeer peerA, peerB;

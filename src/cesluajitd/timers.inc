@@ -196,6 +196,8 @@ int lua_ces_gossip_send(lua_State* L) {
     return luaL_error(L, "ces.gossip.send: msg exceeds 1024 bytes");
   lua_Number budget = luaL_checknumber(L, 2);
   if (budget < 0) budget = 0;
+  if (budget > 9.2233720368547e18)
+    return luaL_error(L, "ces.gossip.send: budget out of range");
   uint8_t zero[32] = {0};
   const uint8_t* dest = zero;
   if (!lua_isnoneornil(L, 3)) {
