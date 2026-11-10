@@ -51,7 +51,7 @@ Each account entry consumes 64 bytes of RAM. Each asset entry consumes 256 bytes
 
 ## Building
 
-Requires: C++20 compiler, CMake 3.28+, Boost 1.83+ (system, log, log_setup, stacktrace_addr2line). Qt6 is optional (for `cesqt`). All other dependencies are pulled in by CMake.
+Requires: C++20 compiler, CMake 3.28+, Boost 1.83+ (log, log_setup, stacktrace_addr2line), and ICU. The static Boost.Log libraries link to ICU. On Ubuntu, install `libboost-all-dev` and `libicu-dev`. Qt6 is optional (for `cesqt`). All other dependencies are pulled in by CMake.
 
 ```bash
 ./build.sh debug            # Debug build
