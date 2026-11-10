@@ -98,7 +98,6 @@ private:
     uint64_t ticket = 0;       // server's gpassword to spend next
     std::chrono::steady_clock::time_point ticketAt{};  // when `ticket` arrived
     uint64_t sentGPass = 0;    // our gpassword on the in-flight packet
-    minx::Hash serverKey{};    // server pubkey from INFO
     QueuedOp currentOp;        // the op we're working on (valid when Busy)
     std::chrono::steady_clock::time_point sentAt;
   };

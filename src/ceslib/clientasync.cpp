@@ -231,12 +231,12 @@ void CesClientAsync::handleInfo(const uint8_t* data, size_t len) {
   uint64_t gpass, spass;
   parseMinxEnvelope(buf, gpass, spass);
   minx::Hash skey = buf.get<minx::Hash>();
+  if (skey != peerServerKey_) return;
 
   for (auto& ch : channels_) {
     if (ch.state == ChState::Handshaking && ch.sentGPass == spass) {
       ch.ticket = gpass;
       ch.ticketAt = std::chrono::steady_clock::now();
-      ch.serverKey = skey;
       ch.state = ChState::Ready;
       dispatch();
       return;
@@ -262,7 +262,7 @@ void CesClientAsync::handleMessage(const uint8_t* data, size_t len) {
   for (auto& ch : channels_) {
     if (ch.state != ChState::Busy || ch.sentGPass != spass) continue;
 
-    PublicKey verifier(ch.serverKey);
+    PublicKey verifier(peerServerKey_);
     minx::Bytes cesBytes(cesData.begin(), cesData.end());
     uint8_t rcode = CES_ERROR_INTERNAL;
     uint64_t paid = 0;

@@ -1280,6 +1280,24 @@ BOOST_AUTO_TEST_CASE(IsConnectedMatchesV4MappedSource) {
   bfs::remove_all(dir, ec);
 }
 
+// A settlement counts only when the known peer key signed it. A server that
+// answers on the peer's address with another key is not the peer.
+BOOST_AUTO_TEST_CASE(SettlementIgnoresAnswerFromAnotherKey) {
+  TicketCheckingPeer impostor;
+  ces::KeyPair realPeer;
+  ces::KeyPair kpA;
+  ces::KeyPair bob;
+  SettlementSender a(impostor.port, kpA, realPeer.getPublicKeyAsHash());
+  auto p = std::make_shared<std::promise<uint8_t>>();
+  auto f = p->get_future();
+  a.client->openTransfer(bob.getPublicKeyAsHash(), 1000,
+                         [p](uint8_t rc) { p->set_value(rc); });
+  const bool done =
+    f.wait_for(std::chrono::seconds(3)) == std::future_status::ready;
+  BOOST_CHECK(!done || f.get() != CES_OK);
+  BOOST_CHECK_EQUAL(impostor.ops.load(), 0);
+}
+
 // The sender idles past the ticket refresh age and the receiver forgets the
 // ticket. The sender must get a new ticket before it sends, so the receiver
 // drops no op.
