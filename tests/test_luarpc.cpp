@@ -199,6 +199,61 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
+BOOST_FIXTURE_TEST_CASE(DirectCloseDeliversEveryQueuedWrite, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string serverPath = "/h/" + ownerHex + "/burst.bin";
+  const std::string serverSrc =
+    "ces.conn.set_listener({ on_data = function(c, b)\n"
+    "  for i = 1, 50 do c:write(string.format('%03d;', i)) end\n"
+    "  c:close()\n"
+    "end })\n"
+    "ces.conn.run()\n";
+  const auto serverPk = deploy(serverPath, serverSrc);
+  const uint64_t serverId = launch(serverPath);
+  uint16_t serverRpc = 0;
+  for (int i = 0; i < 100 && serverRpc == 0; i++) {
+    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
+    if (serverRpc == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_REQUIRE_MESSAGE(serverRpc != 0, "burst server got no rpc port");
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+
+  std::string want;
+  for (int i = 1; i <= 50; ++i) {
+    char b[8];
+    std::snprintf(b, sizeof b, "%03d;", i);
+    want += b;
+  }
+  const std::string beaconLua = luaBytes(beaconPk.data(), 32);
+  const std::string clientSrc =
+    "local got = {}\n"
+    "ces.conn.set_listener({\n"
+    "  on_data = function(c, b) got[#got + 1] = b end,\n"
+    "  on_close = function(c)\n"
+    "    if table.concat(got) == '" + want + "' then ces.transfer('" + beaconLua + "', 7)\n"
+    "    else ces.transfer('" + beaconLua + "', 3) end\n"
+    "  end })\n"
+    "local conn = ces.conn.connect('127.0.0.1:" + std::to_string(serverRpc)
+      + "', '" + luaBytes(serverPk.data(), 32) + "')\n"
+    "if conn then conn:write('go') end\n"
+    "ces.conn.run()\n";
+  const std::string clientPath = "/h/" + ownerHex + "/burstclient.bin";
+  const auto clientPk = deploy(clientPath, clientSrc);
+  server->_brr(clientPk, 1'000'000'000);
+  launch(clientPath);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 4; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 8);
+}
+
 // Regression: a program that opens a /ces/luarpc/1 endpoint and then returns (no
 // ces.conn.run()) makes the child reach static destruction on exit. That path used
 // to SEGV in ~ChannelMeter, which logs through an already-destroyed Boost.Log core

@@ -107,6 +107,7 @@ struct LuaRpcConn {
   std::deque<std::string> writeQ;   // RudpStream forbids overlapping writes,
   bool writing = false;             //   so we serialize: one in flight.
   bool closing = false;
+  bool closeAfterWrites = false;
   size_t queuedBytes = 0;           // sum of writeQ payloads; bounded by the cap
   std::array<uint8_t, 4096> readBuf{};
 };
@@ -144,7 +145,14 @@ void luarpc_push(LuaRpcEvent e) {
 
 // Endpoint strand: drain a conn's writeQ, one async_write at a time.
 void luarpc_drain_writes(uint64_t id, std::shared_ptr<LuaRpcConn> c) {
-  if (c->writing || c->closing || c->writeQ.empty()) return;
+  if (c->writing || (c->closing && !c->closeAfterWrites)) return;
+  if (c->writeQ.empty()) {
+    if (c->closeAfterWrites) {
+      c->closeAfterWrites = false;
+      c->stream->shutdown(ces::kRudpStreamCloseTimeout);
+    }
+    return;
+  }
   c->writing = true;
   auto buf = std::make_shared<std::string>(std::move(c->writeQ.front()));
   c->writeQ.pop_front();
@@ -205,9 +213,11 @@ void luarpc_conn_close(uint64_t id) {
   if (!g_luarpc_io) return;
   boost::asio::post(*g_luarpc_io, [id]() {
     auto it = g_luarpc_conns.find(id);
-    if (it == g_luarpc_conns.end()) return;
-    it->second->closing = true;
-    it->second->stream->shutdown(ces::kRudpStreamCloseTimeout);
+    if (it == g_luarpc_conns.end() || it->second->closing) return;
+    auto c = it->second;
+    c->closing = true;
+    c->closeAfterWrites = true;
+    luarpc_drain_writes(id, c);
     // The read completion (error after shutdown) erases the conn.
   });
 }
