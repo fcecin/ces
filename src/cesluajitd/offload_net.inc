@@ -706,8 +706,8 @@ int lua_ces_cross_transfer(lua_State* L) {
 //
 // Petition the SERVER to fund THIS program's key at remote `addr` with up to
 // `amount` credits — a server-signed regular transfer AT the remote (origin = the
-// server's reserve there), gated by the operator's GLOBAL funding budget (off by
-// default). Returns the CONFIRMED granted amount (0..amount). A 0 is NOT an error
+// server's reserve there), gated by the operator's GLOBAL funding budget.
+// Returns the CONFIRMED granted amount (0..amount). A 0 is NOT an error
 // — budget exhausted/off, or the remote transfer failed; the caller backs off and
 // retries. The program holds no budget and no authority; it only asks.
 int lua_ces_request_funds(lua_State* L) {

@@ -1690,6 +1690,9 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   // amount (the reservation is refunded if the transfer fails). NOT settlement.
   // Args: [u64 amount][u8 srvLen][srv]. Reply: [u8 status][u64 BE granted].
   if (method == kApiMethodRequestFunds) {
+    if (!isServerZone(inst->sourceName)) {
+      sendApiReply(inst, corr_id, kApiStatusDenied); return;
+    }
     if (mlen < sizeof(uint64_t) + 1) {
       sendApiReply(inst, corr_id, kApiStatusInternal); return;
     }

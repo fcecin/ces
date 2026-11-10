@@ -761,8 +761,10 @@ void install_ces_api(lua_State* L) {
   lua_setfield(L, -2, "remote_cross_transfer");
   lua_pushcfunction(L, guarded<lua_ces_cross_transfer>);
   lua_setfield(L, -2, "cross_transfer");
-  lua_pushcfunction(L, guarded<lua_ces_request_funds>);
-  lua_setfield(L, -2, "request_funds");
+  if (g_privileged) {
+    lua_pushcfunction(L, guarded<lua_ces_request_funds>);
+    lua_setfield(L, -2, "request_funds");
+  }
 
   // ces.conn — the UNIFIED connection API: one listener + run loop + conn shape
   // over BOTH transports (relay /ces/lua/1, server-relayed; direct /ces/luarpc/1
