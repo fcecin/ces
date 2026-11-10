@@ -47,6 +47,10 @@ public:
   // address unchanged. A dual-stack socket reports v4 senders v4-mapped.
   static boost::asio::ip::address unmapV4(const boost::asio::ip::address& a);
 
+  // True if `hp` is "host:port": a host of DNS-name, IPv4 or bracketed IPv6
+  // characters and a decimal port in 1..65535.
+  static bool isHostPort(const std::string& hp);
+
   // Give an advertised peer address a routable host. A node with no serverName
   // can't name its own external address, so it advertises only its listen port
   // (":<port>"); the routable host then comes from the packet we received from

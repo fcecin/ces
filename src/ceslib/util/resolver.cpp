@@ -81,6 +81,29 @@ Resolver::unmapV4(const boost::asio::ip::address& a) {
   return a;
 }
 
+bool Resolver::isHostPort(const std::string& hp) {
+  constexpr size_t kMaxHostPort = 300;
+  if (hp.size() > kMaxHostPort) return false;
+  auto pos = hp.find_last_of(':');
+  if (pos == std::string::npos || pos == 0 || pos + 1 == hp.size() ||
+      hp.size() - pos - 1 > 5)
+    return false;
+  uint32_t port = 0;
+  for (size_t i = pos + 1; i < hp.size(); ++i) {
+    if (hp[i] < '0' || hp[i] > '9') return false;
+    port = port * 10 + static_cast<uint32_t>(hp[i] - '0');
+  }
+  if (port == 0 || port > 65535) return false;
+  for (size_t i = 0; i < pos; ++i) {
+    const unsigned char c = static_cast<unsigned char>(hp[i]);
+    const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '-' ||
+                    c == '_' || c == ':' || c == '[' || c == ']' || c == '%';
+    if (!ok) return false;
+  }
+  return true;
+}
+
 std::string Resolver::fillHost(const std::string& advertised,
                                const boost::asio::ip::address& srcIp) {
   auto pos = advertised.find_last_of(':');

@@ -6643,6 +6643,10 @@ void CesServer::upsertPeer(const minx::Hash& ckey, const std::string& address,
   // resolvedIP is populated off-strand by the peer miner when it probes the
   // peer (which already resolves declaredAddress, and is cost-gated to the
   // top peers by inbound PoW).
+  if (!address.empty() && !Resolver::isHostPort(address)) {
+    LOGDEBUG << "peer address rejected (not host:port)" << SVAR(address);
+    return;
+  }
   std::lock_guard lock(peerTableMutex_);
   for (auto& p : peerTable_) {
     if (p.ckey == ckey) {

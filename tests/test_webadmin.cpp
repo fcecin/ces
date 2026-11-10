@@ -278,6 +278,20 @@ BOOST_AUTO_TEST_CASE(PeerAddListRemove) {
   BOOST_CHECK(!has(list2.body, addr));
 }
 
+// An inbound PoW names its own peer address. A value that is not host:port
+// never enters the peer table, which the dashboard renders into script.
+BOOST_AUTO_TEST_CASE(PeerTableRejectsNonHostPortAddress) {
+  minx::Hash bad{};
+  bad.fill(0x51);
+  minx::Hash good{};
+  good.fill(0x52);
+  server->_upsertPeerForTest(bad, "x');alert(1);('y:53830", 100);
+  server->_upsertPeerForTest(good, "peer-two.example:53830", 100);
+  auto list = httpReq(port, "GET", "/api/peers");
+  BOOST_CHECK(!has(list.body, "alert(1)"));
+  BOOST_CHECK(has(list.body, "peer-two.example:53830"));
+}
+
 BOOST_AUTO_TEST_CASE(PeerAddRejectsWrongKey) {
   // A wrong key for a reachable server must be rejected (the handshake reports
   // the real key) — otherwise the miner would burn PoW toward a key the server

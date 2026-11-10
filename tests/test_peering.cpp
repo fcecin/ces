@@ -1333,6 +1333,17 @@ BOOST_AUTO_TEST_CASE(FillHostLessBracketsIpv6Source) {
     "[::1]:41001");
 }
 
+BOOST_AUTO_TEST_CASE(IsHostPortAcceptsOnlyHostPort) {
+  for (const char* ok : {"ces.pubcom.org:53830", "198.51.100.4:1",
+                         "[2001:db8::99]:65535", "[fe80::1%eth0]:9",
+                         "node_1.example:80"})
+    BOOST_CHECK_MESSAGE(ces::Resolver::isHostPort(ok), ok);
+  for (const char* bad : {"x');alert(1);('y:53830", "host:0", "host:65536",
+                          "host:", ":80", "host", "ho st:80", "h\"o:1",
+                          "a<b:1", "host:8a"})
+    BOOST_CHECK_MESSAGE(!ces::Resolver::isHostPort(bad), bad);
+}
+
 BOOST_AUTO_TEST_CASE(KeepsServerNameVerbatim) {
   // A peer that set a real serverName already named its intentional external
   // address — keep it exactly, never overwrite with the packet source.

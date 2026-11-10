@@ -2481,6 +2481,7 @@ function fmtDur(s){s=Number(s)||0;const d=Math.floor(s/86400);s%=86400;const h=M
 function ago(ts){if(!ts)return 'never';const d=Math.floor(Date.now()/1000)-Number(ts);if(d<0)return 'now';
   if(d<60)return d+'s ago';if(d<3600)return Math.floor(d/60)+'m ago';if(d<86400)return Math.floor(d/3600)+'h ago';return Math.floor(d/86400)+'d ago';}
 function esc(s){return (s+'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function jsq(s){return esc((s+'').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/\n/g,'\\n').replace(/\r/g,'\\r'));}
 function setLive(ok){const d=$('#liveDot');d.className='dot'+(ok?' ok':'');$('#liveTxt').textContent=ok?'live':'offline';}
 
 /* tabs */
@@ -2586,8 +2587,8 @@ function renderPeers(d){
   $('#peerTbl').innerHTML=`<tr><th>dir</th><th>address</th><th>key</th><th>reach</th><th title="our reserve on them — what they owe us">our bal (cr)</th><th title="their vostro here — what we owe them">their bal (cr)</th><th title="our lifetime PoW on them (H_out)">our PoW (cr)</th><th title="their lifetime PoW on us (H_in)">their PoW (cr)</th><th>last check</th><th>fails</th><th title="L2-reported grief score; banned peers shown red">grief</th><th>rpc link</th><th></th></tr>`+
     (d.peers.length?d.peers.map(p=>`<tr>
       <td style="white-space:nowrap">${dir(p)}</td>
-      <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${esc(p.key)}','${esc(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
-      <td class="mono copy" title="${esc(p.key)}" onclick="copy('${esc(p.key)}')">${shortKey(p.key)}</td>
+      <td class="copy" title="click: copy address + load it (with the key) into Add peer" onclick="useAddr('${jsq(p.key)}','${jsq(p.address||'')}')">${esc(p.address||'—')}${(p.resolvedIP&&!(p.address||'').includes(p.resolvedIP))?'<br><span class="muted mono" style="font-size:11px">&rarr; '+esc(p.resolvedIP)+'</span>':''}</td>
+      <td class="mono copy" title="${esc(p.key)}" onclick="copy('${jsq(p.key)}')">${shortKey(p.key)}</td>
       <td style="white-space:nowrap">${reachCell(p)}</td>
       <td class="num">${p.ourBalanceThere<0?'<span class="muted">?</span>':fmtCredits(p.ourBalanceThere)}</td>
       <td class="num">${fmtCredits(p.theirBalanceHere)}</td>
@@ -2597,7 +2598,7 @@ function renderPeers(d){
       <td class="num">${p.pingFailures||0}</td>
       <td class="num">${p.grief||0}</td>
       <td style="white-space:nowrap">${p.rpcLink==='up'?'<span style="color:var(--accent)">up</span>':(p.rpcLink==='down'?'<span class="muted">down</span>':'<span class="muted">&mdash;</span>')}</td>
-      <td><button class="danger sm" onclick="rmPeer('${esc(p.key)}')">remove</button></td></tr>`).join('')
+      <td><button class="danger sm" onclick="rmPeer('${jsq(p.key)}')">remove</button></td></tr>`).join('')
      :`<tr><td colspan="13" class="muted" style="text-align:center;padding:20px">no peers yet</td></tr>`);
 }
 async function setTarget(){
@@ -2641,8 +2642,8 @@ async function doInspect(){const addr=$('#inspAddr').value.trim();if(!addr){toas
         <tr><td>server key</td><td class="mono" style="word-break:break-all">${esc(r.serverKey)}</td></tr>${info}</table>
       <div class="row" style="margin-top:14px">
         <input type="number" id="mineCount" class="addr" value="1" min="1" max="32" style="width:90px">
-        <button class="warn" onclick="mineRemote('${esc(addr)}')" id="mineBtn">Mine on it</button>
-        <button class="green" onclick="addInspected('${esc(r.serverKey)}','${esc(addr)}')">Add as outbound peer</button>
+        <button class="warn" onclick="mineRemote('${jsq(addr)}')" id="mineBtn">Mine on it</button>
+        <button class="green" onclick="addInspected('${jsq(r.serverKey)}','${jsq(addr)}')">Add as outbound peer</button>
       </div>
       <p class="hint">Mining bootstraps a reserve balance here (RandomX &mdash; may take a moment). Adding it as a peer lets the miner maintain your target automatically.</p>
       <div id="mineResult"></div></div>`;
@@ -2943,7 +2944,7 @@ function extRow(it){
     +` <span class="extfile">(${esc(it.name)}.lua)</span>`;
   // Buttons come from the single canonical state enum, never from raw booleans,
   // so a contradictory set (e.g. Install + Disable) cannot be rendered.
-  const N=esc(it.name);
+  const N=jsq(it.name);
   const bInstall=`<button class="green sm" onclick="extAct('install','${N}')">Install</button>`;
   const bEnable=`<button class="green sm" onclick="extAct('enable','${N}')">Enable</button>`;
   const bDisable=`<button class="warn sm" onclick="extAct('disable','${N}')">Disable</button>`;
@@ -2967,8 +2968,8 @@ function extRow(it){
       body+=`<div class="menehost" id="extPanel-${id}"><span class="muted">loading panel…</span></div>`;
     }else{
       if(it.caps&1) body+=`<h4>Status</h4><div id="extStatus-${id}"><span class="muted">…</span></div>`;
-      if(it.caps&2&&it.commands.length) body+=`<h4>Commands</h4><div class="row">${it.commands.map(c=>`<button class="sm" onclick="extCmd('${esc(it.name)}','${esc(c.id)}')">${esc(c.label||c.id)}</button>`).join('')}</div><div id="extCmdOut-${id}" class="extcmdout mono"></div>`;
-      if(it.caps&12) body+=`<h4>Config</h4><button class="green sm" onclick="extConfigToggle('${esc(it.name)}',${(it.caps&4)?1:0})">Edit</button><div class="extcfg" id="extCfg-${id}"></div>`;
+      if(it.caps&2&&it.commands.length) body+=`<h4>Commands</h4><div class="row">${it.commands.map(c=>`<button class="sm" onclick="extCmd('${jsq(it.name)}','${jsq(c.id)}')">${esc(c.label||c.id)}</button>`).join('')}</div><div id="extCmdOut-${id}" class="extcmdout mono"></div>`;
+      if(it.caps&12) body+=`<h4>Config</h4><button class="green sm" onclick="extConfigToggle('${jsq(it.name)}',${(it.caps&4)?1:0})">Edit</button><div class="extcfg" id="extCfg-${id}"></div>`;
     }
     if(!body) body=`<div class="muted">Running — implements no status, commands, or config.</div>`;
   }else{
@@ -2977,7 +2978,7 @@ function extRow(it){
   const desc=it.description?`<div class="muted" style="margin-top:4px">${esc(it.description)}</div>`:'';
   return `<div class="extrow${open?' open':''}">`
     +`<div class="exthead">`
-    +`<div class="extname" onclick="extToggle('${esc(it.name)}')"><span class="extchev" id="extChev-${id}">${open?'▾':'▸'}</span>`
+    +`<div class="extname" onclick="extToggle('${jsq(it.name)}')"><span class="extchev" id="extChev-${id}">${open?'▾':'▸'}</span>`
     +`${title} ${extBadge(it)}${it.enabled?`<span class="mono extfile">pid ${it.pid}</span>`:''}</div>`
     +`<div class="extbtns">${btns}</div></div>`
     +`<div class="extbody" id="extBody-${id}" style="${open?'':'display:none'}">${desc}${body}</div></div>`;
@@ -3148,8 +3149,8 @@ async function extConfigToggle(name,hasDefaults){
   if(extOpenConfig===name){el.innerHTML='';extOpenConfig=null;return;}
   extOpenConfig=name;
   let d;try{d=await api('/api/extension_config?name='+encodeURIComponent(name));}catch(e){d={text:''};}
-  const reset=hasDefaults?`<button class="green sm" onclick="extConfigReset('${esc(name)}')">Reset to defaults</button>`:'';
-  el.innerHTML=`<textarea id="extCfgTa-${id}" spellcheck="false">${esc(d.text)}</textarea><div class="row"><button class="green sm" onclick="extConfigSave('${esc(name)}')">Save</button>${reset}<button class="green sm" onclick="extConfigToggle('${esc(name)}',${hasDefaults?1:0})">Close</button></div>`;
+  const reset=hasDefaults?`<button class="green sm" onclick="extConfigReset('${jsq(name)}')">Reset to defaults</button>`:'';
+  el.innerHTML=`<textarea id="extCfgTa-${id}" spellcheck="false">${esc(d.text)}</textarea><div class="row"><button class="green sm" onclick="extConfigSave('${jsq(name)}')">Save</button>${reset}<button class="green sm" onclick="extConfigToggle('${jsq(name)}',${hasDefaults?1:0})">Close</button></div>`;
 }
 async function extConfigSave(name){
   const ta=$('#extCfgTa-'+cssid(name));if(!ta)return;
