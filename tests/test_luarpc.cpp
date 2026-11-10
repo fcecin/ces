@@ -286,6 +286,29 @@ BOOST_FIXTURE_TEST_CASE(InstanceCleanShutdownNoCrash, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(server->computeHandler()->crashedCount(), 0u);
 }
 
+BOOST_FIXTURE_TEST_CASE(PeerMeshDeniedForUserProgram, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+
+  const std::string path = "/h/" + ownerHex + "/meshprobe.bin";
+  const std::string src =
+    "if ces.peer then ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "else ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 3) end\n"
+    "ces.run()\n";
+  const auto probePk = deploy(path, src);
+  server->_brr(probePk, 1'000'000'000);
+  launch(path);
+
+  int64_t bal = 0;
+  for (int i = 0; i < 200 && bal < 4; i++) {
+    bal = balanceOf(beaconPk);
+    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_EQUAL(bal, 4);
+}
+
 // serverSign is /s/-gated: a NON-/s/ user program (here under /h/) must be DENIED, so a
 // malicious user program cannot forge a server-key attestation (the coalition's accountable
 // formation relies on this gate). The probe proves it both RAN and was denied: it transfers

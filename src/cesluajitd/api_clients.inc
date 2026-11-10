@@ -801,12 +801,14 @@ void install_ces_api(lua_State* L) {
   // ces.peer.send(peer_pubkey, service, bytes) fires a targeted, free message
   // over the /ces/peer/1 mesh to a peer server's same-service extension;
   // ces.peer.listen(service, fn) registers fn(from_pubkey, bytes) for inbound.
-  lua_newtable(L);
-  lua_pushcfunction(L, guarded<lua_ces_peer_send>);
-  lua_setfield(L, -2, "send");
-  lua_pushcfunction(L, guarded<lua_ces_peer_listen>);
-  lua_setfield(L, -2, "listen");
-  lua_setfield(L, -2, "peer");
+  if (g_privileged) {
+    lua_newtable(L);
+    lua_pushcfunction(L, guarded<lua_ces_peer_send>);
+    lua_setfield(L, -2, "send");
+    lua_pushcfunction(L, guarded<lua_ces_peer_listen>);
+    lua_setfield(L, -2, "listen");
+    lua_setfield(L, -2, "peer");
+  }
 
   // Direct-transport live-conn registry (the relay's is created lazily in
   // set_listener).

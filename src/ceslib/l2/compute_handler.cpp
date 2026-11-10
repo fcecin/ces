@@ -1346,6 +1346,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   if (tag == kIpcTagPeerListen) {
     // Payload: [u16 service_len][service]. Register this instance as the
     // handler for inbound /ces/peer/1 messages tagged `service`.
+    if (!isServerZone(inst->sourceName)) return;
     constexpr size_t kSlenOff = kIpcHdr;
     constexpr size_t kSvcOff  = kSlenOff + sizeof(uint16_t);
     if (body.size() < kSvcOff) return;
@@ -1361,6 +1362,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   if (tag == kIpcTagPeerMsgOut) {
     // Payload: [32 dest_pubkey][u16 service_len][service][payload].
     // ces.peer.send: relay over /ces/peer/1 to the dest peer's same service.
+    if (!isServerZone(inst->sourceName)) return;
     constexpr size_t kDestOff = kIpcHdr;
     constexpr size_t kSlenOff = kDestOff + sizeof(minx::Hash);
     constexpr size_t kSvcOff  = kSlenOff + sizeof(uint16_t);
