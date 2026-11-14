@@ -19,7 +19,7 @@ constexpr const char* kThinkProto = "/ces/think/1";
 // The longest wait for one reply frame. The server's own call timeout ends
 // a call first; this only catches a server that went silent.
 constexpr auto kFrameTimeout = std::chrono::minutes(15);
-constexpr size_t kOkPreamble = 8 + 32;   // [u64 charged][32 reply hash]
+constexpr size_t kOkPreamble = 8 + 32 + 1;   // [u64 charged][32 hash][u8 updated]
 
 }  // namespace
 
@@ -56,11 +56,13 @@ void CesThinkClient::setServerPubkey(const minx::Hash& pk) {
 uint8_t CesThinkClient::think(
     const std::string& prompt,
     const std::function<void(std::string_view)>& onText, std::string& reply,
-    uint64_t& charged) {
+    uint64_t& charged, const std::string& file, bool* updated) {
   reply.clear();
   charged = 0;
+  if (updated) *updated = false;
   if (!impl_->chan) return CES_ERROR_INTERNAL;
-  if (prompt.empty() || prompt.size() > UINT32_MAX) return CES_ERROR_BAD_INPUT;
+  if (prompt.empty() || prompt.size() > UINT32_MAX || file.size() > 1024)
+    return CES_ERROR_BAD_INPUT;
 
   ces::Bytes body(prompt.begin(), prompt.end());
   minx::Hash h = ces::sha256(body.data(), body.size());
@@ -68,6 +70,8 @@ uint8_t CesThinkClient::think(
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
   ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(body.size()));
   pre.insert(pre.end(), h.begin(), h.end());
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(file.size()));
+  pre.insert(pre.end(), file.begin(), file.end());
   auto env = impl_->chan->buildEnvelope(kVerbThink, pre);
 
   ces::Bytes outPre;
@@ -87,6 +91,7 @@ uint8_t CesThinkClient::think(
       reinterpret_cast<const uint8_t*>(reply.data()), reply.size());
   if (std::memcmp(got.data(), outPre.data() + 8, 32) != 0)
     return CES_ERROR_INTERNAL;
+  if (updated) *updated = outPre[40] != 0;
   return CES_OK;
 }
 

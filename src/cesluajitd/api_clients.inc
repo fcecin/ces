@@ -652,22 +652,26 @@ int lua_ces_compute_client(lua_State* L) {
 
 // ---- ces.think_client verbs ----
 
-// h:think(prompt) -> reply, charged | nil, rc [, partial]. Blocks the calling
-// coroutine until the full reply is in (the reply streams on the wire; this
-// API returns it whole). The program's own account pays.
+// h:think(prompt [, file]) -> reply, charged, updated | nil, rc, partial.
+// Blocks the calling coroutine until the full reply is in (the reply streams
+// on the wire; this API returns it whole). The program's own account pays.
+// `file` is a conversation file on that server (see ces.think).
 int lua_tc_think(lua_State* L) {
   auto it = g_think_clients.find(client_handle_id(L, 1));
   if (it == g_think_clients.end()) return client_push_closed(L);
   size_t plen = 0; const char* p = luaL_checklstring(L, 2, &plen);
+  size_t flen = 0; const char* f = luaL_optlstring(L, 3, "", &flen);
   if (plen == 0) {
     lua_pushnil(L); lua_pushstring(L, "prompt must not be empty"); return 2;
   }
   ces::CesThinkClient* tc = it->second.tc.get();
-  return client_call(L, g_think_clients, [tc, prompt = std::string(p, plen)]()
+  return client_call(L, g_think_clients, [tc, prompt = std::string(p, plen),
+                                          file = std::string(f, flen)]()
                          -> OffloadDeliver {
     std::string reply;
     uint64_t charged = 0;
-    uint8_t rc = tc->think(prompt, nullptr, reply, charged);
+    bool updated = false;
+    uint8_t rc = tc->think(prompt, nullptr, reply, charged, file, &updated);
     if (rc != ces::CES_OK)
       return [rc, reply](lua_State* L) -> int {
         lua_pushnil(L);
@@ -675,10 +679,11 @@ int lua_tc_think(lua_State* L) {
         lua_pushlstring(L, reply.data(), reply.size());
         return 3;
       };
-    return [reply, charged](lua_State* L) -> int {
+    return [reply, charged, updated](lua_State* L) -> int {
       lua_pushlstring(L, reply.data(), reply.size());
       lua_pushnumber(L, static_cast<lua_Number>(charged));
-      return 2;
+      lua_pushboolean(L, updated);
+      return 3;
     };
   });
 }

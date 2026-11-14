@@ -740,6 +740,7 @@ int main(int argc, char* argv[]) {
   std::vector<std::string> think_words;
   ces::Bytes think_in_data;
   std::string think_in_arg;
+  std::string think_file_arg;
   cmd_think->add_option("text", think_words,
                         "Prompt words (joined by spaces). With no words and "
                         "no --in, the prompt is read from stdin.");
@@ -747,6 +748,11 @@ int main(int argc, char* argv[]) {
                         "Prompt (repeatable): text, text:T, hex:XX, file:path")
     ->each([&](const std::string& s) { appendInToken(think_in_data, s); })
     ->take_all();
+  cmd_think->add_option("--file", think_file_arg,
+                        "Conversation file in the server's store: its content "
+                        "goes before the prompt, and the server appends the "
+                        "prompt and the reply to it (when you own it and its "
+                        "balance pays the append)");
 
   // ---- dial (open a byte stream to a running compute instance) ----
   auto* cmd_dial = app.add_subcommand(
@@ -2810,12 +2816,13 @@ int main(int argc, char* argv[]) {
       std::string reply;
       uint64_t charged = 0;
       bool endsInNewline = true;
+      bool updated = false;
       rc = tc.think(prompt,
                     [&](std::string_view piece) {
                       std::cout << piece << std::flush;
                       endsInNewline = piece.back() == '\n';
                     },
-                    reply, charged);
+                    reply, charged, think_file_arg, &updated);
       if (!endsInNewline) std::cout << "\n";
       std::cout << std::flush;
       if (rc != CES_OK) {
@@ -2823,7 +2830,10 @@ int main(int argc, char* argv[]) {
         return 1;
       }
       if (!g_quiet) {
-        std::cerr << "charged " << charged << "\n";   // raw credit units
+        std::cerr << "charged " << charged;   // raw credit units
+        if (!think_file_arg.empty())
+          std::cerr << (updated ? ", file updated" : ", file not updated");
+        std::cerr << "\n";
       }
       return 0;
     };

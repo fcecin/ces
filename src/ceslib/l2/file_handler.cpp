@@ -2805,6 +2805,17 @@ inline L2Billing sourceBilling(minx::Hash sourceProg, bool metered,
   };
 }
 
+// Account billing: `payer` pays `cost` from its ledger account. No dedup (the
+// in-process caller made one request).
+inline L2Billing accountBilling(minx::Hash payer) {
+  return [payer](ces::LedgerTxn& t, int64_t cost) -> L2ChargeResult {
+    if (cost <= 0) return { CES_OK, false };
+    if (!t.debitAccount(payer, static_cast<uint64_t>(cost)))
+      return { CES_ERROR_INSUFFICIENT_BALANCE, false };
+    return { CES_OK, false };
+  };
+}
+
 inline L2Billing noBilling() {
   return [](ces::LedgerTxn&, int64_t) -> L2ChargeResult { return { CES_OK, false }; };
 }
@@ -2820,6 +2831,13 @@ template <typename Fn>
 void execWithSource(CesServer* server, const FileExecReq& req,
                     std::function<void(FileExecResp)> cb,
                     boost::asio::any_io_executor cbEx, Fn&& run) {
+  if (req.payByAccount) {
+    // The account pays and takes the refunds; there is no source to exhaust.
+    minx::Hash payer = hashOf(req.payerAccount);
+    FileExecResp r = run(accountBilling(payer), payer, true);
+    boost::asio::post(cbEx, [cb, r]() { cb(r); });
+    return;
+  }
   minx::Hash srcProg{}; bool metered = false;
   uint8_t srcRc = resolveSourceForBilling(server, req.sourceName, srcProg, metered);
   if (srcRc != CES_OK) {

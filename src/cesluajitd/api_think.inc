@@ -1,5 +1,6 @@
 // ---------------------------------------------------------------------------
-// ces.think(prompt [, on_piece]) -> reply, charged | nil, rc, partial
+// ces.think(prompt [, on_piece [, file]])
+//   -> reply, charged, updated | nil, rc, partial
 //
 // builtin:think for this program, as a host call. The server bills the
 // file's program account (ces.program_pubkey()); the child names no payer.
@@ -10,6 +11,11 @@
 // on_piece runs inside that wait. on_piece cannot yield: a host call in it
 // blocks. An error in on_piece is logged and drops it for the rest of the
 // call. rc is a CES status (see ces.err).
+//
+// `file` names a conversation file in the store. The server puts its content
+// before the prompt and, after a complete reply, appends the prompt and the
+// reply to it, with the authority of the program's owner and billed to the
+// source file (as for ces.file_*). `updated` tells whether it did.
 // ---------------------------------------------------------------------------
 
 constexpr size_t kThinkPromptMax = 16u * 1024u * 1024u;   // IPC sanity cap
@@ -48,7 +54,8 @@ void drain_think(lua_State* L) {
   }
 }
 
-// End a call: push its results from the API reply [u8 status][u64 charged].
+// End a call: push its results from the API reply
+// [u8 status][u64 charged][u8 updated].
 int think_finish(lua_State* L, uint16_t corr, const Frame& reply) {
   ThinkCall call;
   auto it = g_think_calls.find(corr);
@@ -69,7 +76,9 @@ int think_finish(lua_State* L, uint16_t corr, const Frame& reply) {
   }
   lua_pushlstring(L, call.text.data(), call.text.size());
   lua_pushnumber(L, static_cast<lua_Number>(get_u64(reply.body.data() + 1)));
-  return 2;
+  lua_pushboolean(L, reply.body.size() > 1 + sizeof(uint64_t) &&
+                         reply.body[1 + sizeof(uint64_t)] != 0);
+  return 3;
 }
 
 // The main chunk's wait: read frames until this call's reply, and run
@@ -104,6 +113,13 @@ int lua_ces_think(lua_State* L) {
     lua_pushstring(L, plen == 0 ? "prompt must not be empty" : "prompt too large");
     return 2;
   }
+  size_t flen = 0;
+  const char* fpath = luaL_optlstring(L, 3, "", &flen);
+  if (flen > 1024) {
+    lua_pushnil(L);
+    lua_pushstring(L, "file path too long");
+    return 2;
+  }
   int cb = LUA_NOREF;
   if (!lua_isnoneornil(L, 2)) {
     luaL_checktype(L, 2, LUA_TFUNCTION);
@@ -111,9 +127,10 @@ int lua_ces_think(lua_State* L) {
     cb = luaL_ref(L, LUA_REGISTRYINDEX);
   }
   std::vector<uint8_t> args;
-  args.reserve(sizeof(uint32_t) + plen);
+  args.reserve(sizeof(uint32_t) + plen + sizeof(uint16_t) + flen);
   put_u32(args, static_cast<uint32_t>(plen));
   put_bytes(args, p, plen);
+  if (flen > 0) put_name(args, fpath, flen);
   uint16_t corr = send_api_call(METHOD_THINK, args);
   if (corr == 0) {
     if (cb != LUA_NOREF) luaL_unref(L, LUA_REGISTRYINDEX, cb);

@@ -49,9 +49,15 @@ public:
   // which is partial when the status is not CES_OK. On CES_OK, `charged` is
   // the cost in raw credit units, and the reply text matches the hash that
   // the server signed (else CES_ERROR_INTERNAL).
+  //
+  // `file` (optional) names a conversation file in the server's store: the
+  // server puts its content before the prompt, and after a complete reply
+  // appends the prompt and the reply to it if the signer owns it and can pay
+  // the append. `updated` (optional) tells whether that happened.
   uint8_t think(const std::string& prompt,
                 const std::function<void(std::string_view)>& onText,
-                std::string& reply, uint64_t& charged);
+                std::string& reply, uint64_t& charged,
+                const std::string& file = {}, bool* updated = nullptr);
 
   class Impl;
 

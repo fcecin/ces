@@ -260,8 +260,9 @@ constexpr uint16_t kApiMethodRequestFunds  = 0x0235;
 constexpr uint16_t kApiMethodPeerGrief     = 0x0236;
 constexpr uint16_t kApiMethodPeerBan       = 0x0237;
 constexpr uint16_t kApiMethodServerSign    = 0x0238;
-// ces.think(prompt): builtin:think for the program, billed to its program
-// account. Args: [u32 len][prompt]. Reply: [u8 CES status][u64 charged].
+// ces.think(prompt [, on_piece [, file]]): builtin:think for the program,
+// billed to its program account. Args: [u32 len][prompt] then optionally
+// [u16 pathLen][path]. Reply: [u8 CES status][u64 charged][u8 updated].
 constexpr uint16_t kApiMethodThink         = 0x0240;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
@@ -1595,10 +1596,13 @@ class InstanceThinkSink : public ThinkSink {
       enqueueOutbound(inst, f);
     });
   }
-  void finish(uint8_t status, uint64_t charged, const std::string&) override {
-    boost::asio::post(ex_, [inst = inst_, corr = corr_, status, charged]() {
+  void finish(uint8_t status, uint64_t charged, const std::string&,
+              bool updated) override {
+    boost::asio::post(ex_, [inst = inst_, corr = corr_, status, charged,
+                            updated]() {
       ces::Bytes tail;
       ces::Buffer::put<uint64_t>(tail, charged);
+      ces::Buffer::put<uint8_t>(tail, updated ? 1 : 0);
       sendApiReplyWithBody(inst, corr, status, tail);
     });
   }
@@ -1656,11 +1660,14 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
   // ces.transfer and ces.mail.send. Whoever funds that account pays: the
   // owner, or a caller who sends it credits. On /s/ it is the server-funded
   // account that daily maintenance tops up to ext_local_budget, which caps
-  // what an extension can spend. builtin:think must be mounted.
+  // what an extension can spend. builtin:think must be mounted. A
+  // conversation file is read and appended with the authority of the
+  // program's owner and billed to the source file, as for ces.file_*.
   if (method == kApiMethodThink) {
     auto refuse = [&](uint8_t rc) {
       ces::Bytes tail;
       ces::Buffer::put<uint64_t>(tail, 0);
+      ces::Buffer::put<uint8_t>(tail, 0);
       sendApiReplyWithBody(inst, corr_id, rc, tail);
     };
     if (mlen < sizeof(uint32_t)) { refuse(CES_ERROR_BAD_INPUT); return; }
@@ -1671,12 +1678,23 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     CesServer* server = inst->owner->server_;
     ThinkHandler* th = server ? server->thinkHandler() : nullptr;
     if (!th || !inst->peer) { refuse(CES_ERROR_DISABLED); return; }
+    ThinkFile file;
+    size_t off = sizeof(uint32_t) + plen;
+    if (mlen >= off + sizeof(uint16_t)) {
+      uint16_t fl = ces::Buffer::peek<uint16_t>(mbody + off);
+      off += sizeof(uint16_t);
+      if (mlen < off + fl) { refuse(CES_ERROR_BAD_INPUT); return; }
+      file.path.assign(reinterpret_cast<const char*>(mbody + off), fl);
+      file.caller = inst->ownerPk;
+      file.sourceName = inst->sourceName;
+    }
     minx::Hash payer{};
     std::memcpy(payer.data(), inst->programPubkey.data(), 32);
     th->submit(payer,
                std::string(reinterpret_cast<const char*>(mbody + 4), plen),
                std::make_shared<InstanceThinkSink>(
-                   inst, corr_id, inst->peer->get_executor()));
+                   inst, corr_id, inst->peer->get_executor()),
+               std::move(file));
     return;
   }
 

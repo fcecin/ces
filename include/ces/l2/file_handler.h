@@ -74,6 +74,11 @@ inline bool isServerZone(const std::string& name) {
 struct FileExecReq {
   std::array<uint8_t, 32> ownerPubkey{};
   std::string sourceName;         // program's source file - pays all fees
+  // When set, payerAccount pays the fees instead of sourceName, and refunds
+  // (WITHDRAW, DELETE) go to it. For in-process work done for a network
+  // signer (builtin:think's conversation file).
+  bool payByAccount = false;
+  std::array<uint8_t, 32> payerAccount{};
   uint8_t verb = 0;               // 0x01..0x0a (matches wire verb codes)
   std::string name;
   uint64_t offset = 0;            // WRITE, READ

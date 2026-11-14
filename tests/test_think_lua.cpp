@@ -186,6 +186,20 @@ struct ThinkLuaFixture {
     return bal - 1;
   }
 
+  std::string getFile(const std::string& p) {
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    if (fc.connect("localhost", rpcPort, ownerKey) != CES_OK) return "<err>";
+    CesFileClient::StatInfo st{};
+    if (fc.stat(p, st) != CES_OK) return "<err>";
+    ces::Bytes out;
+    minx::Hash h;
+    if (st.size > 0 &&
+        fc.read(p, 0, static_cast<uint32_t>(st.size), out, h) != CES_OK)
+      return "<err>";
+    return std::string(out.begin(), out.end());
+  }
+
   std::string path(const char* name) {
     return "/h/" + ownerKey.getPublicKeyHexStr() + "/" + name;
   }
@@ -288,6 +302,24 @@ BOOST_FIXTURE_TEST_CASE(HostThink_EmptyPromptRefused, ThinkLuaFixture) {
   launch(path("t5.lua"));
   BOOST_CHECK_EQUAL(beaconCode(), 77);
   BOOST_CHECK_EQUAL(backend->calls.load(), 0);
+}
+
+// ces.think with a conversation file: the program acts as its owner, so the
+// owner's file is context and grows by the prompt and the reply.
+BOOST_FIXTURE_TEST_CASE(HostThink_ConversationFile, ThinkLuaFixture) {
+  const std::string chat = path("chat.txt");
+  deploy(chat, "og|");
+  const std::string src = B() +
+    "ces.spawn(function()\n"
+    "  local r, c, upd = ces.think('hi!', nil, '" + chat + "')\n"
+    "  if r == 'Hello, world.' and upd == true then ces.transfer(B, 77)\n"
+    "  else ces.transfer(B, 2) end\n"
+    "end)\n"
+    "ces.run()\n";
+  deploy(path("t8.lua"), src);
+  launch(path("t8.lua"));
+  BOOST_CHECK_EQUAL(beaconCode(), 77);
+  BOOST_CHECK_EQUAL(getFile(chat), "og|hi!Hello, world.");
 }
 
 // ces.think_client: the program dials its own server's /ces/think/1 as its
