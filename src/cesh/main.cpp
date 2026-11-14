@@ -2816,13 +2816,13 @@ int main(int argc, char* argv[]) {
       std::string reply;
       uint64_t charged = 0;
       bool endsInNewline = true;
-      bool updated = false;
+      uint8_t appendError = CES_OK;
       rc = tc.think(prompt,
                     [&](std::string_view piece) {
                       std::cout << piece << std::flush;
                       endsInNewline = piece.back() == '\n';
                     },
-                    reply, charged, think_file_arg, &updated);
+                    reply, charged, think_file_arg, &appendError);
       if (!endsInNewline) std::cout << "\n";
       std::cout << std::flush;
       if (rc != CES_OK) {
@@ -2831,9 +2831,14 @@ int main(int argc, char* argv[]) {
       }
       if (!g_quiet) {
         std::cerr << "charged " << charged;   // raw credit units
-        if (!think_file_arg.empty())
-          std::cerr << (updated ? ", file updated" : ", file not updated");
+        if (!think_file_arg.empty()) {
+          if (appendError == CES_OK) std::cerr << ", file appended";
+          else std::cerr << ", file not updated: " << errorString(appendError);
+        }
         std::cerr << "\n";
+        if (appendError == CES_ERROR_INSUFFICIENT_BALANCE)
+          std::cerr << "the file's balance cannot pay the append; fund it with "
+                       "cesh file deposit " << think_file_arg << " <amount>\n";
       }
       return 0;
     };

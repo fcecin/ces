@@ -53,11 +53,13 @@ public:
   // `file` (optional) names a conversation file in the server's store: the
   // server puts its content before the prompt, and after a complete reply
   // appends the prompt and the reply to it if the signer owns it and can pay
-  // the append. `updated` (optional) tells whether that happened.
+  // the append. `appendError` (optional) gets the APPEND's status: CES_OK
+  // when appended (or with no file), else its error code.
   uint8_t think(const std::string& prompt,
                 const std::function<void(std::string_view)>& onText,
                 std::string& reply, uint64_t& charged,
-                const std::string& file = {}, bool* updated = nullptr);
+                const std::string& file = {},
+                uint8_t* appendError = nullptr);
 
   class Impl;
 

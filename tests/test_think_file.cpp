@@ -1,7 +1,8 @@
 // builtin:think with a conversation file: the server sends the backend the
 // file's content plus the new text, returns only the reply, and appends the
-// text and the reply to the file when the signer owns it. A scripted backend
-// (no network) records what it was sent.
+// text and the reply to the file when the signer owns it. The reply's file
+// status is the APPEND's status code. A scripted backend (no network)
+// records what it was sent.
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
@@ -127,13 +128,14 @@ struct ThinkFileFixture {
     return std::string(out.begin(), out.end());
   }
   uint8_t think(const KeyPair& who, const std::string& text,
-                const std::string& file, std::string& reply, bool& updated) {
+                const std::string& file, std::string& reply,
+                uint8_t& appendError) {
     CesThinkClient tc;
     tc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
     if (tc.connect("localhost", rpcPort, who) != CES_OK)
       return CES_ERROR_INTERNAL;
     uint64_t charged = 0;
-    return tc.think(text, nullptr, reply, charged, file, &updated);
+    return tc.think(text, nullptr, reply, charged, file, &appendError);
   }
 };
 
@@ -146,17 +148,17 @@ BOOST_FIXTURE_TEST_SUITE(ThinkFileTests, ThinkFileFixture)
 BOOST_AUTO_TEST_CASE(File_IsContext_AndGrowsByEachTurn) {
   putFile(chat(), "og|");
   std::string reply;
-  bool updated = false;
-  CES_REQUIRE_OK(think(owner, "hi!", chat(), reply, updated));
+  uint8_t appendError = 0xFF;
+  CES_REQUIRE_OK(think(owner, "hi!", chat(), reply, appendError));
   BOOST_CHECK_EQUAL(reply, "Hello there!");
-  BOOST_CHECK(updated);
+  BOOST_CHECK_EQUAL(appendError, CES_OK);
   BOOST_CHECK_EQUAL(backend->input(), "og|hi!");
   BOOST_CHECK_EQUAL(getFile(chat()), "og|hi!Hello there!");
 
   backend->reply = "nothing new";
-  CES_REQUIRE_OK(think(owner, "so whazap?", chat(), reply, updated));
+  CES_REQUIRE_OK(think(owner, "so whazap?", chat(), reply, appendError));
   BOOST_CHECK_EQUAL(reply, "nothing new");
-  BOOST_CHECK(updated);
+  BOOST_CHECK_EQUAL(appendError, CES_OK);
   BOOST_CHECK_EQUAL(backend->input(), "og|hi!Hello there!so whazap?");
   BOOST_CHECK_EQUAL(getFile(chat()),
                     "og|hi!Hello there!so whazap?nothing new");
@@ -166,29 +168,51 @@ BOOST_AUTO_TEST_CASE(File_IsContext_AndGrowsByEachTurn) {
 BOOST_AUTO_TEST_CASE(NotOwner_ContextOnly) {
   putFile(chat(), "shared|");
   std::string reply;
-  bool updated = true;
-  CES_REQUIRE_OK(think(other, "hi!", chat(), reply, updated));
-  BOOST_CHECK(!updated);
+  uint8_t appendError = 0xFF;
+  CES_REQUIRE_OK(think(other, "hi!", chat(), reply, appendError));
+  BOOST_CHECK_EQUAL(appendError, CES_ERROR_NOT_OWNER);
   BOOST_CHECK_EQUAL(backend->input(), "shared|hi!");
   BOOST_CHECK_EQUAL(getFile(chat()), "shared|");
+}
+
+// A file whose balance cannot pay the append: the reply comes back, the
+// file does not change, and the file status says why.
+BOOST_AUTO_TEST_CASE(UnfundedFile_ReplyButNoAppend) {
+  putFile(chat(), "og|");
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, owner));
+    CesFileClient::StatInfo st{};
+    CES_REQUIRE_OK(fc.stat(chat(), st));
+    BOOST_REQUIRE_GT(st.fileBalance, 1u);
+    uint64_t fb = 0;
+    CES_REQUIRE_OK(fc.withdraw(chat(), st.fileBalance - 1, fb));
+    BOOST_REQUIRE_EQUAL(fb, 1u);
+  }
+  std::string reply;
+  uint8_t appendError = 0xFF;
+  CES_REQUIRE_OK(think(owner, "hi!", chat(), reply, appendError));
+  BOOST_CHECK_EQUAL(reply, "Hello there!");
+  BOOST_CHECK_EQUAL(appendError, CES_ERROR_INSUFFICIENT_BALANCE);
+  BOOST_CHECK_EQUAL(getFile(chat()), "og|");
 }
 
 // A missing file refuses the call before the backend runs.
 BOOST_AUTO_TEST_CASE(MissingFile_Refused) {
   std::string reply;
-  bool updated = true;
-  BOOST_CHECK_EQUAL(think(owner, "hi!", chat(), reply, updated),
+  uint8_t appendError = 0xFF;
+  BOOST_CHECK_EQUAL(think(owner, "hi!", chat(), reply, appendError),
                     CES_ERROR_FILE_NOT_FOUND);
-  BOOST_CHECK(!updated);
   BOOST_CHECK_EQUAL(backend->calls.load(), 0);
 }
 
 // No file: the call is plain text in, text out.
 BOOST_AUTO_TEST_CASE(NoFile_PlainCall) {
   std::string reply;
-  bool updated = true;
-  CES_REQUIRE_OK(think(owner, "hi!", "", reply, updated));
-  BOOST_CHECK(!updated);
+  uint8_t appendError = 0xFF;
+  CES_REQUIRE_OK(think(owner, "hi!", "", reply, appendError));
+  BOOST_CHECK_EQUAL(appendError, CES_OK);   // the normal outcome: no file
   BOOST_CHECK_EQUAL(backend->input(), "hi!");
 }
 
@@ -200,15 +224,15 @@ BOOST_AUTO_TEST_CASE(SameFile_OneCallAtATime) {
   uint8_t rc1 = CES_ERROR_INTERNAL;
   std::thread first([&] {
     std::string reply;
-    bool updated = false;
-    rc1 = think(owner, "one", chat(), reply, updated);
+    uint8_t appendError = 0xFF;
+    rc1 = think(owner, "one", chat(), reply, appendError);
   });
   for (int i = 0; i < 400 && !backend->entered.load(); ++i)
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
   BOOST_REQUIRE(backend->entered.load());
   std::string reply;
-  bool updated = false;
-  BOOST_CHECK_EQUAL(think(owner, "two", chat(), reply, updated),
+  uint8_t appendError = 0xFF;
+  BOOST_CHECK_EQUAL(think(owner, "two", chat(), reply, appendError),
                     CES_ERROR_QUEUE_FULL);
   backend->release = true;
   first.join();

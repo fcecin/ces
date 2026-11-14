@@ -311,8 +311,8 @@ BOOST_FIXTURE_TEST_CASE(HostThink_ConversationFile, ThinkLuaFixture) {
   deploy(chat, "og|");
   const std::string src = B() +
     "ces.spawn(function()\n"
-    "  local r, c, upd = ces.think('hi!', nil, '" + chat + "')\n"
-    "  if r == 'Hello, world.' and upd == true then ces.transfer(B, 77)\n"
+    "  local r, c, append_error = ces.think('hi!', nil, '" + chat + "')\n"
+    "  if r == 'Hello, world.' and append_error == ces.err.OK then ces.transfer(B, 77)\n"
     "  else ces.transfer(B, 2) end\n"
     "end)\n"
     "ces.run()\n";

@@ -262,7 +262,7 @@ constexpr uint16_t kApiMethodPeerBan       = 0x0237;
 constexpr uint16_t kApiMethodServerSign    = 0x0238;
 // ces.think(prompt [, on_piece [, file]]): builtin:think for the program,
 // billed to its program account. Args: [u32 len][prompt] then optionally
-// [u16 pathLen][path]. Reply: [u8 CES status][u64 charged][u8 updated].
+// [u16 pathLen][path]. Reply: [u8 CES status][u64 charged][u8 appendError].
 constexpr uint16_t kApiMethodThink         = 0x0240;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
@@ -1597,12 +1597,12 @@ class InstanceThinkSink : public ThinkSink {
     });
   }
   void finish(uint8_t status, uint64_t charged, const std::string&,
-              bool updated) override {
+              uint8_t appendError) override {
     boost::asio::post(ex_, [inst = inst_, corr = corr_, status, charged,
-                            updated]() {
+                            appendError]() {
       ces::Bytes tail;
       ces::Buffer::put<uint64_t>(tail, charged);
-      ces::Buffer::put<uint8_t>(tail, updated ? 1 : 0);
+      ces::Buffer::put<uint8_t>(tail, appendError);
       sendApiReplyWithBody(inst, corr, status, tail);
     });
   }

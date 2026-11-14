@@ -19,7 +19,7 @@ constexpr const char* kThinkProto = "/ces/think/1";
 // The longest wait for one reply frame. The server's own call timeout ends
 // a call first; this only catches a server that went silent.
 constexpr auto kFrameTimeout = std::chrono::minutes(15);
-constexpr size_t kOkPreamble = 8 + 32 + 1;   // [u64 charged][32 hash][u8 updated]
+constexpr size_t kOkPreamble = 8 + 32 + 1;   // [u64 charged][32 hash][u8 appendError]
 
 }  // namespace
 
@@ -56,10 +56,10 @@ void CesThinkClient::setServerPubkey(const minx::Hash& pk) {
 uint8_t CesThinkClient::think(
     const std::string& prompt,
     const std::function<void(std::string_view)>& onText, std::string& reply,
-    uint64_t& charged, const std::string& file, bool* updated) {
+    uint64_t& charged, const std::string& file, uint8_t* appendError) {
   reply.clear();
   charged = 0;
-  if (updated) *updated = false;
+  if (appendError) *appendError = CES_OK;
   if (!impl_->chan) return CES_ERROR_INTERNAL;
   if (prompt.empty() || prompt.size() > UINT32_MAX || file.size() > 1024)
     return CES_ERROR_BAD_INPUT;
@@ -91,7 +91,7 @@ uint8_t CesThinkClient::think(
       reinterpret_cast<const uint8_t*>(reply.data()), reply.size());
   if (std::memcmp(got.data(), outPre.data() + 8, 32) != 0)
     return CES_ERROR_INTERNAL;
-  if (updated) *updated = outPre[40] != 0;
+  if (appendError) *appendError = outPre[40];
   return CES_OK;
 }
 

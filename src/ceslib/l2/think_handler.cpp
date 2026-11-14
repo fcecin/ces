@@ -125,7 +125,7 @@ uint8_t readWhole(CesServer* server, const ThinkFile& f, uint64_t max,
 }
 
 // The THINK verb's sink: reply frames on the bound channel. On OK the signed
-// preamble is [u64 charged][32 sha256(reply)][u8 updated].
+// preamble is [u64 charged][32 sha256(reply)][u8 appendError].
 class PlexSink : public ThinkSink {
  public:
   explicit PlexSink(std::shared_ptr<CesPlexReplyStream> r) : r_(std::move(r)) {}
@@ -134,7 +134,7 @@ class PlexSink : public ThinkSink {
     r_->write(ces::Bytes(t.begin(), t.end()));
   }
   void finish(uint8_t status, uint64_t charged, const std::string& text,
-              bool updated) override {
+              uint8_t appendError) override {
     if (status != CES_OK) {
       r_->finish(status);
       return;
@@ -144,7 +144,7 @@ class PlexSink : public ThinkSink {
     minx::Hash h = ces::sha256(reinterpret_cast<const uint8_t*>(text.data()),
                                text.size());
     pre.insert(pre.end(), h.begin(), h.end());
-    ces::Buffer::put<uint8_t>(pre, updated ? 1 : 0);
+    ces::Buffer::put<uint8_t>(pre, appendError);
     r_->finish(CES_OK, std::move(pre));
   }
 
@@ -342,12 +342,12 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
                           std::shared_ptr<ThinkSink> sink, ThinkFile file) {
   const auto& cfg = server_->_config();
   if (stopped_.load() || !enabled()) {
-    sink->finish(CES_ERROR_DISABLED, 0, {}, false);
+    sink->finish(CES_ERROR_DISABLED, 0, {}, CES_OK);
     return;
   }
   if (prompt.empty() || prompt.size() > cfg.thinkMaxInputBytes ||
       !thinkValidUtf8(prompt)) {
-    sink->finish(CES_ERROR_BAD_INPUT, 0, {}, false);
+    sink->finish(CES_ERROR_BAD_INPUT, 0, {}, CES_OK);
     return;
   }
   std::shared_ptr<ThinkBackend> backend;
@@ -356,7 +356,7 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
   reapLocked();
   if (jobs_.size() >= cfg.thinkMaxConcurrent ||
       (!file.path.empty() && busyPaths_.count(file.path))) {
-    sink->finish(CES_ERROR_QUEUE_FULL, 0, {}, false);
+    sink->finish(CES_ERROR_QUEUE_FULL, 0, {}, CES_OK);
     return;
   }
   backend = backend_;
@@ -392,7 +392,7 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
                          !thinkValidUtf8(input)))
       rc = CES_ERROR_BAD_INPUT;
     if (rc != CES_OK) {
-      sink.finish(rc, 0, {}, false);
+      sink.finish(rc, 0, {}, CES_OK);
       return;
     }
   }
@@ -411,7 +411,7 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
   });
   if (!held) {
     subsidy_->release(reserved);
-    sink.finish(CES_ERROR_INSUFFICIENT_BALANCE, 0, {}, false);
+    sink.finish(CES_ERROR_INSUFFICIENT_BALANCE, 0, {}, CES_OK);
     return;
   }
 
@@ -451,18 +451,18 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
   // A complete reply goes into the file with the text that asked for it.
   // The APPEND is the caller's own verb: it fails (and the file stays as
   // it was) when the caller is not the owner or cannot pay for it.
-  bool updated = false;
+  uint8_t appendError = CES_OK;
   if (o.status == CES_OK && !file.path.empty()) {
     ces::Bytes turn(prompt.begin(), prompt.end());
     turn.insert(turn.end(), text.begin(), text.end());
-    updated = fileOp(server, file, kFileVerbAppend, 0, 0, std::move(turn))
-                  .status == CES_OK;
+    appendError =
+        fileOp(server, file, kFileVerbAppend, 0, 0, std::move(turn)).status;
   }
   LOGINFO << "think: call done" << VAR(int(o.status))
           << VAR(o.usage.promptTokens) << VAR(o.usage.cachedTokens)
           << VAR(o.usage.outputTokens) << VAR(full) << VAR(mult)
-          << VAR(charge) << VAR(updated) << SVAR(o.detail);
-  sink.finish(o.status, charge, text, updated);
+          << VAR(charge) << VAR(int(appendError)) << SVAR(o.detail);
+  sink.finish(o.status, charge, text, appendError);
 }
 
 }  // namespace ces

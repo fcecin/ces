@@ -17,7 +17,7 @@
 // (pathLen 0, or absent): it names a conversation file (see ThinkFile).
 // Reply: CesPlexReplyStream frames of reply text, then the signed response.
 // On CES_OK the response preamble is [u64 charged][32 sha256(all reply
-// text)][u8 updated], so the server signature covers the full reply. On an
+// text)][u8 appendError], so the server signature covers the full reply. On an
 // error the preamble is empty and the frames before it (if any) are a
 // partial reply.
 //
@@ -94,9 +94,12 @@ class ThinkSink {
   virtual void piece(std::string_view text) = 0;
   // Called once, last. On a refusal before the call started, charged is 0
   // and text is empty. On an error after it started, text is partial.
-  // `updated` is true when the reply was appended to the call's file.
+  // `appendError` is the status of the APPEND to the call's file: CES_OK when
+  // it was appended, or when there was no file (the caller knows which it
+  // asked for), else the APPEND's error (NOT_OWNER, INSUFFICIENT_BALANCE when
+  // the file's balance cannot pay, FILE_NOT_FOUND, STORE_FULL, ...).
   virtual void finish(uint8_t status, uint64_t charged,
-                      const std::string& text, bool updated) = 0;
+                      const std::string& text, uint8_t appendError) = 0;
 };
 
 // A call's conversation file. The file's content goes before the prompt.

@@ -652,7 +652,7 @@ int lua_ces_compute_client(lua_State* L) {
 
 // ---- ces.think_client verbs ----
 
-// h:think(prompt [, file]) -> reply, charged, updated | nil, rc, partial.
+// h:think(prompt [, file]) -> reply, charged, append_error | nil, rc, partial.
 // Blocks the calling coroutine until the full reply is in (the reply streams
 // on the wire; this API returns it whole). The program's own account pays.
 // `file` is a conversation file on that server (see ces.think).
@@ -670,8 +670,8 @@ int lua_tc_think(lua_State* L) {
                          -> OffloadDeliver {
     std::string reply;
     uint64_t charged = 0;
-    bool updated = false;
-    uint8_t rc = tc->think(prompt, nullptr, reply, charged, file, &updated);
+    uint8_t appendError = ces::CES_OK;
+    uint8_t rc = tc->think(prompt, nullptr, reply, charged, file, &appendError);
     if (rc != ces::CES_OK)
       return [rc, reply](lua_State* L) -> int {
         lua_pushnil(L);
@@ -679,10 +679,10 @@ int lua_tc_think(lua_State* L) {
         lua_pushlstring(L, reply.data(), reply.size());
         return 3;
       };
-    return [reply, charged, updated](lua_State* L) -> int {
+    return [reply, charged, appendError](lua_State* L) -> int {
       lua_pushlstring(L, reply.data(), reply.size());
       lua_pushnumber(L, static_cast<lua_Number>(charged));
-      lua_pushboolean(L, updated);
+      lua_pushinteger(L, appendError);
       return 3;
     };
   });

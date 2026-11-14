@@ -1,6 +1,6 @@
 // ---------------------------------------------------------------------------
 // ces.think(prompt [, on_piece [, file]])
-//   -> reply, charged, updated | nil, rc, partial
+//   -> reply, charged, append_error | nil, rc, partial
 //
 // builtin:think for this program, as a host call. The server bills the
 // file's program account (ces.program_pubkey()); the child names no payer.
@@ -15,7 +15,9 @@
 // `file` names a conversation file in the store. The server puts its content
 // before the prompt and, after a complete reply, appends the prompt and the
 // reply to it, with the authority of the program's owner and billed to the
-// source file (as for ces.file_*). `updated` tells whether it did.
+// source file (as for ces.file_*). append_error is the APPEND's status:
+// ces.err.OK when appended (or with no file), else its error code (e.g.
+// NOT_OWNER, or INSUFFICIENT_BALANCE when the file's balance cannot pay).
 // ---------------------------------------------------------------------------
 
 constexpr size_t kThinkPromptMax = 16u * 1024u * 1024u;   // IPC sanity cap
@@ -55,7 +57,7 @@ void drain_think(lua_State* L) {
 }
 
 // End a call: push its results from the API reply
-// [u8 status][u64 charged][u8 updated].
+// [u8 status][u64 charged][u8 appendError].
 int think_finish(lua_State* L, uint16_t corr, const Frame& reply) {
   ThinkCall call;
   auto it = g_think_calls.find(corr);
@@ -76,8 +78,8 @@ int think_finish(lua_State* L, uint16_t corr, const Frame& reply) {
   }
   lua_pushlstring(L, call.text.data(), call.text.size());
   lua_pushnumber(L, static_cast<lua_Number>(get_u64(reply.body.data() + 1)));
-  lua_pushboolean(L, reply.body.size() > 1 + sizeof(uint64_t) &&
-                         reply.body[1 + sizeof(uint64_t)] != 0);
+  lua_pushinteger(L, reply.body.size() > 1 + sizeof(uint64_t)
+                         ? reply.body[1 + sizeof(uint64_t)] : 0);
   return 3;
 }
 
