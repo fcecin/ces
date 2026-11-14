@@ -32,6 +32,7 @@
 
 #include <ces/buffer.h>            // ces::Bytes
 #include <ces/cesplex/mux.h>      // CesPlexHandler, BoundChannelContext
+#include <ces/util/rent_index.h>
 #include <minx/rudp/rudp_stream.h>
 
 namespace ces {
@@ -202,14 +203,26 @@ public:
   // a full one pays the base rent. Space is the scarce thing, so its price
   // follows how much of it is held. Only rent scales: writes (mechanical
   // wear), reads, the prepaid kv cell rent and the GC cap check stay at
-  // base. One atomic load. Thread-safe.
+  // base. Thread-safe.
   uint16_t rentBp();
-  // Set the gauge that rentBp reads. writeStoreMeta calls it each time it
-  // writes the store totals.
+  // The multiplier after `extraBytes` more are stored. The upfront rent of
+  // a request that grows the store uses it, so a request pays the price that
+  // its own bytes make.
+  uint16_t rentBpWith(uint64_t extraBytes);
+  // The rent index now (util/rent_index.h): the sum of rentBp over time.
+  // The rent of a file is the index span since its last charge. GC and the
+  // rent charge both use it. Thread-safe.
+  uint64_t rentIndex();
+  // Set the gauge that rentBp reads, and move the index to now at the old
+  // multiplier. writeStoreMeta calls it each time it writes the store
+  // totals.
   void noteStoreBytes(uint64_t bytes);
+  // The index state to save with the store totals, and to load at start.
+  RentIndex::State rentIndexState();
+  void loadRentIndex(const RentIndex::State& s);
   // Test hook: make rentBp return `bp` (0 = follow the gauge again). For
-  // tests that check rent at the base price.
-  void _testPinRentBp(uint16_t bp) { pinnedRentBp_ = bp; }
+  // tests that check rent at the base price. The index follows the pin.
+  void _testPinRentBp(uint16_t bp);
 
   // In-process verb execution. See FileExecReq / FileExecResp above.
   void exec(const FileExecReq& req,
@@ -227,8 +240,12 @@ public:
 
 private:
   std::atomic<bool> stopped_{false};
-  std::atomic<uint64_t> storeBytes_{0};   // store total_bytes (rent gauge)
-  std::atomic<uint16_t> pinnedRentBp_{0}; // test pin (0 = none)
+  uint16_t bpFor(uint64_t bytes) const;
+  std::mutex rentMu_;                     // guards the three below
+  uint64_t storeBytes_ = 0;               // store total_bytes (rent gauge)
+  uint16_t pinnedRentBp_ = 0;             // test pin (0 = none)
+  RentIndex rentIndex_{RentIndex::fresh(getMicrosNow())};
+  static uint64_t getMicrosNow();
 };
 
 } // namespace ces

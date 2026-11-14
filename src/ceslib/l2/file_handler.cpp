@@ -532,6 +532,12 @@ struct Sidecar {
   // this to now before proceeding. Initialized to created_us at
   // CREATE.
   uint64_t last_rent_us = 0;
+  // The rent index (FileHandler::rentIndex) at the last rent charge. The
+  // rent owed is the index span since then. Optional in the sidecar:
+  // sidecars written before the index pay the base price since
+  // last_rent_us, then get an index at their next charge.
+  uint64_t rent_index = 0;
+  bool has_rent_index = false;
   // Lazily-computed sha256(content || path) used by authentic
   // asset minting. All-zero means "not yet computed" - recompute
   // on demand. Cleared back to all-zero by any content-mutating
@@ -562,6 +568,8 @@ bool writeSidecar(const std::filesystem::path& path, const Sidecar& s) {
   tbl.insert_or_assign("created_us", static_cast<int64_t>(s.created_us));
   tbl.insert_or_assign("modified_us", static_cast<int64_t>(s.modified_us));
   tbl.insert_or_assign("last_rent_us", static_cast<int64_t>(s.last_rent_us));
+  if (s.has_rent_index)
+    tbl.insert_or_assign("rent_index", static_cast<int64_t>(s.rent_index));
   tbl.insert_or_assign("program_hash",
                        hexOf(s.program_hash.data(), s.program_hash.size()));
   tbl.insert_or_assign("type", static_cast<int64_t>(s.type));
@@ -624,6 +632,7 @@ bool readSidecar(const std::filesystem::path& path, Sidecar& s) {
   if (!getU64("created_us", s.created_us)) return false;
   if (!getU64("modified_us", s.modified_us)) return false;
   if (!getU64("last_rent_us", s.last_rent_us)) return false;
+  s.has_rent_index = getU64("rent_index", s.rent_index);
   // program_hash is optional (added later, missing in older sidecars
   // and on the freshly-emitted form before the first authentic-mint).
   // Treat missing or unparseable as "not yet computed" (all-zero).
@@ -653,6 +662,11 @@ struct StoreMeta {
   // debounce JIT GC on CREATE so a flood of over-cap requests can't
   // force a full-store scan on every failed CREATE.
   uint64_t last_gc_us = 0;
+  // The rent index (util/rent_index.h) when the totals were written. On a
+  // restart the index goes on from here, at the multiplier of these totals,
+  // for the time the server was down. has_rent_index false: none saved.
+  bool has_rent_index = false;
+  RentIndex::State rent_index;
 };
 
 // Debounce window for JIT GC on CREATE. If the last gcReclaim ran
@@ -687,19 +701,35 @@ bool readStoreMeta(const std::filesystem::path& path, StoreMeta& m) {
     tbl["total_bytes"].value_or<int64_t>(0));
   m.last_gc_us = static_cast<uint64_t>(
     tbl["last_gc_us"].value_or<int64_t>(0));
+  auto idx = tbl["rent_index"].value<int64_t>();
+  auto idxUs = tbl["rent_index_us"].value<int64_t>();
+  auto idxBp = tbl["rent_index_bp"].value<int64_t>();
+  m.has_rent_index = idx && idxUs && idxBp && *idx >= 0 && *idxUs >= 0 &&
+                     *idxBp >= 1 && *idxBp <= 10000;
+  if (m.has_rent_index)
+    m.rent_index = RentIndex::State{static_cast<uint64_t>(*idx),
+                                    static_cast<uint64_t>(*idxUs),
+                                    static_cast<uint16_t>(*idxBp)};
   return true;
 }
 
 // The one writer of the store totals. It also sets the handler's rent gauge
-// (FileHandler::rentBp), so the price follows the store with no file read.
+// (FileHandler::rentBp), so the price follows the store with no file read,
+// and saves the rent index with the totals.
 bool writeStoreMeta(FileHandler* fh, const std::filesystem::path& path,
                     const StoreMeta& m) {
-  if (fh) fh->noteStoreBytes(m.total_bytes);
   std::ostringstream oss;
   oss << "version = 1\n";
   oss << "total_files = " << m.total_files << "\n";
   oss << "total_bytes = " << m.total_bytes << "\n";
   oss << "last_gc_us = " << m.last_gc_us << "\n";
+  if (fh) {
+    fh->noteStoreBytes(m.total_bytes);
+    const RentIndex::State ri = fh->rentIndexState();
+    oss << "rent_index = " << ri.index << "\n";
+    oss << "rent_index_us = " << ri.atUs << "\n";
+    oss << "rent_index_bp = " << ri.bp << "\n";
+  }
   std::filesystem::path tmp = path;
   tmp += ".tmp";
   {
@@ -752,6 +782,25 @@ uint64_t computeOwedRent(uint64_t size, int64_t feeRent,
   if (owed > std::numeric_limits<uint64_t>::max())
     return std::numeric_limits<uint64_t>::max();
   return static_cast<uint64_t>(owed);
+}
+
+// The rent a file owes from its last charge to now: the rent index span
+// since its last charge (FileHandler::rentIndex). A sidecar from before the
+// index, or with an index past the store's (a lost store meta), pays the
+// base price for the time since last_rent_us. GC and the rent charge both
+// use this, so they agree on which files are broke.
+uint64_t owedRentOf(const Sidecar& sc, int64_t feeRent, uint64_t nowUs,
+                    uint64_t indexNow) {
+  if (sc.has_rent_index && indexNow >= sc.rent_index)
+    return rentForIndexSpan(sc.size, feeRent, indexNow - sc.rent_index);
+  return computeOwedRent(sc.size, feeRent, sc.last_rent_us, nowUs);
+}
+
+// Mark a rent charge at (nowUs, indexNow) in the sidecar.
+void markRentCharged(Sidecar& sc, uint64_t nowUs, uint64_t indexNow) {
+  sc.last_rent_us = nowUs;
+  sc.rent_index = indexNow;
+  sc.has_rent_index = true;
 }
 
 // Roll rent forward on a file up to now. Mutates `sc` in place.
@@ -926,11 +975,10 @@ bool chargeRentOrDelete(CesServer* server,
   // They never accrue whole-file rent here, and never die of it.
   if (sc.type == kFileTypeKv) return true;
   uint64_t now = getMicrosSinceEpoch();
-  // The elapsed rent is charged at today's utilization price.
-  const uint16_t bp = server && server->fileHandler()
-                          ? server->fileHandler()->rentBp() : 10000;
-  uint64_t owed = computeOwedRent(
-    sc.size, feeRent, sc.last_rent_us, now, bp);
+  // The elapsed rent follows the multiplier over the elapsed time.
+  const uint64_t indexNow = server && server->fileHandler()
+      ? server->fileHandler()->rentIndex() : RentIndex::fresh(now).index;
+  uint64_t owed = owedRentOf(sc, feeRent, now, indexNow);
   if (owed == 0) return true;
 
   if (!server) return false;
@@ -963,7 +1011,7 @@ bool chargeRentOrDelete(CesServer* server,
     notifyDeletion(server, sc.name);
     return false;
   }
-  sc.last_rent_us = now;
+  markRentCharged(sc, now, indexNow);
   return true;
 }
 
@@ -1271,7 +1319,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     initialDeposit = 0;
   } else {
     upfrontBurn = computeOwedRent(size, cfg.feeFileRent, 0, kGcDebounceUs,
-                                  server->fileHandler()->rentBp());
+                                  server->fileHandler()->rentBpWith(size));
     if (initialDeposit < upfrontBurn) return { CES_ERROR_INSUFFICIENT_BALANCE, 0, 0 };
   }
   const uint64_t programAccountInitial =
@@ -1333,7 +1381,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   s.type = type;
   s.created_us = getMicrosSinceEpoch();
   s.modified_us = s.created_us;
-  s.last_rent_us = s.created_us;
+  markRentCharged(s, s.created_us, server->fileHandler()->rentIndex());
   if (!writeSidecar(sPath, s)) {
     std::filesystem::remove(cPath, ec);
     return { CES_ERROR_INTERNAL, 0, 0 };
@@ -2063,7 +2111,7 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
   }
   uint64_t writeCost = serverZone ? 0 : kbCeil(length) * uint64_t(cfg.feeFileWrite);
   uint64_t upfront = serverZone ? 0 : computeOwedRent(length, cfg.feeFileRent, 0, kGcDebounceUs,
-                                                      server->fileHandler()->rentBp());
+                                                      server->fileHandler()->rentBpWith(length));
   uint64_t oldSize = sc.size;
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
@@ -2195,7 +2243,9 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
                                          cfg.feeFileRent, static_cast<uint64_t>(bytesDelta));
       if (capRc != CES_OK) return { capRc, 0, 0 }; }
     upfront = computeOwedRent(static_cast<uint64_t>(bytesDelta), cfg.feeFileRent, 0,
-                              kGcDebounceUs, server->fileHandler()->rentBp());
+                              kGcDebounceUs,
+                              server->fileHandler()->rentBpWith(
+                                  static_cast<uint64_t>(bytesDelta)));
   }
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
@@ -2679,6 +2729,8 @@ uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
   int64_t files_delta = 0;
   int64_t bytes_delta = 0;
   uint64_t now = getMicrosSinceEpoch();
+  const uint64_t indexNow = server && server->fileHandler()
+      ? server->fileHandler()->rentIndex() : RentIndex::fresh(now).index;
   walkFileStore(std::filesystem::path(dir),
     [&](const std::filesystem::path& sp,
         const std::filesystem::path& cp, Sidecar& s) {
@@ -2686,8 +2738,8 @@ uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
       // /s/ files are exempt from rent-based GC - unmetered by
       // definition.
       if (isServerZone(s.name)) return;
-      uint64_t owed = computeOwedRent(
-        s.size, feeRent, s.last_rent_us, now);
+      // The same price as the rent charge (owedRentOf).
+      uint64_t owed = owedRentOf(s, feeRent, now, indexNow);
       uint64_t bal = server ? readProgramAccountBalance(server, s) : 0;
       if (owed > bal) {
         // Dead. Delete content + sidecar. Best-effort rmdir of
@@ -3162,20 +3214,58 @@ void FileHandler::serve(std::shared_ptr<minx::RudpStream> stream,
   cesPlexServe(std::move(stream), std::move(bound), server, std::move(proto));
 }
 
-uint16_t FileHandler::rentBp() {
-  if (uint16_t pin = pinnedRentBp_.load()) return pin;
+uint64_t FileHandler::getMicrosNow() { return getMicrosSinceEpoch(); }
+
+uint16_t FileHandler::bpFor(uint64_t bytes) const {
+  if (pinnedRentBp_) return pinnedRentBp_;
   CesServer* server = server_;
   if (!server) return 10000;
   const uint64_t cap = server->_config().cesFileStoreMaxBytes;
   if (cap == 0) return 10000;
-  const __uint128_t bp =
-      static_cast<__uint128_t>(storeBytes_.load()) * 10000u / cap;
+  const __uint128_t bp = static_cast<__uint128_t>(bytes) * 10000u / cap;
   if (bp < 1) return 1;
   if (bp > 10000) return 10000;
   return static_cast<uint16_t>(bp);
 }
 
-void FileHandler::noteStoreBytes(uint64_t bytes) { storeBytes_ = bytes; }
+uint16_t FileHandler::rentBp() {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  return bpFor(storeBytes_);
+}
+
+uint16_t FileHandler::rentBpWith(uint64_t extraBytes) {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  const uint64_t b = storeBytes_ > UINT64_MAX - extraBytes
+                         ? UINT64_MAX : storeBytes_ + extraBytes;
+  return bpFor(b);
+}
+
+uint64_t FileHandler::rentIndex() {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  return rentIndex_.at(getMicrosSinceEpoch());
+}
+
+void FileHandler::noteStoreBytes(uint64_t bytes) {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  storeBytes_ = bytes;
+  rentIndex_.setBp(bpFor(bytes), getMicrosSinceEpoch());
+}
+
+RentIndex::State FileHandler::rentIndexState() {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  return rentIndex_.state();
+}
+
+void FileHandler::loadRentIndex(const RentIndex::State& s) {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  rentIndex_ = RentIndex(s);
+}
+
+void FileHandler::_testPinRentBp(uint16_t bp) {
+  std::lock_guard<std::mutex> lk(rentMu_);
+  pinnedRentBp_ = bp;
+  rentIndex_.setBp(bpFor(storeBytes_), getMicrosSinceEpoch());
+}
 
 void FileHandler::sweepKvRent() {
   CesServer* server = server_;
@@ -3605,6 +3695,18 @@ void FileHandler::startupReconcile() {
   const std::string& dir = server->_config().cesFileStoreDir;
   std::error_code ec;
   std::filesystem::create_directories(dir, ec);
+  // Go on from the saved rent index. The time the server was down counts
+  // at the multiplier of the saved totals; the first write below moves the
+  // index to now at that multiplier.
+  {
+    StoreMeta old;
+    if (readStoreMeta(storeMetaPath(dir), old)) {
+      std::lock_guard lk(storeMetaMutex_);
+      if (old.has_rent_index) loadRentIndex(old.rent_index);
+      std::lock_guard<std::mutex> rl(rentMu_);
+      storeBytes_ = old.total_bytes;
+    }
+  }
   // Publish the bundled /s/welcome site (forced with the file feature), then
   // auto-generate sidecars for any /s/ files the operator dropped on disk.
   seedBuiltinSite(server, dir);
