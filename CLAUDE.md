@@ -366,7 +366,7 @@ Five thread groups:
 4. settlementIO (1): CesClientAsync async I/O.
 5. rpcTaskIO (1): rpc-port Minx + CesPlex sessions + handler `serve` + ChannelMeter tick + compute supervisor tick.
 
-`logicStrand_` is the lock. No ledger mutexes. Cross-handler primitives (e.g. `fileHandlerExec`) hop onto `logicStrand_` internally as needed. Replies are retransmitted on a timer to paper over UDP loss.
+`logicStrand_` is the lock. No ledger mutexes. Cross-handler primitives (e.g. `fileHandlerExec`) hop onto `logicStrand_` internally as needed. A blocking hop uses `logicSync` (or `runSync` for another executor, `util/sync_call.h`): it returns the task's result, or throws the exception the task threw, so a throw never leaves the caller waiting for ever (on rpcTaskIO that stops every CesPlex verb). Do not hand-roll a promise that only the success path sets; `LogicSyncTests` covers it. Replies are retransmitted on a timer to paper over UDP loss.
 
 ## Configuration
 

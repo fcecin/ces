@@ -5115,13 +5115,7 @@ void CesServer::tpsInc() {
 // Serializing on taskIO_ also keeps net-sampler state (lastNetCumulative_,
 // netPeakBps_) free of data races against the live tick.
 void CesServer::runMetricsTickOnce() {
-  std::promise<void> done;
-  auto fut = done.get_future();
-  boost::asio::post(taskIO_, [this, &done]() {
-    metricsCompute();
-    done.set_value();
-  });
-  fut.wait();
+  runSync(taskIO_.get_executor(), [this]() { metricsCompute(); });
 }
 
 // Body of one tick. Touches mutable net-sampler doubles, must run on
@@ -5542,10 +5536,7 @@ bool CesServer::_registerKeyName(const minx::Hash& key, const std::string& name)
            KeyNames::RegisterResult::Ok;
   };
   if (!running_) return doIt();
-  std::promise<bool> p;
-  auto f = p.get_future();
-  postLogic([&p, &doIt]() { p.set_value(doIt()); });
-  return f.get();
+  return logicSync(doIt);
 }
 
 // Boot-time autolaunch of /s/ extensions. For each name in
@@ -5741,8 +5732,7 @@ void CesServer::_burn(const minx::Hash& accountKey, int64_t amount) {
 
 bool CesServer::_walletSend(const minx::Hash& destKey, uint64_t amount) {
   bool ok = false;
-  std::promise<void> done;
-  postLogic([&]() {
+  logicSync([&]() {
     // One strand task so the balance check and the two ledger moves are atomic.
     ActiveAccount sacc = accounts_.get(serverKeyPair_.getPublicKeyAsHash());
     if (amount > 0 && sacc.exists() && sacc.balance() >= 0 &&
@@ -5754,9 +5744,7 @@ bool CesServer::_walletSend(const minx::Hash& destKey, uint64_t amount) {
       ok = true;
       LOGINFO << "wallet send from server account" << VAR(amount);
     }
-    done.set_value();
   });
-  done.get_future().get();
   return ok;
 }
 
@@ -5812,13 +5800,10 @@ struct ServerLedgerTxn : ces::LedgerTxn {
 };
 
 void CesServer::_l2Transact(const std::function<void(LedgerTxn&)>& fn) {
-  std::promise<void> done;
-  postLogic([this, &fn, &done]() {
+  logicSync([this, &fn]() {
     ServerLedgerTxn txn(this);
     fn(txn);
-    done.set_value();
   });
-  done.get_future().get();
 }
 
 void CesServer::_l2DebitProgramAccount(
@@ -5855,50 +5840,30 @@ void CesServer::_l2DebitProgramAccount(
 CesServer::ProgramAccountDebitResult
 CesServer::_l2DebitProgramAccountSync(
     const minx::Hash& pubkey, int64_t amount) {
-  std::promise<ProgramAccountDebitResult> p;
-  auto fut = p.get_future();
-  postLogic(
-    [this, pubkey, amount, &p]() {
+  return logicSync(
+    [this, pubkey, amount]() -> ProgramAccountDebitResult {
       HashPrefix id = Account::getMapKey(pubkey);
       ActiveAccount acc = accounts_.get(id);
-      if (!acc.exists()) {
-        p.set_value({false, 0});
-        return;
-      }
+      if (!acc.exists()) return {false, 0};
       int64_t bal = acc.balance();
-      if (amount < 0 || bal < amount) {
-        p.set_value({false, bal});
-        return;
-      }
+      if (amount < 0 || bal < amount) return {false, bal};
       acc.debit(static_cast<uint64_t>(amount));
-      p.set_value({true, bal - amount});
+      return {true, bal - amount};
     });
-  return fut.get();
 }
 
 void CesServer::_l2CreditProgramAccountSync(
     const minx::Hash& pubkey, int64_t amount) {
-  std::promise<void> p;
-  auto fut = p.get_future();
-  postLogic(
-    [this, pubkey, amount, &p]() {
-      _brrInner(pubkey, amount);
-      p.set_value();
-    });
-  fut.get();
+  logicSync([this, pubkey, amount]() { _brrInner(pubkey, amount); });
 }
 
 int64_t CesServer::_l2ProgramAccountBalanceSync(
     const minx::Hash& pubkey) {
-  std::promise<int64_t> p;
-  auto fut = p.get_future();
-  postLogic(
-    [this, pubkey, &p]() {
-      HashPrefix id = Account::getMapKey(pubkey);
-      ActiveAccount acc = accounts_.get(id);
-      p.set_value(acc.exists() ? acc.balance() : 0);
-    });
-  return fut.get();
+  return logicSync([this, pubkey]() -> int64_t {
+    HashPrefix id = Account::getMapKey(pubkey);
+    ActiveAccount acc = accounts_.get(id);
+    return acc.exists() ? acc.balance() : 0;
+  });
 }
 
 void CesServer::_testRegisterL2Handler(const std::string& name,
@@ -5906,13 +5871,7 @@ void CesServer::_testRegisterL2Handler(const std::string& name,
   minx::Hash dh = ces::sha256(
       reinterpret_cast<const uint8_t*>(name.data()), name.size());
   uint64_t key = ces::Buffer::peek<uint64_t>(dh.data());
-  std::promise<void> p;
-  auto fut = p.get_future();
-  postLogic([this, key, handler, &p]() {
-    l2Registry_[key] = handler;
-    p.set_value();
-  });
-  fut.get();
+  logicSync([this, key, handler]() { l2Registry_[key] = handler; });
 }
 
 #ifdef CES_MAIL
@@ -5953,19 +5912,14 @@ void CesServer::_testSetMailSink(std::function<void(const MailMessage&)> sink) {
 
 bool CesServer::mailChargeSync(const minx::Hash& payer, uint64_t price) {
   if (price == 0) return true;
-  std::promise<bool> pr;
-  auto fut = pr.get_future();
-  postLogic([this, payer, price, &pr]() {
+  return logicSync([this, payer, price]() {
     HashPrefix id = Account::getMapKey(payer);
     ActiveAccount acc = accounts_.get(id);
-    if (!acc.exists() || acc.balance() < static_cast<int64_t>(price)) {
-      pr.set_value(false);
-      return;
-    }
+    if (!acc.exists() || acc.balance() < static_cast<int64_t>(price))
+      return false;
     _burnInner(payer, static_cast<int64_t>(price));   // debit + destroy (burn)
-    pr.set_value(true);
+    return true;
   });
-  return fut.get();
 }
 #endif  // CES_MAIL
 
@@ -6852,12 +6806,8 @@ void CesServer::_testCompletePeering(const minx::Hash& ckey, int64_t reserve,
 void CesServer::_mountCesPlexHandler(const std::string& proto,
                                      CesPlexHandler* handler) {
   if (!cesplex_) return;
-  std::promise<void> done;
-  boost::asio::post(rpcTaskIO_, [&]() {
-    cesplex_->mount(proto, handler);
-    done.set_value();
-  });
-  done.get_future().wait();
+  runSync(rpcTaskIO_.get_executor(),
+          [&]() { cesplex_->mount(proto, handler); });
 }
 
 // =============================================================================
@@ -6865,38 +6815,33 @@ void CesServer::_mountCesPlexHandler(const std::string& proto,
 // =============================================================================
 
 CesServer::AdminStats CesServer::_adminStats() {
-  std::promise<AdminStats> pr;
-  postLogic([&]() {
+  return logicSync([&]() {
     AdminStats s;
     s.circulating = circulatingCredits();
     s.accounts = accounts_->getObjects().size();
     s.assets = assets_->getObjects().size();
     s.aliases = aliases_->getObjects().size();
     s.txCount = txCount_.load();
-    pr.set_value(s);
+    return s;
   });
-  return pr.get_future().get();
 }
 
 std::vector<int64_t> CesServer::_peerVostroBalances(
     const std::vector<minx::Hash>& keys) {
-  std::promise<std::vector<int64_t>> pr;
-  postLogic([&]() {
+  return logicSync([&]() {
     std::vector<int64_t> out;
     out.reserve(keys.size());
     for (const auto& k : keys) {
       ActiveAccount acc = accounts_.get(Account::getMapKey(k));
       out.push_back(acc.exists() ? acc.data().getBalance() : 0);
     }
-    pr.set_value(std::move(out));
+    return out;
   });
-  return pr.get_future().get();
 }
 
 CesServer::AdminAccount CesServer::_adminQueryAccount(
     const minx::Hash& accountKey) {
-  std::promise<AdminAccount> pr;
-  postLogic([&]() {
+  return logicSync([&]() {
     AdminAccount a;
     ActiveAccount acc = accounts_.get(Account::getMapKey(accountKey));
     if (acc.exists()) {
@@ -6916,14 +6861,12 @@ CesServer::AdminAccount CesServer::_adminQueryAccount(
         a.prefixTaken = true;
       }
     }
-    pr.set_value(a);
+    return a;
   });
-  return pr.get_future().get();
 }
 
 CesServer::AdminAsset CesServer::_adminQueryAsset(const minx::Hash& assetId) {
-  std::promise<AdminAsset> pr;
-  postLogic([&]() {
+  return logicSync([&]() {
     AdminAsset a;
     ActiveAsset as = assets_.get(assetId);
     if (as.exists()) {
@@ -6933,9 +6876,8 @@ CesServer::AdminAsset CesServer::_adminQueryAsset(const minx::Hash& assetId) {
       a.price = as.getPrice();
       a.content = as.getContent();
     }
-    pr.set_value(a);
+    return a;
   });
-  return pr.get_future().get();
 }
 
 CesServer::FileStat CesServer::_fileStat(const std::string& path) {
@@ -6947,20 +6889,27 @@ CesServer::FileStat CesServer::_fileStat(const std::string& path) {
   FileExecReq req;
   req.verb = 0x04;  // kVerbStat — public, no signer/owner required
   req.name = path;
-  std::promise<FileExecResp> pr;
+  auto pr = std::make_shared<std::promise<FileExecResp>>();
+  auto fut = pr->get_future();
   // fileHandlerExec runs the verb body (sidecar read-modify-write + lazy rent)
   // on the CALLER thread; only the callback is posted to the executor. Run the
   // whole call on rpcTaskIO so it stays serialized with the handler's other
   // verbs instead of racing them from this web thread, then block on the future.
-  boost::asio::post(_rpcTaskIOExecutor(), [this, &req, &pr]() {
-    if (!fileHandler_) {
-      FileExecResp r; r.status = CES_ERROR_DISABLED; pr.set_value(std::move(r));
-      return;
+  // A throw in the verb body reaches this caller, so it does not wait for ever.
+  boost::asio::post(_rpcTaskIOExecutor(), [this, &req, pr]() {
+    try {
+      if (!fileHandler_) {
+        FileExecResp r; r.status = CES_ERROR_DISABLED; pr->set_value(std::move(r));
+        return;
+      }
+      fileHandler_->exec(req, [pr](FileExecResp r) { pr->set_value(std::move(r)); },
+                         _rpcTaskIOExecutor());
+    } catch (...) {
+      try { pr->set_exception(std::current_exception()); }
+      catch (const std::future_error&) {}   // the callback already answered
     }
-    fileHandler_->exec(req, [&pr](FileExecResp r) { pr.set_value(std::move(r)); },
-                       _rpcTaskIOExecutor());
   });
-  FileExecResp r = pr.get_future().get();
+  FileExecResp r = fut.get();
   if (r.status == CES_OK) {
     out.found = true;
     out.ownerPubkey = r.ownerPubkey;
@@ -7249,8 +7198,7 @@ bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
   // as an immutable shared_ptr<const CesConfig> snapshot (RCU) loaded atomically,
   // skipped here as the only writer is this rare operator action.
   bool ok = false;
-  std::promise<void> done;
-  postLogic([&]() {
+  logicSync([&]() {
     if      (key == "fee_account")  { cfg_.feeAccount = value; ok = true; }
     else if (key == "fee_asset")    { cfg_.feeAsset   = value; ok = true; }
     else if (key == "fee_tx")       { cfg_.feeTx      = value; ok = true; }
@@ -7302,9 +7250,7 @@ bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
       }
     }
     if (ok) { LOGINFO << "config knob set via admin" << SVAR(key) << VAR(value); }
-    done.set_value();
   });
-  done.get_future().get();
   return ok;
 }
 
@@ -7453,36 +7399,27 @@ std::string CesServer::_exportConfig(std::string* errReason) {
 }
 
 void CesServer::_runAutoexecSync() {
-  std::promise<void> done;
-  postLogic( [this, &done]() {
-    runAutoexec();
-    done.set_value();
-  });
-  done.get_future().wait();
+  logicSync([this]() { runAutoexec(); });
 }
 
 void CesServer::_drainLogic() {
   if (!running_) return;
-  std::promise<void> done;
-  postLogic( [&done]() { done.set_value(); });
-  done.get_future().wait();
+  logicSync([]() {});
 }
 
 bool CesServer::_executeScheduledRunSync(const HashPrefix& callerPrefix,
                                          const minx::Hash& assetId,
                                          uint64_t budget, uint64_t allowance,
                                          const ces::Bytes& input) {
-  std::promise<bool> done;
-  postLogic( [&]() {
+  return logicSync([&]() {
     ScheduledRun run;
     run.callerPrefix = callerPrefix;
     run.assetId      = assetId;
     run.budget       = budget;
     run.allowance    = allowance;
     run.input        = input;
-    done.set_value(executeScheduledRun(run));
+    return executeScheduledRun(run);
   });
-  return done.get_future().get();
 }
 
 void CesServer::_primePresence(const HashPrefix& prefix,
@@ -8547,15 +8484,12 @@ uint8_t CesServer::enqueueChannelL2Call(CesPlexHandler* handler,
 bool CesServer::l2TransferSync(const minx::Hash& from, const minx::Hash& to,
                                uint64_t amount) {
   if (amount == 0) return true;
-  std::promise<bool> pr;
-  auto fut = pr.get_future();
-  postLogic([this, from, to, amount, &pr]() {
+  return logicSync([this, from, to, amount]() {
     int64_t outBal = 0;
     uint8_t rc = transfer(from, to, amount, TransferMode::Open, 0, CES_NONCELESS,
                           outBal, /*txFee=*/0, /*rentFee=*/0, /*errFee=*/0);
-    pr.set_value(rc == CES_OK);
+    return rc == CES_OK;
   });
-  return fut.get();
 }
 
 // --- Autoexec (cron assets on boot) ---

@@ -3833,26 +3833,15 @@ size_t ComputeHandler::testFloodDeliver(uint64_t pid, size_t count) {
   // outbox depth read at the end is the exact saturation point: the cap
   // (kMaxDeliverBacklog) when the flood guard is in place, or `count` when
   // it is not. Deterministic, with no socket-buffer or timing dependence.
-  std::mutex m;
-  std::condition_variable cv;
-  bool done = false;
-  size_t depth = 0;
-  boost::asio::post(ex, [&]() {
+  return runSync(ex, [&]() -> size_t {
     auto it = instances_.find(pid);
-    if (it != instances_.end()) {
-      std::array<uint8_t, 8> sender{};
-      std::array<uint8_t, 16> payload{};
-      for (size_t i = 0; i < count; ++i)
-        sendDeliverFrame(it->second, sender, payload.data(), payload.size());
-      depth = it->second->outbox.size();
-    }
-    std::lock_guard lk(m);
-    done = true;
-    cv.notify_all();
+    if (it == instances_.end()) return 0;
+    std::array<uint8_t, 8> sender{};
+    std::array<uint8_t, 16> payload{};
+    for (size_t i = 0; i < count; ++i)
+      sendDeliverFrame(it->second, sender, payload.data(), payload.size());
+    return it->second->outbox.size();
   });
-  std::unique_lock lk(m);
-  cv.wait(lk, [&]{ return done; });
-  return depth;
 }
 
 uint16_t ComputeHandler::testInstanceClientPort(uint64_t pid) {
@@ -3860,20 +3849,10 @@ uint16_t ComputeHandler::testInstanceClientPort(uint64_t pid) {
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return 0;
-  std::mutex m;
-  std::condition_variable cv;
-  bool done = false;
-  uint16_t port = 0;
-  boost::asio::post(ex, [&]() {
+  return runSync(ex, [&]() -> uint16_t {
     auto it = instances_.find(pid);
-    if (it != instances_.end()) port = it->second->clientPort;
-    std::lock_guard lk(m);
-    done = true;
-    cv.notify_all();
+    return it == instances_.end() ? 0 : it->second->clientPort;
   });
-  std::unique_lock lk(m);
-  cv.wait(lk, [&]{ return done; });
-  return port;
 }
 
 uint16_t ComputeHandler::testInstanceRpcPort(uint64_t pid) {
@@ -3881,20 +3860,10 @@ uint16_t ComputeHandler::testInstanceRpcPort(uint64_t pid) {
   if (!server) return 0;
   auto ex = server->_rpcTaskIOExecutor();
   if (!ex) return 0;
-  std::mutex m;
-  std::condition_variable cv;
-  bool done = false;
-  uint16_t port = 0;
-  boost::asio::post(ex, [&]() {
+  return runSync(ex, [&]() -> uint16_t {
     auto it = instances_.find(pid);
-    if (it != instances_.end()) port = it->second->rpcPort;
-    std::lock_guard lk(m);
-    done = true;
-    cv.notify_all();
+    return it == instances_.end() ? 0 : it->second->rpcPort;
   });
-  std::unique_lock lk(m);
-  cv.wait(lk, [&]{ return done; });
-  return port;
 }
 
 // ---------------------------------------------------------------------------

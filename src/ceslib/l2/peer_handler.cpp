@@ -497,12 +497,7 @@ bool PeerHandler::hasLink(const minx::Hash& destKey) {
 void PeerHandler::reconcileNow() {
   auto exec = server_->_rpcTaskIOExecutor();
   if (!exec) return;
-  std::promise<void> done;
-  boost::asio::post(exec, [this, &done]() {
-    reconcileOnce();
-    done.set_value();
-  });
-  done.get_future().get();
+  runSync(exec, [this]() { reconcileOnce(); });
 }
 
 void PeerHandler::sendMessage(const minx::Hash& destKey,

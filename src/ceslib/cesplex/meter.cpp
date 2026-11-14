@@ -1,6 +1,7 @@
 // meter.cpp — implementation of ChannelMeter.
 
 #include <ces/cesplex/meter.h>
+#include <ces/util/sync_call.h>
 
 #include <minx/blog.h>
 
@@ -107,9 +108,7 @@ ChannelMeter::snapshot() const {
   // channels_, which is owned by io_'s strand — no concurrent
   // writers from outside.
   auto self = const_cast<ChannelMeter*>(this);
-  auto promise = std::make_shared<std::promise<std::vector<ChannelSnapshot>>>();
-  auto future = promise->get_future();
-  boost::asio::post(io_, [self, promise]() {
+  return runSync(io_.get_executor(), [self]() {
     std::vector<ChannelSnapshot> out;
     out.reserve(self->channels_.size());
     for (const auto& [key, mc] : self->channels_) {
@@ -126,19 +125,12 @@ ChannelMeter::snapshot() const {
       s.deltaAgeSec = mc.deltaAgeSec;
       out.push_back(std::move(s));
     }
-    promise->set_value(std::move(out));
+    return out;
   });
-  return future.get();
 }
 
 void ChannelMeter::_runTick() {
-  auto promise = std::make_shared<std::promise<void>>();
-  auto fut = promise->get_future();
-  boost::asio::post(io_, [this, promise]() {
-    doTick();
-    promise->set_value();
-  });
-  fut.get();
+  runSync(io_.get_executor(), [this]() { doTick(); });
 }
 
 void ChannelMeter::_testSetBaseline(const minx::SockAddr& peer,
@@ -146,18 +138,14 @@ void ChannelMeter::_testSetBaseline(const minx::SockAddr& peer,
                                       uint64_t lastBytesSent,
                                       uint64_t lastBytesReceived,
                                       uint64_t lastMemByteSeconds) {
-  auto promise = std::make_shared<std::promise<void>>();
-  auto fut = promise->get_future();
-  boost::asio::post(io_, [=, this]() {
+  runSync(io_.get_executor(), [=, this]() {
     auto it = channels_.find(std::make_pair(peer, channelId));
     if (it != channels_.end()) {
       it->second.lastBytesSent      = lastBytesSent;
       it->second.lastBytesReceived  = lastBytesReceived;
       it->second.lastMemByteSeconds = lastMemByteSeconds;
     }
-    promise->set_value();
   });
-  fut.get();
 }
 
 void ChannelMeter::scheduleTick() {

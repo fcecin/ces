@@ -25,6 +25,7 @@
 #include <ces/keys.h>
 #include <ces/util/account_holds.h>
 #include <ces/util/metrics.h>
+#include <ces/util/sync_call.h>
 #include <ces/cesplex/meter.h>
 #include <ces/l2/ledger_txn.h>
 #include <functional>
@@ -1381,8 +1382,9 @@ public:
 
   // The L2 verb primitive: run `fn` as one atomic logicStrand_ task with a
   // LedgerTxn over the account/asset stores (dedup + debit + credit + reads).
-  // Blocks until the task completes. The caller must not be on logicStrand_
-  // (would deadlock); a verb makes at most one of these per request.
+  // Blocks until the task completes, and throws what `fn` throws. The caller
+  // must not be on logicStrand_ (would deadlock); a verb makes at most one of
+  // these per request.
   void _l2Transact(const std::function<void(LedgerTxn&)>& fn);
 
   // Program-initiated transfer. Origin is the program's owner pubkey
@@ -2142,6 +2144,28 @@ private:
         l1cpuGauge_.record(static_cast<uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(dt).count()));
       });
+  }
+
+  // Run `f` as one logicStrand_ task and wait for it (util/sync_call.h).
+  // Returns f's result. A throw in f is logged as for any logic handler, and
+  // then reaches the caller as the same exception, so the caller never waits
+  // for ever. The caller must not be on logicStrand_ (that would deadlock).
+  template <class F>
+  auto logicSync(F&& f) {
+    auto logged = [this, &f]() -> decltype(f()) {
+      try {
+        return f();
+      } catch (const std::exception& e) {
+        onLogicHandlerThrew(e.what());
+        throw;
+      } catch (...) {
+        onLogicHandlerThrew(nullptr);
+        throw;
+      }
+    };
+    auto [task, fut] = makeSyncTask(logged);
+    postLogic(std::move(task));
+    return fut.get();
   }
 
  public:

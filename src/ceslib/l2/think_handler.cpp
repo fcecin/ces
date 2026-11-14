@@ -100,7 +100,14 @@ FileExecResp fileOp(CesServer* server, const ThinkFile& f, uint8_t verb,
   boost::asio::post(ex, [fh, req = std::move(req), pr, ex, state]() {
     int queued = 0;
     if (!state->compare_exchange_strong(queued, 1)) return;
-    fh->exec(req, [pr](FileExecResp r) { pr->set_value(std::move(r)); }, ex);
+    // A throw in the verb reaches the waiter (and the worker's catch), so
+    // the wait below never lasts for ever.
+    try {
+      fh->exec(req, [pr](FileExecResp r) { pr->set_value(std::move(r)); }, ex);
+    } catch (...) {
+      try { pr->set_exception(std::current_exception()); }
+      catch (const std::future_error&) {}   // the callback already answered
+    }
   });
   if (fut.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
     int queued = 0;
