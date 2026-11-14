@@ -27,9 +27,7 @@ BOOST_AUTO_TEST_CASE(AttachRequiresListener) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  // Let the child reach ces.client_recv (ensures it's running, not
-  // that the gate would change — gate stays OFF either way).
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -53,10 +51,7 @@ BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  // Give the child time to install set_listener (which sends the
-  // TAG_LISTEN_ON IPC frame the supervisor needs to flip
-  // acceptsConnections=true).
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -94,7 +89,7 @@ BOOST_AUTO_TEST_CASE(HelloRidesAttachReply) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -119,7 +114,7 @@ BOOST_AUTO_TEST_CASE(OnOpenFiresWithBoundPubkey) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -155,7 +150,7 @@ BOOST_AUTO_TEST_CASE(BurstyBidirectionalEcho) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -167,7 +162,7 @@ BOOST_AUTO_TEST_CASE(BurstyBidirectionalEcho) {
   // One inbound byte triggers ten outbound writes.
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
   ces::Bytes got;
-  BOOST_REQUIRE(peerReadExact(peer, got, 30, std::chrono::seconds(5)));
+  BOOST_REQUIRE(peerReadExact(peer, got, 30, kTestWaitLimit));
   std::string s(got.begin(), got.end());
   // Strict ordering: c00..c09 in sequence.
   BOOST_CHECK_EQUAL(s, "c00c01c02c03c04c05c06c07c08c09");
@@ -189,7 +184,7 @@ BOOST_AUTO_TEST_CASE(ProgramCloseTearsDownUserChannel) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -200,7 +195,7 @@ BOOST_AUTO_TEST_CASE(ProgramCloseTearsDownUserChannel) {
 
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
   ces::Bytes got;
-  BOOST_REQUIRE(peerReadExact(peer, got, 3, std::chrono::seconds(5)));
+  BOOST_REQUIRE(peerReadExact(peer, got, 3, kTestWaitLimit));
   BOOST_CHECK_EQUAL(std::string(got.begin(), got.end()), "bye");
 
   // Subsequent reads must fail — the channel is gone.
@@ -232,7 +227,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramCloseDeliversEveryQueuedWrite, SmallWindowLuaConn
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -294,7 +289,7 @@ BOOST_AUTO_TEST_CASE(OnCloseFiresOnUserClose) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   {
     PlexLuaPeer peer;
@@ -331,7 +326,7 @@ BOOST_AUTO_TEST_CASE(InstanceDyingCascadesToUser) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -372,7 +367,7 @@ BOOST_AUTO_TEST_CASE(MultipleConnsSameUser) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer p1, p2;
   BOOST_REQUIRE(p1.start() != 0);
@@ -417,7 +412,7 @@ BOOST_AUTO_TEST_CASE(MultipleConnsMultipleUsers) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   KeyPair u2;
   server->_brr(u2.getPublicKeyAsHash(), 10'000'000'000);
@@ -520,7 +515,7 @@ BOOST_AUTO_TEST_CASE(SetListenerNilFlipsGateOff) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(400));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   // First peer attaches successfully.
   PlexLuaPeer p1;

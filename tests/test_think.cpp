@@ -5,6 +5,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 
 #include <ces/account.h>
 #include <ces/client.h>
@@ -151,7 +152,8 @@ struct ThinkFixture {
     client->start(0);
     client->setKey(ownerKey);
     client->connect();
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    // _brr lands on the logic strand; wait for the fund.
+    BOOST_REQUIRE(waitUntil([&] { return balance() == fund; }));
   }
   ~ThinkFixture() {
     backend->release = true;
@@ -173,13 +175,10 @@ struct ThinkFixture {
                          bal, nonce);
     return bal;
   }
-  // The refund is posted to the logic strand, so wait for it.
+  // Wait for the balance to reach `want` (the fee_query and the settle
+  // land on the logic strand).
   bool waitBalance(int64_t want) {
-    for (int i = 0; i < 200; ++i) {
-      if (balance() == want) return true;
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    return false;
+    return waitUntil([&] { return balance() == want; });
   }
   ThinkFees fees() const { return ThinkFees{kFeeIn, kFeeCachedIn, kFeeOut}; }
 };
@@ -548,9 +547,7 @@ BOOST_AUTO_TEST_CASE(Think_StopWithCallInFlight) {
     uint64_t charged = 0;
     rc = tc.think("wait", nullptr, reply, charged);
   });
-  for (int i = 0; i < 400 && !backend->entered.load(); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  BOOST_REQUIRE(backend->entered.load());
+  BOOST_REQUIRE(waitUntil([&] { return backend->entered.load(); }));
   BOOST_CHECK_EQUAL(server->thinkHandler()->active(), 1u);
   server->thinkHandler()->stop();
   BOOST_CHECK_EQUAL(server->thinkHandler()->active(), 0u);
@@ -674,9 +671,7 @@ BOOST_AUTO_TEST_CASE(Think_ConcurrencyCap) {
     uint64_t charged = 0;
     rc1 = first.think("one", nullptr, reply, charged);
   });
-  for (int i = 0; i < 400 && !backend->entered.load(); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  BOOST_REQUIRE(backend->entered.load());
+  BOOST_REQUIRE(waitUntil([&] { return backend->entered.load(); }));
 
   CesThinkClient second;
   open(second);

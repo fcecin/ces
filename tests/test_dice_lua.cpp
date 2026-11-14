@@ -146,10 +146,15 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
   fx.uploadScript(path, readDiceSource());
   uint64_t instId = fx.launchScript(path);
   BOOST_REQUIRE(instId > 0);
-  // Wait out (a) set_listener arming the accept gate and (b) the dice's
+  // Wait for (a) set_listener arming the accept gate and (b) the dice's
   // START_S floor: a deposit whose whole-second timestamp == the instance's
-  // start second is rejected as "predates this dice instance".
-  std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+  // start second is rejected as "predates this dice instance". The instance
+  // started before its gate opened, so its start second is at most the
+  // second in which the gate is seen open; wait for the next one.
+  BOOST_REQUIRE(waitInstanceListening(*fx.server, instId));
+  const uint64_t openSec = getMicrosSinceEpoch() / 1'000'000;
+  BOOST_REQUIRE(waitUntil(
+      [&] { return getMicrosSinceEpoch() / 1'000'000 > openSec; }));
 
   BOOST_REQUIRE(peer.start() != 0);
   uint64_t st = 0;
@@ -174,7 +179,9 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
 
   drainQuiet(peer, rd);                       // no greeting streams now; clears rd
   fx.server->_brr(house, 1'000'000'000);      // bankroll for heads payouts
-  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  BOOST_REQUIRE(waitUntil([&] {               // _brr lands on the logic strand
+    return fx.server->_l2ProgramAccountBalanceSync(house) >= 1'000'000'000;
+  }));
   return house;
 }
 
@@ -241,12 +248,16 @@ BOOST_AUTO_TEST_CASE(HeadsPaysTwoNFromHouse) {
 
   bool sawHeads = false;
   const int kMaxRounds = 16;
+  uint64_t lastSec = 0;
   for (int i = 0; i < kMaxRounds && !sawHeads; ++i) {
     // Each bet must land in a NEW whole second: the ledger stamps
     // last_xfer_time in seconds, and the dice's replay guard keys on it, so
-    // two same-second deposits would collide.
-    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    // two same-second deposits would collide. The last deposit's stamp is at
+    // most the second read after it returned; wait for a later one.
+    BOOST_REQUIRE(waitUntil(
+        [&] { return getMicrosSinceEpoch() / 1'000'000 > lastSec; }));
     CES_REQUIRE_OK(ops.deposit(userPub, house, kBet));
+    lastSec = getMicrosSinceEpoch() / 1'000'000;
     BOOST_REQUIRE_EQUAL(readAvailable(peer, rd), static_cast<int64_t>(kBet));
 
     const int64_t pre = ops.balance(userPub);

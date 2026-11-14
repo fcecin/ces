@@ -18,6 +18,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"
 
 #include <ces/account.h>
@@ -261,11 +262,12 @@ BOOST_AUTO_TEST_CASE(StoreRoundTrip) {
   )LUA");
   const std::string path = "/h/" + ownerHex() + "/rt_store.lua";
   uploadScript(path, src);
-  BOOST_REQUIRE(launchScript(path) > 0);
+  const uint64_t launched = launchScript(path);
+  BOOST_REQUIRE(launched > 0);
   auto pfx = progPrefixOf(path);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, launched));
   sendAppToProgram(pfx, "go");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, kTestWaitLimit),
                         "no reply from round-trip program");
   BOOST_CHECK_EQUAL(listener->at(0), "ok");
 }
@@ -296,20 +298,20 @@ BOOST_AUTO_TEST_CASE(StorePersistsAcrossRestart) {
   // Launch #1: write the value, then kill it.
   uint64_t inst1 = launchScript(path);
   BOOST_REQUIRE(inst1 > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, inst1));
   sendAppToProgram(pfx, "put");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, kTestWaitLimit),
                         "no reply from writer instance");
   BOOST_CHECK_EQUAL(listener->at(0), "put_ok");
   killInstance(inst1);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceGone(*server, inst1));
 
   // Launch #2 (fresh child, same source): read the value back.
   uint64_t inst2 = launchScript(path);
   BOOST_REQUIRE(inst2 > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, inst2));
   sendAppToProgram(pfx, "get");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(2, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(2, kTestWaitLimit),
                         "no reply from reader instance");
   BOOST_CHECK_EQUAL(listener->at(1), "got:hello-kv");
 }
@@ -343,11 +345,12 @@ BOOST_AUTO_TEST_CASE(GetDistinguishesAbsentFromError) {
   )LUA");
   const std::string path = "/h/" + ownerHex() + "/err_store.lua";
   uploadScript(path, src);
-  BOOST_REQUIRE(launchScript(path) > 0);
+  const uint64_t launched = launchScript(path);
+  BOOST_REQUIRE(launched > 0);
   auto pfx = progPrefixOf(path);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, launched));
   sendAppToProgram(pfx, "go");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, kTestWaitLimit),
                         "no reply from errprop program");
   BOOST_CHECK_EQUAL(listener->at(0), "errprop_ok");
 }
@@ -377,11 +380,12 @@ BOOST_AUTO_TEST_CASE(PutDepositBalances) {
   )LUA");
   const std::string path = "/h/" + ownerHex() + "/fund_store.lua";
   uploadScript(path, src);
-  BOOST_REQUIRE(launchScript(path) > 0);
+  const uint64_t launched = launchScript(path);
+  BOOST_REQUIRE(launched > 0);
   auto pfx = progPrefixOf(path);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, launched));
   sendAppToProgram(pfx, "go");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, kTestWaitLimit),
                         "no reply from fund program");
   BOOST_CHECK_EQUAL(listener->at(0), "fund_ok");
 }
@@ -410,11 +414,12 @@ BOOST_AUTO_TEST_CASE(RangeFromLua) {
   )LUA");
   const std::string path = "/h/" + ownerHex() + "/range_store.lua";
   uploadScript(path, src);
-  BOOST_REQUIRE(launchScript(path) > 0);
+  const uint64_t launched = launchScript(path);
+  BOOST_REQUIRE(launched > 0);
   auto pfx = progPrefixOf(path);
-  std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  BOOST_REQUIRE(waitInstanceConnected(*server, launched));
   sendAppToProgram(pfx, "go");
-  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, std::chrono::seconds(5)),
+  BOOST_REQUIRE_MESSAGE(listener->wait_for(1, kTestWaitLimit),
                         "no reply from range program");
   BOOST_CHECK_EQUAL(listener->at(0), "range_ok");
 }

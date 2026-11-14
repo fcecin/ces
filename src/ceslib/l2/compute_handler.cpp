@@ -3855,6 +3855,17 @@ uint16_t ComputeHandler::testInstanceClientPort(uint64_t pid) {
   });
 }
 
+bool ComputeHandler::testInstanceConnected(uint64_t pid) {
+  CesServer* server = server_;
+  if (!server) return false;
+  auto ex = server->_rpcTaskIOExecutor();
+  if (!ex) return false;
+  return runSync(ex, [&]() {
+    auto it = instances_.find(pid);
+    return it != instances_.end() && it->second->peer != nullptr;
+  });
+}
+
 uint16_t ComputeHandler::testInstanceRpcPort(uint64_t pid) {
   CesServer* server = server_;
   if (!server) return 0;

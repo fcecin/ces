@@ -16,6 +16,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"
 
 #include <ces/l2/compute_client.h>
@@ -256,17 +257,12 @@ BOOST_AUTO_TEST_CASE(HelloWorldEcho) {
 
   auto pfx = progPrefixOf(path);
 
-  // Give cesluajitd a moment to finish luaL_openlibs + run to the
-  // ces.client_recv() entry before we fire the message. In
-  // practice the child is ready within a few ms of LAUNCH return,
-  // but the send-before-recv race would make this test flakey
-  // without a brief settle.
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   sendAppToProgram(pfx, "World");
 
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
 
   std::pair<uint8_t, minx::Bytes> got;
@@ -341,13 +337,12 @@ BOOST_AUTO_TEST_CASE(FileApiRoundTrip) {
 
   auto pfx = progPrefixOf(scriptPath);
 
-  // Give the child time to reach ces.client_recv.
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   sendAppToProgram(pfx, "World");
 
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
 
   std::pair<uint8_t, minx::Bytes> got;
@@ -407,7 +402,7 @@ BOOST_AUTO_TEST_CASE(FileApiFeesDrainSource) {
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
   auto pfx = progPrefixOf(scriptPath);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   auto readSourceBalance = [&]() -> uint64_t {
     std::array<uint8_t, 32> ownerPk;
@@ -421,7 +416,7 @@ BOOST_AUTO_TEST_CASE(FileApiFeesDrainSource) {
   sendAppToProgram(pfx, "x");
 
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
 
   // Give the handler's delete-refund credit a moment to settle onto
@@ -500,8 +495,8 @@ BOOST_AUTO_TEST_CASE(CpuAndRssReportedForBusyLuaProgram) {
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
 
-  // Let the Lua program get to its busy loop + allocation.
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  // The busy loop starts as soon as the child runs the program.
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
   // First tick: baseline sample (sets lastCpuTicks / lastSampleUs).
   server->computeHandler()->testForceTick();
   // Give the child measurable CPU between samples, then sample again.
@@ -551,8 +546,8 @@ BOOST_AUTO_TEST_CASE(MemoryBombIsContainedByRlimit) {
   BOOST_REQUIRE(bombId > 0);   // launch ok: child connects before running Lua
 
   // The child runs the Lua, the 1 GB alloc is denied, it exits; the IPC
-  // EOF path reaps the instance. Give it a beat.
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  // EOF path reaps the instance.
+  BOOST_REQUIRE(waitInstanceGone(*server, bombId));
 
   CesComputeClient cc;
   cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
@@ -601,13 +596,14 @@ BOOST_AUTO_TEST_CASE(SandboxStripsDangerousGlobals) {
     "if type(table.insert) ~= 'function' then error('missing table') end\n"
     "if type(math.floor) ~= 'function' then error('missing math') end\n"
     "if type(bit.band) ~= 'function' then error('missing bit') end\n"
+    "ces.conn.set_listener({})\n"   // the checks passed: the test sees this
     "while true do ces.client_recv() end\n");
   uint64_t instId = launchScript(path);
   BOOST_REQUIRE(instId > 0);
 
-  // If any global leaked, the top-level error kills the child at once;
-  // give it a beat, then confirm the instance is still alive (= clean).
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // If any global leaked, the top-level error kills the child before it
+  // opens its listener. An open listener proves the checks passed.
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   CesComputeClient cc;
   cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
@@ -636,8 +632,8 @@ BOOST_AUTO_TEST_CASE(RefusesBytecodeProgram) {
   BOOST_REQUIRE(instId > 0);   // launch ok: child connects before it loads
 
   // The child reads the bootstrap, sees the bytecode marker, refuses, and
-  // exits; the supervisor reaps it. Give it a beat.
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  // exits; the supervisor reaps it.
+  BOOST_REQUIRE(waitInstanceGone(*server, instId));
 
   CesComputeClient cc;
   cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
@@ -663,7 +659,7 @@ BOOST_AUTO_TEST_CASE(DeliverFloodIsBounded) {
   uploadScript(path, "while true do ces.client_recv() end\n");
   uint64_t instId = launchScript(path);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(150));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   // Push 5000 deliver frames at it on the strand, measured at peak (before
   // anything drains). Without the cap the outbox would hold all 5000 (and
@@ -748,13 +744,13 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetCreate) {
   BOOST_REQUIRE(instId > 0);
 
   auto pfx = progPrefixOf(scriptPath);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   const std::string payload = "loot:gold-coin:50";
   sendAppToProgram(pfx, payload);
 
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
   std::pair<uint8_t, minx::Bytes> got;
   {
@@ -888,11 +884,11 @@ BOOST_AUTO_TEST_CASE(AuthenticAssetHashStableAcrossMints) {
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
   sendAppToProgram(progPrefixOf(scriptPath), "go");
 
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
   {
     std::lock_guard lk(listener->m);
@@ -957,11 +953,11 @@ BOOST_FIXTURE_TEST_CASE(FileApiExecMutatorsRoundTrip, LuaComputeFixture) {
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
   auto pfx = progPrefixOf(scriptPath);
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   sendAppToProgram(pfx, "go");
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
 
   std::pair<uint8_t, minx::Bytes> got;
@@ -1004,11 +1000,11 @@ BOOST_FIXTURE_TEST_CASE(ExecTargetInsufficientKeepsSource, LuaComputeFixture) {
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
   auto pfx = progPrefixOf(scriptPath);
-  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_REQUIRE(waitInstanceConnected(*server, instId));
 
   sendAppToProgram(pfx, "go");
   BOOST_REQUIRE_MESSAGE(
-    listener->wait_for(1, std::chrono::seconds(5)),
+    listener->wait_for(1, kTestWaitLimit),
     "timed out waiting for program to reply");
 
   std::pair<uint8_t, minx::Bytes> got;

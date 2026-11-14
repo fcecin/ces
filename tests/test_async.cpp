@@ -19,6 +19,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"
 #include "test_lua_conn_common.h"  // PlexLuaPeer + LuaConnFixture (relay conn harness)
 
@@ -217,12 +218,13 @@ struct AsyncFixture {
   // the single reply payload the program sends back via ces.client_send.
   std::string runAndCollect(const std::string& tag, const std::string& source,
                             std::chrono::milliseconds timeout =
-                              std::chrono::seconds(5)) {
+                              kTestWaitLimit) {
     std::string path = "/h/" + ownerHex() + "/" + tag + ".lua";
     uploadScript(path, source);
-    BOOST_REQUIRE(launchScript(path) > 0);
+    const uint64_t launched = launchScript(path);
+    BOOST_REQUIRE(launched > 0);
     auto pfx = progPrefixOf(path);
-    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    BOOST_REQUIRE(waitInstanceConnected(*server, launched));
     sendAppToProgram(pfx, "go");
     BOOST_REQUIRE_MESSAGE(listener->wait_for(1, timeout),
                           "timed out waiting for program reply (" + tag + ")");
@@ -370,7 +372,7 @@ BOOST_AUTO_TEST_CASE(OnDataIsAYieldingCoroutine) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -382,7 +384,7 @@ BOOST_AUTO_TEST_CASE(OnDataIsAYieldingCoroutine) {
   ces::Bytes ping{'x'};
   BOOST_REQUIRE(peerWrite(peer, ping));
   ces::Bytes got;
-  BOOST_REQUIRE(peerReadExact(peer, got, 4, std::chrono::seconds(5)));
+  BOOST_REQUIRE(peerReadExact(peer, got, 4, kTestWaitLimit));
   BOOST_CHECK_EQUAL(std::string(got.begin(), got.end()), "ok:0");
   peer.closeStream();
 }
@@ -392,25 +394,25 @@ BOOST_AUTO_TEST_CASE(OnDataIsAYieldingCoroutine) {
 //     so on the old host-thread dispatch it would error every tick and the body
 //     would never get past it;
 //   * an inbound on_data answering WHILE the tick is parked proves the timer no
-//     longer freezes the VM (the whole point of Item 1);
+//     longer freezes the VM;
 //   * `entered` staying at 1 across the many re-fires that come due during one
 //     long park proves skip-if-busy (a long tick never laps itself).
-// The program replies [entered][exited] as two ascii digits to each conn write.
-// The park is deliberately long (seconds) so probe 1 lands inside the first park
-// regardless of how long the attach handshake takes under load; the property under
-// test is order-of-events, not wall-clock, so a generous margin removes the race.
+// The first tick parks until probe 'b' releases it, so each probe sees a known
+// state however slow the machine is. The program replies [entered][exited] as
+// two ascii digits to each conn write.
 BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   const std::string scriptPath =
     "/h/" + ownerKey.getPublicKeyHexStr() + "/h_timer.lua";
   const std::string src =
-    "local entered, exited = 0, 0\n"
+    "local entered, exited, released = 0, 0, false\n"
     "ces.every(20, function()\n"
     "  entered = entered + 1\n"
-    "  ces.sleep(1200)\n"           // long park; the 20ms re-fires must be skipped
+    "  while not released do ces.sleep(10) end\n"   // park until probe 'b'
     "  exited = exited + 1\n"
     "end)\n"
     "ces.conn.set_listener({\n"
     "  on_data = function(conn, data)\n"
+    "    if data == 'b' then released = true end\n"
     "    local e = entered > 9 and 9 or entered\n"
     "    local x = exited  > 9 and 9 or exited\n"
     "    conn:write(tostring(e) .. tostring(x))\n"
@@ -420,7 +422,7 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   uploadScript(scriptPath, src);
   uint64_t instId = launchScript(scriptPath);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
@@ -429,27 +431,31 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
   auto r = peer.attach(userKey, sessionToken, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
-  // Probe 1, during the first tick's 1200ms park: on_data answers (VM not
-  // frozen), exactly one tick has started (skip-if-busy), none has finished.
-  ces::Bytes p1{'a'};
-  BOOST_REQUIRE(peerWrite(peer, p1));
-  ces::Bytes g1;
-  BOOST_REQUIRE(peerReadExact(peer, g1, 2, std::chrono::seconds(5)));
-  BOOST_CHECK_EQUAL(std::string(g1.begin(), g1.end()), "10");
+  auto probe = [&](char c) {
+    BOOST_REQUIRE(peerWrite(peer, ces::Bytes{static_cast<uint8_t>(c)}));
+    ces::Bytes g;
+    BOOST_REQUIRE(peerReadExact(peer, g, 2, kTestWaitLimit));
+    return std::string(g.begin(), g.end());
+  };
 
-  // Wait past the full 1200ms park (the tick was already in flight at probe 1,
-  // so 1500ms guarantees it resumed past ces.sleep and a later tick has begun).
-  std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+  // Wait for the first tick to start. While it parks, on_data still answers
+  // (the VM is not frozen), and however many re-fires come due, exactly one
+  // tick has started (skip-if-busy) and none has finished.
+  std::string st;
+  BOOST_REQUIRE(waitUntil([&] { st = probe('a'); return st != "00"; }));
+  BOOST_CHECK_EQUAL(st, "10");
+  for (int i = 0; i < 5; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    BOOST_CHECK_EQUAL(probe('a'), "10");
+  }
 
-  // Probe 2: exited incremented -> the body resumed past ces.sleep (a real
-  // coroutine); entered advanced -> the timer kept ticking after the long one.
-  ces::Bytes p2{'b'};
-  BOOST_REQUIRE(peerWrite(peer, p2));
-  ces::Bytes g2;
-  BOOST_REQUIRE(peerReadExact(peer, g2, 2, std::chrono::seconds(5)));
-  BOOST_CHECK_MESSAGE(g2.size() == 2 && g2[0] >= '2' && g2[1] >= '1',
-                      "probe2 expected entered>=2,exited>=1 got '"
-                        + std::string(g2.begin(), g2.end()) + "'");
+  // Release the tick. It resumes past ces.sleep (a real coroutine) and the
+  // timer keeps ticking after it.
+  probe('b');
+  BOOST_CHECK(waitUntil([&] {
+    st = probe('c');
+    return st[0] >= '2' && st[1] >= '1';
+  }));
   peer.closeStream();
 }
 

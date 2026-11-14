@@ -225,6 +225,10 @@ public:
   std::size_t testFloodDeliver(uint64_t pid, std::size_t count);
   uint16_t testInstanceClientPort(uint64_t pid);
   uint16_t testInstanceRpcPort(uint64_t pid);
+  // True once the child of `pid` has connected its IPC socket. A deliver
+  // sent before then is dropped (the lane is lossy), so a test waits for
+  // this instead of sleeping for a guessed time. Any thread.
+  bool testInstanceConnected(uint64_t pid);
 
   // Count of child instances that terminated by a signal (a crash, e.g. SIGSEGV
   // on a bad shutdown). Surfaced in the supervisor WARNING; lets a test assert

@@ -8,6 +8,7 @@
 // not help a poor program) and by the owner's balance not moving.
 
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"   // ces::e2e::findBinary
 
 #include <ces/account.h>
@@ -139,7 +140,11 @@ struct ThinkLuaFixture {
     client->start(0);
     client->setKey(ownerKey);
     client->connect();
-    wait_net();
+    // _brr lands on the logic strand; wait for the funds.
+    BOOST_REQUIRE(waitUntil([&] {
+      return balanceOf(ownerKey.getPublicKeyAsHash()) > 0 &&
+             balanceOf(beacon.getPublicKeyAsHash()) == 1;
+    }));
   }
 
   ~ThinkLuaFixture() {
@@ -184,21 +189,18 @@ struct ThinkLuaFixture {
     return bal;
   }
 
-  // Wait for the beacon to leave 1; return the code the program sent.
-  int64_t beaconCode(const KeyPair& b, int tries = 300) {
+  // Wait for the beacon to leave 1; return the code the program sent (0 =
+  // none within the limit).
+  int64_t beaconCode(const KeyPair& b,
+                     std::chrono::steady_clock::duration limit = kTestWaitLimit) {
     const auto pk = b.getPublicKeyAsHash();
     int64_t bal = 1;
-    for (int i = 0; i < tries && bal == 1; i++) {
-      bal = balanceOf(pk);
-      if (bal == 1) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
+    waitUntil([&] { bal = balanceOf(pk); return bal != 1; }, limit);
     return bal - 1;
   }
   int64_t beaconCode() { return beaconCode(beacon); }
   bool waitEntered() {
-    for (int i = 0; i < 400 && !backend->entered.load(); ++i)
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    return backend->entered.load();
+    return waitUntil([&] { return backend->entered.load(); });
   }
   bool fileExists(const std::string& p) {
     std::array<uint8_t, 32> pk{};
@@ -416,10 +418,10 @@ BOOST_FIXTURE_TEST_CASE(HostThink_RefundGoesToOwnerWhenSourceIsGone,
   backend->release = true;
   // The hold (about 8e9) less the small charge comes back to the owner.
   int64_t now = afterDelete;
-  for (int i = 0; i < 200 && now < afterDelete + 7'000'000'000; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  waitUntil([&] {
     now = balanceOf(ownerPk);
-  }
+    return now >= afterDelete + 7'000'000'000;
+  });
   BOOST_CHECK_GE(now, afterDelete + 7'000'000'000);
 }
 
@@ -429,7 +431,8 @@ BOOST_FIXTURE_TEST_CASE(HostThink_CorrIdWrapKeepsTheCall, ThinkLuaFixture) {
   backend->block = true;
   KeyPair loopBeacon;
   server->_brr(loopBeacon.getPublicKeyAsHash(), 1);
-  wait_net();
+  BOOST_REQUIRE(waitUntil(
+      [&] { return balanceOf(loopBeacon.getPublicKeyAsHash()) == 1; }));
   const std::string src = B() + B2(loopBeacon) +
     "ces.spawn(function()\n"
     "  local r = ces.think('hi')\n"
@@ -445,7 +448,8 @@ BOOST_FIXTURE_TEST_CASE(HostThink_CorrIdWrapKeepsTheCall, ThinkLuaFixture) {
   deploy(p, src);
   launch(p);
   BOOST_REQUIRE(waitEntered());
-  BOOST_REQUIRE_EQUAL(beaconCode(loopBeacon, 2400), 5);
+  // 66000 host calls: allow a slow machine plenty of time.
+  BOOST_REQUIRE_EQUAL(beaconCode(loopBeacon, std::chrono::minutes(5)), 5);
   backend->release = true;
   BOOST_CHECK_EQUAL(beaconCode(), 77);
 }

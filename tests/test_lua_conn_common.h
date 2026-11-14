@@ -32,6 +32,7 @@
 
 #include "test_common.h"
 #include "test_e2e_common.h"
+#include "test_compute_wait.h"
 
 #include <ces/l2/compute_client.h>
 #include <ces/buffer.h>

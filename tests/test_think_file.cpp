@@ -6,6 +6,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 
 #include <ces/keys.h>
 #include <ces/server.h>
@@ -100,7 +101,11 @@ struct ThinkFileFixture {
     server->thinkHandler()->_testSetBackend(backend);
     server->_brr(owner.getPublicKeyAsHash(), 10'000'000'000);
     server->_brr(other.getPublicKeyAsHash(), 10'000'000'000);
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // _brr lands on the logic strand; wait for both funds.
+    BOOST_REQUIRE(waitUntil([&] {
+      return server->_l2ProgramAccountBalanceSync(owner.getPublicKeyAsHash()) > 0 &&
+             server->_l2ProgramAccountBalanceSync(other.getPublicKeyAsHash()) > 0;
+    }));
   }
   ~ThinkFileFixture() {
     backend->release = true;
@@ -234,9 +239,7 @@ BOOST_AUTO_TEST_CASE(SameFile_OneCallAtATime) {
     uint8_t appendError = 0xFF;
     rc1 = think(owner, "one", chat(), reply, appendError);
   });
-  for (int i = 0; i < 400 && !backend->entered.load(); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  BOOST_REQUIRE(backend->entered.load());
+  BOOST_REQUIRE(waitUntil([&] { return backend->entered.load(); }));
   std::string reply;
   uint8_t appendError = 0xFF;
   BOOST_CHECK_EQUAL(think(owner, "two", chat(), reply, appendError),
@@ -259,9 +262,7 @@ BOOST_AUTO_TEST_CASE(NotOwner_DoesNotLockTheFile) {
     uint8_t appendError = 0xFF;
     rcOther = think(other, "peek", chat(), reply, appendError);
   });
-  for (int i = 0; i < 400 && !backend->entered.load(); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
-  BOOST_REQUIRE(backend->entered.load());
+  BOOST_REQUIRE(waitUntil([&] { return backend->entered.load(); }));
   std::string reply;
   uint8_t appendError = 0xFF;
   BOOST_CHECK_EQUAL(think(owner, "mine", chat(), reply, appendError), CES_OK);
