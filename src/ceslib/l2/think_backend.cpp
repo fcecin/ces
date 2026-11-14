@@ -69,7 +69,7 @@ bool ThinkSseParser::feed(std::string_view bytes,
     return false;
   // Events end at a blank line. Accept LF and CRLF line ends.
   for (;;) {
-    if (done_ || stopped_) { buf_.clear(); return true; }
+    if (done_) { buf_.clear(); return true; }
     size_t end = std::string::npos, skip = 0;
     size_t lf = buf_.find("\n\n");
     size_t crlf = buf_.find("\r\n\r\n");
@@ -134,14 +134,17 @@ bool ThinkSseParser::event(std::string_view data,
     if (!ch.is_object()) continue;
     auto d = ch.as_object().find("delta");
     if (d == ch.as_object().end() || !d->value().is_object()) continue;
-    auto t = d->value().as_object().find("content");
-    if (t == d->value().as_object().end() || !t->value().is_string()) continue;
+    const json::object& delta = d->value().as_object();
+    auto r = delta.find("reasoning_content");
+    if (r != delta.end() && r->value().is_string())
+      reasoningBytes_ += r->value().as_string().size();
+    auto t = delta.find("content");
+    if (t == delta.end() || !t->value().is_string()) continue;
     const json::string& s = t->value().as_string();
     if (s.empty()) continue;
-    if (!onText(std::string_view(s.data(), s.size()))) {
-      stopped_ = true;
-      return true;
-    }
+    textBytes_ += s.size();
+    if (stopped_) continue;   // the reader left; count, do not forward
+    if (!onText(std::string_view(s.data(), s.size()))) stopped_ = true;
   }
   return true;
 }

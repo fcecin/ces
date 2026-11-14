@@ -46,14 +46,22 @@ std::string luaBytes(const uint8_t* p, size_t n) {
 }
 
 // Replies "Hello, world." in three pieces with fixed usage, or fails after
-// the pieces with `status`.
+// the pieces with `status`. With `block` it waits for `release` (or stop)
+// before the first piece.
 struct LuaScriptBackend : ThinkBackend {
   uint8_t status = CES_OK;
   std::atomic<int> calls{0};
-  ThinkOutcome run(const std::string&, uint32_t, const std::atomic<bool>&,
+  std::atomic<bool> block{false};
+  std::atomic<bool> release{false};
+  std::atomic<bool> entered{false};
+  ThinkOutcome run(const std::string&, uint32_t,
+                   const std::atomic<bool>& stop,
                    const std::function<bool(std::string_view)>& onText)
       override {
     ++calls;
+    entered = true;
+    while (block.load() && !release.load() && !stop.load())
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
     ThinkOutcome o;
     for (const char* p : {"Hel", "lo, ", "world."}) {
       if (!onText(p)) {
@@ -135,6 +143,7 @@ struct ThinkLuaFixture {
   }
 
   ~ThinkLuaFixture() {
+    backend->release = true;
     if (client) client->stop();
     if (server) server->stop();
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
@@ -176,14 +185,24 @@ struct ThinkLuaFixture {
   }
 
   // Wait for the beacon to leave 1; return the code the program sent.
-  int64_t beaconCode() {
-    const auto pk = beacon.getPublicKeyAsHash();
+  int64_t beaconCode(const KeyPair& b, int tries = 300) {
+    const auto pk = b.getPublicKeyAsHash();
     int64_t bal = 1;
-    for (int i = 0; i < 300 && bal == 1; i++) {
+    for (int i = 0; i < tries && bal == 1; i++) {
       bal = balanceOf(pk);
       if (bal == 1) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
     return bal - 1;
+  }
+  int64_t beaconCode() { return beaconCode(beacon); }
+  bool waitEntered() {
+    for (int i = 0; i < 400 && !backend->entered.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    return backend->entered.load();
+  }
+  bool fileExists(const std::string& p) {
+    std::array<uint8_t, 32> pk{};
+    return server->fileHandler()->readProgramPubkey(p, pk);
   }
 
   std::string getFile(const std::string& p) {
@@ -205,6 +224,10 @@ struct ThinkLuaFixture {
   }
   std::string B() {
     return "local B = '" + luaBytes(beacon.getPublicKeyAsHash().data(), 32) +
+           "'\n";
+  }
+  std::string B2(const KeyPair& b) {
+    return "local B2 = '" + luaBytes(b.getPublicKeyAsHash().data(), 32) +
            "'\n";
   }
 };
@@ -343,6 +366,103 @@ BOOST_FIXTURE_TEST_CASE(ThinkClient_FromCoroutine, ThinkLuaFixture) {
   const int64_t ownerAfterLaunch = balanceOf(ownerKey.getPublicKeyAsHash());
   BOOST_CHECK_EQUAL(beaconCode(), 77);
   BOOST_CHECK_EQUAL(balanceOf(ownerKey.getPublicKeyAsHash()), ownerAfterLaunch);
+}
+
+// A charge that falls due during a ces.think call, and that the account can
+// pay only with the credits on hold, does not delete the file. The hold is
+// about 8e9 of a 9e9 deposit, so the free balance is about 1e9.
+BOOST_FIXTURE_TEST_CASE(HostThink_HoldDoesNotExhaustTheFile,
+                        ThinkLuaBigHoldFixture) {
+  backend->block = true;
+  const std::string p = path("t9.lua");
+  const std::string src = B() +
+    "ces.spawn(function()\n"
+    "  local r = ces.think('hi')\n"
+    "  if r == 'Hello, world.' then ces.transfer(B, 77)\n"
+    "  else ces.transfer(B, 2) end\n"
+    "end)\n"
+    "ces.run()\n";
+  deploy(p, src, 9'000'000'000);
+  launch(p);
+  BOOST_REQUIRE(waitEntered());
+  BOOST_CHECK(!server->fileHandler()->debitBalance(p, 2'000'000'000));
+  BOOST_CHECK(fileExists(p));
+  backend->release = true;
+  BOOST_CHECK_EQUAL(beaconCode(), 77);
+  BOOST_CHECK(fileExists(p));
+}
+
+// When the owner deletes the source file during a ces.think call, the
+// refund of the hold goes to the owner, as the file's balance did.
+BOOST_FIXTURE_TEST_CASE(HostThink_RefundGoesToOwnerWhenSourceIsGone,
+                        ThinkLuaBigHoldFixture) {
+  backend->block = true;
+  const std::string p = path("t10.lua");
+  const std::string src = B() +
+    "ces.spawn(function() ces.think('hi') end)\n"
+    "ces.run()\n";
+  deploy(p, src, 9'000'000'000);
+  launch(p);
+  BOOST_REQUIRE(waitEntered());
+  const auto ownerPk = ownerKey.getPublicKeyAsHash();
+  uint64_t refunded = 0;
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, ownerKey));
+    CES_REQUIRE_OK(fc.deleteFile(p, refunded));
+  }
+  const int64_t afterDelete = balanceOf(ownerPk);
+  backend->release = true;
+  // The hold (about 8e9) less the small charge comes back to the owner.
+  int64_t now = afterDelete;
+  for (int i = 0; i < 200 && now < afterDelete + 7'000'000'000; ++i) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    now = balanceOf(ownerPk);
+  }
+  BOOST_CHECK_GE(now, afterDelete + 7'000'000'000);
+}
+
+// More than 65535 host calls while one ces.think call waits: the call id
+// counter wraps, but it never takes the id of a call in flight.
+BOOST_FIXTURE_TEST_CASE(HostThink_CorrIdWrapKeepsTheCall, ThinkLuaFixture) {
+  backend->block = true;
+  KeyPair loopBeacon;
+  server->_brr(loopBeacon.getPublicKeyAsHash(), 1);
+  wait_net();
+  const std::string src = B() + B2(loopBeacon) +
+    "ces.spawn(function()\n"
+    "  local r = ces.think('hi')\n"
+    "  if r == 'Hello, world.' then ces.transfer(B, 77)\n"
+    "  else ces.transfer(B, 2) end\n"
+    "end)\n"
+    "ces.spawn(function()\n"
+    "  for i = 1, 66000 do ces.random_bytes(1) end\n"
+    "  ces.transfer(B2, 5)\n"
+    "end)\n"
+    "ces.run()\n";
+  const std::string p = path("t11.lua");
+  deploy(p, src);
+  launch(p);
+  BOOST_REQUIRE(waitEntered());
+  BOOST_REQUIRE_EQUAL(beaconCode(loopBeacon, 2400), 5);
+  backend->release = true;
+  BOOST_CHECK_EQUAL(beaconCode(), 77);
+}
+
+// A prompt too large for one IPC frame is refused in the child, and the
+// program keeps running.
+BOOST_FIXTURE_TEST_CASE(HostThink_PromptOverFrameCapRefused,
+                        ThinkLuaFixture) {
+  const std::string src = B() +
+    "local r, err = ces.think(string.rep('x', 3 * 1024 * 1024))\n"
+    "if r == nil and type(err) == 'string' then ces.transfer(B, 77)\n"
+    "else ces.transfer(B, 2) end\n";
+  const std::string p = path("t12.lua");
+  deploy(p, src);
+  launch(p);
+  BOOST_CHECK_EQUAL(beaconCode(), 77);
+  BOOST_CHECK_EQUAL(backend->calls.load(), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

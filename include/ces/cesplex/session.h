@@ -103,13 +103,17 @@ struct CesPlexRequest : std::enable_shared_from_this<CesPlexRequest> {
 };
 
 // A streamed reply for one op. The reply wire is
-//     ([u32 BE len][len bytes])* [u32 0] <signed response>
-// Each frame has len > 0. The [u32 0] terminator ends the frames, and the
-// usual server-signed response follows it. A handler opens one per op, calls
+//     ([u32 BE len][len bytes] | [u32 0xFFFFFFFF])* [u32 0] <signed response>
+// Each frame has len > 0. A bare 0xFFFFFFFF is a keepalive with no bytes
+// (see keepAlive): the reader skips it. The [u32 0] terminator ends the
+// frames, and the usual server-signed response follows it. A handler opens one per op, calls
 // write() for each piece of the reply as it has it, then calls finish() once.
 // write() and finish() are safe from any thread. All stream writes run on the
 // stream's executor, in call order. The client reads it with
 // CesPlexChannel::driveStreamVerb.
+// The [u32] length word of a keepalive in a streamed reply.
+inline constexpr uint32_t kCesPlexKeepAlive = 0xFFFFFFFFu;
+
 class CesPlexReplyStream
     : public std::enable_shared_from_this<CesPlexReplyStream> {
 public:
@@ -124,6 +128,11 @@ public:
   void finishAndClose(uint8_t status, ces::Bytes preamble = {});
   // True when a stream write failed (the client is gone).
   bool dead() const { return dead_.load(); }
+  // Send a keepalive whenever the stream has been quiet for `every`, until
+  // finish. A channel with no traffic is dropped when it is idle for the
+  // RUDP inactivity time (60 s on a default client), and a producer can be
+  // silent longer than that. Call once.
+  void keepAlive(std::chrono::milliseconds every);
 
 private:
   struct Item {
@@ -135,12 +144,17 @@ private:
   };
   void enqueue(Item it);
   void pump();             // stream executor only
+  void armKeepAlive();     // stream executor only
 
   std::shared_ptr<CesPlexRequest> req_;
   std::deque<Item> queue_; // stream executor only
   bool writing_ = false;   // stream executor only
   bool finished_ = false;  // stream executor only
   std::atomic<bool> dead_{false};
+  std::chrono::milliseconds keepAliveEvery_{0};
+  std::chrono::steady_clock::time_point lastWrite_{};  // stream executor only
+  std::shared_ptr<void> keepAliveTimer_;               // a steady_timer
+
 };
 
 // Begin the signed-request loop on `stream`. Call from serve(); loops
@@ -215,15 +229,18 @@ public:
   // Drive one verb that has a streamed reply (see CesPlexReplyStream). Write
   // [verb][envelope][extraBodyToSend?], call onFrame for each reply frame in
   // order, then read the status, the fixed preamble on OK, and the signed
-  // trailer. `frameTimeout` bounds each wait for a frame, so a slow producer
-  // can take longer than the usual verb timeout. Returns the status byte, or
-  // CES_ERROR_INTERNAL on a wire failure.
+  // trailer. Keepalives are skipped. `frameTimeout` bounds each wait for a
+  // frame or a keepalive, so a slow producer can take longer than the usual
+  // verb timeout. `totalTimeout` bounds the whole reply. When onFrame
+  // returns false the verb ends with CES_ERROR_INTERNAL and the channel is
+  // reset. Returns the status byte, or CES_ERROR_INTERNAL on a wire failure.
   uint8_t driveStreamVerb(
       uint8_t verb,
       const minx::Bytes& envelope,
       const ces::Bytes& extraBodyToSend,
-      const std::function<void(const ces::Bytes& frame)>& onFrame,
+      const std::function<bool(const ces::Bytes& frame)>& onFrame,
       std::chrono::steady_clock::duration frameTimeout,
+      std::chrono::steady_clock::duration totalTimeout,
       size_t respFixedPreambleLen,
       ces::Bytes& outPreamble);
 

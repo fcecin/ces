@@ -631,8 +631,8 @@ int lua_ces_client_recv(lua_State* L) {
   if (nowait) return 0;
 
   // Blocking path: read frames until a deliver arrives (or socket
-  // dies). Replies we don't expect get buffered; non-deliver frames
-  // (which shouldn't happen) get dropped.
+  // dies). Every other frame goes to its queue (a reply, a ces.think
+  // piece, a conn event), so nothing is lost while the program waits.
   for (;;) {
     Frame f;
     if (!read_frame(f)) return 0; // socket dead
@@ -640,11 +640,7 @@ int lua_ces_client_recv(lua_State* L) {
       g_inbox.push_back(std::move(f));
       return pop_if_available();
     }
-    if (f.tag == TAG_API_REPLY) {
-      route_to_queue(std::move(f));   // diverts a parked coroutine's reply to g_io_ready
-      continue;
-    }
-    // Anything else: ignore and keep waiting.
+    route_to_queue(std::move(f));
   }
 }
 

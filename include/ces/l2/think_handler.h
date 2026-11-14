@@ -32,12 +32,16 @@
 // with use it heats back to the full price. It applies to the hold and the charge alike. Its total over any
 // window T is at most budget + T * budget / tau.
 //
-// Billing: before the call the server burns a hold from the signer, the
+// Billing: each THINK pays fee_query, with replay dedup, as other signed
+// verbs do. Before the call the server burns a hold from the payer, the
 // most the call can cost (every prompt byte as one token, plus the max
-// output tokens). When the call ends it charges the cost of the token usage
-// that the backend reported and gives the rest of the hold back. A call
-// that fails before the backend does work costs nothing. A call that ends
-// with no usage report is charged an estimate from the text sizes.
+// output tokens). While the call runs the hold is listed in
+// CesServer::accountHolds, so the file store does not take a program file
+// for exhaustion that the hold can cover. When the call ends the server
+// charges the cost of the token usage that the backend reported and gives
+// the rest of the hold back. A call that fails before the backend does work
+// costs nothing. A call that ends with no usage report is charged an
+// estimate from the text sizes.
 
 #pragma once
 
@@ -77,10 +81,15 @@ uint64_t thinkCost(const ThinkFees& fees, const ThinkUsage& usage);
 // uncached token and the reply used all `maxOut` tokens.
 uint64_t thinkHold(const ThinkFees& fees, uint64_t promptBytes,
                    uint32_t maxOut);
-// The charge for a call with no usage report: about three bytes per token
-// for the prompt and the reply text.
+// The charge for a call with no usage report: each prompt byte as one token
+// (as the hold: a caller can make text that is one token per byte), and
+// about three bytes per token for the reply and reasoning text.
 uint64_t thinkEstimate(const ThinkFees& fees, uint64_t promptBytes,
                        uint64_t replyBytes);
+// The expected cost of a call, for the subsidy reservation: about three
+// prompt bytes per token, and all `maxOut` tokens. Not above the hold.
+uint64_t thinkExpected(const ThinkFees& fees, uint64_t promptBytes,
+                       uint32_t maxOut);
 
 // Where one call's reply goes: the THINK verb's channel, or a compute
 // instance (ces.think). The handler calls these from the call's worker
@@ -119,6 +128,18 @@ struct ThinkFile {
   std::string sourceName;
 };
 
+// Who pays a call, and where its refund goes.
+struct ThinkPayer {
+  ThinkPayer() = default;
+  ThinkPayer(const minx::Hash& a) : account(a) {}   // a plain account
+  minx::Hash account{};   // pays the hold and the charge
+  // For ces.think: the program file whose program account `account` is.
+  // When that file is gone at the end of the call, the refund goes to
+  // `owner`, as the file's balance does at DELETE. "" = a plain account.
+  std::string source;
+  minx::Hash owner{};
+};
+
 class ThinkHandler : public CesPlexHandler {
  public:
   // Builds the backend from the server config: in a CES_THINK build, the
@@ -152,9 +173,12 @@ class ThinkHandler : public CesPlexHandler {
   // sink->finish. The caller decides who `payer` is and must have
   // authenticated it: the bound signer for THINK, the instance's program
   // account for ces.think.
-  // With a file, at most one call runs on a path at a time (a second gets
-  // CES_ERROR_QUEUE_FULL), so two turns never answer the same transcript.
-  void submit(const minx::Hash& payer, std::string prompt,
+  // With a file that the caller owns, at most one call runs on a path at a
+  // time (a second gets CES_ERROR_QUEUE_FULL), so two turns never answer
+  // the same transcript. A caller who does not own the file cannot append
+  // to it, so its call takes no lock. The /m/ mail zone is refused
+  // (NOT_OWNER), as on the wire.
+  void submit(const ThinkPayer& payer, std::string prompt,
               std::shared_ptr<ThinkSink> sink, ThinkFile file = {});
 
  private:
@@ -165,15 +189,21 @@ class ThinkHandler : public CesPlexHandler {
   };
   void reapLocked();   // join finished jobs; mu_ held
   // One call, on its worker thread.
-  void run(Job& job, ThinkBackend& backend, const minx::Hash& payer,
+  void run(Job& job, ThinkBackend& backend, const ThinkPayer& payer,
            std::string prompt, const ThinkFile& file, ThinkSink& sink);
+  // The part of run() between the file read and the append: hold, backend,
+  // settle. Sets `text`, `charge` and returns the outcome.
+  ThinkOutcome callAndSettle(Job& job, ThinkBackend& backend,
+                             const ThinkPayer& payer, const std::string& input,
+                             ThinkSink& sink, std::string& text,
+                             uint64_t& charge);
 
   CesServer* server_ = nullptr;
   std::atomic<bool> stopped_{false};
   mutable std::mutex mu_;              // backend_ and jobs_
   std::shared_ptr<ThinkBackend> backend_;
   std::list<std::shared_ptr<Job>> jobs_;
-  std::set<std::string> busyPaths_;    // files with a call in flight
+  std::set<std::string> busyPaths_;    // owned files with a call in flight
   std::unique_ptr<HeatSubsidy> subsidy_;
 };
 

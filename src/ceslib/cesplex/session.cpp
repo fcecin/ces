@@ -221,6 +221,39 @@ void CesPlexReplyStream::finishAndClose(uint8_t status, ces::Bytes preamble) {
   enqueue(std::move(it));
 }
 
+void CesPlexReplyStream::keepAlive(std::chrono::milliseconds every) {
+  if (every.count() <= 0) return;
+  auto self = shared_from_this();
+  boost::asio::post(req_->stream->get_executor(), [self, every]() {
+    if (self->keepAliveTimer_ || self->finished_ || self->dead_.load()) return;
+    self->keepAliveEvery_ = every;
+    self->lastWrite_ = std::chrono::steady_clock::now();
+    self->keepAliveTimer_ = std::make_shared<boost::asio::steady_timer>(
+        self->req_->stream->get_executor());
+    self->armKeepAlive();
+  });
+}
+
+void CesPlexReplyStream::armKeepAlive() {
+  auto t = std::static_pointer_cast<boost::asio::steady_timer>(keepAliveTimer_);
+  t->expires_at(lastWrite_ + keepAliveEvery_);
+  auto self = shared_from_this();
+  t->async_wait([self](const boost::system::error_code& ec) {
+    if (ec || self->finished_ || self->dead_.load()) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= self->lastWrite_ + self->keepAliveEvery_ &&
+        !self->writing_ && self->queue_.empty()) {
+      Item ka;
+      ces::Buffer::put<uint32_t>(ka.bytes, kCesPlexKeepAlive);
+      self->queue_.push_back(std::move(ka));
+      self->pump();
+    }
+    if (now >= self->lastWrite_ + self->keepAliveEvery_)
+      self->lastWrite_ = now;   // a write is in flight or queued
+    self->armKeepAlive();
+  });
+}
+
 void CesPlexReplyStream::enqueue(Item it) {
   auto self = shared_from_this();
   boost::asio::post(req_->stream->get_executor(),
@@ -234,6 +267,7 @@ void CesPlexReplyStream::enqueue(Item it) {
 void CesPlexReplyStream::pump() {
   if (writing_ || queue_.empty()) return;
   writing_ = true;
+  lastWrite_ = std::chrono::steady_clock::now();
   auto self = shared_from_this();
   auto bytes = std::make_shared<ces::Bytes>(std::move(queue_.front().bytes));
   boost::asio::async_write(
@@ -250,6 +284,9 @@ void CesPlexReplyStream::pump() {
       if (done.final) {
         self->finished_ = true;
         self->queue_.clear();
+        if (self->keepAliveTimer_)
+          std::static_pointer_cast<boost::asio::steady_timer>(
+              self->keepAliveTimer_)->cancel();
         if (done.close)
           self->req_->respondAndClose(done.status, std::move(done.preamble));
         else
@@ -541,8 +578,9 @@ public:
       uint8_t verb,
       const minx::Bytes& envelope,
       const ces::Bytes& extraBodyToSend,
-      const std::function<void(const ces::Bytes&)>& onFrame,
+      const std::function<bool(const ces::Bytes&)>& onFrame,
       std::chrono::steady_clock::duration frameTimeout,
+      std::chrono::steady_clock::duration totalTimeout,
       size_t respFixedPreambleLen,
       ces::Bytes& outPreamble) {
     if (ensureClean() != CES_OK) return CES_ERROR_INTERNAL;
@@ -556,17 +594,25 @@ public:
     if (!extraBodyToSend.empty() && !writeAll(extraBodyToSend))
       return fail(CES_ERROR_INTERNAL);
 
+    const auto end = std::chrono::steady_clock::now() + totalTimeout;
+    auto wait = [&]() {
+      const auto left = end - std::chrono::steady_clock::now();
+      return std::min<std::chrono::steady_clock::duration>(frameTimeout, left);
+    };
     for (;;) {
+      if (std::chrono::steady_clock::now() >= end)
+        return fail(CES_ERROR_TIMEOUT);
       ces::Bytes lenBuf;
-      if (!readExactFor(lenBuf, 4, frameTimeout))
+      if (!readExactFor(lenBuf, 4, wait()))
         return fail(CES_ERROR_INTERNAL);
       uint32_t len = ces::Buffer::peek<uint32_t>(lenBuf.data());
       if (len == 0) break;
+      if (len == kCesPlexKeepAlive) continue;
       if (len > kMaxStreamFrame) return fail(CES_ERROR_INTERNAL);
       ces::Bytes frame;
-      if (!readExactFor(frame, len, frameTimeout))
+      if (!readExactFor(frame, len, wait()))
         return fail(CES_ERROR_INTERNAL);
-      if (onFrame) onFrame(frame);
+      if (onFrame && !onFrame(frame)) return fail(CES_ERROR_INTERNAL);
     }
 
     ces::Bytes statusBuf;
@@ -783,13 +829,14 @@ uint8_t CesPlexChannel::driveStreamVerb(
     uint8_t verb,
     const minx::Bytes& envelope,
     const ces::Bytes& extraBodyToSend,
-    const std::function<void(const ces::Bytes&)>& onFrame,
+    const std::function<bool(const ces::Bytes&)>& onFrame,
     std::chrono::steady_clock::duration frameTimeout,
+    std::chrono::steady_clock::duration totalTimeout,
     size_t respFixedPreambleLen,
     ces::Bytes& outPreamble) {
   return impl_->driveStreamVerb(verb, envelope, extraBodyToSend, onFrame,
-                                frameTimeout, respFixedPreambleLen,
-                                outPreamble);
+                                frameTimeout, totalTimeout,
+                                respFixedPreambleLen, outPreamble);
 }
 
 // ---------------------------------------------------------------------------

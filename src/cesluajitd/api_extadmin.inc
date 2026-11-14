@@ -524,6 +524,10 @@ static void drain_ready(lua_State* mainL) {
 // the intended out-of-memory behavior and cannot harm the host.
 static void drain_io_completions(lua_State* mainL) {
   while (!g_io_ready.empty()) {
+    // The pieces of a ces.think call reach g_think_q before its reply. A
+    // coroutine resumed below can read the socket (a non-blocking
+    // client_recv) and queue both, so take the pieces before each reply.
+    drain_think(mainL);
     Frame f = std::move(g_io_ready.front());
     g_io_ready.pop_front();
     auto it = g_io_waiters.find(f.corr_id);

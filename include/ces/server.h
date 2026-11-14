@@ -23,6 +23,7 @@
 #include <ces/clientasync.h>
 #include <ces/feemult.h>
 #include <ces/keys.h>
+#include <ces/util/account_holds.h>
 #include <ces/util/metrics.h>
 #include <ces/cesplex/meter.h>
 #include <ces/l2/ledger_txn.h>
@@ -953,6 +954,10 @@ public:
   MailHandler* mailHandler() { return mailHandler_.get(); }
 #endif
   ThinkHandler* thinkHandler() { return thinkHandler_.get(); }
+  // Credits that calls in flight hold for accounts (util/account_holds.h).
+  // The file store does not delete a file for exhaustion while a hold on its
+  // program account covers the shortfall.
+  AccountHolds& accountHolds() { return accountHolds_; }
 
   // Test hook: add a peer with a pre-resolved plex endpoint (simulates a
   // completed probe) without starting the peer miner. Drives the
@@ -1857,6 +1862,7 @@ private:
   std::unique_ptr<MailHandler> mailHandler_;
 #endif
   std::unique_ptr<ThinkHandler> thinkHandler_;
+  AccountHolds accountHolds_;
 
   // SYS_RPC dispatcher state. queueRpc runs on the logic strand
   // (validates the file, materializes request bytes, signs the

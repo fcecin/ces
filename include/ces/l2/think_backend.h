@@ -36,6 +36,9 @@ struct ThinkOutcome {
   uint8_t status = 0;          // CES status. 0 = the reply is complete.
   Billing billing = kNone;
   ThinkUsage usage;
+  // Bytes of reply and reasoning text the backend produced, for the estimate
+  // (kEstimate). 0 = unknown: the handler counts the text it got.
+  uint64_t outBytes = 0;
   std::string detail;          // for the log only; never sent to clients
 };
 
@@ -62,7 +65,10 @@ std::string thinkRequestJson(const std::string& model,
 // Reads a streamed chat-completions body (text/event-stream). Feed it the
 // body bytes in any split. It calls onText for each content delta, keeps the
 // last usage object, and records an error object if the stream has one.
-// Reasoning deltas are not reply text and are skipped.
+// Reasoning deltas are not reply text: they are counted, not forwarded.
+// After onText returns false the parser forwards no more text, but it still
+// reads the stream to its usage report and its end, so the caller can bill
+// the call by usage.
 class ThinkSseParser {
  public:
   // False when an event is malformed JSON, or when more than 1 MiB arrives
@@ -71,6 +77,10 @@ class ThinkSseParser {
             const std::function<bool(std::string_view)>& onText);
   bool done() const { return done_; }         // "[DONE]" seen
   bool stopped() const { return stopped_; }   // onText returned false
+  // Bytes of reply text and of reasoning text seen, forwarded or not. For
+  // the billing estimate when the stream has no usage report.
+  uint64_t textBytes() const { return textBytes_; }
+  uint64_t reasoningBytes() const { return reasoningBytes_; }
   bool hasUsage() const { return hasUsage_; }
   const ThinkUsage& usage() const { return usage_; }
   const std::string& error() const { return error_; }   // "" = none
@@ -82,6 +92,8 @@ class ThinkSseParser {
   bool done_ = false;
   bool stopped_ = false;
   bool hasUsage_ = false;
+  uint64_t textBytes_ = 0;
+  uint64_t reasoningBytes_ = 0;
   ThinkUsage usage_;
   std::string error_;
 };

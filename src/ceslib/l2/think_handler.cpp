@@ -93,23 +93,30 @@ FileExecResp fileOp(CesServer* server, const ThinkFile& f, uint8_t verb,
   req.body = std::move(body);
   auto pr = std::make_shared<std::promise<FileExecResp>>();
   auto fut = pr->get_future();
+  // 0 = queued, 1 = started, 2 = given up. An op that the wait gave up on
+  // does not start later, so a TIMEOUT means the op did not run.
+  auto state = std::make_shared<std::atomic<int>>(0);
   auto ex = server->_rpcTaskIOExecutor();
-  boost::asio::post(ex, [fh, req = std::move(req), pr, ex]() {
+  boost::asio::post(ex, [fh, req = std::move(req), pr, ex, state]() {
+    int queued = 0;
+    if (!state->compare_exchange_strong(queued, 1)) return;
     fh->exec(req, [pr](FileExecResp r) { pr->set_value(std::move(r)); }, ex);
   });
   if (fut.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
-    fail.status = CES_ERROR_TIMEOUT;
-    return fail;
+    int queued = 0;
+    if (state->compare_exchange_strong(queued, 2)) {
+      fail.status = CES_ERROR_TIMEOUT;
+      return fail;
+    }
+    fut.wait();   // it started: wait for its real result
   }
   return fut.get();
 }
 
-// Read a whole conversation file of at most `max` bytes. CES_OK or the
-// verb's status (BAD_INPUT when the file is too big).
-uint8_t readWhole(CesServer* server, const ThinkFile& f, uint64_t max,
-                  std::string& out) {
-  FileExecResp st = fileOp(server, f, kFileVerbStat);
-  if (st.status != CES_OK) return st.status;
+// Read a whole conversation file of `st.size` bytes (its STAT), at most
+// `max`. CES_OK or the verb's status (BAD_INPUT when the file is too big).
+uint8_t readWhole(CesServer* server, const ThinkFile& f,
+                  const FileExecResp& st, uint64_t max, std::string& out) {
   if (st.size > max) return CES_ERROR_BAD_INPUT;
   out.clear();
   out.reserve(st.size);
@@ -214,9 +221,35 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
         reply->finish(CES_ERROR_BAD_INPUT);
         return;
       }
+      const minx::Hash signer = req->bound.boundPubkey.getHash();
+      // fee_query and replay dedup, as for every signed verb. A replay of a
+      // THINK runs nothing and costs the signer nothing.
+      auto* server = static_cast<CesServer*>(req->host);
+      const auto& c = server->_config();
+      uint8_t rc = CES_OK;
+      server->_l2Transact([&](LedgerTxn& t) {
+        const bool nonceless = req->reqNonce == CES_NONCELESS;
+        if (nonceless && t.isReplay(req->reqSigHash)) {
+          rc = CES_ERROR_WRONG_NONCE;
+          return;
+        }
+        rc = t.signerSpend(signer, static_cast<uint64_t>(c.feeQuery),
+                           req->reqNonce,
+                           static_cast<int64_t>(c.getFeeError()));
+        if (rc == CES_OK && nonceless) t.recordDedup(req->reqSigHash);
+      });
+      if (rc != CES_OK) {
+        reply->finish(rc);
+        return;
+      }
+      // A call can be silent for longer than the channel idle time (a long
+      // wait for the first token), so keep the channel busy while it runs.
+      const uint32_t idle = c.rpcRudpChannelIdleSecs > 0
+                                ? c.rpcRudpChannelIdleSecs : 60;
+      reply->keepAlive(std::min<std::chrono::milliseconds>(
+          std::chrono::seconds(20), std::chrono::milliseconds(idle * 1000 / 3)));
       // The signer is the file's caller and pays the caller-side fees, as on
       // the wire.
-      const minx::Hash signer = req->bound.boundPubkey.getHash();
       ThinkFile file;
       file.path = path;
       std::memcpy(file.caller.data(), signer.data(), 32);
@@ -241,8 +274,13 @@ uint64_t thinkHold(const ThinkFees& fees, uint64_t promptBytes,
 
 uint64_t thinkEstimate(const ThinkFees& fees, uint64_t promptBytes,
                        uint64_t replyBytes) {
-  return priceOf(promptBytes / 3 + kThinkPromptOverhead, 0,
-                 replyBytes / 3 + 1, fees);
+  return priceOf(promptBytes + kThinkPromptOverhead, 0, replyBytes / 3 + 1,
+                 fees);
+}
+
+uint64_t thinkExpected(const ThinkFees& fees, uint64_t promptBytes,
+                       uint32_t maxOut) {
+  return priceOf(promptBytes / 3 + kThinkPromptOverhead, 0, maxOut, fees);
 }
 
 ThinkHandler::ThinkHandler(CesServer* server) : server_(server) {
@@ -340,7 +378,7 @@ void ThinkHandler::reapLocked() {
   }
 }
 
-void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
+void ThinkHandler::submit(const ThinkPayer& payer, std::string prompt,
                           std::shared_ptr<ThinkSink> sink, ThinkFile file) {
   const auto& cfg = server_->_config();
   if (stopped_.load() || !enabled()) {
@@ -352,6 +390,12 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
     sink->finish(CES_ERROR_BAD_INPUT, 0, {}, CES_OK);
     return;
   }
+  // The /m/ mail zone is private: no status may tell whether a file there
+  // exists, as for the wire STAT.
+  if (file.path.size() > 1 && file.path.rfind("/m/", 0) == 0) {
+    sink->finish(CES_ERROR_NOT_OWNER, 0, {}, CES_OK);
+    return;
+  }
   std::shared_ptr<ThinkBackend> backend;
   auto job = std::make_shared<Job>();
   std::lock_guard<std::mutex> lk(mu_);
@@ -360,99 +404,80 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
     sink->finish(CES_ERROR_DISABLED, 0, {}, CES_OK);
     return;
   }
-  if (jobs_.size() >= cfg.thinkMaxConcurrent ||
-      (!file.path.empty() && busyPaths_.count(file.path))) {
+  if (jobs_.size() >= cfg.thinkMaxConcurrent) {
     sink->finish(CES_ERROR_QUEUE_FULL, 0, {}, CES_OK);
     return;
   }
   backend = backend_;
-  if (!file.path.empty()) busyPaths_.insert(file.path);
   jobs_.push_back(job);
   // The call runs on its own thread: the file read, the hold, the backend,
   // the settle, the append. Every exit ends in one sink->finish.
-  job->thread = std::thread([this, job, sink, backend, payer,
-                             prompt = std::move(prompt),
-                             file = std::move(file)]() mutable {
-    run(*job, *backend, payer, std::move(prompt), file, *sink);
-    if (!file.path.empty()) {
-      std::lock_guard<std::mutex> g(mu_);
-      busyPaths_.erase(file.path);
-    }
-    job->done = true;
-  });
+  try {
+    job->thread = std::thread([this, job, sink, backend, payer,
+                               prompt = std::move(prompt),
+                               file = std::move(file)]() mutable {
+      try {
+        run(*job, *backend, payer, std::move(prompt), file, *sink);
+      } catch (const std::exception& e) {
+        LOGERROR << "think: call failed" << SVAR(e.what());
+        sink->finish(CES_ERROR_INTERNAL, 0, {}, CES_OK);
+      } catch (...) {
+        LOGERROR << "think: call failed";
+        sink->finish(CES_ERROR_INTERNAL, 0, {}, CES_OK);
+      }
+      job->done = true;
+    });
+  } catch (const std::system_error&) {
+    jobs_.pop_back();
+    sink->finish(CES_ERROR_QUEUE_FULL, 0, {}, CES_OK);
+  }
 }
 
 void ThinkHandler::run(Job& job, ThinkBackend& backend,
-                       const minx::Hash& payer, std::string prompt,
+                       const ThinkPayer& payer, std::string prompt,
                        const ThinkFile& file, ThinkSink& sink) {
   CesServer* server = server_;
   const auto& cfg = server->_config();
-  const ThinkFees fees = feesOf(cfg);
-  const uint32_t maxOut = cfg.thinkMaxOutTokens;
 
-  // The backend gets the file's content, then the new text.
+  // The backend gets the file's content, then the new text. Only the owner
+  // can append, so only the owner's call locks the path, from the read to
+  // the append.
   std::string input;
+  bool locked = false;
+  auto unlock = [&] {
+    if (!locked) return;
+    std::lock_guard<std::mutex> g(mu_);
+    busyPaths_.erase(file.path);
+    locked = false;
+  };
+  struct OnExit {
+    std::function<void()> f;
+    ~OnExit() { f(); }
+  } onExit{unlock};
   if (!file.path.empty()) {
-    uint8_t rc = readWhole(server, file, cfg.thinkMaxInputBytes, input);
+    FileExecResp st = fileOp(server, file, kFileVerbStat);
+    uint8_t rc = st.status;
+    if (rc == CES_OK && st.ownerPubkey == file.caller) {
+      std::lock_guard<std::mutex> g(mu_);
+      if (busyPaths_.count(file.path)) rc = CES_ERROR_QUEUE_FULL;
+      else locked = busyPaths_.insert(file.path).second;
+    }
+    if (rc == CES_OK)
+      rc = readWhole(server, file, st, cfg.thinkMaxInputBytes, input);
     if (rc == CES_OK && (input.size() + prompt.size() > cfg.thinkMaxInputBytes ||
                          !thinkValidUtf8(input)))
       rc = CES_ERROR_BAD_INPUT;
     if (rc != CES_OK) {
+      unlock();
       sink.finish(rc, 0, {}, CES_OK);
       return;
     }
   }
   input += prompt;
 
-  // The subsidy discounts the hold too, so a cool service lets an account
-  // with almost nothing start a call. Its share is reserved as heat now, so
-  // calls in flight together cannot take more than the budget.
-  const uint64_t fullHold = thinkHold(fees, input.size(), maxOut);
-  uint64_t reserved = 0;
-  const uint16_t mult = subsidy_->reserve(fullHold, reserved);   // 10000 = full
-  const uint64_t hold = fullHold - reserved;
-  bool held = false;
-  server->_l2Transact([&](LedgerTxn& tx) {
-    held = tx.debitAccount(payer, hold);   // burned; the unused part returns
-  });
-  if (!held) {
-    subsidy_->release(reserved);
-    sink.finish(CES_ERROR_INSUFFICIENT_BALANCE, 0, {}, CES_OK);
-    return;
-  }
-
   std::string text;
-  auto onText = [&](std::string_view piece) {
-    if (job.stop.load() || !sink.open()) return false;
-    text.append(piece.data(), piece.size());
-    sink.piece(piece);
-    return true;
-  };
-  ThinkOutcome o;
-  if (job.stop.load()) {
-    o.status = CES_ERROR_DISABLED;   // stop() ran during the read or hold
-  } else {
-    try {
-      o = backend.run(input, maxOut, job.stop, onText);
-    } catch (const std::exception& e) {
-      o.status = CES_ERROR_INTERNAL;
-      o.billing = ThinkOutcome::kEstimate;
-      o.detail = e.what();
-    }
-  }
-  // The full cost of what was used, then the subsidy's share at the
-  // reserved multiplier. full <= fullHold, so the share is <= reserved and
-  // the charge is <= hold.
-  uint64_t full = 0;
-  if (o.billing == ThinkOutcome::kUsage) full = thinkCost(fees, o.usage);
-  else if (o.billing == ThinkOutcome::kEstimate)
-    full = thinkEstimate(fees, input.size(), text.size());
-  if (full > fullHold) full = fullHold;
-  const uint64_t subsidized =
-      static_cast<uint64_t>(static_cast<U128>(full) * (10000u - mult) / 10000u);
-  const uint64_t charge = full - subsidized;
-  if (reserved > subsidized) subsidy_->release(reserved - subsidized);
-  if (hold > charge) server->_brr(payer, static_cast<int64_t>(hold - charge));
+  uint64_t charge = 0;
+  ThinkOutcome o = callAndSettle(job, backend, payer, input, sink, text, charge);
 
   // A complete reply goes into the file with the text that asked for it.
   // The APPEND is the caller's own verb: it fails (and the file stays as
@@ -465,11 +490,109 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
     appendError =
         fileOp(server, file, kFileVerbAppend, 0, 0, std::move(turn)).status;
   }
+  // The next turn on the file may start as soon as the caller sees this one
+  // end, so free the path first.
+  unlock();
+  sink.finish(o.status, charge, text, appendError);
+}
+
+ThinkOutcome ThinkHandler::callAndSettle(Job& job, ThinkBackend& backend,
+                                         const ThinkPayer& payer,
+                                         const std::string& input,
+                                         ThinkSink& sink, std::string& text,
+                                         uint64_t& charge) {
+  CesServer* server = server_;
+  const auto& cfg = server->_config();
+  const ThinkFees fees = feesOf(cfg);
+  const uint32_t maxOut = cfg.thinkMaxOutTokens;
+  charge = 0;
+
+  // The subsidy discounts the hold too, so a cool service lets an account
+  // with almost nothing start a call. Its share of the expected cost is
+  // reserved as heat now, so calls in flight together cannot take more than
+  // the budget, and a long prompt does not reserve for a worst case that
+  // does not come.
+  const uint64_t fullHold = thinkHold(fees, input.size(), maxOut);
+  const uint64_t expected =
+      std::min(fullHold, thinkExpected(fees, input.size(), maxOut));
+  uint64_t reserved = 0;
+  const uint16_t mult = subsidy_->reserve(expected, reserved);  // 10000 = full
+  const uint64_t hold = fullHold - reserved;
+  // List the hold before the burn, so no exhaustion check sees the account
+  // without it.
+  server->accountHolds().add(payer.account, hold);
+  bool held = false;
+  server->_l2Transact([&](LedgerTxn& tx) {
+    held = tx.debitAccount(payer.account, hold);   // burned; the unused part returns
+  });
+  ThinkOutcome o;
+  if (!held) {
+    server->accountHolds().remove(payer.account, hold);
+    subsidy_->release(reserved);
+    o.status = CES_ERROR_INSUFFICIENT_BALANCE;
+    return o;
+  }
+
+  auto onText = [&](std::string_view piece) {
+    if (job.stop.load() || !sink.open()) return false;
+    text.append(piece.data(), piece.size());
+    sink.piece(piece);
+    return true;
+  };
+  if (job.stop.load()) {
+    o.status = CES_ERROR_DISABLED;   // stop() ran during the read or hold
+  } else {
+    try {
+      o = backend.run(input, maxOut, job.stop, onText);
+    } catch (const std::exception& e) {
+      o.status = CES_ERROR_INTERNAL;
+      o.billing = ThinkOutcome::kEstimate;
+      o.detail = e.what();
+    } catch (...) {
+      o.status = CES_ERROR_INTERNAL;
+      o.billing = ThinkOutcome::kEstimate;
+      o.detail = "backend threw";
+    }
+  }
+  // The full cost of what was used, then the subsidy's share at the
+  // reserved multiplier, never above what was reserved. full <= fullHold,
+  // and the charge is <= hold (thinkExpected <= fullHold).
+  uint64_t full = 0;
+  if (o.billing == ThinkOutcome::kUsage) {
+    full = thinkCost(fees, o.usage);
+  } else if (o.billing == ThinkOutcome::kEstimate) {
+    full = thinkEstimate(fees, input.size(),
+                         std::max<uint64_t>(o.outBytes, text.size()));
+  }
+  if (full > fullHold) full = fullHold;
+  const uint64_t subsidized = std::min<uint64_t>(
+      reserved,
+      static_cast<uint64_t>(static_cast<U128>(full) * (10000u - mult) / 10000u));
+  charge = full - subsidized;
+  if (charge > hold) charge = hold;
+  if (reserved > subsidized) subsidy_->release(reserved - subsidized);
+
+  // The refund lands before this returns (and before shutdown can drop it).
+  // A program file that went away during the call has no account to take
+  // it: the refund goes to the file's owner, as its balance did at DELETE.
+  if (hold > charge) {
+    minx::Hash to = payer.account;
+    if (!payer.source.empty()) {
+      std::array<uint8_t, 32> pk{};
+      FileHandler* fh = server->fileHandler();
+      if (!fh || !fh->readProgramPubkey(payer.source, pk) ||
+          std::memcmp(pk.data(), payer.account.data(), 32) != 0)
+        to = payer.owner;
+    }
+    const int64_t back = static_cast<int64_t>(hold - charge);
+    server->_l2Transact([&](LedgerTxn& tx) { tx.credit(to, back); });
+  }
+  server->accountHolds().remove(payer.account, hold);
   LOGINFO << "think: call done" << VAR(int(o.status))
           << VAR(o.usage.promptTokens) << VAR(o.usage.cachedTokens)
           << VAR(o.usage.outputTokens) << VAR(full) << VAR(mult)
-          << VAR(charge) << VAR(int(appendError)) << SVAR(o.detail);
-  sink.finish(o.status, charge, text, appendError);
+          << VAR(charge) << SVAR(o.detail);
+  return o;
 }
 
 }  // namespace ces

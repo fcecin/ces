@@ -13,7 +13,15 @@
 #include <ces/l2/think_backend.h>
 #include <ces/l2/think_client.h>
 #include <ces/l2/think_handler.h>
+#ifdef CES_THINK
+#include <ces/l2/think_https.h>
+#endif
 
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/read.hpp>
+#include <boost/asio/read_until.hpp>
+#include <boost/asio/streambuf.hpp>
+#include <boost/asio/write.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <atomic>
@@ -36,6 +44,9 @@ struct ScriptBackend : ThinkBackend {
   ThinkOutcome::Billing billing = ThinkOutcome::kUsage;
   uint8_t status = CES_OK;
   bool block = false;              // wait for `stop` or `release`
+  int gapMs = 0;                   // silence after the first piece
+  bool throwOdd = false;           // throw a value that is no std::exception
+  uint64_t outBytes = 0;           // ThinkOutcome::outBytes to report
   std::atomic<bool> release{false};
   std::atomic<bool> entered{false};
   std::atomic<int> calls{0};
@@ -54,7 +65,9 @@ struct ScriptBackend : ThinkBackend {
       lastMaxOut = maxOut;
     }
     entered = true;
+    if (throwOdd) throw 42;
     ThinkOutcome o;
+    o.outBytes = outBytes;
     if (block) {
       while (!stop.load() && !release.load())
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -64,11 +77,17 @@ struct ScriptBackend : ThinkBackend {
         return o;
       }
     }
-    for (const auto& p : pieces) {
-      if (!onText(p)) {
+    for (size_t i = 0; i < pieces.size(); ++i) {
+      if (!onText(pieces[i])) {
         o.status = CES_ERROR_INTERNAL;
         o.billing = ThinkOutcome::kEstimate;
         return o;
+      }
+      if (i == 0 && gapMs > 0) {
+        auto end = std::chrono::steady_clock::now() +
+                   std::chrono::milliseconds(gapMs);
+        while (!stop.load() && std::chrono::steady_clock::now() < end)
+          std::this_thread::sleep_for(std::chrono::milliseconds(5));
       }
     }
     o.status = status;
@@ -97,7 +116,8 @@ struct ThinkFixture {
   ThinkFixture() : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 8, true) {}
   ThinkFixture(int64_t fund, uint64_t feeIn, uint64_t feeOut,
                uint32_t maxConcurrent, bool withBackend,
-               uint64_t subsidyBudget = 0) {
+               uint64_t subsidyBudget = 0, uint32_t idleSecs = 0,
+               int64_t feeQuery = 0) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("thinkh");
@@ -108,7 +128,7 @@ struct ThinkFixture {
     cfg.rpcPort = 0;
     cfg.rpcAutoPort = true;
     cfg.cesplexMounts = {{"/ces/think/1", "builtin:think"}};
-    cfg.feeQuery = 0;
+    cfg.feeQuery = feeQuery;
     cfg.thinkFeeIn = feeIn;
     cfg.thinkFeeCachedIn = kFeeCachedIn;
     cfg.thinkFeeOut = feeOut;
@@ -118,6 +138,7 @@ struct ThinkFixture {
     cfg.thinkSubsidyBudget = subsidyBudget;
     cfg.thinkSubsidyTauSecs = 3600;
     cfg.thinkSubsidyFloorBp = 1;
+    if (idleSecs > 0) cfg.rpcRudpChannelIdleSecs = idleSecs;
     server = std::make_unique<CesServer>(cfg);
     uint16_t mainPort = server->start(0);
     rpcPort = server->_rpcBoundPort();
@@ -176,6 +197,22 @@ struct ThinkFreeFixture : ThinkFixture {
 struct ThinkSubsidyFixture : ThinkFixture {
   ThinkSubsidyFixture()
       : ThinkFixture(1000, kFeeIn, kFeeOut, 8, true, 1'000'000'000) {}
+};
+// The server drops a channel after 1 s with no traffic.
+struct ThinkShortIdleFixture : ThinkFixture {
+  ThinkShortIdleFixture()
+      : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 8, true, 0, 1) {}
+};
+// Each THINK pays fee_query 5.
+struct ThinkFeeQueryFixture : ThinkFixture {
+  ThinkFeeQueryFixture()
+      : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 8, true, 0, 0, 5) {}
+};
+// Subsidy on, at rest, with a budget of 4000: more than the expected cost
+// of a 3000-byte prompt (3064), less than its hold (5064).
+struct ThinkSmallBudgetFixture : ThinkFixture {
+  ThinkSmallBudgetFixture()
+      : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 8, true, 4000) {}
 };
 struct ThinkOneSlotFixture : ThinkFixture {
   ThinkOneSlotFixture() : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 1, true) {}
@@ -263,6 +300,33 @@ BOOST_AUTO_TEST_CASE(Sse_StopAndErrorAndMalformed) {
                          [](std::string_view) { return true; }));
 }
 
+// After onText says stop, the parser sends no more text, but it still reads
+// the usage and the end of the stream, so the call is billed by usage.
+BOOST_AUTO_TEST_CASE(Sse_StoppedReaderStillReadsUsage) {
+  for (size_t step : {kSse.size(), size_t(1), size_t(13)}) {
+    ThinkSseParser p;
+    int n = 0;
+    for (size_t i = 0; i < kSse.size(); i += step)
+      BOOST_REQUIRE(p.feed(std::string_view(kSse).substr(i, step),
+                           [&](std::string_view) { ++n; return false; }));
+    BOOST_CHECK_EQUAL(n, 1);
+    BOOST_CHECK(p.stopped());
+    BOOST_CHECK(p.done());
+    BOOST_REQUIRE(p.hasUsage());
+    BOOST_CHECK_EQUAL(p.usage().promptTokens, 36u);
+    BOOST_CHECK_EQUAL(p.usage().outputTokens, 57u);
+  }
+}
+
+// Reasoning text is counted for the estimate, and is not reply text.
+BOOST_AUTO_TEST_CASE(Sse_CountsReasoningBytes) {
+  ThinkSseParser p;
+  std::string text;
+  BOOST_REQUIRE(p.feed(kSse, [&](std::string_view t) { text.append(t); return true; }));
+  BOOST_CHECK_EQUAL(p.reasoningBytes(), 7u);   // "We need"
+  BOOST_CHECK_EQUAL(p.textBytes(), text.size());
+}
+
 // Bytes with no event end are not buffered without bound.
 BOOST_AUTO_TEST_CASE(Sse_UnboundedEventIsMalformed) {
   ThinkSseParser p;
@@ -331,8 +395,11 @@ BOOST_AUTO_TEST_CASE(Prices_RoundUpAndHoldCoversUsage) {
   // Cached never counts above the prompt.
   BOOST_CHECK_EQUAL(thinkCost(f, ThinkUsage{10, 50, 0}), 1u);
   BOOST_CHECK_EQUAL(thinkHold(f, 8, 1000), (8 + kThinkPromptOverhead) + 2000);
+  // The estimate counts each prompt byte as a token, as the hold does: a
+  // caller can make text that is one token per byte. The reply counts one
+  // token per 3 bytes.
   BOOST_CHECK_EQUAL(thinkEstimate(f, 30, 9),
-                    (10 + kThinkPromptOverhead) + 2 * 4);
+                    (30 + kThinkPromptOverhead) + 2 * 4);
   // Huge values clamp, never wrap.
   ThinkFees big{UINT64_MAX, UINT64_MAX, UINT64_MAX};
   BOOST_CHECK_EQUAL(thinkHold(big, UINT32_MAX, UINT32_MAX), UINT64_MAX);
@@ -417,6 +484,38 @@ BOOST_AUTO_TEST_CASE(Think_FailureWithoutUsageIsEstimated) {
   const int64_t est =
       static_cast<int64_t>(thinkEstimate(fees(), prompt.size(), reply.size()));
   BOOST_CHECK(waitBalance(before - est));
+}
+
+// The estimate counts the reasoning text that the backend reports in
+// outBytes, not only the reply text that reached the caller.
+BOOST_AUTO_TEST_CASE(Think_EstimateCountsReasoning) {
+  backend->status = CES_ERROR_INTERNAL;
+  backend->billing = ThinkOutcome::kEstimate;
+  backend->outBytes = 1500;   // 501 tokens: under the hold
+  CesThinkClient tc;
+  open(tc);
+  const int64_t before = balance();
+  std::string reply;
+  uint64_t charged = 0;
+  BOOST_CHECK_EQUAL(tc.think("hello", nullptr, reply, charged),
+                    CES_ERROR_INTERNAL);
+  const int64_t est =
+      static_cast<int64_t>(thinkEstimate(fees(), 5, 1500));
+  BOOST_CHECK(waitBalance(before - est));
+}
+
+// A backend that throws a value that is no std::exception ends the call
+// with INTERNAL. The server keeps running.
+BOOST_AUTO_TEST_CASE(Think_BackendThrowingAnythingIsInternal) {
+  backend->throwOdd = true;
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  uint64_t charged = 0;
+  BOOST_CHECK_EQUAL(tc.think("hello", nullptr, reply, charged),
+                    CES_ERROR_INTERNAL);
+  backend->throwOdd = false;
+  CES_CHECK_OK(tc.think("again", nullptr, reply, charged));
 }
 
 // Bad prompts are refused before the backend runs, and the client still
@@ -508,6 +607,59 @@ BOOST_AUTO_TEST_CASE(Think_ZeroFeesIsDisabled) {
 
 BOOST_AUTO_TEST_SUITE_END()
 
+BOOST_FIXTURE_TEST_SUITE(ThinkShortIdleTests, ThinkShortIdleFixture)
+
+// A gap between pieces that is longer than the channel idle time does not
+// drop the channel: the server sends keepalive frames while the call runs.
+BOOST_AUTO_TEST_CASE(Think_LongGapKeepsTheChannel) {
+  backend->gapMs = 2500;
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  uint64_t charged = 0;
+  std::vector<std::string> got;
+  CES_REQUIRE_OK(tc.think("hi",
+                          [&](std::string_view t) { got.emplace_back(t); },
+                          reply, charged));
+  BOOST_CHECK_EQUAL(reply, "Hello, world.");
+  BOOST_CHECK_EQUAL(got.size(), 3u);   // keepalives are not pieces
+  BOOST_CHECK_EQUAL(charged, thinkCost(fees(), backend->usage));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(ThinkFeeQueryTests, ThinkFeeQueryFixture)
+
+// A THINK pays fee_query, as every signed verb does, on top of its charge.
+BOOST_AUTO_TEST_CASE(Think_PaysFeeQuery) {
+  CesThinkClient tc;
+  open(tc);
+  const int64_t before = balance();
+  std::string reply;
+  uint64_t charged = 0;
+  CES_REQUIRE_OK(tc.think("hi", nullptr, reply, charged));
+  BOOST_CHECK(waitBalance(before - static_cast<int64_t>(charged) - 5));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(ThinkSmallBudgetTests, ThinkSmallBudgetFixture)
+
+// The subsidy reservation is sized on the expected cost of the call, not on
+// its worst case. A long prompt in a cool service gets the full discount
+// when its expected cost fits the budget.
+BOOST_AUTO_TEST_CASE(Think_LongPromptGetsTheFullDiscount) {
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  uint64_t charged = 0;
+  CES_REQUIRE_OK(tc.think(std::string(3000, 'x'), nullptr, reply, charged));
+  const uint64_t full = thinkCost(fees(), backend->usage);   // 70
+  BOOST_CHECK_EQUAL(charged, full - full * 9999 / 10000);    // 1
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
 BOOST_FIXTURE_TEST_SUITE(ThinkOneSlotTests, ThinkOneSlotFixture)
 
 // Past think_max_concurrent a call is refused with QUEUE_FULL, and the
@@ -565,3 +717,190 @@ BOOST_AUTO_TEST_CASE(Think_CoolServiceIsNearlyFree) {
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+#ifdef CES_THINK
+// ===========================================================================
+// ThinkHttpsBackend against a local plain-HTTP server (no network)
+// ===========================================================================
+
+namespace {
+
+// Accepts connections on loopback. For each one it reads one request, counts
+// it, and sends a 200 event-stream reply as chunks, one per entry of
+// `parts`, with `gapMs` between them.
+struct FakeChatServer {
+  boost::asio::io_context ioc;
+  boost::asio::ip::tcp::acceptor acc{
+      ioc, boost::asio::ip::tcp::endpoint(
+               boost::asio::ip::address_v4::loopback(), 0)};
+  std::vector<std::string> parts;
+  int gapMs = 0;
+  std::atomic<int> requests{0};
+  std::atomic<bool> stopping{false};
+  std::thread th;
+
+  void start() { th = std::thread([this] { serve(); }); }
+  uint16_t port() const { return acc.local_endpoint().port(); }
+  std::string url() const { return "http://127.0.0.1:" + std::to_string(port()); }
+  ~FakeChatServer() {
+    stopping = true;
+    boost::system::error_code ec;
+    boost::asio::ip::tcp::socket poke(ioc);
+    poke.connect(acc.local_endpoint(), ec);   // ends the blocking accept
+    if (th.joinable()) th.join();
+  }
+
+  void serve() {
+    namespace asio = boost::asio;
+    for (;;) {
+      asio::ip::tcp::socket s(ioc);
+      boost::system::error_code ec;
+      acc.accept(s, ec);
+      if (ec || stopping.load()) return;
+      asio::streambuf in;
+      size_t n = asio::read_until(s, in, "\r\n\r\n", ec);
+      if (ec) continue;
+      std::string head(asio::buffers_begin(in.data()),
+                       asio::buffers_begin(in.data()) + n);
+      in.consume(n);
+      size_t len = 0;
+      auto cl = head.find("Content-Length: ");
+      if (cl != std::string::npos) len = std::stoul(head.substr(cl + 16));
+      if (in.size() < len) asio::read(s, in, asio::transfer_exactly(len - in.size()), ec);
+      ++requests;
+      std::string resp =
+          "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+          "Transfer-Encoding: chunked\r\n\r\n";
+      asio::write(s, asio::buffer(resp), ec);
+      for (const auto& p : parts) {
+        if (gapMs > 0)
+          std::this_thread::sleep_for(std::chrono::milliseconds(gapMs));
+        char hex[16];
+        std::snprintf(hex, sizeof(hex), "%zx\r\n", p.size());
+        std::string chunk = hex + p + "\r\n";
+        asio::write(s, asio::buffer(chunk), ec);
+        if (ec) break;
+      }
+      asio::write(s, asio::buffer(std::string("0\r\n\r\n")), ec);
+      s.shutdown(asio::ip::tcp::socket::shutdown_both, ec);
+    }
+  }
+};
+
+// kSse split at its event ends, one chunk per event.
+std::vector<std::string> sseEvents(const std::string& sse) {
+  std::vector<std::string> out;
+  size_t pos = 0;
+  while (pos < sse.size()) {
+    size_t e = sse.find("\n\n", pos);
+    size_t end = e == std::string::npos ? sse.size() : e + 2;
+    out.push_back(sse.substr(pos, end - pos));
+    pos = end;
+  }
+  return out;
+}
+
+ThinkHttpsBackend makeBackend(const FakeChatServer& srv) {
+  ThinkHttpsConfig c;
+  c.baseUrl = srv.url();
+  c.apiKey = "test-key";
+  c.model = "m";
+  c.timeout = std::chrono::seconds(20);
+  return ThinkHttpsBackend(c);
+}
+
+}  // namespace
+
+BOOST_AUTO_TEST_SUITE(ThinkHttpsTests)
+
+// A whole stream: the text, the usage, OK.
+BOOST_AUTO_TEST_CASE(Https_CompleteStream) {
+  FakeChatServer srv;
+  srv.parts = sseEvents(kSse);
+  srv.start();
+  auto b = makeBackend(srv);
+  BOOST_REQUIRE(b.valid());
+  std::atomic<bool> stop{false};
+  std::string text;
+  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view t) {
+    text.append(t);
+    return true;
+  });
+  CES_CHECK_OK(o.status);
+  BOOST_CHECK_EQUAL(text, "Hi th\xc3\xa9re\n");
+  BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kUsage);
+  BOOST_CHECK_EQUAL(o.usage.promptTokens, 36u);
+  BOOST_CHECK_EQUAL(srv.requests.load(), 1);
+}
+
+// A stream that ends without "[DONE]" is not a complete reply.
+BOOST_AUTO_TEST_CASE(Https_NoDoneIsNotSuccess) {
+  FakeChatServer srv;
+  auto ev = sseEvents(kSse);
+  ev.pop_back();   // the [DONE] event
+  srv.parts = ev;
+  srv.start();
+  auto b = makeBackend(srv);
+  std::atomic<bool> stop{false};
+  ThinkOutcome o = b.run("hi", 10, stop,
+                         [](std::string_view) { return true; });
+  BOOST_CHECK_NE(o.status, CES_OK);
+  BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kUsage);   // still billed by usage
+}
+
+// When the reader stops taking text (its client left), the backend still
+// reads to the usage report, so the call is billed by usage.
+BOOST_AUTO_TEST_CASE(Https_ClosedSinkStillReadsUsage) {
+  FakeChatServer srv;
+  srv.parts = sseEvents(kSse);
+  srv.gapMs = 20;
+  srv.start();
+  auto b = makeBackend(srv);
+  std::atomic<bool> stop{false};
+  int n = 0;
+  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view) {
+    ++n;
+    return false;
+  });
+  BOOST_CHECK_EQUAL(n, 1);
+  BOOST_CHECK_NE(o.status, CES_OK);
+  BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kUsage);
+  BOOST_CHECK_EQUAL(o.usage.promptTokens, 36u);
+}
+
+// A stop that is set before the call sends no request.
+BOOST_AUTO_TEST_CASE(Https_StopBeforeStartSendsNothing) {
+  FakeChatServer srv;
+  srv.parts = sseEvents(kSse);
+  srv.start();
+  auto b = makeBackend(srv);
+  std::atomic<bool> stop{true};
+  ThinkOutcome o = b.run("hi", 10, stop,
+                         [](std::string_view) { return true; });
+  BOOST_CHECK_NE(o.status, CES_OK);
+  BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kNone);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_CHECK_EQUAL(srv.requests.load(), 0);
+}
+
+// A stop while the reply streams ends the call soon, with no use of the
+// finished stream.
+BOOST_AUTO_TEST_CASE(Https_StopWhileStreaming) {
+  FakeChatServer srv;
+  srv.parts = sseEvents(kSse);
+  srv.gapMs = 300;
+  srv.start();
+  auto b = makeBackend(srv);
+  std::atomic<bool> stop{false};
+  const auto t0 = std::chrono::steady_clock::now();
+  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view) {
+    stop = true;
+    return true;
+  });
+  const auto took = std::chrono::steady_clock::now() - t0;
+  BOOST_CHECK_NE(o.status, CES_OK);
+  BOOST_CHECK(took < std::chrono::seconds(3));
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+#endif  // CES_THINK

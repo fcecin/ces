@@ -27,9 +27,11 @@ using namespace ces;
 namespace {
 
 // Replies with a fixed text; records each input; can block until released.
+// With `blockIf` set, only an input that ends with it blocks.
 struct EchoBackend : ThinkBackend {
   std::string reply = "Hello there!";
   bool block = false;
+  std::string blockIf;
   std::atomic<bool> release{false};
   std::atomic<bool> entered{false};
   std::atomic<int> calls{0};
@@ -46,7 +48,12 @@ struct EchoBackend : ThinkBackend {
       lastInput = input;
     }
     entered = true;
-    while (block && !stop.load() && !release.load())
+    const bool blocks =
+        block && (blockIf.empty() ||
+                  (input.size() >= blockIf.size() &&
+                   input.compare(input.size() - blockIf.size(),
+                                 blockIf.size(), blockIf) == 0));
+    while (blocks && !stop.load() && !release.load())
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     ThinkOutcome o;
     if (stop.load()) { o.status = CES_ERROR_INTERNAL; return o; }
@@ -238,6 +245,60 @@ BOOST_AUTO_TEST_CASE(SameFile_OneCallAtATime) {
   first.join();
   BOOST_CHECK_EQUAL(rc1, CES_OK);
   BOOST_CHECK_EQUAL(getFile(chat()), "og|oneHello there!");
+}
+
+// A signer who does not own the file cannot append to it, so its call does
+// not lock the file. The owner's turn runs while that call waits.
+BOOST_AUTO_TEST_CASE(NotOwner_DoesNotLockTheFile) {
+  putFile(chat(), "og|");
+  backend->block = true;
+  backend->blockIf = "peek";
+  uint8_t rcOther = CES_ERROR_INTERNAL;
+  std::thread first([&] {
+    std::string reply;
+    uint8_t appendError = 0xFF;
+    rcOther = think(other, "peek", chat(), reply, appendError);
+  });
+  for (int i = 0; i < 400 && !backend->entered.load(); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  BOOST_REQUIRE(backend->entered.load());
+  std::string reply;
+  uint8_t appendError = 0xFF;
+  BOOST_CHECK_EQUAL(think(owner, "mine", chat(), reply, appendError), CES_OK);
+  BOOST_CHECK_EQUAL(appendError, CES_OK);
+  backend->release = true;
+  first.join();
+  BOOST_CHECK_EQUAL(rcOther, CES_OK);
+  BOOST_CHECK_EQUAL(getFile(chat()), "og|mineHello there!");
+}
+
+// The file is free again before the reply ends, so the next turn on the
+// same channel never gets QUEUE_FULL.
+BOOST_AUTO_TEST_CASE(SameFile_NextTurnRightAway) {
+  putFile(chat(), "og|");
+  CesThinkClient tc;
+  tc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(tc.connect("localhost", rpcPort, owner));
+  for (int i = 0; i < 20; ++i) {
+    std::string reply;
+    uint64_t charged = 0;
+    uint8_t appendError = 0xFF;
+    CES_REQUIRE_OK(tc.think("t", nullptr, reply, charged, chat(),
+                            &appendError));
+    BOOST_CHECK_EQUAL(appendError, CES_OK);
+  }
+}
+
+// The /m/ mail zone is private. A THINK on a /m/ path gets NOT_OWNER
+// whether the file exists or not, so the status tells nothing about it.
+BOOST_AUTO_TEST_CASE(MailZone_Refused) {
+  std::string reply;
+  uint8_t appendError = 0xFF;
+  BOOST_CHECK_EQUAL(think(owner, "hi!", "/m/" + other.getPublicKeyHexStr() +
+                                            "/inbox/x",
+                          reply, appendError),
+                    CES_ERROR_NOT_OWNER);
+  BOOST_CHECK_EQUAL(backend->calls.load(), 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

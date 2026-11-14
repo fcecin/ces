@@ -20,13 +20,10 @@
 // NOT_OWNER, or INSUFFICIENT_BALANCE when the file's balance cannot pay).
 // ---------------------------------------------------------------------------
 
-constexpr size_t kThinkPromptMax = 16u * 1024u * 1024u;   // IPC sanity cap
-
-struct ThinkCall {
-  std::string text;      // the reply so far
-  int cb = LUA_NOREF;    // registry ref of on_piece
-};
-std::map<uint16_t, ThinkCall> g_think_calls;   // corr_id -> call (Lua thread)
+// The longest prompt that fits one IPC frame: [u8 tag][u16 corr] then
+// [u16 method][u32 len][prompt][u16 pathLen][path of at most 1024].
+constexpr size_t kThinkPromptMax =
+    kIpcMaxFrameLen - 3 - 2 - 4 - 2 - 1024;
 
 // Add each queued piece to its call and run the call's on_piece. `L` must be
 // a running state: the main thread in the run loop, or the main chunk in its

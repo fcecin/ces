@@ -52,13 +52,14 @@ uint64_t get_u64(const uint8_t* p) {
 
 // Build + send a TAG_API_CALL; returns its corr_id, or 0 on write failure.
 // corr_id 0 is reserved for one-way frames, so the counter skips it on wrap.
+// It also skips the ids of calls in flight (corr_in_use).
 uint16_t send_api_call(uint16_t method, const std::vector<uint8_t>& args) {
   std::vector<uint8_t> body;
   body.reserve(sizeof(uint16_t) + args.size());
   put_u16(body, method);
   body.insert(body.end(), args.begin(), args.end());
   uint16_t corr;
-  do { corr = g_next_corr_id++; } while (corr == 0);
+  do { corr = g_next_corr_id++; } while (corr == 0 || corr_in_use(corr));
   if (!write_frame(TAG_API_CALL, corr, body.data(), body.size())) return 0;
   return corr;
 }

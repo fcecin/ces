@@ -803,6 +803,15 @@ void markRentCharged(Sidecar& sc, uint64_t nowUs, uint64_t indexNow) {
   sc.has_rent_index = true;
 }
 
+// Credits that a call in flight holds for the file's program account
+// (util/account_holds.h). They come back when the call ends.
+uint64_t heldFor(CesServer* server, const Sidecar& sc) {
+  if (!server) return 0;
+  minx::Hash pk{};
+  std::memcpy(pk.data(), sc.program_pubkey.data(), 32);
+  return server->accountHolds().of(pk);
+}
+
 // Roll rent forward on a file up to now. Mutates `sc` in place.
 //
 // - If the file can cover the owed rent: deducts it, advances
@@ -987,6 +996,12 @@ bool chargeRentOrDelete(CesServer* server,
   auto r = server->_l2DebitProgramAccountSync(
     pubkey, static_cast<int64_t>(owed));
   bool dead = !r.ok;
+  // A call in flight holds credits of this account that come back when it
+  // ends. When they cover the shortfall, the rent waits: it stays owed and
+  // the next charge takes it.
+  if (dead && static_cast<uint64_t>(std::max<int64_t>(r.newBalance, 0)) +
+                  heldFor(server, sc) >= owed)
+    return true;
 
   if (dead) {
     // Dead. Delete and bump meta.
@@ -1900,6 +1915,10 @@ StatOutcome statCore(CesServer* server, const std::string& name,
                      const L2Billing& bill) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) return { rc, {}, 0, 0, 0, 0, 0 };
+  // The /m/ mail zone is private: no STAT (metadata) from the wire or from
+  // a program either. Only builtin:mail reads it in-process.
+  if (name.size() > 1 && name[1] == 'm')
+    return { CES_ERROR_NOT_OWNER, {}, 0, 0, 0, 0, 0 };
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
@@ -2738,10 +2757,11 @@ uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
       // /s/ files are exempt from rent-based GC - unmetered by
       // definition.
       if (isServerZone(s.name)) return;
-      // The same price as the rent charge (owedRentOf).
+      // The same price as the rent charge (owedRentOf), and the credits
+      // that a call in flight holds for the account count as its own.
       uint64_t owed = owedRentOf(s, feeRent, now, indexNow);
       uint64_t bal = server ? readProgramAccountBalance(server, s) : 0;
-      if (owed > bal) {
+      if (owed > bal + heldFor(server, s)) {
         // Dead. Delete content + sidecar. Best-effort rmdir of
         // empty parents.
         std::error_code ec;
@@ -2826,7 +2846,11 @@ void deleteExhaustedSource(CesServer* server, const std::string& sourceName) {
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, sourceName);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, sourceName);
   Sidecar sc{};
-  uint64_t size = readSidecar(sPath, sc) ? sc.size : 0;
+  const bool haveSc = readSidecar(sPath, sc);
+  uint64_t size = haveSc ? sc.size : 0;
+  // A call in flight holds credits of this account that come back when it
+  // ends. The source is not exhausted while it has a hold; the op fails.
+  if (haveSc && heldFor(server, sc) > 0) return;
   std::error_code ec;
   std::filesystem::remove(cPath, ec);
   std::filesystem::remove(sPath, ec);
@@ -3465,7 +3489,9 @@ bool FileHandler::getProgramHash(
   return true;
 }
 
-bool FileHandler::debitBalance(const std::string& name, uint64_t amount) {
+bool FileHandler::debitBalance(const std::string& name, uint64_t amount,
+                               bool* deferred) {
+  if (deferred) *deferred = false;
   CesServer* server = server_;
   if (!server) return false;
   // /s/ files are unmetered - operator donates everything via the
@@ -3486,6 +3512,13 @@ bool FileHandler::debitBalance(const std::string& name, uint64_t amount) {
   auto debit = debitProgramAccount(server, sc, amount);
   bool insufficient = !debit.ok;
 
+  // A call in flight holds credits of this account that come back when it
+  // ends. When they cover the shortfall the file stays: the debit fails and
+  // the caller can try again later.
+  if (insufficient && debit.newBalance + heldFor(server, sc) >= amount) {
+    if (deferred) *deferred = true;
+    return false;
+  }
   if (insufficient) {
     // Debit exhaustion - treat exactly like rent exhaustion: delete.
     std::error_code ec;

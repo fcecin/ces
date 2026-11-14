@@ -326,8 +326,11 @@ namespace {
 inline FileHandler* fileHOf(CesServer* sv) {
   return sv ? sv->fileHandler() : nullptr;
 }
-inline bool fhDebitBalance(CesServer* sv, const std::string& name, uint64_t amount) {
-  FileHandler* fh = fileHOf(sv);  return fh && fh->debitBalance(name, amount);
+inline bool fhDebitBalance(CesServer* sv, const std::string& name, uint64_t amount,
+                           bool* deferred = nullptr) {
+  FileHandler* fh = fileHOf(sv);
+  if (deferred) *deferred = false;
+  return fh && fh->debitBalance(name, amount, deferred);
 }
 inline bool fhCreditBalance(CesServer* sv, const std::string& name, uint64_t amount) {
   FileHandler* fh = fileHOf(sv);  return fh && fh->creditBalance(name, amount);
@@ -1688,8 +1691,12 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       file.caller = inst->ownerPk;
       file.sourceName = inst->sourceName;
     }
-    minx::Hash payer{};
-    std::memcpy(payer.data(), inst->programPubkey.data(), 32);
+    // The refund goes back to the program account, or to the owner when the
+    // source file is gone by the end of the call.
+    ThinkPayer payer;
+    std::memcpy(payer.account.data(), inst->programPubkey.data(), 32);
+    payer.source = inst->sourceName;
+    std::memcpy(payer.owner.data(), inst->ownerPk.data(), 32);
     th->submit(payer,
                std::string(reinterpret_cast<const char*>(mbody + 4), plen),
                std::make_shared<InstanceThinkSink>(
@@ -3330,11 +3337,14 @@ void supervisorTick(ComputeHandler& H) {
     uint64_t debit = (total > static_cast<__uint128_t>(UINT64_MAX))
       ? UINT64_MAX : static_cast<uint64_t>(total);
     if (debit == 0) continue;
-    if (!fhDebitBalance(server, inst->sourceName, debit)) {
-      toKill.push_back(pid);
-    } else {
+    bool deferred = false;
+    if (fhDebitBalance(server, inst->sourceName, debit, &deferred)) {
       inst->lastTickUs = now;
+    } else if (!deferred) {
+      toKill.push_back(pid);
     }
+    // deferred: a ces.think call holds credits that cover the debit. The
+    // tick does not move, so the next tick charges this time too.
 
     // Reap zombies: if the child exited on its own, drop the
     // instance. No restart — owner re-LAUNCHes manually.

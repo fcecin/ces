@@ -125,6 +125,14 @@ std::deque<Frame> g_peer_q;      // pending PEER_MSG_IN frames (drained by run()
 std::deque<Frame> g_l2call_q;    // pending L2_CALL_IN frames (drained by run())
 std::deque<Frame> g_think_q;     // pending THINK_PIECE frames (drain_think)
 
+// The ces.think calls in flight (api_think.inc). Here so send_api_call can
+// see their ids.
+struct ThinkCall {
+  std::string text;      // the reply so far
+  int cb = LUA_NOREF;    // registry ref of on_piece
+};
+std::map<uint16_t, ThinkCall> g_think_calls;   // corr_id -> call (Lua thread)
+
 // Optional C++ interceptor for inbound peer-mesh messages, set by the hyle net
 // lifecycle so its consensus frames feed the Runtime directly, not a Lua listener.
 // Returns true if it consumed the message. Null when no net chain runs.
@@ -142,6 +150,18 @@ struct IoWaiter { lua_State* co; IoDecoder decode; };
 std::set<lua_State*>         g_parked;      // coroutines suspended on a host call
 std::map<uint16_t, IoWaiter> g_io_waiters;  // corr_id -> parked coroutine + decoder
 std::deque<Frame>            g_io_ready;     // arrived replies for parked coroutines
+
+// True when a call in flight has this corr_id. The 16-bit counter wraps, and
+// a long call (ces.think) can see 65535 other calls go by, so a new call
+// must not take a live id.
+bool corr_in_use(uint16_t corr) {
+  return g_io_waiters.count(corr) != 0 || g_think_calls.count(corr) != 0;
+}
+
+// The host kills a child that sends a frame longer than this (the
+// compute_handler.cpp kIpcMaxFrameLen). write_frame refuses such a frame
+// instead, so the call fails and the program keeps running.
+constexpr uint32_t kIpcMaxFrameLen = 2u * 1024u * 1024u;
 
 // Per-conn handler dispatch. Each inbound conn event (relay CONN_* frame or
 // direct /ces/luarpc/1 event) runs its listener callback (on_open/on_data/
@@ -220,6 +240,8 @@ bool read_frame(Frame& out) {
 
 bool write_frame(uint8_t tag, uint16_t corr_id,
                  const uint8_t* body, size_t body_len) {
+  if (body_len > kIpcMaxFrameLen - sizeof(uint8_t) - sizeof(uint16_t))
+    return false;
   uint32_t len = static_cast<uint32_t>(
       sizeof(uint8_t) + sizeof(uint16_t) + body_len);   // tag + corr + body
   uint8_t hdr[7];

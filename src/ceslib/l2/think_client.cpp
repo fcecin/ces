@@ -16,9 +16,13 @@ namespace {
 
 constexpr uint8_t kVerbThink = 1;
 constexpr const char* kThinkProto = "/ces/think/1";
-// The longest wait for one reply frame. The server's own call timeout ends
-// a call first; this only catches a server that went silent.
-constexpr auto kFrameTimeout = std::chrono::minutes(15);
+// The longest wait for one reply frame. The server sends a keepalive at
+// least every 20 s while a call runs, so a longer silence means it is gone.
+constexpr auto kFrameTimeout = std::chrono::minutes(2);
+// The longest whole reply, and the largest. The server's own limits end a
+// call well before these; they only stop a server that never ends.
+constexpr auto kTotalTimeout = std::chrono::minutes(30);
+constexpr size_t kMaxReply = 64u * 1024u * 1024u;
 constexpr size_t kOkPreamble = 8 + 32 + 1;   // [u64 charged][32 hash][u8 appendError]
 
 }  // namespace
@@ -78,12 +82,14 @@ uint8_t CesThinkClient::think(
   uint8_t rc = impl_->chan->driveStreamVerb(
       kVerbThink, env, body,
       [&](const ces::Bytes& frame) {
+        if (reply.size() + frame.size() > kMaxReply) return false;
         std::string_view piece(reinterpret_cast<const char*>(frame.data()),
                                frame.size());
         reply.append(piece);
         if (onText) onText(piece);
+        return true;
       },
-      kFrameTimeout, kOkPreamble, outPre);
+      kFrameTimeout, kTotalTimeout, kOkPreamble, outPre);
   if (rc != CES_OK) return rc;
   if (outPre.size() != kOkPreamble) return CES_ERROR_INTERNAL;
   charged = ces::Buffer::peek<uint64_t>(outPre.data());

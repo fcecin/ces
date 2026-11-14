@@ -40,11 +40,27 @@ namespace {
 struct Call {
   const std::atomic<bool>* stop = nullptr;
   const std::function<bool(std::string_view)>* onText = nullptr;
-  beast::tcp_stream* low = nullptr;   // to cancel the call on `stop`
+  // The stream to cancel on `stop`. It lives in the coroutine frame, so
+  // callAsync clears it before that frame goes away.
+  beast::tcp_stream* low = nullptr;
   ThinkSseParser parser;
   ThinkOutcome out;
   bool finished = false;
 };
+
+// Clears Call::low on every exit from callAsync, before the stream it
+// points to is destroyed.
+struct ClearLow {
+  Call& c;
+  ~ClearLow() { c.low = nullptr; }
+};
+
+// End the call before the next step when `stop` is set, so a stopped call
+// sends no request.
+void throwIfStopped(const Call& c) {
+  if (c.stop->load())
+    throw boost::system::system_error(asio::error::operation_aborted);
+}
 
 template <class Stream>
 asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
@@ -58,6 +74,7 @@ asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
   req.set(http::field::user_agent, "ces-think");
   req.body() = body;
   req.prepare_payload();
+  throwIfStopped(c);
   co_await http::async_write(s, req, asio::use_awaitable);
 
   beast::flat_buffer buf;
@@ -86,7 +103,10 @@ asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
     co_return;
   }
 
-  // From here the backend did work that it can bill.
+  // From here the backend did work that it can bill. When the reader
+  // stops taking text (its client left), the loop still reads to the usage
+  // report, so the call is billed by usage. Only `stop` (shutdown) or the
+  // timeout ends it early.
   c.out.billing = ThinkOutcome::kEstimate;
   bool bad = false;
   while (!p.is_done()) {
@@ -101,8 +121,9 @@ asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
       bad = true;
       break;
     }
-    if (c.parser.done() || c.parser.stopped() || c.stop->load()) break;
+    if (c.parser.done() || c.stop->load()) break;
   }
+  c.out.outBytes = c.parser.textBytes() + c.parser.reasoningBytes();
   if (c.parser.hasUsage()) {
     c.out.usage = c.parser.usage();
     c.out.billing = ThinkOutcome::kUsage;
@@ -116,7 +137,9 @@ asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
   } else if (c.parser.stopped() || c.stop->load()) {
     c.out.status = CES_ERROR_INTERNAL;
     c.out.detail = "stopped";
-  } else if (!c.parser.done() && !p.is_done()) {
+  } else if (!c.parser.done()) {
+    // A complete reply ends with "[DONE]". A body that ends before it may
+    // have lost text.
     c.out.status = CES_ERROR_INTERNAL;
     c.out.detail = "stream ended early";
   } else {
@@ -128,12 +151,15 @@ asio::awaitable<void> callAsync(const ThinkHttpsBackend::Impl& im,
                                 asio::ssl::context* ctx,
                                 std::chrono::steady_clock::time_point deadline,
                                 std::string auth, std::string body, Call& c) {
+  ClearLow clearLow{c};
+  throwIfStopped(c);
   auto ex = co_await asio::this_coro::executor;
   tcp::resolver res(ex);
   beast::tcp_stream tcpStream(ex);
   c.low = &tcpStream;
   tcpStream.expires_at(deadline);
   auto eps = co_await res.async_resolve(im.host, im.port, asio::use_awaitable);
+  throwIfStopped(c);
   co_await tcpStream.async_connect(eps, asio::use_awaitable);
   if (!im.tls) {
     co_await exchange(tcpStream, im, auth, body, c);
@@ -146,6 +172,7 @@ asio::awaitable<void> callAsync(const ThinkHttpsBackend::Impl& im,
         boost::system::error_code(static_cast<int>(::ERR_get_error()),
                                   asio::error::get_ssl_category()));
   s.set_verify_callback(asio::ssl::host_name_verification(im.host));
+  throwIfStopped(c);
   co_await s.async_handshake(asio::ssl::stream_base::client,
                              asio::use_awaitable);
   co_await exchange(s, im, auth, body, c);
@@ -216,8 +243,9 @@ ThinkOutcome ThinkHttpsBackend::run(
   while (!c.finished) {
     ioc.run_for(std::chrono::milliseconds(100));
     if (ioc.stopped() && !c.finished) ioc.restart();
-    if (!cancelled && stop.load() && c.low) {
+    if (!cancelled && stop.load() && !c.finished && c.low) {
       // This thread runs the io_context, so the socket is safe to touch.
+      // c.low is set only while the coroutine that owns the stream lives.
       c.low->cancel();
       cancelled = true;
     }

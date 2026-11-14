@@ -187,7 +187,11 @@ public:
                          ces::Bytes& outContent);
   // Debit `amount` from the file's program account (rolls rent first). The
   // file is DELETED if the post-roll balance cannot cover it; returns false.
-  bool debitBalance(const std::string& name, uint64_t amount);
+  // When a call in flight holds credits of the account (CesServer::
+  // accountHolds) that cover the shortfall, the file stays, nothing is
+  // debited, the result is false and `*deferred` (when given) is true.
+  bool debitBalance(const std::string& name, uint64_t amount,
+                    bool* deferred = nullptr);
   // Credit `amount` into the file's program account (rolls rent first).
   bool creditBalance(const std::string& name, uint64_t amount);
   // sha256(file_content || file_path), cached in the sidecar until the file
