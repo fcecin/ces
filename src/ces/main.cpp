@@ -330,6 +330,14 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # think_max_input_bytes = 1048576   # largest prompt text
 # think_timeout_secs    = 300       # one call, end to end
 # think_max_concurrent  = 8         # calls in flight
+# Global subsidy: the price multiplier (basis points of the full price, as in
+# the fee multipliers) cools to think_subsidy_floor_bp while nobody thinks and
+# heats back to 10000 with use. The most it gives over a window T is
+# budget + T * budget / tau (raw credit units). Off when the budget or tau is
+# 0 or the floor is 10000.
+# think_subsidy_budget   = 0        # e.g. 200000000000 (2000 credits)
+# think_subsidy_tau_secs = 0        # e.g. 172800 (2 days)
+# think_subsidy_floor_bp = 10000    # e.g. 1 (99.99% off at rest)
 )"
        << R"(
 # === CesPlex mounts: the crucial L2 wiring (rpc_port only). ===
@@ -499,6 +507,8 @@ int main(int argc, char* argv[]) {
   uint32_t    optThinkMaxInputBytes = 1024 * 1024;
   uint32_t    optThinkTimeoutSecs = 300;
   uint32_t    optThinkMaxConcurrent = 8;
+  uint64_t    optThinkSubsidyBudget = 0, optThinkSubsidyTauSecs = 0;
+  uint16_t    optThinkSubsidyFloorBp = 10000;
   // CesPlex mounts — `proto=target` pairs. Target is
   // "builtin:<name>" (statically linked handler).
   std::vector<std::string> optCesplexMounts;
@@ -705,6 +715,15 @@ int main(int argc, char* argv[]) {
       "Timeout of one builtin:think call, seconds")->default_val("300");
     app.add_option("--thinkmaxconcurrent", optThinkMaxConcurrent,
       "builtin:think calls in flight")->default_val("8");
+    app.add_option("--thinksubsidybudget", optThinkSubsidyBudget,
+      "builtin:think subsidy heat budget, raw credits (0 = off)")
+      ->default_val("0");
+    app.add_option("--thinksubsidytausecs", optThinkSubsidyTauSecs,
+      "builtin:think subsidy cool-down time constant, seconds (0 = off)")
+      ->default_val("0");
+    app.add_option("--thinksubsidyfloorbp", optThinkSubsidyFloorBp,
+      "builtin:think subsidy price multiplier at rest, bp of full price "
+      "(1 = 99.99% off; 10000 = off)")->default_val("10000");
 
     // --- File-storage feature (CesPlex builtin:file) ---
     app.add_option("--filestoremaxbytes", optFileStoreMaxBytes,
@@ -963,6 +982,12 @@ int main(int argc, char* argv[]) {
                      "--thinktimeoutsecs");
       applyIfDefault("think_max_concurrent", optThinkMaxConcurrent,
                      "--thinkmaxconcurrent");
+      applyIfDefault("think_subsidy_budget", optThinkSubsidyBudget,
+                     "--thinksubsidybudget");
+      applyIfDefault("think_subsidy_tau_secs", optThinkSubsidyTauSecs,
+                     "--thinksubsidytausecs");
+      applyIfDefault("think_subsidy_floor_bp", optThinkSubsidyFloorBp,
+                     "--thinksubsidyfloorbp");
 
       // Compute feature knobs.
       applyIfDefault("compute_max_instances",    optComputeMaxInstances,
@@ -1185,6 +1210,9 @@ int main(int argc, char* argv[]) {
   config.thinkMaxInputBytes = optThinkMaxInputBytes;
   config.thinkTimeoutSecs   = optThinkTimeoutSecs;
   config.thinkMaxConcurrent = optThinkMaxConcurrent;
+  config.thinkSubsidyBudget  = optThinkSubsidyBudget;
+  config.thinkSubsidyTauSecs = optThinkSubsidyTauSecs;
+  config.thinkSubsidyFloorBp = optThinkSubsidyFloorBp;
   config.extFundingPerDay     = optExtFundingPerDay;
   config.extLocalBudget       = optExtLocalBudget;
   if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;

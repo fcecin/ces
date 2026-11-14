@@ -96,7 +96,8 @@ struct ThinkFixture {
 
   ThinkFixture() : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 8, true) {}
   ThinkFixture(int64_t fund, uint64_t feeIn, uint64_t feeOut,
-               uint32_t maxConcurrent, bool withBackend) {
+               uint32_t maxConcurrent, bool withBackend,
+               uint64_t subsidyBudget = 0) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("thinkh");
@@ -114,6 +115,9 @@ struct ThinkFixture {
     cfg.thinkMaxOutTokens = kMaxOut;
     cfg.thinkMaxInputBytes = kMaxInput;
     cfg.thinkMaxConcurrent = maxConcurrent;
+    cfg.thinkSubsidyBudget = subsidyBudget;
+    cfg.thinkSubsidyTauSecs = 3600;
+    cfg.thinkSubsidyFloorBp = 1;
     server = std::make_unique<CesServer>(cfg);
     uint16_t mainPort = server->start(0);
     rpcPort = server->_rpcBoundPort();
@@ -167,6 +171,11 @@ struct ThinkNoBackendFixture : ThinkFixture {
 };
 struct ThinkFreeFixture : ThinkFixture {
   ThinkFreeFixture() : ThinkFixture(10'000'000, 0, 0, 8, true) {}
+};
+// Subsidy on, at rest. The fund (1000) is below the full hold (2066).
+struct ThinkSubsidyFixture : ThinkFixture {
+  ThinkSubsidyFixture()
+      : ThinkFixture(1000, kFeeIn, kFeeOut, 8, true, 1'000'000'000) {}
 };
 struct ThinkOneSlotFixture : ThinkFixture {
   ThinkOneSlotFixture() : ThinkFixture(10'000'000, kFeeIn, kFeeOut, 1, true) {}
@@ -518,6 +527,31 @@ BOOST_AUTO_TEST_CASE(Think_ConcurrencyCap) {
   backend->release = true;
   caller.join();
   BOOST_CHECK_EQUAL(rc1, CES_OK);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_FIXTURE_TEST_SUITE(ThinkSubsidyTests, ThinkSubsidyFixture)
+
+// A cool service gives 99.99% off the hold and the charge, so an account
+// with too little for the full hold can think. The subsidy it got stays in
+// the heat; the unused reservation goes back.
+BOOST_AUTO_TEST_CASE(Think_CoolServiceIsNearlyFree) {
+  HeatSubsidy* sub = server->thinkHandler()->subsidy();
+  BOOST_REQUIRE(sub->enabled());
+  BOOST_REQUIRE_EQUAL(sub->multBp(), 1);   // at rest: 1 bp of the price
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  uint64_t charged = 0;
+  CES_REQUIRE_OK(tc.think("hi there", nullptr, reply, charged));
+  const uint64_t full = thinkCost(fees(), backend->usage);   // 70
+  const uint64_t subsidized = full * 9999 / 10000;           // 69
+  BOOST_CHECK_EQUAL(charged, full - subsidized);
+  BOOST_CHECK(waitBalance(1000 - static_cast<int64_t>(charged)));
+  // The heat holds what was given (less a little cooling since).
+  BOOST_CHECK_LE(sub->heat(), subsidized);
+  BOOST_CHECK_GE(sub->heat(), subsidized - 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -109,6 +109,11 @@ think_max_out_tokens  = 4096
 think_max_input_bytes = 1048576
 think_timeout_secs    = 300
 think_max_concurrent  = 8
+# Global subsidy: up to 99.99% off while nobody thinks. Worst case 2000
+# credits (~$0.10 at the peg) at once plus 1000 credits (~$0.05) a day.
+think_subsidy_budget   = 200000000000
+think_subsidy_tau_secs = 172800
+think_subsidy_floor_bp = 1
 
 # L2 handlers wired on: file + lua + compute + the peer mesh. Nothing
 # auto-mounts; the peer mesh must be listed here too.

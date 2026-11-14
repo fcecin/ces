@@ -557,6 +557,15 @@ struct CesConfig {
   uint32_t    thinkMaxInputBytes = 1024 * 1024;
   uint32_t    thinkTimeoutSecs = 300;
   uint32_t    thinkMaxConcurrent = 8;
+  // builtin:think global subsidy (util/heat_subsidy.h). The price multiplier
+  // (basis points of the full price, as in feemult.h) cools to
+  // thinkSubsidyFloorBp while nobody thinks, and heats back to 10000 with use.
+  // The subsidy given over any window T is at most budget + T * budget / tau
+  // (raw credit units). Off when the budget or tau is 0 or the floor is
+  // 10000. The heat is saved in <data_dir>/think_subsidy.state.
+  uint64_t    thinkSubsidyBudget = 0;
+  uint64_t    thinkSubsidyTauSecs = 0;
+  uint16_t    thinkSubsidyFloorBp = 10000;
 
   // L2 compute program UDP port range: [computePortBase, computePortBase
   // + computePortCount - 1]. Each launched child binds its outbound CES

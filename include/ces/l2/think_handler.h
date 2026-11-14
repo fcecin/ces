@@ -23,6 +23,11 @@
 // one, send the transcript again with the new part at its end. The backend's
 // prompt cache bills the repeated prefix at the cached-input price.
 //
+// Subsidy: a global discount (HeatSubsidy, think_subsidy_*). While nobody
+// thinks the price multiplier cools to think_subsidy_floor_bp of the price;
+// with use it heats back to the full price. It applies to the hold and the charge alike. Its total over any
+// window T is at most budget + T * budget / tau.
+//
 // Billing: before the call the server burns a hold from the signer, the
 // most the call can cost (every prompt byte as one token, plus the max
 // output tokens). When the call ends it charges the cost of the token usage
@@ -35,6 +40,7 @@
 #include <ces/cesplex/mux.h>
 #include <ces/keys.h>
 #include <ces/l2/think_backend.h>
+#include <ces/util/heat_subsidy.h>
 
 #include <atomic>
 #include <cstdint>
@@ -110,6 +116,10 @@ class ThinkHandler : public CesPlexHandler {
   // Test hook: replace the backend.
   void _testSetBackend(std::shared_ptr<ThinkBackend> backend);
 
+  // The global price discount (think_subsidy_*). Never null; off when the
+  // budget or tau is 0 or the floor is 10000.
+  HeatSubsidy* subsidy() { return subsidy_.get(); }
+
   // Run one call billed to `payer`: check, hold, call the backend on a
   // worker thread, settle. Every outcome, refusals included, ends in one
   // sink->finish. The caller decides who `payer` is and must have
@@ -131,6 +141,7 @@ class ThinkHandler : public CesPlexHandler {
   mutable std::mutex mu_;              // backend_ and jobs_
   std::shared_ptr<ThinkBackend> backend_;
   std::list<std::shared_ptr<Job>> jobs_;
+  std::unique_ptr<HeatSubsidy> subsidy_;
 };
 
 }  // namespace ces

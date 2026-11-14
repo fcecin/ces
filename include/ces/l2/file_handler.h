@@ -191,6 +191,21 @@ public:
   // Register a callback invoked right after a file is deleted by any internal
   // path. Fires in registration order on the deleting thread. No deregister.
   void registerDeletionCallback(std::function<void(const std::string&)> cb);
+  // The rent multiplier now, in basis points of fee_file_rent: the used
+  // fraction of the metered store (total bytes / file_store_max_bytes),
+  // floored at 1 bp. An empty store pays almost nothing (up to 99.99% off);
+  // a full one pays the base rent. Space is the scarce thing, so its price
+  // follows how much of it is held. Only rent scales: writes (mechanical
+  // wear), reads, the prepaid kv cell rent and the GC cap check stay at
+  // base. One atomic load. Thread-safe.
+  uint16_t rentBp();
+  // Set the gauge that rentBp reads. writeStoreMeta calls it each time it
+  // writes the store totals.
+  void noteStoreBytes(uint64_t bytes);
+  // Test hook: make rentBp return `bp` (0 = follow the gauge again). For
+  // tests that check rent at the base price.
+  void _testPinRentBp(uint16_t bp) { pinnedRentBp_ = bp; }
+
   // In-process verb execution. See FileExecReq / FileExecResp above.
   void exec(const FileExecReq& req,
             std::function<void(FileExecResp)> cb,
@@ -207,6 +222,8 @@ public:
 
 private:
   std::atomic<bool> stopped_{false};
+  std::atomic<uint64_t> storeBytes_{0};   // store total_bytes (rent gauge)
+  std::atomic<uint16_t> pinnedRentBp_{0}; // test pin (0 = none)
 };
 
 } // namespace ces

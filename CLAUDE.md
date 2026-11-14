@@ -215,7 +215,7 @@ Four-zone naming (mandatory):
 Anything else returns `BAD_NAME`. Zone ownership is checked only at CREATE; subsequent ops use the sidecar's stamped `owner_pubkey`.
 
 Three-cost model:
-- `feeFileRent`: credits per byte-day; drains `file_balance`.
+- `feeFileRent`: credits per byte-day; drains `file_balance`. Charged at the store's utilization: `FileHandler::rentBp()` is the used fraction of the metered store (total bytes / `file_store_max_bytes`, floored at 1 bp), so an empty store pays up to 99.99% less and a full one pays the base. `writeStoreMeta` sets the gauge, so a read is one atomic load. Only rent scales; writes (wear), reads, prepaid kv cell rent and the GC cap check stay at base. Tests that check base rent pin it with `_testPinRentBp(10000)`; `RentPriceTests` covers it.
 - `feeFileWrite`: per KB; drains `file_balance` at WRITE/APPEND.
 - `feeFileRead`: per KB; drains the reader's account (burned; even the owner pays).
 
@@ -257,6 +257,7 @@ One verb, THINK. The signer sends one UTF-8 prompt as a hash-committed body (pre
 - Lua, host call: `ces.think(prompt [, on_piece])` returns `reply, charged`, or `nil, rc, partial`. It is `kApiMethodThink` over the instance IPC; the pieces arrive as `TAG_THINK_PIECE` frames under the call's corr_id, and on_piece runs for each one (from the run loop in a coroutine, inside the wait in the main chunk; it cannot yield). The payer is the file's program account, which the server reads from its instance record. For a flat file that account is the file's balance (the owner's deposit, plus credits anyone sends to `ces.program_pubkey()`). On /s/ it is topped up to `ext_local_budget` at boot and daily, which caps what an extension spends. Needs builtin:think mounted, else DISABLED.
 - Lua, client: `ces.think_client(addr [, server_pubkey]):think(prompt)` dials any server's `/ces/think/1` as the program account, with the same returns and no streaming to Lua.
 - No path lets a program bill another account: every program spend comes from its own program account.
+- Subsidy: `HeatSubsidy` (`util/heat_subsidy.h`, `think_subsidy_budget` / `_tau_secs` / `_floor_bp`) is a global discount on the hold and the charge. Its bp is a price multiplier, as in `feemult.h` (10000 = full price). The heat is the subsidy given recently, decaying as `exp(-t/tau)`; the multiplier is `floor_bp + (10000 - floor_bp) * heat/budget`, and a grant never takes the heat past the budget. Off when the budget or tau is 0 or the floor is 10000. So the subsidy over any window T is at most `budget + T * budget / tau`. The heat is saved in `<data_dir>/think_subsidy.state`; with no state file the service starts at rest. `HeatSubsidyTests` and `ThinkSubsidyTests`.
 - Tests: `ThinkHelperTests`, `ThinkTests` and related suites (`test_think.cpp`), and `ThinkLuaTests` (`test_think_lua.cpp`, real cesluajitd) use a scripted backend, with no network. `local/think/smoke.sh KEYFILE "prompt"` is the gitignored live check.
 
 ## L2 lua: `builtin:lua` (channel routing)

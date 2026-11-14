@@ -690,7 +690,11 @@ bool readStoreMeta(const std::filesystem::path& path, StoreMeta& m) {
   return true;
 }
 
-bool writeStoreMeta(const std::filesystem::path& path, const StoreMeta& m) {
+// The one writer of the store totals. It also sets the handler's rent gauge
+// (FileHandler::rentBp), so the price follows the store with no file read.
+bool writeStoreMeta(FileHandler* fh, const std::filesystem::path& path,
+                    const StoreMeta& m) {
+  if (fh) fh->noteStoreBytes(m.total_bytes);
   std::ostringstream oss;
   oss << "version = 1\n";
   oss << "total_files = " << m.total_files << "\n";
@@ -713,7 +717,8 @@ bool writeStoreMeta(const std::filesystem::path& path, const StoreMeta& m) {
 
 // Updates the store meta by (delta_files, delta_bytes). Caller must
 // hold the store-meta mutex. Creates .store.toml if missing.
-void adjustStoreMeta(const std::string& dir, int64_t df, int64_t db) {
+void adjustStoreMeta(FileHandler* fh, const std::string& dir, int64_t df,
+                     int64_t db) {
   auto p = storeMetaPath(dir);
   StoreMeta m;
   readStoreMeta(p, m); // tolerant of missing file
@@ -721,7 +726,7 @@ void adjustStoreMeta(const std::string& dir, int64_t df, int64_t db) {
   else m.total_files -= std::min(m.total_files, uint64_t(-df));
   if (db >= 0) m.total_bytes += static_cast<uint64_t>(db);
   else m.total_bytes -= std::min(m.total_bytes, uint64_t(-db));
-  writeStoreMeta(p, m);
+  writeStoreMeta(fh, p, m);
 }
 
 // ---------------------------------------------------------------------------
@@ -732,14 +737,18 @@ void adjustStoreMeta(const std::string& dir, int64_t df, int64_t db) {
 // Uses __uint128_t for safety - realistic inputs don't come close to
 // overflow, but a malicious tamper of last_rent_us or extreme values
 // can; we clamp to UINT64_MAX in that case (effectively "dead file").
+// `bp` scales the base rent (FileHandler::rentBp). Applied before the one
+// division, so a small base rent keeps its precision at low bp.
 uint64_t computeOwedRent(uint64_t size, int64_t feeRent,
-                         uint64_t lastRentUs, uint64_t nowUs) {
+                         uint64_t lastRentUs, uint64_t nowUs,
+                         uint16_t bp = 10000) {
   if (nowUs <= lastRentUs) return 0;
-  if (feeRent <= 0 || size == 0) return 0;
+  if (feeRent <= 0 || size == 0 || bp == 0) return 0;
   __uint128_t owed = static_cast<__uint128_t>(size)
                    * static_cast<__uint128_t>(static_cast<uint64_t>(feeRent))
-                   * static_cast<__uint128_t>(nowUs - lastRentUs);
-  owed /= static_cast<__uint128_t>(kUsecsPerDay);
+                   * static_cast<__uint128_t>(nowUs - lastRentUs)
+                   * static_cast<__uint128_t>(bp);
+  owed /= static_cast<__uint128_t>(kUsecsPerDay) * 10000u;
   if (owed > std::numeric_limits<uint64_t>::max())
     return std::numeric_limits<uint64_t>::max();
   return static_cast<uint64_t>(owed);
@@ -917,8 +926,11 @@ bool chargeRentOrDelete(CesServer* server,
   // They never accrue whole-file rent here, and never die of it.
   if (sc.type == kFileTypeKv) return true;
   uint64_t now = getMicrosSinceEpoch();
+  // The elapsed rent is charged at today's utilization price.
+  const uint16_t bp = server && server->fileHandler()
+                          ? server->fileHandler()->rentBp() : 10000;
   uint64_t owed = computeOwedRent(
-    sc.size, feeRent, sc.last_rent_us, now);
+    sc.size, feeRent, sc.last_rent_us, now, bp);
   if (owed == 0) return true;
 
   if (!server) return false;
@@ -946,7 +958,7 @@ bool chargeRentOrDelete(CesServer* server,
     }
     {
       std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-      adjustStoreMeta(dir, -1, -static_cast<int64_t>(sc.size));
+      adjustStoreMeta(server->fileHandler(), dir, -1, -static_cast<int64_t>(sc.size));
     }
     notifyDeletion(server, sc.name);
     return false;
@@ -1258,7 +1270,8 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
     // (cells are funded, and burned, per-key). Neither mints a program account.
     initialDeposit = 0;
   } else {
-    upfrontBurn = computeOwedRent(size, cfg.feeFileRent, 0, kGcDebounceUs);
+    upfrontBurn = computeOwedRent(size, cfg.feeFileRent, 0, kGcDebounceUs,
+                                  server->fileHandler()->rentBp());
     if (initialDeposit < upfrontBurn) return { CES_ERROR_INSUFFICIENT_BALANCE, 0, 0 };
   }
   const uint64_t programAccountInitial =
@@ -1327,7 +1340,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   }
   if (!serverZone) {
     std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, +1,
+    adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, +1,
         static_cast<int64_t>(type == kFileTypeKv ? kKvCompactFloorBytes : size));
   }
   noteServerZoneMutation(server, name);
@@ -1960,7 +1973,7 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
     std::filesystem::remove(sPath, ec);
     if (!isServerZone(name)) {
       std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-      adjustStoreMeta(cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size));
+      adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size));
     }
     std::filesystem::path p = cPath.parent_path();
     std::filesystem::path base = cfg.cesFileStoreDir;
@@ -2049,7 +2062,8 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
     if (capRc != CES_OK) return { capRc, 0, 0 };
   }
   uint64_t writeCost = serverZone ? 0 : kbCeil(length) * uint64_t(cfg.feeFileWrite);
-  uint64_t upfront = serverZone ? 0 : computeOwedRent(length, cfg.feeFileRent, 0, kGcDebounceUs);
+  uint64_t upfront = serverZone ? 0 : computeOwedRent(length, cfg.feeFileRent, 0, kGcDebounceUs,
+                                                      server->fileHandler()->rentBp());
   uint64_t oldSize = sc.size;
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
@@ -2091,7 +2105,7 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
   if (!serverZone) {
     std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, 0, static_cast<int64_t>(length));
+    adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, 0, static_cast<int64_t>(length));
   }
   return { CES_OK, newBal, sc2.size };
 }
@@ -2180,7 +2194,8 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
       uint8_t capRc = checkCapAndMaybeGc(server, cfg.cesFileStoreDir, cfg.cesFileStoreMaxBytes,
                                          cfg.feeFileRent, static_cast<uint64_t>(bytesDelta));
       if (capRc != CES_OK) return { capRc, 0, 0 }; }
-    upfront = computeOwedRent(static_cast<uint64_t>(bytesDelta), cfg.feeFileRent, 0, kGcDebounceUs);
+    upfront = computeOwedRent(static_cast<uint64_t>(bytesDelta), cfg.feeFileRent, 0,
+                              kGcDebounceUs, server->fileHandler()->rentBp());
   }
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
@@ -2216,7 +2231,7 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
   if (!writeSidecar(sPath, sc2)) return { CES_ERROR_INTERNAL, 0, 0 };
   if (bytesDelta != 0 && !serverZone) {
     std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, 0, bytesDelta);
+    adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, 0, bytesDelta);
   }
   return { CES_OK, sc2.size, bal };
 }
@@ -2308,7 +2323,7 @@ void kvRefreshQuotaLocked(CesServer* server, const std::string& dir,
   if (!writeSidecar(sPath, sc)) return;
   if (!isServerZone(name)) {
     std::lock_guard<std::mutex> mlk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(dir, 0,
+    adjustStoreMeta(server->fileHandler(), dir, 0,
         static_cast<int64_t>(estDisk) - static_cast<int64_t>(reserved));
   }
   cache.reservedBytes[key] = estDisk;
@@ -2696,7 +2711,7 @@ uint64_t gcReclaim(CesServer* server, const std::string& dir, int64_t feeRent,
       // Live files: leave alone. Their rent advances on next touch.
     });
   if (files_delta != 0 || bytes_delta != 0)
-    adjustStoreMeta(dir, files_delta, bytes_delta);
+    adjustStoreMeta(server->fileHandler(), dir, files_delta, bytes_delta);
   return reclaimed;
 }
 
@@ -2717,7 +2732,7 @@ uint8_t checkCapAndMaybeGc(CesServer* server,
   uint64_t reclaimed = gcReclaim(server, dir, feeRent, need);
   readStoreMeta(metaP, m);
   m.last_gc_us = now;
-  writeStoreMeta(metaP, m);
+  writeStoreMeta(server->fileHandler(), metaP, m);
   LOGINFO << "file-store: JIT GC" << VAR(need) << VAR(reclaimed);
   if (m.total_bytes + addBytes > cap) return CES_ERROR_STORE_FULL;
   return CES_OK;
@@ -2771,7 +2786,7 @@ void deleteExhaustedSource(CesServer* server, const std::string& sourceName) {
     p = p.parent_path();
   }
   { std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-    adjustStoreMeta(cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size)); }
+    adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, -1, -static_cast<int64_t>(size)); }
   notifyDeletion(server, sourceName);
 }
 
@@ -3129,6 +3144,21 @@ void FileHandler::serve(std::shared_ptr<minx::RudpStream> stream,
   cesPlexServe(std::move(stream), std::move(bound), server, std::move(proto));
 }
 
+uint16_t FileHandler::rentBp() {
+  if (uint16_t pin = pinnedRentBp_.load()) return pin;
+  CesServer* server = server_;
+  if (!server) return 10000;
+  const uint64_t cap = server->_config().cesFileStoreMaxBytes;
+  if (cap == 0) return 10000;
+  const __uint128_t bp =
+      static_cast<__uint128_t>(storeBytes_.load()) * 10000u / cap;
+  if (bp < 1) return 1;
+  if (bp > 10000) return 10000;
+  return static_cast<uint16_t>(bp);
+}
+
+void FileHandler::noteStoreBytes(uint64_t bytes) { storeBytes_ = bytes; }
+
 void FileHandler::sweepKvRent() {
   CesServer* server = server_;
   const auto& cfg = server->_config();
@@ -3364,7 +3394,7 @@ bool FileHandler::debitBalance(const std::string& name, uint64_t amount) {
     }
     {
       std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-      adjustStoreMeta(cfg.cesFileStoreDir, -1,
+      adjustStoreMeta(server->fileHandler(), cfg.cesFileStoreDir, -1,
                       -static_cast<int64_t>(sc.size));
     }
     notifyDeletion(server, sc.name);
@@ -3573,7 +3603,7 @@ void FileHandler::startupReconcile() {
     m.total_bytes += s.size;
   });
   std::lock_guard lk(server->fileHandler()->storeMetaMutex_);
-  writeStoreMeta(storeMetaPath(dir), m);
+  writeStoreMeta(server->fileHandler(), storeMetaPath(dir), m);
   LOGINFO << "store reconciled"
           << VAR(m.total_files) << VAR(m.total_bytes);
 }

@@ -371,6 +371,9 @@ struct CesPlexFixture {
     rpcPort = server->_rpcBoundPort();
     BOOST_REQUIRE_MESSAGE(rpcPort != 0,
       "CesServer failed to bind secondary port for CesPlex test");
+    // These tests check rent at the base price, so pin the utilization
+    // rent multiplier to full. RentPriceTests covers the multiplier.
+    if (server->fileHandler()) server->fileHandler()->_testPinRentBp(10000);
     // Mount non-core test handlers (e.g. echo) directly as objects; there is
     // no global registry, so the host mounts what it serves.
     for (const auto& [proto, h] : objMounts)

@@ -172,6 +172,13 @@ uint64_t thinkEstimate(const ThinkFees& fees, uint64_t promptBytes,
 
 ThinkHandler::ThinkHandler(CesServer* server) : server_(server) {
   const auto& cfg = server_->_config();
+  HeatSubsidy::Config sc;
+  sc.budget = cfg.thinkSubsidyBudget;
+  sc.tauSecs = cfg.thinkSubsidyTauSecs;
+  sc.floorBp = cfg.thinkSubsidyFloorBp;
+  if (!cfg.dataDir.empty())
+    sc.statePath = (cfg.dataDir / "think_subsidy.state").string();
+  subsidy_ = std::make_unique<HeatSubsidy>(std::move(sc));
   if (cfg.thinkApiKeyFile.empty()) return;
 #ifdef CES_THINK
   std::string key = readKeyFile(cfg.thinkApiKeyFile);
@@ -282,27 +289,37 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
     backend = backend_;
   }
   const uint32_t maxOut = cfg.thinkMaxOutTokens;
-  const uint64_t hold = thinkHold(fees, prompt.size(), maxOut);
+  // The subsidy discounts the hold too, so a cool service lets an account
+  // with almost nothing start a call. Its share is reserved as heat now, so
+  // calls in flight together cannot take more than the budget.
+  const uint64_t fullHold = thinkHold(fees, prompt.size(), maxOut);
+  uint64_t reserved = 0;
+  const uint16_t mult = subsidy_->reserve(fullHold, reserved);   // 10000 = full
+  const uint64_t hold = fullHold - reserved;
   bool held = false;
   server_->_l2Transact([&](LedgerTxn& tx) {
     held = tx.debitAccount(payer, hold);   // burned; the unused part returns
   });
   if (!held) {
+    subsidy_->release(reserved);
     sink->finish(CES_ERROR_INSUFFICIENT_BALANCE, 0, {});
     return;
   }
 
   auto job = std::make_shared<Job>();
   CesServer* server = server_;
+  HeatSubsidy* subsidy = subsidy_.get();   // outlives the job: stop() joins
   std::lock_guard<std::mutex> lk(mu_);
   if (stopped_.load()) {   // stop() ran while the hold was taken
     server->_brr(payer, static_cast<int64_t>(hold));
+    subsidy->release(reserved);
     sink->finish(CES_ERROR_DISABLED, 0, {});
     return;
   }
   jobs_.push_back(job);
-  job->thread = std::thread([job, sink, backend, server, payer, fees, hold,
-                             maxOut, prompt = std::move(prompt)]() {
+  job->thread = std::thread([job, sink, backend, server, subsidy, payer, fees,
+                             fullHold, hold, mult, reserved, maxOut,
+                             prompt = std::move(prompt)]() {
     std::string text;
     auto onText = [&](std::string_view piece) {
       if (job->stop.load() || !sink->open()) return false;
@@ -318,16 +335,25 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
       o.billing = ThinkOutcome::kEstimate;
       o.detail = e.what();
     }
-    uint64_t charge = 0;
-    if (o.billing == ThinkOutcome::kUsage) charge = thinkCost(fees, o.usage);
+    // The full cost of what was used, then the subsidy's share at the
+    // reserved multiplier. full <= fullHold, so the share is <= reserved
+    // and the charge is <= hold.
+    uint64_t full = 0;
+    if (o.billing == ThinkOutcome::kUsage) full = thinkCost(fees, o.usage);
     else if (o.billing == ThinkOutcome::kEstimate)
-      charge = thinkEstimate(fees, prompt.size(), text.size());
-    if (charge > hold) charge = hold;
+      full = thinkEstimate(fees, prompt.size(), text.size());
+    if (full > fullHold) full = fullHold;
+    const uint64_t subsidized =
+        static_cast<uint64_t>(static_cast<U128>(full) * (10000u - mult) /
+                              10000u);
+    const uint64_t charge = full - subsidized;
+    if (reserved > subsidized) subsidy->release(reserved - subsidized);
     if (hold > charge)
       server->_brr(payer, static_cast<int64_t>(hold - charge));
     LOGINFO << "think: call done" << VAR(int(o.status))
             << VAR(o.usage.promptTokens) << VAR(o.usage.cachedTokens)
-            << VAR(o.usage.outputTokens) << VAR(charge) << SVAR(o.detail);
+            << VAR(o.usage.outputTokens) << VAR(full) << VAR(mult)
+            << VAR(charge) << SVAR(o.detail);
     sink->finish(o.status, charge, text);
     job->done = true;
   });
