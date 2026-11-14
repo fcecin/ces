@@ -313,6 +313,24 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # mail_max_encoded_bytes = 20971520   # 20 MiB cap on one message
 )"
 #endif
+       << R"(#
+# builtin:think: text in, text out, through an OpenAI-format chat API
+# (mount "/ces/think/1" = "builtin:think"). The API key is read from
+# think_api_key_file, so it is never in this file. THINK is served only when
+# the key file is readable (in a --think build) and both fees are not zero.
+# Fees are raw credit units (1 credit = 100000000) per one million tokens.
+# think_base_url        = "https://api.deepseek.com"
+# think_model           = "deepseek-flash"
+# think_api_key_file    = ""        # e.g. "/opt/ces/think.key" (mode 600)
+# think_reasoning       = false     # model reasoning: slower, more tokens
+# think_fee_in          = 0         # per 1M input tokens not in the cache
+# think_fee_cached_in   = 0         # per 1M input tokens from the cache
+# think_fee_out         = 0         # per 1M output tokens
+# think_max_out_tokens  = 8192      # max_tokens of every call
+# think_max_input_bytes = 1048576   # largest prompt text
+# think_timeout_secs    = 300       # one call, end to end
+# think_max_concurrent  = 8         # calls in flight
+)"
        << R"(
 # === CesPlex mounts: the crucial L2 wiring (rpc_port only). ===
 # CesPlex is implementation-agnostic. Each entry wires a protocol name to a
@@ -327,6 +345,7 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 "/ces/peer/1"    = "builtin:peer"
 # "/ces/lua/1"     = "builtin:lua"
 # "/ces/compute/1" = "builtin:compute"
+# "/ces/think/1"   = "builtin:think"
 
 # Transport caps on the rpc_port's RUDP (a TOML sub-table). max_channels_per_peer
 # is a CES opinion (default 2 — cesh/cesqt typically want a long-lived stream
@@ -470,6 +489,16 @@ int main(int argc, char* argv[]) {
   uint64_t    optMailFeePerMB = 0;
   uint64_t    optMailMaxEncodedBytes = 20ull * 1024 * 1024;
 #endif  // CES_MAIL
+  // builtin:think.
+  std::string optThinkBaseUrl = "https://api.deepseek.com";
+  std::string optThinkModel = "deepseek-flash";
+  std::string optThinkApiKeyFile;
+  bool        optThinkReasoning = false;
+  uint64_t    optThinkFeeIn = 0, optThinkFeeCachedIn = 0, optThinkFeeOut = 0;
+  uint32_t    optThinkMaxOutTokens = 8192;
+  uint32_t    optThinkMaxInputBytes = 1024 * 1024;
+  uint32_t    optThinkTimeoutSecs = 300;
+  uint32_t    optThinkMaxConcurrent = 8;
   // CesPlex mounts — `proto=target` pairs. Target is
   // "builtin:<name>" (statically linked handler).
   std::vector<std::string> optCesplexMounts;
@@ -649,6 +678,33 @@ int main(int argc, char* argv[]) {
       "Max encoded size of one email, bytes")
       ->default_val(std::to_string(20ull * 1024 * 1024));
 #endif  // CES_MAIL
+
+    // --- builtin:think ---
+    app.add_option("--thinkbaseurl", optThinkBaseUrl,
+      "OpenAI-format API base URL for builtin:think")
+      ->default_val("https://api.deepseek.com");
+    app.add_option("--thinkmodel", optThinkModel,
+      "Model name for builtin:think")->default_val("deepseek-flash");
+    app.add_option("--thinkapikeyfile", optThinkApiKeyFile,
+      "File that holds the builtin:think API key (empty = THINK off)")
+      ->default_val("");
+    app.add_option("--thinkreasoning", optThinkReasoning,
+      "Turn on model reasoning for builtin:think")->default_val("false");
+    app.add_option("--thinkfeein", optThinkFeeIn,
+      "Raw credits per 1M uncached input tokens (0 = THINK off)")
+      ->default_val("0");
+    app.add_option("--thinkfeecachedin", optThinkFeeCachedIn,
+      "Raw credits per 1M cached input tokens")->default_val("0");
+    app.add_option("--thinkfeeout", optThinkFeeOut,
+      "Raw credits per 1M output tokens (0 = THINK off)")->default_val("0");
+    app.add_option("--thinkmaxouttokens", optThinkMaxOutTokens,
+      "max_tokens of every builtin:think call")->default_val("8192");
+    app.add_option("--thinkmaxinputbytes", optThinkMaxInputBytes,
+      "Largest builtin:think prompt, bytes")->default_val("1048576");
+    app.add_option("--thinktimeoutsecs", optThinkTimeoutSecs,
+      "Timeout of one builtin:think call, seconds")->default_val("300");
+    app.add_option("--thinkmaxconcurrent", optThinkMaxConcurrent,
+      "builtin:think calls in flight")->default_val("8");
 
     // --- File-storage feature (CesPlex builtin:file) ---
     app.add_option("--filestoremaxbytes", optFileStoreMaxBytes,
@@ -889,6 +945,25 @@ int main(int argc, char* argv[]) {
                      "--mailmaxencodedbytes");
 #endif  // CES_MAIL
 
+      // builtin:think.
+      applyIfDefault("think_base_url", optThinkBaseUrl, "--thinkbaseurl");
+      applyIfDefault("think_model", optThinkModel, "--thinkmodel");
+      applyIfDefault("think_api_key_file", optThinkApiKeyFile,
+                     "--thinkapikeyfile");
+      applyIfDefault("think_reasoning", optThinkReasoning, "--thinkreasoning");
+      applyIfDefault("think_fee_in", optThinkFeeIn, "--thinkfeein");
+      applyIfDefault("think_fee_cached_in", optThinkFeeCachedIn,
+                     "--thinkfeecachedin");
+      applyIfDefault("think_fee_out", optThinkFeeOut, "--thinkfeeout");
+      applyIfDefault("think_max_out_tokens", optThinkMaxOutTokens,
+                     "--thinkmaxouttokens");
+      applyIfDefault("think_max_input_bytes", optThinkMaxInputBytes,
+                     "--thinkmaxinputbytes");
+      applyIfDefault("think_timeout_secs", optThinkTimeoutSecs,
+                     "--thinktimeoutsecs");
+      applyIfDefault("think_max_concurrent", optThinkMaxConcurrent,
+                     "--thinkmaxconcurrent");
+
       // Compute feature knobs.
       applyIfDefault("compute_max_instances",    optComputeMaxInstances,
                      "--computemaxinstances");
@@ -1099,6 +1174,17 @@ int main(int argc, char* argv[]) {
   config.mailFeePerMB        = optMailFeePerMB;
   config.mailMaxEncodedBytes = optMailMaxEncodedBytes;
 #endif  // CES_MAIL
+  config.thinkBaseUrl       = optThinkBaseUrl;
+  config.thinkModel         = optThinkModel;
+  config.thinkApiKeyFile    = optThinkApiKeyFile;
+  config.thinkReasoning     = optThinkReasoning;
+  config.thinkFeeIn         = optThinkFeeIn;
+  config.thinkFeeCachedIn   = optThinkFeeCachedIn;
+  config.thinkFeeOut        = optThinkFeeOut;
+  config.thinkMaxOutTokens  = optThinkMaxOutTokens;
+  config.thinkMaxInputBytes = optThinkMaxInputBytes;
+  config.thinkTimeoutSecs   = optThinkTimeoutSecs;
+  config.thinkMaxConcurrent = optThinkMaxConcurrent;
   config.extFundingPerDay     = optExtFundingPerDay;
   config.extLocalBudget       = optExtLocalBudget;
   if (optFeeFileRent  >= 0) config.feeFileRent  = optFeeFileRent;

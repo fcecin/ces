@@ -4,6 +4,7 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
 #include <ces/l2/mail_handler.h>
+#include <ces/l2/think_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/l2/peer_handler.h>
 #include <ces/cesvm.h>
@@ -1505,6 +1506,11 @@ uint16_t CesServer::start(uint16_t serverPort) {
           return mailHandler_.get();
         }
 #endif
+        if (target == "builtin:think") {
+          if (!thinkHandler_)
+            thinkHandler_ = std::make_unique<ThinkHandler>(this);
+          return thinkHandler_.get();
+        }
         return nullptr;  // unknown builtin -> skipped below
       };
 
@@ -1569,11 +1575,13 @@ uint16_t CesServer::start(uint16_t serverPort) {
       // Tear down in reverse construction order: CesPlex holds
       // references into rpcRudp_ and must go first; channelMeter_
       // also references rpcRudp_.
+      if (thinkHandler_) thinkHandler_->stop();
       if (peerHandler_) peerHandler_->stop();
       if (luaHandler_) luaHandler_->stop();
       if (computeHandler_) computeHandler_->stop();
       if (fileHandler_) fileHandler_->stop();   // after compute (depends on file)
       cesplex_.reset();
+      thinkHandler_.reset();
       peerHandler_.reset();
       luaHandler_.reset();
       computeHandler_.reset();
@@ -1626,6 +1634,9 @@ void CesServer::stop(bool flushEvents) {
     return;
   LOGDEBUG << "stop flagging server for termination";
   receiving_ = false;
+  // End the builtin:think calls in flight first, while the logic strand
+  // takes their refunds and the rpc port still carries their last replies.
+  if (thinkHandler_) thinkHandler_->stop();
   const int maxCtrlCCount = 5;
   // Without a usable PoW engine verifyPoWs() bails before popping work, so
   // the queue can never drain; waiting on it would hang shutdown forever
@@ -1753,6 +1764,7 @@ void CesServer::stop(bool flushEvents) {
     // CesPlex, and no RudpStream outlives its Rudp. Compute unbind
     // must run BEFORE its rpcTaskIO_ executor goes away — it cancels
     // the supervisor timer and SIGKILLs live instances.
+    if (thinkHandler_) thinkHandler_->stop();   // no-op: stopped above
     if (peerHandler_) peerHandler_->stop();
     if (luaHandler_) luaHandler_->stop();
     if (computeHandler_) {
@@ -1761,6 +1773,7 @@ void CesServer::stop(bool flushEvents) {
     }
     if (fileHandler_) fileHandler_->stop();   // after compute (depends on file)
     cesplex_.reset();
+    thinkHandler_.reset();
     peerHandler_.reset();
     luaHandler_.reset();
     computeHandler_.reset();

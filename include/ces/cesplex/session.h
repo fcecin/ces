@@ -25,7 +25,10 @@
 #include <minx/types.h>
 
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <span>
@@ -99,6 +102,47 @@ struct CesPlexRequest : std::enable_shared_from_this<CesPlexRequest> {
   void errorAndClose(uint8_t status) { respondAndClose(status); }
 };
 
+// A streamed reply for one op. The reply wire is
+//     ([u32 BE len][len bytes])* [u32 0] <signed response>
+// Each frame has len > 0. The [u32 0] terminator ends the frames, and the
+// usual server-signed response follows it. A handler opens one per op, calls
+// write() for each piece of the reply as it has it, then calls finish() once.
+// write() and finish() are safe from any thread. All stream writes run on the
+// stream's executor, in call order. The client reads it with
+// CesPlexChannel::driveStreamVerb.
+class CesPlexReplyStream
+    : public std::enable_shared_from_this<CesPlexReplyStream> {
+public:
+  explicit CesPlexReplyStream(std::shared_ptr<CesPlexRequest> req);
+
+  // Queue one frame. An empty chunk is ignored.
+  void write(ces::Bytes chunk);
+  // Queue the terminator and the signed response, then loop the channel.
+  void finish(uint8_t status, ces::Bytes preamble = {});
+  // As finish(), but close the channel after the response. For a verb that
+  // rejects its request before it read the request body.
+  void finishAndClose(uint8_t status, ces::Bytes preamble = {});
+  // True when a stream write failed (the client is gone).
+  bool dead() const { return dead_.load(); }
+
+private:
+  struct Item {
+    ces::Bytes bytes;      // frame bytes, or the terminator
+    bool final = false;    // after `bytes`, send the response
+    bool close = false;    // response, then close
+    uint8_t status = 0;
+    ces::Bytes preamble;
+  };
+  void enqueue(Item it);
+  void pump();             // stream executor only
+
+  std::shared_ptr<CesPlexRequest> req_;
+  std::deque<Item> queue_; // stream executor only
+  bool writing_ = false;   // stream executor only
+  bool finished_ = false;  // stream executor only
+  std::atomic<bool> dead_{false};
+};
+
 // Begin the signed-request loop on `stream`. Call from serve(); loops
 // until the channel closes. Everything runs on the rpcTaskIO_ strand.
 void cesPlexServe(std::shared_ptr<minx::RudpStream> stream,
@@ -167,6 +211,21 @@ public:
       ces::Bytes& outPreamble);
 
   bool readExact(ces::Bytes& out, size_t n);
+
+  // Drive one verb that has a streamed reply (see CesPlexReplyStream). Write
+  // [verb][envelope][extraBodyToSend?], call onFrame for each reply frame in
+  // order, then read the status, the fixed preamble on OK, and the signed
+  // trailer. `frameTimeout` bounds each wait for a frame, so a slow producer
+  // can take longer than the usual verb timeout. Returns the status byte, or
+  // CES_ERROR_INTERNAL on a wire failure.
+  uint8_t driveStreamVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      const ces::Bytes& extraBodyToSend,
+      const std::function<void(const ces::Bytes& frame)>& onFrame,
+      std::chrono::steady_clock::duration frameTimeout,
+      size_t respFixedPreambleLen,
+      ces::Bytes& outPreamble);
 
   uint64_t boundSessionToken() const;
 

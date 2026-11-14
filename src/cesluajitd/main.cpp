@@ -100,6 +100,7 @@ extern "C" {
 #include <ces/keys.h>
 #include <ces/l2/compute_client.h>
 #include <ces/l2/file_client.h>
+#include <ces/l2/think_client.h>
 #include <ces/protocol.h>
 #include <ces/types.h>
 #include <ces/util/resolver.h>
@@ -135,6 +136,7 @@ namespace cesluajitd {
 #include "api_store.inc"
 #include "api_conn.inc"
 #include "timers.inc"
+#include "api_think.inc"
 #include "api_chan.inc"
 #include "api_mene.inc"
 #include "api_extadmin.inc"

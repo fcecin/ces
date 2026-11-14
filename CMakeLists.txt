@@ -329,6 +329,17 @@ if(CES_MAIL AND NOT CES_CLIENT_ONLY)
   message(STATUS "CES_MAIL ON: builtin:mail + SMTP/TLS (OpenSSL)")
 endif()
 
+# builtin:think HTTPS backend (OpenAI-format chat API over TLS). Off by
+# default; build.sh --think. Needs system OpenSSL. Without it builtin:think
+# still builds and mounts, but has no backend and answers DISABLED.
+option(CES_THINK "Enable the builtin:think HTTPS backend (OpenSSL)" OFF)
+if(CES_THINK AND NOT CES_CLIENT_ONLY)
+  find_package(OpenSSL REQUIRED)
+  target_link_libraries(ceslib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+  target_compile_definitions(ceslib PUBLIC CES_THINK=1)
+  message(STATUS "CES_THINK ON: builtin:think HTTPS backend (OpenSSL)")
+endif()
+
 include(${CMAKE_CURRENT_LIST_DIR}/cmake/QtDiscovery.cmake)
 find_package(Qt6 QUIET COMPONENTS Widgets Network)
 if(Qt6_FOUND AND NOT CES_CLIENT_ONLY)

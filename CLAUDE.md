@@ -31,6 +31,7 @@ CesPlex is the L1 connection multiplexer on `rpc_port`: it runs the signed bind 
 ./build.sh debug --asan             # AddressSanitizer
 ./build.sh debug --hyle             # + the hyle consensus engine (see "The Hyle layer")
 ./build.sh debug --hyle-src <path>  # ... against a local hyle checkout
+./build.sh debug --think            # + the builtin:think HTTPS backend (OpenSSL)
 ./build.sh rm                       # delete all build dirs
 ```
 
@@ -189,6 +190,7 @@ Handlers shipped (registered in CES core):
 - `/ces/compute/1` to `builtin:compute`: instance lifecycle (LAUNCH/KILL/LIST/STAT/INSTANCES). `l2/compute_{handler,client}.{h,cpp}`
 - `/ces/lua/1` to `builtin:lua`: one-shot ATTACH; converts the channel into a raw byte tunnel into a running compute instance. `l2/compute_lua_handler.{h,cpp}`. No client lib (use `cesh dial`).
 - `/ces/peer/1` to `builtin:peer`: the server-to-server mesh. `l2/peer_handler.{h,cpp}`. Mounted only when wired in `[cesplex_mounts]` (like every builtin; nothing auto-mounts). A persistent, unmetered, bidirectional channel between two servers that are mutual peer-table entries. Peer-gated in `PeerHandler::serve` (`_isPeerByKey`: an outbound or verified entry); never metered (`cesplexChannelMetered`). Self-maintains on a reconcile pass riding the rpcTaskIO tick: dial a peer we should link to but do not, drop a link whose peer left the table, keepalive the rest (a sub-60s keepalive holds the link past RUDP's idle GC and surfaces a dead peer via send failure). Lower-pubkey side dials, higher accepts (one channel per pair). The dialer rides the server's own `rpcRudp_`; the reconcile decision (`computePeerLinkActions`) is pure and separately tested.
+- `/ces/think/1` to `builtin:think`: text in, text out, through an OpenAI-format chat API. `l2/think_{handler,backend,https,client}.{h,cpp}`. See "L2 think" below.
 
 Compute handler pair: `compute_handler` runs the management verbs and the per-instance supervisor (CPU/RSS sampling, slot/rent billing); `compute_lua_handler` runs the channel-attach protocol that pipes user bytes into a chosen instance. They are two CesPlexHandler subclasses; each .cpp includes both .h files because compute exposes APIs the lua handler calls (`computeOpenConnection`, `computeSendConnDataIn`) and lua exposes APIs compute calls (`luaHandlerHandleConnDataOut`, `luaHandlerOnInstanceDying`).
 
@@ -242,6 +244,20 @@ Per-instance ports: each instance gets a CES client on a statically-allocated UD
 cesluajitd: one sandboxed LuaJIT VM per process, with no `os`/`io`/`debug`/`require`/`loadstring`/`ffi`. The supervisor frames IPC over the UDS and hands the child a bootstrap frame with its identity (owner key + program keypair), its reserved ports, and the source. The Lua API surfaces client messaging, the file store (owner-authority, billed to the source's `file_balance`), `ces.transfer` / `account_read` / `random_bytes`, identity and time helpers, capacity-billed `bucket`s, and the unified `ces.conn` raw byte-stream API.
 
 `[extension]` auto-launches named Lua programs from `/s/` at boot. For each enabled name, `launchExtensions` calls `computeHandlerLaunchInternal("/s/<name>.lua")` (no auth/dedup/upfront fee). The source is operator-deployed, not embedded in the binary: the operator drops `<name>.lua` into `<storeDir>/s/` (startup reconcile stamps its sidecar before launch); a missing source logs a WRN and is skipped. The repeatable flag is the generic `--extension <name>`. Shipped in extensions/: `dice` (fair-coin double-or-nothing whose house bankroll is the file's program account, `ces.program_pubkey()`), `discovery` (cesdk bundle; keeps the host's peer table populated and gossips known servers via paid sample exchange), `hylesolo` (cesdk bundle; the hyle development net, needs a `--hyle` build; see "The Hyle layer"), `peerfunder`, `peerclusterer`, and `coalition` (cesdk bundles; peer-liquidity seeding, clique clustering, coalition formation). All six register `ces.extension_admin` with a mene admin panel (see Web admin dashboard).
+
+## L2 think: `builtin:think` (text in, text out)
+
+One verb, THINK. The signer sends one UTF-8 prompt as a hash-committed body (preamble `[u32 len][32 sha256]`). The reply is a stream (`CesPlexReplyStream` in `cesplex/session.h`): frames `[u32 len][text]`, a `[u32 0]` terminator, then the usual signed response. On OK the response preamble is `[u64 charged][32 sha256(reply)]`, so the server signature covers the full reply. On an error the preamble is empty and the frames before it are a partial reply. The client reads it with `CesPlexChannel::driveStreamVerb`; `CesThinkClient` wraps it.
+
+- The server config sets the model and every limit. The client picks nothing. The API is stateless: a conversation is the caller's text, sent again with each new turn. The backend's prompt cache bills the repeated prefix at the cached price.
+- Billing: a hold (every prompt byte as one token, plus `think_max_out_tokens`) is burned before the call. When the call ends, the cost of the reported `usage` is kept and the rest is refunded with `_brr`. No billable work means no charge. A call with no usage report is charged a size estimate. Fees are raw credit units per 1M tokens (`think_fee_in`, `think_fee_cached_in`, `think_fee_out`).
+- `ThinkBackend` is the model interface. `ThinkHttpsBackend` (`--think` build, `CES_THINK`, OpenSSL) streams `POST <think_base_url>/chat/completions` (SSE) with certificate and host name checks. The API key comes from `think_api_key_file`, never from the TOML. With no backend, or with a zero input or output fee, THINK answers DISABLED.
+- Each call runs on its own worker thread, up to `think_max_concurrent` (then QUEUE_FULL). `ThinkHandler::stop()` stops and joins the calls in flight. `CesServer::stop` calls it first, so refunds and last replies still go out.
+- Clients: `cesh think <words>` (or `--in`, or stdin) streams the reply to stdout.
+- Lua, host call: `ces.think(prompt [, on_piece])` returns `reply, charged`, or `nil, rc, partial`. It is `kApiMethodThink` over the instance IPC; the pieces arrive as `TAG_THINK_PIECE` frames under the call's corr_id, and on_piece runs for each one (from the run loop in a coroutine, inside the wait in the main chunk; it cannot yield). The payer is the file's program account, which the server reads from its instance record. For a flat file that account is the file's balance (the owner's deposit, plus credits anyone sends to `ces.program_pubkey()`). On /s/ it is topped up to `ext_local_budget` at boot and daily, which caps what an extension spends. Needs builtin:think mounted, else DISABLED.
+- Lua, client: `ces.think_client(addr [, server_pubkey]):think(prompt)` dials any server's `/ces/think/1` as the program account, with the same returns and no streaming to Lua.
+- No path lets a program bill another account: every program spend comes from its own program account.
+- Tests: `ThinkHelperTests`, `ThinkTests` and related suites (`test_think.cpp`), and `ThinkLuaTests` (`test_think_lua.cpp`, real cesluajitd) use a scripted backend, with no network. `local/think/smoke.sh KEYFILE "prompt"` is the gitignored live check.
 
 ## L2 lua: `builtin:lua` (channel routing)
 

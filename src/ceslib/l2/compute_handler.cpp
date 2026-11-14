@@ -49,6 +49,7 @@
 #include <ces/l2/file_handler.h>
 #include <ces/l2/mail_handler.h>
 #include <ces/l2/peer_handler.h>
+#include <ces/l2/think_handler.h>
 #include <ces/buffer.h>
 #include <ces/client.h>
 #include <ces/ramfilestore.h>
@@ -175,6 +176,8 @@ constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip
 constexpr uint8_t kIpcTagL2CallIn       = 0x1c;  // server → child (paid call)
 constexpr uint8_t kIpcTagL2CallResult   = 0x1d;  // child → server (delivered/no-handler)
 constexpr uint8_t kIpcTagL2CallReply    = 0x1f;  // child → server (on_l2call return bytes)
+// ces.think reply text, one frame per piece, under the API call's corr_id.
+constexpr uint8_t kIpcTagThinkPiece     = 0x20;  // server → child
 #ifdef CES_MAIL
 constexpr uint8_t kIpcTagMailOut        = 0x1e;  // child → server (ces.mail.send)
 #endif
@@ -212,9 +215,9 @@ constexpr uint16_t kApiMethodKvIter       = 0x010e;
 constexpr uint16_t kApiMethodKvDeposit    = 0x010f;
 constexpr uint16_t kApiMethodKvRange      = 0x0110;
 // Ledger / RNG bindings exposed to the Lua sandbox:
-//   TRANSFER     — program-initiated transfer from owner's account.
-//                  /s/ programs see the server's account, which is
-//                  bottomless by boot top-up.
+//   TRANSFER     — program-initiated transfer from the file's program
+//                  account (ces.program_pubkey()). On /s/ that account is
+//                  topped up to ext_local_budget at boot and daily.
 //   RANDOM_BYTES — crypto-grade RNG, n ≤ 256.
 //   ACCOUNT_READ — unsigned account query, no fee.
 constexpr uint16_t kApiMethodTransfer     = 0x0200;
@@ -257,6 +260,9 @@ constexpr uint16_t kApiMethodRequestFunds  = 0x0235;
 constexpr uint16_t kApiMethodPeerGrief     = 0x0236;
 constexpr uint16_t kApiMethodPeerBan       = 0x0237;
 constexpr uint16_t kApiMethodServerSign    = 0x0238;
+// ces.think(prompt): builtin:think for the program, billed to its program
+// account. Args: [u32 len][prompt]. Reply: [u8 CES status][u64 charged].
+constexpr uint16_t kApiMethodThink         = 0x0240;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -1570,6 +1576,41 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
   handleChildApiCall(inst, corr, body.data() + 3, body.size() - 3);
 }
 
+// ces.think's sink: each reply piece goes to the child as a TAG_THINK_PIECE
+// frame under the call's corr_id, then the API reply ends the call. The
+// handler calls these from its worker thread, so every touch of the
+// instance hops to the instance's executor. An instance that went away
+// (peer gone) closes the sink, and the call stops at its next piece.
+class InstanceThinkSink : public ThinkSink {
+ public:
+  InstanceThinkSink(std::shared_ptr<Instance> inst, uint16_t corr,
+                    boost::asio::any_io_executor ex)
+      : inst_(std::move(inst)), corr_(corr), ex_(std::move(ex)) {}
+  bool open() override { return !gone_->load(); }
+  void piece(std::string_view t) override {
+    auto f = makeFrame(kIpcTagThinkPiece, corr_,
+                       reinterpret_cast<const uint8_t*>(t.data()), t.size());
+    boost::asio::post(ex_, [inst = inst_, f, gone = gone_]() {
+      if (!inst->peer) { *gone = true; return; }
+      enqueueOutbound(inst, f);
+    });
+  }
+  void finish(uint8_t status, uint64_t charged, const std::string&) override {
+    boost::asio::post(ex_, [inst = inst_, corr = corr_, status, charged]() {
+      ces::Bytes tail;
+      ces::Buffer::put<uint64_t>(tail, charged);
+      sendApiReplyWithBody(inst, corr, status, tail);
+    });
+  }
+
+ private:
+  std::shared_ptr<Instance> inst_;
+  uint16_t corr_;
+  boost::asio::any_io_executor ex_;
+  std::shared_ptr<std::atomic<bool>> gone_ =
+      std::make_shared<std::atomic<bool>>(false);
+};
+
 void handleChildApiCall(std::shared_ptr<Instance> inst,
                         uint16_t corr_id,
                         const uint8_t* args, size_t argsLen) {
@@ -1607,6 +1648,35 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     bool ok = server && server->send(target, CES_APP_COMPUTE_MSG, pkt);
     sendApiReply(inst, corr_id,
                  ok ? kApiStatusOk : kApiStatusNotConnected);
+    return;
+  }
+
+  // ---- ces.think(prompt). The payer is the file's PROGRAM account, read
+  // from the server's own instance record (never from the child), as for
+  // ces.transfer and ces.mail.send. Whoever funds that account pays: the
+  // owner, or a caller who sends it credits. On /s/ it is the server-funded
+  // account that daily maintenance tops up to ext_local_budget, which caps
+  // what an extension can spend. builtin:think must be mounted.
+  if (method == kApiMethodThink) {
+    auto refuse = [&](uint8_t rc) {
+      ces::Bytes tail;
+      ces::Buffer::put<uint64_t>(tail, 0);
+      sendApiReplyWithBody(inst, corr_id, rc, tail);
+    };
+    if (mlen < sizeof(uint32_t)) { refuse(CES_ERROR_BAD_INPUT); return; }
+    uint32_t plen = ces::Buffer::peek<uint32_t>(mbody);
+    if (mlen < sizeof(uint32_t) + size_t(plen)) {
+      refuse(CES_ERROR_BAD_INPUT); return;
+    }
+    CesServer* server = inst->owner->server_;
+    ThinkHandler* th = server ? server->thinkHandler() : nullptr;
+    if (!th || !inst->peer) { refuse(CES_ERROR_DISABLED); return; }
+    minx::Hash payer{};
+    std::memcpy(payer.data(), inst->programPubkey.data(), 32);
+    th->submit(payer,
+               std::string(reinterpret_cast<const char*>(mbody + 4), plen),
+               std::make_shared<InstanceThinkSink>(
+                   inst, corr_id, inst->peer->get_executor()));
     return;
   }
 

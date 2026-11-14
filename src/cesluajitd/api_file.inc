@@ -109,12 +109,11 @@ int io_call(lua_State* L, uint16_t method,
 // ces.transfer(target_pubkey:string(32), amount:number)
 //   → true, new_origin_balance | nil, err_code
 //
-// Sends `amount` credits from the program's owner account to the
-// target. /s/ programs run with owner = server (auto-topped to
-// near-INT64_MAX every boot), so dice / payouts / etc. just work.
-// Programs in /h/ or /f/ pull from their owner's account exactly the
-// same way file ops do — i.e. the program acts under the owner's
-// authority.
+// Sends `amount` credits from the file's program account
+// (ces.program_pubkey()) to the target. The host picks that account from
+// its own record of the instance; the program cannot name another payer.
+// Whoever funds the program account pays. On /s/ the server tops it up to
+// ext_local_budget at boot and daily.
 int lua_ces_transfer(lua_State* L) {
   size_t pk_len = 0;
   const char* pk = luaL_checklstring(L, 1, &pk_len);

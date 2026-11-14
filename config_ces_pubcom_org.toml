@@ -94,9 +94,26 @@ compute_port_count = 100
 web_port = 8080
 web_bind = "127.0.0.1"
 
+# builtin:think: text in, text out (DeepSeek, OpenAI format). The key is in
+# think.key (mode 600), never in this file. Prices are the anti-leech peg
+# (1 credit ~ $0.0001, 2x margin) over DeepSeek flash peak prices, in raw
+# credit units per 1M tokens: in $0.30, cached $0.006, out $1.20.
+think_base_url        = "https://api.deepseek.com"
+think_model           = "deepseek-flash"
+think_api_key_file    = "./think.key"
+think_reasoning       = false
+think_fee_in          = 600000000000
+think_fee_cached_in   = 12000000000
+think_fee_out         = 2400000000000
+think_max_out_tokens  = 4096
+think_max_input_bytes = 1048576
+think_timeout_secs    = 300
+think_max_concurrent  = 8
+
 # L2 handlers wired on: file + lua + compute + the peer mesh. Nothing
 # auto-mounts; the peer mesh must be listed here too.
 [cesplex_mounts]
+"/ces/think/1"   = "builtin:think"
 "/ces/file/1"    = "builtin:file"
 "/ces/lua/1"     = "builtin:lua"
 "/ces/compute/1" = "builtin:compute"

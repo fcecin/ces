@@ -539,6 +539,25 @@ struct CesConfig {
   uint64_t mailMaxEncodedBytes = 20ull * 1024 * 1024;
 #endif  // CES_MAIL
 
+  // builtin:think (text in, text out, through an OpenAI-format chat API).
+  // thinkApiKeyFile names a file that holds the API key, so the key is not
+  // in the config. The handler serves only when the key file is readable (in
+  // a CES_THINK build) and thinkFeeIn and thinkFeeOut are not zero. Fees are
+  // raw credit units per one million tokens. thinkReasoning turns the model's
+  // reasoning on (slower and more output tokens). thinkMaxOutTokens is
+  // max_tokens for every call and sizes the hold.
+  std::string thinkBaseUrl = "https://api.deepseek.com";
+  std::string thinkModel = "deepseek-flash";
+  std::string thinkApiKeyFile;
+  bool        thinkReasoning = false;
+  uint64_t    thinkFeeIn = 0;
+  uint64_t    thinkFeeCachedIn = 0;
+  uint64_t    thinkFeeOut = 0;
+  uint32_t    thinkMaxOutTokens = 8192;
+  uint32_t    thinkMaxInputBytes = 1024 * 1024;
+  uint32_t    thinkTimeoutSecs = 300;
+  uint32_t    thinkMaxConcurrent = 8;
+
   // L2 compute program UDP port range: [computePortBase, computePortBase
   // + computePortCount - 1]. Each launched child binds its outbound CES
   // client to a port the server allocates statically from this range. The
@@ -616,6 +635,7 @@ class ComputeHandler;
 #ifdef CES_MAIL
 class MailHandler;
 #endif
+class ThinkHandler;
 
 // Rudp::Listener for the rpc port. Owns the back-pointer to CesServer
 // for onSend (forward to rpcMinx_) and onAccept (delegate to CesPlex
@@ -923,6 +943,7 @@ public:
 #ifdef CES_MAIL
   MailHandler* mailHandler() { return mailHandler_.get(); }
 #endif
+  ThinkHandler* thinkHandler() { return thinkHandler_.get(); }
 
   // Test hook: add a peer with a pre-resolved plex endpoint (simulates a
   // completed probe) without starting the peer miner. Drives the
@@ -1826,6 +1847,7 @@ private:
 #ifdef CES_MAIL
   std::unique_ptr<MailHandler> mailHandler_;
 #endif
+  std::unique_ptr<ThinkHandler> thinkHandler_;
 
   // SYS_RPC dispatcher state. queueRpc runs on the logic strand
   // (validates the file, materializes request bytes, signs the

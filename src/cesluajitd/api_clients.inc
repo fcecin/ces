@@ -30,8 +30,15 @@ struct LuaComputeClientEntry {
   bool inflight = false;
   bool closePending = false;
 };
+struct LuaThinkClientEntry {
+  std::unique_ptr<ces::CesPlexChannel> ch;
+  std::unique_ptr<ces::CesThinkClient> tc;
+  bool inflight = false;
+  bool closePending = false;
+};
 std::map<uint64_t, LuaFileClientEntry>    g_file_clients;     // Lua-thread-only
 std::map<uint64_t, LuaComputeClientEntry> g_compute_clients;  // Lua-thread-only
+std::map<uint64_t, LuaThinkClientEntry>   g_think_clients;    // Lua-thread-only
 uint64_t g_client_next_id = 1;
 
 uint64_t client_handle_id(lua_State* L, int idx) {
@@ -643,6 +650,73 @@ int lua_ces_compute_client(lua_State* L) {
     });
 }
 
+// ---- ces.think_client verbs ----
+
+// h:think(prompt) -> reply, charged | nil, rc [, partial]. Blocks the calling
+// coroutine until the full reply is in (the reply streams on the wire; this
+// API returns it whole). The program's own account pays.
+int lua_tc_think(lua_State* L) {
+  auto it = g_think_clients.find(client_handle_id(L, 1));
+  if (it == g_think_clients.end()) return client_push_closed(L);
+  size_t plen = 0; const char* p = luaL_checklstring(L, 2, &plen);
+  if (plen == 0) {
+    lua_pushnil(L); lua_pushstring(L, "prompt must not be empty"); return 2;
+  }
+  ces::CesThinkClient* tc = it->second.tc.get();
+  return client_call(L, g_think_clients, [tc, prompt = std::string(p, plen)]()
+                         -> OffloadDeliver {
+    std::string reply;
+    uint64_t charged = 0;
+    uint8_t rc = tc->think(prompt, nullptr, reply, charged);
+    if (rc != ces::CES_OK)
+      return [rc, reply](lua_State* L) -> int {
+        lua_pushnil(L);
+        lua_pushinteger(L, rc);
+        lua_pushlstring(L, reply.data(), reply.size());
+        return 3;
+      };
+    return [reply, charged](lua_State* L) -> int {
+      lua_pushlstring(L, reply.data(), reply.size());
+      lua_pushnumber(L, static_cast<lua_Number>(charged));
+      return 2;
+    };
+  });
+}
+
+int lua_tc_close(lua_State* L) {
+  uint64_t id = client_handle_id(L, 1);
+  auto it = g_think_clients.find(id);
+  if (it == g_think_clients.end()) return 0;
+  if (it->second.inflight) { it->second.closePending = true; return 0; }  // defer
+  client_close(g_think_clients, id);
+  return 0;
+}
+
+void push_think_handle(lua_State* L, uint64_t id) {
+  lua_newtable(L);
+  lua_pushnumber(L, static_cast<lua_Number>(id)); lua_setfield(L, -2, "id");
+  lua_pushcfunction(L, guarded<lua_tc_think>); lua_setfield(L, -2, "think");
+  lua_pushcfunction(L, guarded<lua_tc_close>); lua_setfield(L, -2, "close");
+}
+
+// ces.think_client(addr [, server_pubkey]) -> handle | nil, err. A client of a
+// server's /ces/think/1, as the program's own identity.
+int lua_ces_think_client(lua_State* L) {
+  std::string addr; const uint8_t* pk = nullptr; uint8_t pkbuf[32];
+  if (!client_read_dial_args(L, addr, &pk, pkbuf)) return 2;
+  return client_dial(L, addr, pk, "/ces/think/1",
+    [](lua_State* L, std::unique_ptr<ces::CesPlexChannel> ch) -> int {
+      auto tc = std::make_unique<ces::CesThinkClient>();
+      tc->attach(*ch);
+      uint64_t id = g_client_next_id++;
+      auto& e = g_think_clients[id];
+      e.ch = std::move(ch);
+      e.tc = std::move(tc);
+      push_think_handle(L, id);
+      return 1;
+    });
+}
+
 // ces.err — CES error names → codes, for legible error checks.
 void install_ces_err_table(lua_State* L) {
   lua_newtable(L);
@@ -755,6 +829,8 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_store>);         lua_setfield(L, -2, "store");
   lua_pushcfunction(L, guarded<lua_ces_file_client>);   lua_setfield(L, -2, "file_client");
   lua_pushcfunction(L, guarded<lua_ces_compute_client>);lua_setfield(L, -2, "compute_client");
+  lua_pushcfunction(L, guarded<lua_ces_think_client>); lua_setfield(L, -2, "think_client");
+  lua_pushcfunction(L, guarded<lua_ces_think>);        lua_setfield(L, -2, "think");
   lua_pushcfunction(L, guarded<lua_ces_remote_account_read>);
   lua_setfield(L, -2, "remote_account_read");
   lua_pushcfunction(L, guarded<lua_ces_remote_transfer>);

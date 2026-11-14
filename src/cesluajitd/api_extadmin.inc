@@ -607,6 +607,7 @@ int lua_ces_run(lua_State* L) {
     // ready coroutine before blocking.
     fire_due_timers(L);
     drain_chan_timeouts(L);
+    drain_think(L);            // before completions: a call's pieces precede its reply
     drain_io_completions(L);
     drain_connect_done(L);
     drain_offload_done(L);

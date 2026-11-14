@@ -18,6 +18,7 @@
 #include <ces/l2/compute_client.h>
 #include <ces/l2/file_client.h>
 #include <ces/l2/mail_client.h>
+#include <ces/l2/think_client.h>
 #include <ces/ramfilestore.h>
 #include <ces/util/log.h>
 #include <ces/util/hex.h>
@@ -732,6 +733,21 @@ int main(int argc, char* argv[]) {
   cmd_msend->add_option("--attach", mail_attach_arg,
                         "One attachment by store path (e.g. /m/<hex>/note.pdf)");
 
+  // ---- think (L2 text in, text out, via --rpc-port) ----
+  auto* cmd_think = app.add_subcommand(
+    "think", "Send a prompt to builtin:think and stream the reply to stdout "
+             "(via --rpc-port). The signer pays for the tokens.");
+  std::vector<std::string> think_words;
+  ces::Bytes think_in_data;
+  std::string think_in_arg;
+  cmd_think->add_option("text", think_words,
+                        "Prompt words (joined by spaces). With no words and "
+                        "no --in, the prompt is read from stdin.");
+  cmd_think->add_option("--in", think_in_arg,
+                        "Prompt (repeatable): text, text:T, hex:XX, file:path")
+    ->each([&](const std::string& s) { appendInToken(think_in_data, s); })
+    ->take_all();
+
   // ---- dial (open a byte stream to a running compute instance) ----
   auto* cmd_dial = app.add_subcommand(
     "dial",
@@ -1372,7 +1388,8 @@ int main(int argc, char* argv[]) {
      cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
-     cmd_mail->parsed() || cmd_gossip->parsed() || cmd_alias_write->parsed() ||
+     cmd_mail->parsed() || cmd_think->parsed() || cmd_gossip->parsed() ||
+     cmd_alias_write->parsed() ||
      cmd_alias_rm->parsed() || cmd_alias_run->parsed() ||
      cmd_keyname->parsed());
 
@@ -2759,6 +2776,58 @@ int main(int argc, char* argv[]) {
       return 1;
     };
 
+    // ---- handleThink handler ----
+    auto handleThink = [&]() -> int {
+      L2Target tgt;
+      if (!resolveL2Target("think", tgt)) return 1;
+      auto& [host, serverPk, hasServerPk] = tgt;
+
+      std::string prompt;
+      for (size_t i = 0; i < think_words.size(); ++i) {
+        if (i) prompt.push_back(' ');
+        prompt += think_words[i];
+      }
+      if (!think_in_data.empty()) {
+        if (!prompt.empty()) prompt.push_back('\n');
+        prompt.append(think_in_data.begin(), think_in_data.end());
+      }
+      if (prompt.empty())
+        prompt.assign(std::istreambuf_iterator<char>(std::cin),
+                      std::istreambuf_iterator<char>());
+      if (prompt.empty()) {
+        std::cerr << "Error: empty prompt\n";
+        return 1;
+      }
+
+      CesThinkClient tc;
+      uint8_t rc = tc.connect(host, rpcPort_arg, actorKey);
+      if (rc != CES_OK) {
+        std::cerr << "Error: think connect failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (hasServerPk) tc.setServerPubkey(serverPk);
+
+      std::string reply;
+      uint64_t charged = 0;
+      bool endsInNewline = true;
+      rc = tc.think(prompt,
+                    [&](std::string_view piece) {
+                      std::cout << piece << std::flush;
+                      endsInNewline = piece.back() == '\n';
+                    },
+                    reply, charged);
+      if (!endsInNewline) std::cout << "\n";
+      std::cout << std::flush;
+      if (rc != CES_OK) {
+        std::cerr << "THINK Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+      if (!g_quiet) {
+        std::cerr << "charged " << charged << "\n";   // raw credit units
+      }
+      return 0;
+    };
+
     // ---- handleAutoexec handler ----
     auto handleAutoexec = [&]() -> int {
     if (cmd_axi->parsed()) {
@@ -3021,6 +3090,10 @@ int main(int argc, char* argv[]) {
     // ---- mail (L2 outbound email) ----
 
     else if (cmd_mail->parsed()) return handleMail();
+
+    // ---- think (L2 text in, text out) ----
+
+    else if (cmd_think->parsed()) return handleThink();
 
     // ---- autoexec ----
 

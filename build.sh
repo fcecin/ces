@@ -26,6 +26,8 @@ print_help() {
     echo "  --minx-src PATH Build against a local MINX checkout instead of the published one."
     echo "  --mail          Enable outbound mail (builtin:mail + SMTP with TLS). Needs"
     echo "                  system OpenSSL. Gated behind CES_MAIL; off by default."
+    echo "  --think         Enable the HTTPS backend of builtin:think (an OpenAI-format"
+    echo "                  chat API). Needs system OpenSSL. Gated behind CES_THINK."
     echo "  --test [FILTER] Runs tests after building. Optional Boost.Test filter."
     echo "                  Examples:"
     echo "                    --test                Run all tests"
@@ -95,6 +97,10 @@ build_one_config() {
     local MAIL_ARG="-DCES_MAIL=OFF"
     [ "$ENABLE_MAIL" = true ] && MAIL_ARG="-DCES_MAIL=ON"
 
+    # builtin:think HTTPS backend on/off.
+    local THINK_ARG="-DCES_THINK=OFF"
+    [ "$ENABLE_THINK" = true ] && THINK_ARG="-DCES_THINK=ON"
+
     # Portable -march by default; --native pins to the build host.
     local MARCH="x86-64-v3"
     [ "$ENABLE_NATIVE" = true ] && MARCH="native"
@@ -110,6 +116,7 @@ build_one_config() {
         "$HYLE_SRC_ARG" \
         "$MINX_SRC_ARG" \
         $MAIL_ARG \
+        $THINK_ARG \
         $EXTRA_ARGS
 
     echo "Building ${BUILD_TYPE_CAMEL}..."
@@ -129,6 +136,7 @@ ENABLE_HYLE=false
 HYLE_SRC=""
 MINX_SRC=""
 ENABLE_MAIL=false
+ENABLE_THINK=false
 DO_DEEP_CLEAN=false
 
 # Parse arguments — --test may optionally consume the next arg as a filter
@@ -189,6 +197,9 @@ while [ $i -lt ${#ARGS[@]} ]; do
             ;;
         --mail)
             ENABLE_MAIL=true
+            ;;
+        --think)
+            ENABLE_THINK=true
             ;;
         --asan)
             ENABLE_ASAN=true

@@ -34,6 +34,7 @@ constexpr uint8_t  TAG_EXT_UI_WATCH     = 0x1b;  // server → child ([u8 on]; d
 constexpr uint8_t  TAG_L2_CALL_IN       = 0x1c;  // server → child (paid L2 call -> on_l2call)
 constexpr uint8_t  TAG_L2_CALL_RESULT   = 0x1d;  // child → server (delivered / no-handler)
 constexpr uint8_t  TAG_L2_CALL_REPLY    = 0x1f;  // child → server (on_l2call return bytes)
+constexpr uint8_t  TAG_THINK_PIECE      = 0x20;  // server → child (ces.think reply text)
 #ifdef CES_MAIL
 constexpr uint8_t  TAG_MAIL_OUT         = 0x1e;  // child → server (ces.mail.send)
 #endif
@@ -95,6 +96,7 @@ constexpr uint16_t METHOD_PEER_GRIEF       = 0x0236;
 constexpr uint16_t METHOD_PEER_BAN         = 0x0237;
 constexpr uint16_t METHOD_SERVER_SIGN      = 0x0238;
 constexpr uint16_t METHOD_SERVER_INFO      = 0x0239;
+constexpr uint16_t METHOD_THINK            = 0x0240;  // ces.think
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
@@ -121,6 +123,7 @@ std::deque<Frame> g_conn_q;      // pending CONN_* frames (drained by run())
 std::deque<Frame> g_gossip_q;    // pending GOSSIP_IN frames (drained by run())
 std::deque<Frame> g_peer_q;      // pending PEER_MSG_IN frames (drained by run())
 std::deque<Frame> g_l2call_q;    // pending L2_CALL_IN frames (drained by run())
+std::deque<Frame> g_think_q;     // pending THINK_PIECE frames (drain_think)
 
 // Optional C++ interceptor for inbound peer-mesh messages, set by the hyle net
 // lifecycle so its consensus frames feed the Runtime directly, not a Lua listener.
@@ -308,6 +311,7 @@ void route_to_queue(Frame f) {
   else if (f.tag == TAG_GOSSIP_IN) g_gossip_q.push_back(std::move(f));
   else if (f.tag == TAG_PEER_MSG_IN) g_peer_q.push_back(std::move(f));
   else if (f.tag == TAG_L2_CALL_IN) g_l2call_q.push_back(std::move(f));
+  else if (f.tag == TAG_THINK_PIECE) g_think_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
 }
 

@@ -1,0 +1,230 @@
+// think_https.cpp - see think_https.h.
+
+#ifdef CES_THINK
+
+#include <ces/l2/think_https.h>
+
+#include <ces/types.h>
+
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/asio/use_awaitable.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
+
+namespace ces {
+
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+using tcp = asio::ip::tcp;
+
+struct ThinkHttpsBackend::Impl {
+  bool tls = true;
+  std::string host, port, target;
+  std::unique_ptr<asio::ssl::context> ctx;
+};
+
+namespace {
+
+// The state of one call, shared by the coroutine and the run() loop. Both
+// run on the caller's thread (one io_context, one thread).
+struct Call {
+  const std::atomic<bool>* stop = nullptr;
+  const std::function<bool(std::string_view)>* onText = nullptr;
+  beast::tcp_stream* low = nullptr;   // to cancel the call on `stop`
+  ThinkSseParser parser;
+  ThinkOutcome out;
+  bool finished = false;
+};
+
+template <class Stream>
+asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
+                               const std::string& auth,
+                               const std::string& body, Call& c) {
+  http::request<http::string_body> req{http::verb::post, im.target, 11};
+  req.set(http::field::host, im.host);
+  req.set(http::field::authorization, auth);
+  req.set(http::field::content_type, "application/json");
+  req.set(http::field::accept, "text/event-stream");
+  req.set(http::field::user_agent, "ces-think");
+  req.body() = body;
+  req.prepare_payload();
+  co_await http::async_write(s, req, asio::use_awaitable);
+
+  beast::flat_buffer buf;
+  http::response_parser<http::buffer_body> p;
+  p.body_limit(boost::none);
+  co_await http::async_read_header(s, buf, p, asio::use_awaitable);
+  const unsigned code = p.get().result_int();
+
+  char tmp[16384];
+  if (code != 200) {
+    // Read a bounded part of the error body for the log.
+    std::string err;
+    while (!p.is_done() && err.size() < 65536) {
+      p.get().body().data = tmp;
+      p.get().body().size = sizeof(tmp);
+      auto [ec, n] = co_await http::async_read(
+          s, buf, p, asio::as_tuple(asio::use_awaitable));
+      if (ec == http::error::need_buffer) ec = {};
+      if (ec) break;
+      err.append(tmp, sizeof(tmp) - p.get().body().size);
+    }
+    c.out.status = code == 429 ? CES_ERROR_QUEUE_FULL : CES_ERROR_INTERNAL;
+    c.out.billing = ThinkOutcome::kNone;
+    c.out.detail = "http " + std::to_string(code) + ": " +
+                   thinkErrorMessage(err);
+    co_return;
+  }
+
+  // From here the backend did work that it can bill.
+  c.out.billing = ThinkOutcome::kEstimate;
+  bool bad = false;
+  while (!p.is_done()) {
+    p.get().body().data = tmp;
+    p.get().body().size = sizeof(tmp);
+    auto [ec, n] = co_await http::async_read(
+        s, buf, p, asio::as_tuple(asio::use_awaitable));
+    if (ec == http::error::need_buffer) ec = {};
+    if (ec) throw boost::system::system_error(ec);
+    size_t got = sizeof(tmp) - p.get().body().size;
+    if (!c.parser.feed(std::string_view(tmp, got), *c.onText)) {
+      bad = true;
+      break;
+    }
+    if (c.parser.done() || c.parser.stopped() || c.stop->load()) break;
+  }
+  if (c.parser.hasUsage()) {
+    c.out.usage = c.parser.usage();
+    c.out.billing = ThinkOutcome::kUsage;
+  }
+  if (bad) {
+    c.out.status = CES_ERROR_INTERNAL;
+    c.out.detail = "malformed stream";
+  } else if (!c.parser.error().empty()) {
+    c.out.status = CES_ERROR_INTERNAL;
+    c.out.detail = c.parser.error();
+  } else if (c.parser.stopped() || c.stop->load()) {
+    c.out.status = CES_ERROR_INTERNAL;
+    c.out.detail = "stopped";
+  } else if (!c.parser.done() && !p.is_done()) {
+    c.out.status = CES_ERROR_INTERNAL;
+    c.out.detail = "stream ended early";
+  } else {
+    c.out.status = CES_OK;
+  }
+}
+
+asio::awaitable<void> callAsync(const ThinkHttpsBackend::Impl& im,
+                                asio::ssl::context* ctx,
+                                std::chrono::steady_clock::time_point deadline,
+                                std::string auth, std::string body, Call& c) {
+  auto ex = co_await asio::this_coro::executor;
+  tcp::resolver res(ex);
+  beast::tcp_stream tcpStream(ex);
+  c.low = &tcpStream;
+  tcpStream.expires_at(deadline);
+  auto eps = co_await res.async_resolve(im.host, im.port, asio::use_awaitable);
+  co_await tcpStream.async_connect(eps, asio::use_awaitable);
+  if (!im.tls) {
+    co_await exchange(tcpStream, im, auth, body, c);
+    co_return;
+  }
+  beast::ssl_stream<beast::tcp_stream> s(std::move(tcpStream), *ctx);
+  c.low = &beast::get_lowest_layer(s);
+  if (!SSL_set_tlsext_host_name(s.native_handle(), im.host.c_str()))
+    throw boost::system::system_error(
+        boost::system::error_code(static_cast<int>(::ERR_get_error()),
+                                  asio::error::get_ssl_category()));
+  s.set_verify_callback(asio::ssl::host_name_verification(im.host));
+  co_await s.async_handshake(asio::ssl::stream_base::client,
+                             asio::use_awaitable);
+  co_await exchange(s, im, auth, body, c);
+}
+
+}  // namespace
+
+ThinkHttpsBackend::ThinkHttpsBackend(ThinkHttpsConfig cfg)
+    : cfg_(std::move(cfg)), impl_(std::make_unique<Impl>()) {
+  std::string prefix;
+  if (!thinkParseBaseUrl(cfg_.baseUrl, impl_->tls, impl_->host, impl_->port,
+                         prefix))
+    return;
+  impl_->target = prefix + "/chat/completions";
+  if (impl_->tls) {
+    try {
+      impl_->ctx = std::make_unique<asio::ssl::context>(
+          asio::ssl::context::tls_client);
+      impl_->ctx->set_default_verify_paths();
+      impl_->ctx->set_verify_mode(asio::ssl::verify_peer);
+    } catch (const std::exception&) {
+      return;
+    }
+  }
+  valid_ = true;
+}
+
+ThinkHttpsBackend::~ThinkHttpsBackend() = default;
+
+ThinkOutcome ThinkHttpsBackend::run(
+    const std::string& prompt, uint32_t maxOut, const std::atomic<bool>& stop,
+    const std::function<bool(std::string_view)>& onText) {
+  ThinkOutcome fail;
+  fail.status = CES_ERROR_DISABLED;
+  if (!valid_) return fail;
+
+  const auto deadline = std::chrono::steady_clock::now() + cfg_.timeout;
+  asio::io_context ioc;
+  Call c;
+  c.stop = &stop;
+  c.onText = &onText;
+  asio::co_spawn(
+      ioc,
+      callAsync(*impl_, impl_->ctx.get(), deadline,
+                "Bearer " + cfg_.apiKey,
+                thinkRequestJson(cfg_.model, prompt, maxOut, cfg_.reasoning),
+                c),
+      [&c, deadline](std::exception_ptr e) {
+        c.finished = true;
+        if (!e) return;
+        try {
+          std::rethrow_exception(e);
+        } catch (const boost::system::system_error& se) {
+          const bool late = std::chrono::steady_clock::now() >= deadline ||
+                            se.code() == beast::error::timeout;
+          c.out.status = late ? CES_ERROR_TIMEOUT : CES_ERROR_INTERNAL;
+          c.out.detail = se.code().message();
+        } catch (const std::exception& ex) {
+          c.out.status = CES_ERROR_INTERNAL;
+          c.out.detail = ex.what();
+        }
+        if (c.parser.hasUsage()) {
+          c.out.usage = c.parser.usage();
+          c.out.billing = ThinkOutcome::kUsage;
+        }
+      });
+  bool cancelled = false;
+  while (!c.finished) {
+    ioc.run_for(std::chrono::milliseconds(100));
+    if (ioc.stopped() && !c.finished) ioc.restart();
+    if (!cancelled && stop.load() && c.low) {
+      // This thread runs the io_context, so the socket is safe to touch.
+      c.low->cancel();
+      cancelled = true;
+    }
+  }
+  return c.out;
+}
+
+}  // namespace ces
+
+#endif  // CES_THINK

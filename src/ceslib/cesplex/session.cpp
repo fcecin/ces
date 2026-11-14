@@ -191,6 +191,75 @@ void CesPlexRequest::respondAndClose(uint8_t status, ces::Bytes preamble) {
   stream.reset();
 }
 
+CesPlexReplyStream::CesPlexReplyStream(std::shared_ptr<CesPlexRequest> req)
+  : req_(std::move(req)) {}
+
+void CesPlexReplyStream::write(ces::Bytes chunk) {
+  if (chunk.empty()) return;
+  Item it;
+  ces::Buffer::put<uint32_t>(it.bytes, static_cast<uint32_t>(chunk.size()));
+  it.bytes.insert(it.bytes.end(), chunk.begin(), chunk.end());
+  enqueue(std::move(it));
+}
+
+void CesPlexReplyStream::finish(uint8_t status, ces::Bytes preamble) {
+  Item it;
+  ces::Buffer::put<uint32_t>(it.bytes, 0);
+  it.final = true;
+  it.status = status;
+  it.preamble = std::move(preamble);
+  enqueue(std::move(it));
+}
+
+void CesPlexReplyStream::finishAndClose(uint8_t status, ces::Bytes preamble) {
+  Item it;
+  ces::Buffer::put<uint32_t>(it.bytes, 0);
+  it.final = true;
+  it.close = true;
+  it.status = status;
+  it.preamble = std::move(preamble);
+  enqueue(std::move(it));
+}
+
+void CesPlexReplyStream::enqueue(Item it) {
+  auto self = shared_from_this();
+  boost::asio::post(req_->stream->get_executor(),
+    [self, it = std::move(it)]() mutable {
+      if (self->finished_ || self->dead_.load()) return;
+      self->queue_.push_back(std::move(it));
+      self->pump();
+    });
+}
+
+void CesPlexReplyStream::pump() {
+  if (writing_ || queue_.empty()) return;
+  writing_ = true;
+  auto self = shared_from_this();
+  auto bytes = std::make_shared<ces::Bytes>(std::move(queue_.front().bytes));
+  boost::asio::async_write(
+    *req_->stream, boost::asio::buffer(*bytes),
+    [self, bytes](const boost::system::error_code& ec, std::size_t) {
+      self->writing_ = false;
+      if (ec) {
+        self->dead_ = true;
+        self->queue_.clear();
+        return;
+      }
+      Item done = std::move(self->queue_.front());
+      self->queue_.pop_front();
+      if (done.final) {
+        self->finished_ = true;
+        self->queue_.clear();
+        if (done.close)
+          self->req_->respondAndClose(done.status, std::move(done.preamble));
+        else
+          self->req_->respond(done.status, std::move(done.preamble));
+        return;
+      }
+      self->pump();
+    });
+}
+
 // ===========================================================================
 // Client side — CesPlexChannel (protocol) + CesPlexClient (owned transport)
 // ===========================================================================
@@ -198,6 +267,7 @@ void CesPlexRequest::respondAndClose(uint8_t status, ces::Bytes preamble) {
 namespace {
 
 constexpr auto kVerbTimeout = std::chrono::seconds(60);
+constexpr uint32_t kMaxStreamFrame = 1024 * 1024;   // one reply frame
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 
 uint64_t nowMicros() {
@@ -369,6 +439,11 @@ public:
   }
 
   bool readExact(ces::Bytes& out, size_t n) {
+    return readExactFor(out, n, kVerbTimeout);
+  }
+
+  bool readExactFor(ces::Bytes& out, size_t n,
+                    std::chrono::steady_clock::duration timeout) {
     if (!stream_) return false;
     // Heap-owned (see readAndVerifyTail): survives a post-timeout late read.
     auto buf = std::make_shared<ces::Bytes>(n);
@@ -383,7 +458,7 @@ public:
             run->set_value(!ec);
           });
       });
-    if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
+    if (fut.wait_for(timeout) != std::future_status::ready) return false;
     if (!fut.get()) return false;
     out = std::move(*buf);
     return true;
@@ -460,6 +535,50 @@ public:
         return fail(CES_ERROR_INTERNAL);
     }
     return CES_OK;
+  }
+
+  uint8_t driveStreamVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      const ces::Bytes& extraBodyToSend,
+      const std::function<void(const ces::Bytes&)>& onFrame,
+      std::chrono::steady_clock::duration frameTimeout,
+      size_t respFixedPreambleLen,
+      ces::Bytes& outPreamble) {
+    if (ensureClean() != CES_OK) return CES_ERROR_INTERNAL;
+    auto fail = [&](uint8_t rc) -> uint8_t {
+      markDirty();
+      return rc;
+    };
+    ces::Bytes verbByte{verb};
+    if (!writeAll(verbByte)) return fail(CES_ERROR_INTERNAL);
+    if (!writeAll(envelope)) return fail(CES_ERROR_INTERNAL);
+    if (!extraBodyToSend.empty() && !writeAll(extraBodyToSend))
+      return fail(CES_ERROR_INTERNAL);
+
+    for (;;) {
+      ces::Bytes lenBuf;
+      if (!readExactFor(lenBuf, 4, frameTimeout))
+        return fail(CES_ERROR_INTERNAL);
+      uint32_t len = ces::Buffer::peek<uint32_t>(lenBuf.data());
+      if (len == 0) break;
+      if (len > kMaxStreamFrame) return fail(CES_ERROR_INTERNAL);
+      ces::Bytes frame;
+      if (!readExactFor(frame, len, frameTimeout))
+        return fail(CES_ERROR_INTERNAL);
+      if (onFrame) onFrame(frame);
+    }
+
+    ces::Bytes statusBuf;
+    if (!readExact(statusBuf, 1)) return fail(CES_ERROR_INTERNAL);
+    uint8_t status = statusBuf[0];
+    outPreamble.clear();
+    if (status == CES_OK && respFixedPreambleLen > 0 &&
+        !readExact(outPreamble, respFixedPreambleLen))
+      return fail(CES_ERROR_INTERNAL);
+    if (!readAndVerifyTail(status, verb, outPreamble))
+      return fail(CES_ERROR_INTERNAL);
+    return status;
   }
 
 private:
@@ -658,6 +777,19 @@ uint8_t CesPlexChannel::driveVerb(
 
 bool CesPlexChannel::readExact(ces::Bytes& out, size_t n) {
   return impl_->readExact(out, n);
+}
+
+uint8_t CesPlexChannel::driveStreamVerb(
+    uint8_t verb,
+    const minx::Bytes& envelope,
+    const ces::Bytes& extraBodyToSend,
+    const std::function<void(const ces::Bytes&)>& onFrame,
+    std::chrono::steady_clock::duration frameTimeout,
+    size_t respFixedPreambleLen,
+    ces::Bytes& outPreamble) {
+  return impl_->driveStreamVerb(verb, envelope, extraBodyToSend, onFrame,
+                                frameTimeout, respFixedPreambleLen,
+                                outPreamble);
 }
 
 // ---------------------------------------------------------------------------
