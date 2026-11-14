@@ -91,26 +91,20 @@ bool CesClient::connect() {
   }
   LOGTRACE << "connect";
 
+  // getInfo sends up to tries_ times and waits retryIntervalMs_ for each
+  // reply, so one call is the whole budget. A retry loop here would square
+  // it: a dead server would cost tries_ * tries_ waits.
   try {
-    for (int i = 0; i < tries_; ++i) {
-      if (getInfo()) {
-        LOGTRACE << "connect ok";
-        return connected_ = true;
-      }
-      if (i + 1 < tries_) {
-        LOGTRACE << "connect failed; retrying..." << VAR(i) << VAR(tries_);
-        if (!ces::sleep(retryIntervalMs_)) {
-          LOGTRACE << "connect interrupted";
-          return false;
-        }
-      }
+    if (getInfo()) {
+      LOGTRACE << "connect ok";
+      return connected_ = true;
     }
   } catch (const std::exception& e) {
     LOGDEBUG << "connect threw" << SVAR(e.what());
     return connected_ = false;
   }
 
-  LOGTRACE << "connect out of tries, failed";
+  LOGTRACE << "connect failed: no reply";
   return connected_ = false;
 }
 

@@ -285,6 +285,19 @@ std::string contentToDisplayString(const AssetData& data) {
 // ClientSession
 // =============================================================================
 
+namespace {
+
+// "Connect failed: no reply from <where> (<how>, N tries)". Names the
+// address, so a caller that used the default server sees which one.
+template <class Endpoint>
+std::string connectFailed(const Endpoint& ep, const char* how, int tries) {
+  return "Connect failed: no reply from " + ep.address().to_string() + ":" +
+         std::to_string(ep.port()) + " (" + how + ", " +
+         std::to_string(tries) + (tries == 1 ? " try)" : " tries)");
+}
+
+}  // namespace
+
 ClientSession::ClientSession(bool cacheOnly, uint16_t port,
                              const boost::asio::ip::udp::endpoint& ep,
                              const KeyPair* kp, int tries)
@@ -295,7 +308,7 @@ ClientSession::ClientSession(bool cacheOnly, uint16_t port,
   if (kp)
     client_->setKey(*kp);
   if (!client_->connect())
-    throw std::runtime_error("Connect failed");
+    throw std::runtime_error(connectFailed(ep, "UDP", tries));
 }
 
 ClientSession::ClientSession(bool cacheOnly,
@@ -308,7 +321,7 @@ ClientSession::ClientSession(bool cacheOnly,
   if (kp)
     client_->setKey(*kp);
   if (!client_->connect())
-    throw std::runtime_error("Connect through proxy failed");
+    throw std::runtime_error(connectFailed(proxyEp, "TCP proxy", tries));
 }
 
 ClientSession::ClientSession(bool cacheOnly, const std::string& serverStr,
@@ -326,9 +339,10 @@ ClientSession::ClientSession(bool cacheOnly, const std::string& serverStr,
   client_->setTries(tries);
   if (kp)
     client_->setKey(*kp);
-  if (!client_->connect())
-    throw std::runtime_error(
-      std::string("Connect failed (") + (probe.isTcp ? "TCP" : "UDP") + ")");
+  if (!client_->connect()) {
+    if (probe.isTcp) throw std::runtime_error(connectFailed(probe.tcpEp, "TCP", tries));
+    throw std::runtime_error(connectFailed(probe.udpEp, "UDP", tries));
+  }
 }
 
 ClientSession::~ClientSession() {

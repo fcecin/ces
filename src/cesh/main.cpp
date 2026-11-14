@@ -19,6 +19,7 @@
 #include <ces/l2/file_client.h>
 #include <ces/l2/mail_client.h>
 #include <ces/l2/think_client.h>
+#include <unistd.h>
 #include <ces/ramfilestore.h>
 #include <ces/util/log.h>
 #include <ces/util/hex.h>
@@ -753,6 +754,11 @@ int main(int argc, char* argv[]) {
                         "goes before the prompt, and the server appends the "
                         "prompt and the reply to it (when you own it and its "
                         "balance pays the append)");
+  bool think_verbose_arg = false;
+  cmd_think->add_flag("-v,--verbose", think_verbose_arg,
+                      "Also print the charge (raw units) and the file append "
+                      "on stderr. Without it, only the reply is printed, and "
+                      "stderr has only problems");
 
   // ---- dial (open a byte stream to a running compute instance) ----
   auto* cmd_dial = app.add_subcommand(
@@ -2797,9 +2803,17 @@ int main(int argc, char* argv[]) {
         if (!prompt.empty()) prompt.push_back('\n');
         prompt.append(think_in_data.begin(), think_in_data.end());
       }
-      if (prompt.empty())
+      if (prompt.empty()) {
+        // No words and no --in: the prompt comes from stdin. A terminal
+        // would wait silently for Ctrl-D, so say how to give a prompt.
+        if (::isatty(STDIN_FILENO)) {
+          std::cerr << "Error: no prompt. Give it as words (cesh think hello"
+                       " there), with --in, or pipe it on stdin.\n";
+          return 1;
+        }
         prompt.assign(std::istreambuf_iterator<char>(std::cin),
                       std::istreambuf_iterator<char>());
+      }
       if (prompt.empty()) {
         std::cerr << "Error: empty prompt\n";
         return 1;
@@ -2827,15 +2841,24 @@ int main(int argc, char* argv[]) {
       std::cout << std::flush;
       if (rc != CES_OK) {
         std::cerr << "THINK Failed: " << errorString(rc) << "\n";
+        if (rc == CES_ERROR_ORIGIN_NOT_FOUND ||
+            rc == CES_ERROR_INSUFFICIENT_BALANCE)
+          std::cerr << "the signer " << actorKey.getPublicKeyHexStr()
+                    << " has no account or too little balance on this"
+                       " server; fund it (cesh transfer <that key> <amount>"
+                       " --open, from a funded key)\n";
         return 1;
       }
-      if (!g_quiet) {
+      // Only the reply goes to stdout. stderr gets the charge with -v, and
+      // a file that was not updated always (the caller asked for it).
+      if (think_verbose_arg && !g_quiet) {
         std::cerr << "charged " << charged;   // raw credit units
-        if (!think_file_arg.empty()) {
-          if (appendError == CES_OK) std::cerr << ", file appended";
-          else std::cerr << ", file not updated: " << errorString(appendError);
-        }
+        if (!think_file_arg.empty() && appendError == CES_OK)
+          std::cerr << ", file appended";
         std::cerr << "\n";
+      }
+      if (!think_file_arg.empty() && appendError != CES_OK) {
+        std::cerr << "file not updated: " << errorString(appendError) << "\n";
         if (appendError == CES_ERROR_INSUFFICIENT_BALANCE)
           std::cerr << "the file's balance cannot pay the append; fund it with "
                        "cesh file deposit " << think_file_arg << " <amount>\n";
