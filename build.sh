@@ -78,7 +78,9 @@ build_one_config() {
     local BUILD_TYPE_LOWER="$1"
     local BUILD_TYPE_CAMEL="$2"
     local BUILD_DIR="build/${BUILD_TYPE_LOWER}"
-    local EXTRA_ARGS=""
+    # ASan on/off, explicit each run: the flags are cache values, so a build
+    # without --asan after one with it would stay an ASan build.
+    local EXTRA_ARGS="-DCMAKE_CXX_FLAGS= -DCMAKE_EXE_LINKER_FLAGS="
 
     if [ "$ENABLE_ASAN" = true ]; then
         EXTRA_ARGS="-DCMAKE_CXX_FLAGS=-fsanitize=address -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address"
