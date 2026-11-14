@@ -61,6 +61,12 @@ std::string errorOf(const json::object& o) {
 bool ThinkSseParser::feed(std::string_view bytes,
                           const std::function<bool(std::string_view)>& onText) {
   buf_.append(bytes.data(), bytes.size());
+  // One event is one small JSON chunk. A backend that sends this much with
+  // no event end is broken; stop instead of buffering without bound.
+  constexpr size_t kMaxPending = 1024 * 1024;
+  if (buf_.size() > kMaxPending && buf_.find("\n\n") == std::string::npos &&
+      buf_.find("\r\n\r\n") == std::string::npos)
+    return false;
   // Events end at a blank line. Accept LF and CRLF line ends.
   for (;;) {
     if (done_ || stopped_) { buf_.clear(); return true; }

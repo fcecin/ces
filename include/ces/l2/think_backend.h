@@ -65,7 +65,8 @@ std::string thinkRequestJson(const std::string& model,
 // Reasoning deltas are not reply text and are skipped.
 class ThinkSseParser {
  public:
-  // False when an event is malformed JSON. Stops at "[DONE]".
+  // False when an event is malformed JSON, or when more than 1 MiB arrives
+  // with no event end. Stops at "[DONE]".
   bool feed(std::string_view bytes,
             const std::function<bool(std::string_view)>& onText);
   bool done() const { return done_; }         // "[DONE]" seen

@@ -263,6 +263,16 @@ BOOST_AUTO_TEST_CASE(Sse_StopAndErrorAndMalformed) {
                          [](std::string_view) { return true; }));
 }
 
+// Bytes with no event end are not buffered without bound.
+BOOST_AUTO_TEST_CASE(Sse_UnboundedEventIsMalformed) {
+  ThinkSseParser p;
+  const std::string junk(256 * 1024, 'x');
+  bool ok = true;
+  for (int i = 0; i < 5 && ok; ++i)
+    ok = p.feed(junk, [](std::string_view) { return true; });
+  BOOST_CHECK(!ok);
+}
+
 BOOST_AUTO_TEST_CASE(RequestJson_FieldsAndEscapes) {
   std::string j = thinkRequestJson("deepseek-flash", "say \"hi\"\n", 77, false);
   BOOST_CHECK(j.find("\"model\":\"deepseek-flash\"") != std::string::npos);

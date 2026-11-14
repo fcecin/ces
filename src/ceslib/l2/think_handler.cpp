@@ -172,7 +172,8 @@ void drainThenFinish(std::shared_ptr<CesPlexRequest> req,
 }
 
 // THINK. The prompt streams as the request body (hash-committed in the
-// preamble, like mail SEND). Preamble (after nonce): [u32 textLen][32 hash].
+// preamble, like mail SEND). Preamble (after nonce): [u32 textLen][32 hash]
+// then optionally [u16 pathLen][path] (the conversation file).
 void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
                    ThinkHandler* self) {
   auto reply = std::make_shared<CesPlexReplyStream>(req);
@@ -213,7 +214,8 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
         reply->finish(CES_ERROR_BAD_INPUT);
         return;
       }
-      // The signer is the file's caller and pays its fees, as on the wire.
+      // The signer is the file's caller and pays the caller-side fees, as on
+      // the wire.
       const minx::Hash signer = req->bound.boundPubkey.getHash();
       ThinkFile file;
       file.path = path;
@@ -354,6 +356,10 @@ void ThinkHandler::submit(const minx::Hash& payer, std::string prompt,
   auto job = std::make_shared<Job>();
   std::lock_guard<std::mutex> lk(mu_);
   reapLocked();
+  if (stopped_.load()) {   // stop() ran since the check above
+    sink->finish(CES_ERROR_DISABLED, 0, {}, CES_OK);
+    return;
+  }
   if (jobs_.size() >= cfg.thinkMaxConcurrent ||
       (!file.path.empty() && busyPaths_.count(file.path))) {
     sink->finish(CES_ERROR_QUEUE_FULL, 0, {}, CES_OK);
@@ -450,7 +456,8 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
 
   // A complete reply goes into the file with the text that asked for it.
   // The APPEND is the caller's own verb: it fails (and the file stays as
-  // it was) when the caller is not the owner or cannot pay for it.
+  // it was) when the caller is not the owner, or when the file's balance
+  // cannot pay for the growth. appendError carries its status.
   uint8_t appendError = CES_OK;
   if (o.status == CES_OK && !file.path.empty()) {
     ces::Bytes turn(prompt.begin(), prompt.end());
