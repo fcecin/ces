@@ -18,8 +18,9 @@
 
 namespace ces {
 
-// Restrict `path` to owner-only read/write. POSIX: 0600. Windows: ACL with
-// Built-in Administrators + SYSTEM + Owner full-control. Returns "" on
+// Restrict `path` to its owner. POSIX: 0600 for a file, 0700 for a
+// directory (a directory needs the execute bit to be entered). Windows: ACL
+// with Built-in Administrators + SYSTEM + Owner full-control. Returns "" on
 // success, error string on failure.
 inline std::string setSecurePermission(const std::filesystem::path& path) {
   try {
@@ -37,10 +38,10 @@ inline std::string setSecurePermission(const std::filesystem::path& path) {
       LocalFree(pSD);
     }
 #else
-    std::filesystem::permissions(path,
-                                 std::filesystem::perms::owner_read |
-                                   std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace);
+    const auto mode = std::filesystem::is_directory(path)
+      ? std::filesystem::perms::owner_all
+      : std::filesystem::perms::owner_read | std::filesystem::perms::owner_write;
+    std::filesystem::permissions(path, mode, std::filesystem::perm_options::replace);
 #endif
   } catch (const std::exception& e) {
     return std::string("Error: ") + e.what();
