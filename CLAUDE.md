@@ -280,6 +280,8 @@ Coroutine contexts (calls yield; the VM keeps serving others): `ces.spawn(fn)`; 
 
 `ces.sleep(ms)` (coroutine only) parks for `ms`; `ces.sleep(0)` is the voluntary yield (return to the run loop, service pending inbound, resume).
 
+`ces.exit()` ends the instance at once, from any context, and does not return. A `pcall` cannot catch it. The process sends the channel usage that it has queued (`flush_net_usage`) and calls `_exit(0)`. The server sees the IPC socket close and removes the instance. Files and balances do not change. Without it, `ces.run()` returns only when the IPC socket dies, so a program stops only when its balance is gone or its owner kills it. Tests: `ComputeLuaTests/Exit_*`.
+
 `ces.chan()` is a CSP message channel. `ch:send(v)` enqueues any Lua value, never blocks, returns `false` on a closed channel; `ch:recv([timeout_ms])` returns the next value or `nil,"timeout"` / `nil,"closed"` (default 10000 ms); `ch:close()` wakes parked receivers and drops later sends. It carries whole values, not bytes. Tests: `ChanTests` / `AsyncTests` / `AsyncConnTests` in `tests/test_async.cpp`.
 
 Invariant: every wait has an external backstop (a network `timeout_ms`, the host reply, or process death). No primitive waits on a program-internal event that may never arrive; `recv`'s default timeout keeps channels inside that rule.

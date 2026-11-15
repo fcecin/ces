@@ -646,6 +646,73 @@ BOOST_AUTO_TEST_CASE(RefusesBytecodeProgram) {
 }
 
 // ---------------------------------------------------------------------------
+// ces.exit() ends the instance at once. The program makes a 1-byte mark file,
+// calls ces.exit() and then tries to append to the mark. The instance must go
+// from the supervisor, the mark must keep its 1 byte (no code ran after the
+// exit), and the source file must stay. A second coroutine that sleeps in a
+// loop keeps a program without ces.exit alive.
+// ---------------------------------------------------------------------------
+
+namespace {
+uint64_t markSize(CesServer& server, uint16_t rpcPort, const KeyPair& owner,
+                  const std::string& path, uint8_t& rc) {
+  CesFileClient fc;
+  fc.setServerPubkey(server._serverKeyPair().getPublicKeyAsHash());
+  rc = fc.connect("localhost", rpcPort, owner);
+  if (rc != CES_OK) return 0;
+  CesFileClient::StatInfo info;
+  rc = fc.stat(path, info);
+  fc.disconnect();
+  return info.size;
+}
+}  // namespace
+
+BOOST_AUTO_TEST_CASE(Exit_FromCoroutine_EndsInstance) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/exit_co.lua";
+  const std::string mark = "/h/" + ownerHex + "/exit_co.mark";
+  uploadScript(path,
+    "local p = '" + mark + "'\n"
+    "ces.spawn(function() while true do ces.sleep(20) end end)\n"
+    "ces.spawn(function()\n"
+    "  ces.file_create(p, 1, 0, 1000000)\n"
+    "  ces.exit()\n"
+    "  ces.file_append(p, 'b')\n"
+    "end)\n"
+    "ces.run()\n");
+  uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(instId > 0);
+  BOOST_REQUIRE(waitInstanceGone(*server, instId));
+
+  uint8_t rc = CES_ERROR_INTERNAL;
+  BOOST_CHECK_EQUAL(markSize(*server, rpcPort, ownerKey, mark, rc), 1u);
+  BOOST_CHECK_EQUAL(int(rc), int(CES_OK));
+  markSize(*server, rpcPort, ownerKey, path, rc);
+  BOOST_CHECK_MESSAGE(rc == CES_OK, "source must stay; rc=" << int(rc));
+}
+
+// In the main chunk, ces.exit() also ends the process at once, so a pcall
+// around it cannot catch it and continue.
+BOOST_AUTO_TEST_CASE(Exit_FromMainChunk_UnderPcall_EndsInstance) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string path = "/h/" + ownerHex + "/exit_main.lua";
+  const std::string mark = "/h/" + ownerHex + "/exit_main.mark";
+  uploadScript(path,
+    "local p = '" + mark + "'\n"
+    "ces.file_create(p, 1, 0, 1000000)\n"
+    "pcall(ces.exit)\n"
+    "ces.file_append(p, 'b')\n"
+    "ces.run()\n");
+  uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(instId > 0);
+  BOOST_REQUIRE(waitInstanceGone(*server, instId));
+
+  uint8_t rc = CES_ERROR_INTERNAL;
+  BOOST_CHECK_EQUAL(markSize(*server, rpcPort, ownerKey, mark, rc), 1u);
+  BOOST_CHECK_EQUAL(int(rc), int(CES_OK));
+}
+
+// ---------------------------------------------------------------------------
 // Best-effort DELIVER frames (incoming CES_APP_COMPUTE_MSG) are shed once
 // the per-instance outbound queue is deep, so a remote flood aimed at a
 // slow or non-reading program cannot grow the server's memory without

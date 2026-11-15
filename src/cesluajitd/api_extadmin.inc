@@ -550,6 +550,38 @@ static void drain_io_completions(lua_State* mainL) {
   }
 }
 
+// Send the channel usage that the endpoint's meter queued to the parent
+// (one-way TAG_NET_USAGE). Only the IPC thread may write g_sock_fd.
+static void flush_net_usage() {
+  for (;;) {
+    NetUsageRecord r;
+    {
+      std::lock_guard<std::mutex> lk(g_net_usage_mx);
+      if (g_net_usage_q.empty()) break;
+      r = g_net_usage_q.front();
+      g_net_usage_q.pop_front();
+    }
+    std::vector<uint8_t> nb;
+    put_bytes(nb, r.payer.data(), r.payer.size());
+    put_u64(nb, r.usage.bytesSent);
+    put_u64(nb, r.usage.bytesReceived);
+    put_u64(nb, r.usage.memByteSeconds);
+    put_u64(nb, r.usage.ageSeconds);
+    write_frame(TAG_NET_USAGE, 0, nb.data(), nb.size());
+  }
+}
+
+// ces.exit() — does not return. Ends this instance from any context: the
+// process sends the channel usage that it has, then exits with status 0. The
+// server sees the IPC socket close and removes the instance at once. Files
+// and balances do not change. Each host call is complete when it returns, so
+// the work of the program is not lost. A pcall cannot catch the exit, and no
+// code runs after it.
+int lua_ces_exit(lua_State* /*L*/) {
+  flush_net_usage();
+  ::_exit(0);
+}
+
 // The UNIFIED event loop — ces.run() (= ces.conn.run).
 // Consumes the program: blocks OUTSIDE Lua on every event source at once —
 // the host IPC socket (/ces/lua/1 conn frames + client DELIVER) AND the
@@ -587,24 +619,7 @@ int lua_ces_run(lua_State* L) {
       dispatch_luarpc_event(L, std::move(e));
     }
 
-    // Drain channel-usage the endpoint's meter queued and report it to the
-    // parent (one-way TAG_NET_USAGE). Only this (IPC) thread may write g_sock_fd.
-    for (;;) {
-      NetUsageRecord r;
-      {
-        std::lock_guard<std::mutex> lk(g_net_usage_mx);
-        if (g_net_usage_q.empty()) break;
-        r = g_net_usage_q.front();
-        g_net_usage_q.pop_front();
-      }
-      std::vector<uint8_t> nb;
-      put_bytes(nb, r.payer.data(), r.payer.size());
-      put_u64(nb, r.usage.bytesSent);
-      put_u64(nb, r.usage.bytesReceived);
-      put_u64(nb, r.usage.memByteSeconds);
-      put_u64(nb, r.usage.ageSeconds);
-      write_frame(TAG_NET_USAGE, 0, nb.data(), nb.size());
-    }
+    flush_net_usage();
 
     // Fire due periodic timers (ces.every) + sleep wakeups, resume coroutines
     // whose host reply arrived, dispatch ready conn handlers, then run every

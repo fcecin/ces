@@ -783,6 +783,7 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_cancel>);        lua_setfield(L, -2, "cancel");
   lua_pushcfunction(L, guarded<lua_ces_spawn>);         lua_setfield(L, -2, "spawn");
   lua_pushcfunction(L, guarded<lua_ces_sleep>);         lua_setfield(L, -2, "sleep");
+  lua_pushcfunction(L, guarded<lua_ces_exit>);          lua_setfield(L, -2, "exit");
   lua_pushcfunction(L, guarded<lua_chan_new>);          lua_setfield(L, -2, "chan");
   // ces.chan metatable (methods + __gc), created once.
   luaL_newmetatable(L, kChanMT);
