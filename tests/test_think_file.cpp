@@ -290,8 +290,8 @@ BOOST_AUTO_TEST_CASE(SameFile_NextTurnRightAway) {
   }
 }
 
-// The /m/ mail zone is private. A THINK on a /m/ path gets NOT_OWNER
-// whether the file exists or not, so the status tells nothing about it.
+// The /m/ zone is private. A THINK on someone else's /m/ path gets
+// NOT_OWNER whether the file exists or not, so the status tells nothing.
 BOOST_AUTO_TEST_CASE(MailZone_Refused) {
   std::string reply;
   uint8_t appendError = 0xFF;
@@ -300,6 +300,31 @@ BOOST_AUTO_TEST_CASE(MailZone_Refused) {
                           reply, appendError),
                     CES_ERROR_NOT_OWNER);
   BOOST_CHECK_EQUAL(backend->calls.load(), 0);
+}
+
+// The owner's own /m/ file is a private conversation: THINK reads it and
+// appends to it in-process, and nobody reads it over the wire, the owner
+// included.
+BOOST_AUTO_TEST_CASE(OwnPrivateZone_IsAConversation) {
+  const std::string path = "/m/" + owner.getPublicKeyHexStr() + "/chat.txt";
+  putFile(path, "og|");
+  std::string reply;
+  uint8_t appendError = 0xFF;
+  CES_REQUIRE_OK(think(owner, "hi!", path, reply, appendError));
+  BOOST_CHECK_EQUAL(appendError, CES_OK);
+  BOOST_CHECK_EQUAL(backend->input(), "og|hi!");
+  backend->reply = "again";
+  CES_REQUIRE_OK(think(owner, "more", path, reply, appendError));
+  BOOST_CHECK_EQUAL(backend->input(), "og|hi!Hello there!more");
+  // No wire read or stat, also for the owner.
+  BOOST_CHECK_EQUAL(getFile(path), "<err>");
+  // Another signer on this path: NOT_OWNER, as for a path with no file.
+  const int calls = backend->calls.load();
+  BOOST_CHECK_EQUAL(think(other, "hi!", path, reply, appendError), CES_ERROR_NOT_OWNER);
+  BOOST_CHECK_EQUAL(think(other, "hi!", "/m/" + owner.getPublicKeyHexStr() + "/none.txt", reply,
+                          appendError),
+                    CES_ERROR_NOT_OWNER);
+  BOOST_CHECK_EQUAL(backend->calls.load(), calls);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

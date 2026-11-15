@@ -531,7 +531,7 @@ How you act:
 - A command that fails comes back to you: fix it, or say in a few words why it failed.
 - A %%CESH-EXEC%% line is the only thing that runs. Everything else that you write is shown as it is: markdown code blocks are text, and nothing in them runs. Do not write commands for the user to type: run them. The chat asks the user before each action.
 - After your %%CESH-EXEC%% lines, stop and end your reply. Only the chat writes RESULT and CHAT lines: never write one yourself, and never guess a result.
-- A manual page that you read stays in your prompt until the user's next line. Do not read a page twice in one turn.
+- A manual page or a file that you read stays in the conversation. Do not read one twice.
 - Reads (man, query, ping, file stat, compute ps, ...) run at once.
 - All other commands (transfers, uploads, deposits, launches, keys, names, ...) run only if the user says yes, and the chat asks the user before each one. So when the user asks you to do something, do it. Do not ask the user whether to go ahead; the chat does that.
 - You can manage the user's keys: keys list, keys gen, keys add, keys export. You never see a private key, and the chat keeps it that way: keys list gives you the public keys, keys gen saves the new key in the wallet file and tells you its public key, keys add asks the user for the key itself (write only `keys add`, never a key), and keys export shows the private keys to the user only. Never write a private key in a command or in your reply.
@@ -551,7 +551,9 @@ ces.run()
 }  // namespace
 
 Chat::Chat(Options opt, Hooks hooks, Memory memory)
-  : opt_(std::move(opt)), hooks_(std::move(hooks)), memory_(std::move(memory)) {}
+  : opt_(std::move(opt)), hooks_(std::move(hooks)), memory_(std::move(memory)) {
+  notes_ = notesText();
+}
 
 std::string Chat::declined(const std::string& head, const std::string& what) {
   declined_ = true;
@@ -564,21 +566,24 @@ void Chat::emit(const std::string& type, const std::string& text) {
   if (hooks_.event) hooks_.event(type, text);
 }
 
-std::string Chat::prompt() const {
+std::string Chat::notesText() const {
   std::string notes;
   for (auto& [k, v] : memory_.notes()) notes += "- " + k + ": " + v + "\n";
-  if (notes.empty()) notes = "(none)\n";
+  return notes.empty() ? "(none)\n" : notes;
+}
+
+std::string Chat::prompt() const {
+  // The notes as they were when the chat started (or at the last fold): a
+  // note saved or dropped since is in the conversation, so the start of the
+  // prompt does not change and the model's cache keeps serving it.
+  const std::string& notes = notes_;
   return std::string(kRules) +
          "\n\n## The manual (open a page with `man <path>`)\n\n" + opt_.manualIndex +
          "\n## The user's notes\n\n" + notes +
          "\n## This session\n\n" + opt_.context +
          (summary_.empty() ? std::string()
                            : "\n\n## Earlier in this conversation (a summary)\n\n" + summary_) +
-         "\n\n## The conversation\n\n" + transcript_ +
-         (fresh_.empty() ? std::string()
-                         : "CHAT: the manual pages that you read in this turn (they leave the prompt "
-                           "when the turn ends):\n\n" + fresh_) +
-         "YOU:";
+         "\n\n## The conversation\n\n" + transcript_ + "YOU:";
 }
 
 std::vector<std::string> Chat::withGlobals(const std::vector<std::string>& args) const {
@@ -611,7 +616,7 @@ std::string Chat::runMemory(const std::vector<std::string>& args, const std::str
     memory_.set(name, text);
     if (!memory_.save()) return head + "the note file could not be written\n\n";
     ok_ = true;
-    return head + "saved\n\n";
+    return head + "saved; the notes now have " + name + ": " + text + "\n\n";
   }
   if (args.size() < 2) return head + "write `forget <name>`\n\n";
   std::string name = trim(line.substr(line.find("forget") + 6));
@@ -621,7 +626,7 @@ std::string Chat::runMemory(const std::vector<std::string>& args, const std::str
   memory_.erase(name);
   if (!memory_.save()) return head + "the note file could not be written\n\n";
   ok_ = true;
-  return head + "forgotten\n\n";
+  return head + "forgotten; the notes no longer have " + name + "\n\n";
 }
 
 std::string Chat::runKeys(const std::vector<std::string>& args, const std::string& line) {
@@ -733,9 +738,9 @@ std::string Chat::runFile(const std::string& verb, const std::string& name, cons
     std::ifstream f(file);
     std::string t((std::istreambuf_iterator<char>(f)), {});
     emit("result", "0");
-    show(echo("read " + name));
-    output(t.empty() ? "(an empty file)" : trim(t));
-    ok_ = true;
+    // The file goes into the conversation for the model, and stays. The user
+    // sees what went in. The model goes on from it.
+    show(readLine(name, t));
     return head + std::to_string(count(t)) + " lines\n" + t + (t.empty() || t.back() == '\n' ? "" : "\n") + "\n";
   }
 
@@ -785,6 +790,12 @@ bool Chat::confirm(const std::string& question) {
 }
 
 std::string Chat::echo(const std::string& command) const { return "→ " + command; }
+
+std::string Chat::readLine(const std::string& what, const std::string& text) const {
+  size_t n = static_cast<size_t>(std::count(text.begin(), text.end(), '\n'));
+  if (!text.empty() && text.back() != '\n') ++n;
+  return "→ Read " + trim(what) + " (" + std::to_string(n) + (n == 1 ? " line)" : " lines)");
+}
 
 std::string Chat::runLine(const std::string& raw, const std::string& body) {
   std::string line = raw;
@@ -860,7 +871,8 @@ std::string Chat::runLine(const std::string& raw, const std::string& body) {
              cap(trim(h.out), 2500) + "\n\n";
     }
   }
-  show(echo("cesh " + line));
+  const bool manual = !commandWords(args).empty() && commandWords(args)[0] == "man";
+  if (!manual) show(echo("cesh " + line));
   if (kind == Kind::Action) {
     std::string what = describeAction(withGlobals(args));
     if (!confirm(what.empty() ? "Run it?" : what + ". Run it?"))
@@ -870,25 +882,20 @@ std::string Chat::runLine(const std::string& raw, const std::string& body) {
   CeshResult r = hooks_.run(withGlobals(args));
   emit("result", std::to_string(r.code));
   std::string shown = trim(r.out + r.err);
-  const bool manual = !commandWords(args).empty() && commandWords(args)[0] == "man";
   if (manual && r.code == 0) {
-    // A manual page is for the model; the user sees its size only.
-    size_t n = shown.empty() ? 0 : static_cast<size_t>(std::count(shown.begin(), shown.end(), '\n')) + 1;
-    show("(" + std::to_string(n) + (n == 1 ? " line" : " lines") + " of the manual, for the model)");
+    // A manual page goes into the conversation for the model, and stays. The
+    // user sees what went in. The model goes on from it.
+    show(readLine("man " + trim(line.substr(line.find("man") + 3)), shown));
   } else {
+    if (manual) show(echo("cesh " + line));   // a page that failed: show the command
     // Say so when a command prints nothing. Else the model makes up a reason
     // for the empty result ("the reply went to stdout").
     output(shown.empty() ? "(no output)" : shown);
     ok_ = r.code == 0;
   }
   std::string o = head + "exit " + std::to_string(r.code) + "\n";
-  // A manual page goes to the next model call only, and the transcript keeps
-  // a stub: a page read once would otherwise be paid for in every later call.
-  if (r.code == 0 && manual) {
-    fresh_ += head + "exit 0\n" + cap(r.out, opt_.maxResult) + "\n";
-    return head + "exit 0 (" + std::to_string(std::count(r.out.begin(), r.out.end(), '\n')) +
-           " lines, in your prompt for this turn)\n\n";
-  }
+  // A manual page goes in whole (the pages are built in and short).
+  if (r.code == 0 && manual) return o + r.out + (r.out.empty() || r.out.back() == '\n' ? "" : "\n") + "\n";
   if (!r.out.empty()) o += cap(r.out, opt_.maxResult);
   if (!r.err.empty()) o += "[stderr]\n" + cap(r.err, opt_.maxResult);
   if (r.out.empty() && r.err.empty()) o += "(no output: the command printed nothing)\n";
@@ -1016,6 +1023,7 @@ bool Chat::compact() {
     // The floor: the older turns go, and the model knows that they went.
     summary_ += (summary_.empty() ? "" : "\n") + std::string("(Older turns were dropped here; they are lost.)");
     dropFront(cut);
+    notes_ = notesText();
     show("(could not fold " + kb + " KB of older conversation: " + oneLine(r.ok ? "empty summary" : r.error) +
          "; those turns were dropped)");
     emit("compact", "dropped " + std::to_string(folded.size()));
@@ -1023,6 +1031,7 @@ bool Chat::compact() {
   }
   summary_ = trim(r.text);
   dropFront(cut);
+  notes_ = notesText();   // the start of the prompt changes here anyway
   show("(folded " + kb + " KB of older conversation into a summary" +
        (r.charged >= 0 ? ", " + credits(r.charged) + " credits" : std::string()) + ")");
   emit("compact", "folded " + std::to_string(folded.size()));
@@ -1051,11 +1060,6 @@ void Chat::dropFront(size_t n) {
 }
 
 void Chat::turn(const std::string& userLine) {
-  // The manual pages read in a turn stay in the prompts of that turn only.
-  struct ClearFresh {
-    std::string& f;
-    ~ClearFresh() { f.clear(); }
-  } clearFresh{fresh_};
   turns_.push_back(transcript_.size());
   transcript_ += "USER: " + userLine + "\n\n";
   declined_ = false;

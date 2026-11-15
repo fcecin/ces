@@ -54,6 +54,9 @@ struct ScriptBackend : ThinkBackend {
   std::mutex mu;
   std::string lastPrompt;
   uint32_t lastMaxOut = 0;
+  uint32_t window = 0;             // what contextWindow() states
+
+  uint32_t contextWindow() override { return window; }
 
   ThinkOutcome run(const std::string& prompt, uint32_t maxOut,
                    const std::atomic<bool>& stop,
@@ -374,6 +377,31 @@ BOOST_AUTO_TEST_CASE(BaseUrl_Parse) {
   BOOST_CHECK(!thinkParseBaseUrl("https://h:x1/", tls, h, p, pre));
 }
 
+// The model list of DeepSeek's API (its documented example): the window of
+// the configured model. There is no standard field; other lists give 0.
+BOOST_AUTO_TEST_CASE(ModelWindow_FromTheModelList) {
+  const std::string list = R"({"object":"list","data":[
+    {"id":"deepseek-flash","object":"model","owned_by":"deepseek",
+     "context_window":1048576,"max_output_tokens":393216},
+    {"id":"deepseek-v4-pro","object":"model","owned_by":"deepseek",
+     "context_window":1048576,"max_output_tokens":393216}]})";
+  BOOST_CHECK_EQUAL(thinkModelWindow(list, "deepseek-flash"), 1048576u);
+  BOOST_CHECK_EQUAL(thinkModelWindow(list, "other-model"), 0u);
+  BOOST_CHECK_EQUAL(thinkModelWindow(R"({"data":[{"id":"gpt-x","object":"model"}]})", "gpt-x"), 0u);
+  BOOST_CHECK_EQUAL(thinkModelWindow("not json", "deepseek-flash"), 0u);
+  BOOST_CHECK_EQUAL(thinkModelWindow(R"({"data":{}})", "deepseek-flash"), 0u);
+}
+
+// The operator's ceiling only lowers the API's window, and stands in for it
+// when the API states none.
+BOOST_AUTO_TEST_CASE(ModelWindow_CeilingOnlyLowers) {
+  BOOST_CHECK_EQUAL(thinkWindow(0, 0), 0u);
+  BOOST_CHECK_EQUAL(thinkWindow(0, 1048576), 1048576u);
+  BOOST_CHECK_EQUAL(thinkWindow(200000, 1048576), 200000u);
+  BOOST_CHECK_EQUAL(thinkWindow(2000000, 1048576), 1048576u);
+  BOOST_CHECK_EQUAL(thinkWindow(200000, 0), 200000u);
+}
+
 BOOST_AUTO_TEST_CASE(Utf8_Check) {
   BOOST_CHECK(thinkValidUtf8("plain"));
   BOOST_CHECK(thinkValidUtf8("ol\xc3\xa1 \xe2\x82\xac \xf0\x9f\x9a\x80"));
@@ -454,7 +482,12 @@ BOOST_AUTO_TEST_CASE(Think_ReportsUsageAndLimits) {
   BOOST_CHECK_EQUAL(rep.usage.outputTokens, 3u);
   BOOST_CHECK_EQUAL(rep.maxInputBytes, kMaxInput);
   BOOST_CHECK_EQUAL(rep.maxOutTokens, kMaxOut);
-  BOOST_CHECK_EQUAL(rep.contextTokens, 131072u);
+  BOOST_CHECK_EQUAL(rep.contextTokens, 0u);   // the API states none, no ceiling
+
+  // The window that the model API states reaches the caller.
+  backend->window = 1048576;
+  CES_REQUIRE_OK(tc.think("window", nullptr, reply, charged, {}, nullptr, &rep));
+  BOOST_CHECK_EQUAL(rep.contextTokens, 1048576u);
 
   uint8_t appendError = 0xff;
   CES_REQUIRE_OK(tc.think("again", nullptr, reply, charged, {}, &appendError));

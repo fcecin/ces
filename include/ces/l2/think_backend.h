@@ -64,6 +64,9 @@ class ThinkBackend {
                            const std::atomic<bool>& stop,
                            const std::function<bool(std::string_view)>& onText)
       = 0;
+  // The model's context window in tokens, as the model API states it; 0 when
+  // the API does not state it. May block once, to ask the API.
+  virtual uint32_t contextWindow() { return 0; }
 };
 
 // The chat-completions request body for one prompt: one user message, the
@@ -120,5 +123,16 @@ bool thinkParseBaseUrl(const std::string& url, bool& tls, std::string& host,
 
 // True when `s` is well-formed UTF-8.
 bool thinkValidUtf8(std::string_view s);
+
+// The context window of `model` in a model list (GET <base>/models): the
+// "context_window" of the entry whose "id" is `model`. 0 when the list does
+// not parse, has no such entry, or the entry does not state it. There is no
+// standard field for it; this is the one that DeepSeek's API sends.
+uint32_t thinkModelWindow(std::string_view modelsJson, const std::string& model);
+
+// The window told to callers: the API's, or the operator's ceiling
+// (think_context_tokens) when that is lower; the ceiling alone when the API
+// does not state one. 0 = not stated.
+uint32_t thinkWindow(uint32_t ceiling, uint32_t fromApi);
 
 }  // namespace ces

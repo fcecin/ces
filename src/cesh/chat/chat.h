@@ -217,6 +217,9 @@ private:
   // `line` is a command of a reply, with "$ " in front for a shell line.
   std::string runLine(const std::string& line, const std::string& body = "");
   std::string echo(const std::string& command) const;
+  // "→ Read man compute (77 lines)": what went into the conversation.
+  std::string readLine(const std::string& what, const std::string& text) const;
+  std::string notesText() const;
   void show(const std::string& text);
   void output(const std::string& text);
   bool confirm(const std::string& question);
@@ -255,7 +258,9 @@ private:
   // user nothing (it does not parse, or names no file) goes back to the
   // model, also when it is a shell line.
   size_t seen_ = 0;
-  std::string fresh_;   // manual pages read since the last model call; in the next prompt only
+  // The notes at the start of the prompt: as they were when the chat began,
+  // or at the last fold. A change since is in the conversation.
+  std::string notes_;
   std::string summary_;   // the older turns, folded by compaction
   // Where each turn starts in the transcript. Kept here, not searched for:
   // a command's output can hold a line that starts "USER: ".

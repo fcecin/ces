@@ -38,4 +38,8 @@ cesh think <words...> [--file <path>] [-v]
 
 The prompt goes to the server and to the model provider that the operator
 uses. A conversation file under `/h/` can be read by anyone who knows its
-path.
+path. A conversation file under your own `/m/<your key>/` is private: the
+server reads it and appends to it for your `think`, and nobody can read it
+over the network, you included. Make it with `cesh file put` as any file.
+Another signer who names it gets `CES_ERROR_NOT_OWNER`, the same answer as
+for a path with no file.

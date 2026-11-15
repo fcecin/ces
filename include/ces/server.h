@@ -557,9 +557,10 @@ struct CesConfig {
   uint64_t    thinkFeeOut = 0;
   uint32_t    thinkMaxOutTokens = 8192;
   uint32_t    thinkMaxInputBytes = 1024 * 1024;
-  // The model's context window, in tokens: a caller that asks for the report
-  // gets it, to keep its prompt in the window. 0 = not stated.
-  uint32_t    thinkContextTokens = 131072;
+  // A ceiling on the context window told to callers, in tokens. The window
+  // comes from the model API when it states one (thinkWindow); this lowers
+  // it, or stands in for it when the API does not state one. 0 = no ceiling.
+  uint32_t    thinkContextTokens = 0;
   uint32_t    thinkTimeoutSecs = 300;
   uint32_t    thinkMaxConcurrent = 8;
   // builtin:think global subsidy (util/heat_subsidy.h). The price multiplier

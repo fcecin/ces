@@ -88,6 +88,8 @@ FileExecResp fileOp(CesServer* server, const ThinkFile& f, uint8_t verb,
   req.sourceName = f.sourceName;
   req.payByAccount = f.payByAccount;
   req.payerAccount = f.payerAccount;
+  // A THINK signer may use its own /m/ conversation (a program may not).
+  req.ownPrivate = f.payByAccount;
   req.verb = verb;
   req.name = f.path;
   req.offset = offset;
@@ -419,11 +421,22 @@ void ThinkHandler::submit(const ThinkPayer& payer, std::string prompt,
     sink->finish(CES_ERROR_BAD_INPUT, 0, {}, CES_OK);
     return;
   }
-  // The /m/ mail zone is private: no status may tell whether a file there
-  // exists, as for the wire STAT.
+  // The /m/ zone is private: no status may tell anyone else whether a file
+  // there exists, as for the wire STAT. Its owner, as the THINK signer, may
+  // keep a conversation there: the server reads and appends it in-process,
+  // and nobody reads it over the wire. A program (ces.think) may not.
   if (file.path.size() > 1 && file.path.rfind("/m/", 0) == 0) {
-    sink->finish(CES_ERROR_NOT_OWNER, 0, {}, CES_OK);
-    return;
+    bool own = false;
+    if (file.payByAccount && file.path.size() >= 3 + 64) {
+      static const char* kHex = "0123456789abcdef";
+      std::string hex;
+      for (uint8_t b : file.caller) { hex += kHex[b >> 4]; hex += kHex[b & 15]; }
+      own = file.path.compare(3, 64, hex) == 0;
+    }
+    if (!own) {
+      sink->finish(CES_ERROR_NOT_OWNER, 0, {}, CES_OK);
+      return;
+    }
   }
   std::shared_ptr<ThinkBackend> backend;
   auto job = std::make_shared<Job>();
@@ -527,7 +540,7 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
   if (rep.usageKnown) rep.usage = o.usage;
   rep.maxInputBytes = cfg.thinkMaxInputBytes;
   rep.maxOutTokens = cfg.thinkMaxOutTokens;
-  rep.contextTokens = cfg.thinkContextTokens;
+  rep.contextTokens = thinkWindow(cfg.thinkContextTokens, backend.contextWindow());
   sink.report(rep);
   sink.finish(o.status, charge, text, appendError);
 }

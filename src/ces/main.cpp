@@ -328,7 +328,7 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # think_fee_out         = 0         # per 1M output tokens
 # think_max_out_tokens  = 8192      # max_tokens of every call
 # think_max_input_bytes = 1048576   # largest prompt text
-# think_context_tokens  = 131072    # the model's context window, for callers
+# think_context_tokens  = 0         # ceiling on the model's window (0 = the API's)
 # think_timeout_secs    = 300       # one call, end to end
 # think_max_concurrent  = 8         # calls in flight
 # Global subsidy: the price multiplier (basis points of the full price, as in
@@ -506,7 +506,7 @@ int main(int argc, char* argv[]) {
   uint64_t    optThinkFeeIn = 0, optThinkFeeCachedIn = 0, optThinkFeeOut = 0;
   uint32_t    optThinkMaxOutTokens = 8192;
   uint32_t    optThinkMaxInputBytes = 1024 * 1024;
-  uint32_t    optThinkContextTokens = 131072;
+  uint32_t    optThinkContextTokens = 0;
   uint32_t    optThinkTimeoutSecs = 300;
   uint32_t    optThinkMaxConcurrent = 8;
   uint64_t    optThinkSubsidyBudget = 0, optThinkSubsidyTauSecs = 0;
@@ -714,8 +714,8 @@ int main(int argc, char* argv[]) {
     app.add_option("--thinkmaxinputbytes", optThinkMaxInputBytes,
       "Largest builtin:think prompt, bytes")->default_val("1048576");
     app.add_option("--thinkcontexttokens", optThinkContextTokens,
-      "The model's context window in tokens, told to callers (0 = not stated)")
-      ->default_val("131072");
+      "Ceiling on the model's context window told to callers, in tokens "
+      "(0 = the window that the model API states)")->default_val("0");
     app.add_option("--thinktimeoutsecs", optThinkTimeoutSecs,
       "Timeout of one builtin:think call, seconds")->default_val("300");
     app.add_option("--thinkmaxconcurrent", optThinkMaxConcurrent,

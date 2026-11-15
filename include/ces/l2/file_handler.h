@@ -80,6 +80,10 @@ struct FileExecReq {
   // signer (builtin:think's conversation file).
   bool payByAccount = false;
   std::array<uint8_t, 32> payerAccount{};
+  // When set, READ and STAT may open a /m/ (private) file whose path key is
+  // ownerPubkey: builtin:think, for the signer of a call on its own /m/
+  // conversation. Nothing on the wire and no program sets it.
+  bool ownPrivate = false;
   uint8_t verb = 0;               // 0x01..0x0a (matches wire verb codes)
   std::string name;
   uint64_t offset = 0;            // WRITE, READ

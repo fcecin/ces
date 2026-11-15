@@ -1122,6 +1122,10 @@ void extractZoneAndNamespace(const std::string& name,
 
 // Hex-decode 64 lowercase hex chars into a 32-byte Hash. Pre:
 // already validated as 64 lowercase-hex (via validateCesFileName).
+// True when `name` is "/m/<64-hex of owner>/...": the owner's own private
+// zone. (validateCesFileName checks the form first.)
+bool ownMailPath(const std::string& name, const minx::Hash& owner);
+
 void hexDecodePubkey32(const std::string& hex64, minx::Hash& out) {
   auto nib = [](char c) -> uint8_t {
     if (c >= '0' && c <= '9') return c - '0';
@@ -1131,6 +1135,13 @@ void hexDecodePubkey32(const std::string& hex64, minx::Hash& out) {
     out[i] = static_cast<uint8_t>(
       (nib(hex64[i * 2]) << 4) | nib(hex64[i * 2 + 1]));
   }
+}
+
+bool ownMailPath(const std::string& name, const minx::Hash& owner) {
+  if (name.size() < 3 + 64 || name.compare(0, 3, "/m/") != 0) return false;
+  minx::Hash pk;
+  hexDecodePubkey32(name.substr(3, 64), pk);
+  return pk == owner;
 }
 
 // Perform the zone-ownership check for a CREATE. For /h/ and /p/
@@ -1603,13 +1614,15 @@ struct ReadOutcome { uint8_t status; ces::Bytes data; };
 // unchanged bytes without re-crediting.
 ReadOutcome readCore(CesServer* server, const std::string& name,
                      uint64_t offset, uint32_t length, const minx::Hash& caller,
-                     const L2Billing& bill) {
+                     const L2Billing& bill, bool ownPrivate = false) {
   if (length == 0 || length > kMaxReadLen) return { CES_ERROR_BAD_INPUT, {} };
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) return { rc, {} };
-  // The /m/ mail zone is private: nothing reads it over the wire or from a
-  // program. Only builtin:mail reads it in-process (readAttachment).
-  if (name.size() > 1 && name[1] == 'm') return { CES_ERROR_NOT_OWNER, {} };
+  // The /m/ zone is private: nothing reads it over the wire or from a
+  // program. builtin:mail reads it in-process (readAttachment), and
+  // builtin:think reads a signer's own /m/ conversation (ownPrivate).
+  if (name.size() > 1 && name[1] == 'm' && !(ownPrivate && ownMailPath(name, caller)))
+    return { CES_ERROR_NOT_OWNER, {} };
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
   auto cPath = resolveContentPath(cfg.cesFileStoreDir, name);
@@ -1912,12 +1925,13 @@ struct StatOutcome {
 // loadSidecar lazy-mints a dropped /s/ file on first stat. A duplicate replay
 // just re-reads (read-only).
 StatOutcome statCore(CesServer* server, const std::string& name,
-                     const L2Billing& bill) {
+                     const L2Billing& bill, const minx::Hash* privateOwner = nullptr) {
   uint8_t rc = validateCesFileName(name);
   if (rc != CES_OK) return { rc, {}, 0, 0, 0, 0, 0 };
-  // The /m/ mail zone is private: no STAT (metadata) from the wire or from
-  // a program either. Only builtin:mail reads it in-process.
-  if (name.size() > 1 && name[1] == 'm')
+  // The /m/ zone is private: no STAT (metadata) from the wire or from a
+  // program either. builtin:mail reads it in-process, and builtin:think
+  // stats a signer's own /m/ conversation (privateOwner).
+  if (name.size() > 1 && name[1] == 'm' && !(privateOwner && ownMailPath(name, *privateOwner)))
     return { CES_ERROR_NOT_OWNER, {}, 0, 0, 0, 0, 0 };
   const auto& cfg = server->_config();
   auto sPath = resolveSidecarPath(cfg.cesFileStoreDir, name);
@@ -2934,7 +2948,8 @@ void execStat(CesServer* server, FileExecReq req,
               std::function<void(FileExecResp)> cb,
               boost::asio::any_io_executor cbEx) {
   // STAT is free for the in-process caller (no source charge).
-  StatOutcome out = statCore(server, req.name, noBilling());
+  const minx::Hash owner = hashOf(req.ownerPubkey);
+  StatOutcome out = statCore(server, req.name, noBilling(), req.ownPrivate ? &owner : nullptr);
   FileExecResp r; r.status = out.status;
   if (out.status == CES_OK) {
     r.ownerPubkey = out.owner;
@@ -2952,7 +2967,7 @@ void execRead(CesServer* server, FileExecReq req,
               boost::asio::any_io_executor cbEx) {
   execWithSource(server, req, cb, cbEx, [&](L2Billing bill, minx::Hash, bool) -> FileExecResp {
     ReadOutcome out = readCore(server, req.name, req.offset, req.length,
-                               hashOf(req.ownerPubkey), bill);
+                               hashOf(req.ownerPubkey), bill, req.ownPrivate);
     FileExecResp r; r.status = out.status;
     if (out.status == CES_OK) r.data = std::move(out.data);
     return r;

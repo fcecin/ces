@@ -112,6 +112,17 @@ struct Script {
   }
 };
 
+bool shows(const Script& s, const std::string& t) {
+  return std::find(s.shown.begin(), s.shown.end(), t) != s.shown.end();
+}
+
+// The commands that ran, without the manual reads of a syntax error's help.
+size_t commandsRun(const Script& s) {
+  size_t n = 0;
+  for (auto& a : s.ran) n += a.empty() || a[0] != "man";
+  return n;
+}
+
 Options testOptions() {
   Options o;
   o.manualIndex = "index  Start\n  money/transfer  Send credits\n";
@@ -570,7 +581,9 @@ BOOST_AUTO_TEST_CASE(CleanReply_ChatNoteIsAnImitation) {
   BOOST_CHECK(c.commands.empty());
 }
 
-BOOST_AUTO_TEST_CASE(Turn_ManualPageStaysForTheTurn) {
+// A manual page goes into the conversation and stays there. The user sees a
+// Read line, not the page, and the model goes on from the page.
+BOOST_AUTO_TEST_CASE(Turn_ManualPageStaysInTheConversation) {
   Script s;
   s.replies = {"%%CESH-EXEC%% man rent", "Rent is per byte.", "Anything else?"};
   Hooks h = s.hooks();
@@ -584,9 +597,10 @@ BOOST_AUTO_TEST_CASE(Turn_ManualPageStaysForTheTurn) {
   chat.turn("how does rent work?");
   chat.turn("thanks");
   BOOST_REQUIRE_EQUAL(s.prompts.size(), 3u);
-  BOOST_CHECK(has(s.prompts[1], "PAGE-BODY-LINE"));    // the same turn
-  BOOST_CHECK(!has(s.prompts[2], "PAGE-BODY-LINE"));   // the next turn: the stub only
-  BOOST_CHECK(has(s.prompts[2], "RESULT of `man rent`: exit 0 (2 lines, in your prompt for this turn)"));
+  BOOST_CHECK(has(s.prompts[1], "RESULT of `man rent`: exit 0\n# Rent\nPAGE-BODY-LINE\n"));
+  BOOST_CHECK(has(s.prompts[2], "PAGE-BODY-LINE"));   // the next turn too
+  BOOST_CHECK(shows(s, "→ Read man rent (2 lines)"));
+  for (auto& t : s.shown) BOOST_CHECK(!has(t, "PAGE-BODY-LINE"));
 }
 
 BOOST_AUTO_TEST_CASE(Turn_ImitationIsCutAndTheModelAsksAgain) {
@@ -647,16 +661,6 @@ BOOST_AUTO_TEST_CASE(Turn_EmptyOutputIsSaid) {
   BOOST_CHECK(has(chat.transcript(), "exit 0\n(no output: the command printed nothing)"));
 }
 
-bool shows(const Script& s, const std::string& t) {
-  return std::find(s.shown.begin(), s.shown.end(), t) != s.shown.end();
-}
-
-// The commands that ran, without the manual reads of a syntax error's help.
-size_t commandsRun(const Script& s) {
-  size_t n = 0;
-  for (auto& a : s.ran) n += a.empty() || a[0] != "man";
-  return n;
-}
 
 // A reply of commands with no words is the answer: the user sees each
 // command and its output, and when they succeed, the turn ends with no
@@ -716,7 +720,7 @@ BOOST_AUTO_TEST_CASE(Turn_ResultsGoBackWhenTheModelGoesOn) {
   Chat chatM(testOptions(), m.hooks(), Memory());
   chatM.turn("my programs");
   BOOST_CHECK_EQUAL(m.thinks, 2u);
-  BOOST_CHECK(shows(m, "(1 line of the manual, for the model)"));
+  BOOST_CHECK(shows(m, "→ Read man compute (1 line)"));
   for (auto& t : m.shown) BOOST_CHECK(t != "Balance: 42" || m.ran.size() == 2);
 }
 
@@ -820,7 +824,10 @@ BOOST_AUTO_TEST_CASE(Turn_RememberAndForget) {
   chat.turn("remember my box");
   BOOST_CHECK(s.ran.empty());   // a note is not a cesh command
   BOOST_CHECK_EQUAL(chat.memory().notes().at("box"), "ces.pubcom.org:53830");
-  BOOST_CHECK(has(s.prompts.back(), "- box: ces.pubcom.org:53830"));
+  // The start of the prompt keeps the notes it began with; the change is in
+  // the conversation.
+  BOOST_CHECK(has(s.prompts.back(), "## The user's notes\n\n(none)"));
+  BOOST_CHECK(has(s.prompts.back(), "saved; the notes now have box: ces.pubcom.org:53830"));
   std::ifstream f(path);
   std::string text((std::istreambuf_iterator<char>(f)), {});
   BOOST_CHECK(has(text, "- box: ces.pubcom.org:53830"));
@@ -880,6 +887,36 @@ BOOST_AUTO_TEST_CASE(Prompt_GrowsOnlyAtItsEnd) {
     BOOST_CHECK_MESSAGE(s.prompts[i].rfind(head, 0) == 0, "prompt " << i);
   }
   BOOST_CHECK_EQUAL(s.folds, 0u);   // far from the window: nothing folds
+}
+
+// The history is linear: a manual page, a file read and a saved note go
+// into the conversation and stay; no part of the prompt is edited or taken
+// out. Each prompt starts with the one before it, so the cache serves it.
+BOOST_AUTO_TEST_CASE(Prompt_IsLinearThroughPagesFilesAndNotes) {
+  auto dir = makeUniqueTempDir("chatlinear");
+  {
+    std::ofstream f((dir / "notes.txt").string());
+    f << "a file line\n";
+  }
+  Script s;
+  s.replies = {"I will read the page.\n%%CESH-EXEC%% man rent",
+               "I will read the file.\n%%CESH-EXEC%% read notes.txt",
+               "I will save it.\n%%CESH-EXEC%% remember box: x1",
+               "Done.", "Fine."};
+  s.answers = {true};
+  Options o = testOptions();
+  o.scratchDir = dir.string();
+  Chat chat(o, s.hooks(), Memory((dir / "m.md").string()));
+  chat.turn("read, then save");
+  chat.turn("and now?");
+  BOOST_REQUIRE_GE(s.prompts.size(), 5u);
+  for (size_t i = 1; i < s.prompts.size(); ++i) {
+    const std::string& prev = s.prompts[i - 1];
+    BOOST_CHECK_MESSAGE(s.prompts[i].rfind(prev.substr(0, prev.size() - 4), 0) == 0, "prompt " << i);
+  }
+  BOOST_CHECK(has(s.prompts.back(), "a file line"));
+  BOOST_CHECK(std::any_of(s.shown.begin(), s.shown.end(),
+                          [](const std::string& t) { return t == "→ Read notes.txt (1 line)"; }));
 }
 
 // Past compactAt percent of the room, the older turns fold into a summary in

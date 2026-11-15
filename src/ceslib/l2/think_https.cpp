@@ -29,7 +29,7 @@ using tcp = asio::ip::tcp;
 
 struct ThinkHttpsBackend::Impl {
   bool tls = true;
-  std::string host, port, target;
+  std::string host, port, prefix, target;
   std::unique_ptr<asio::ssl::context> ctx;
 };
 
@@ -178,7 +178,78 @@ asio::awaitable<void> callAsync(const ThinkHttpsBackend::Impl& im,
   co_await exchange(s, im, auth, body, c);
 }
 
+// One GET, the whole body into `out` (at most 1 MB). Throws on a network
+// failure; `code` is the HTTP status.
+template <class Stream>
+asio::awaitable<void> getOn(Stream& s, const ThinkHttpsBackend::Impl& im,
+                            const std::string& target, const std::string& auth,
+                            unsigned& code, std::string& out) {
+  http::request<http::empty_body> req{http::verb::get, target, 11};
+  req.set(http::field::host, im.host);
+  req.set(http::field::authorization, auth);
+  req.set(http::field::accept, "application/json");
+  req.set(http::field::user_agent, "ces-think");
+  co_await http::async_write(s, req, asio::use_awaitable);
+  beast::flat_buffer buf;
+  http::response_parser<http::string_body> p;
+  p.body_limit(1024 * 1024);
+  co_await http::async_read(s, buf, p, asio::use_awaitable);
+  code = p.get().result_int();
+  out = std::move(p.get().body());
+}
+
+asio::awaitable<void> getAsync(const ThinkHttpsBackend::Impl& im,
+                               asio::ssl::context* ctx,
+                               std::chrono::steady_clock::time_point deadline,
+                               std::string target, std::string auth,
+                               unsigned& code, std::string& out) {
+  auto ex = co_await asio::this_coro::executor;
+  tcp::resolver res(ex);
+  beast::tcp_stream tcpStream(ex);
+  tcpStream.expires_at(deadline);
+  auto eps = co_await res.async_resolve(im.host, im.port, asio::use_awaitable);
+  co_await tcpStream.async_connect(eps, asio::use_awaitable);
+  if (!im.tls) {
+    co_await getOn(tcpStream, im, target, auth, code, out);
+    co_return;
+  }
+  beast::ssl_stream<beast::tcp_stream> s(std::move(tcpStream), *ctx);
+  if (!SSL_set_tlsext_host_name(s.native_handle(), im.host.c_str()))
+    throw boost::system::system_error(
+        boost::system::error_code(static_cast<int>(::ERR_get_error()),
+                                  asio::error::get_ssl_category()));
+  s.set_verify_callback(asio::ssl::host_name_verification(im.host));
+  co_await s.async_handshake(asio::ssl::stream_base::client,
+                             asio::use_awaitable);
+  co_await getOn(s, im, target, auth, code, out);
+}
+
 }  // namespace
+
+uint32_t ThinkHttpsBackend::contextWindow() {
+  if (!valid_) return 0;
+  std::lock_guard<std::mutex> g(windowMu_);
+  const auto now = std::chrono::steady_clock::now();
+  if (windowKnown_) return window_;
+  if (windowAskedAt_ != std::chrono::steady_clock::time_point{} &&
+      now - windowAskedAt_ < std::chrono::minutes(10))
+    return 0;
+  windowAskedAt_ = now;
+  asio::io_context ioc;
+  unsigned code = 0;
+  std::string body;
+  bool failed = false;
+  asio::co_spawn(ioc,
+                 getAsync(*impl_, impl_->ctx.get(), now + std::chrono::seconds(5),
+                          impl_->prefix + "/models", "Bearer " + cfg_.apiKey, code,
+                          body),
+                 [&failed](std::exception_ptr e) { failed = e != nullptr; });
+  ioc.run();
+  if (failed || code != 200) return 0;   // ask again later
+  window_ = thinkModelWindow(body, cfg_.model);
+  windowKnown_ = true;
+  return window_;
+}
 
 ThinkHttpsBackend::ThinkHttpsBackend(ThinkHttpsConfig cfg)
     : cfg_(std::move(cfg)), impl_(std::make_unique<Impl>()) {
@@ -186,6 +257,7 @@ ThinkHttpsBackend::ThinkHttpsBackend(ThinkHttpsConfig cfg)
   if (!thinkParseBaseUrl(cfg_.baseUrl, impl_->tls, impl_->host, impl_->port,
                          prefix))
     return;
+  impl_->prefix = prefix;
   impl_->target = prefix + "/chat/completions";
   if (impl_->tls) {
     try {

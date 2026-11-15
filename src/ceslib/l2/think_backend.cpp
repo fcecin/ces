@@ -215,4 +215,27 @@ bool thinkValidUtf8(std::string_view s) {
   return true;
 }
 
+uint32_t thinkModelWindow(std::string_view modelsJson, const std::string& model) {
+  boost::system::error_code ec;
+  json::value v = json::parse(modelsJson, ec);
+  if (ec || !v.is_object()) return 0;
+  auto d = v.as_object().find("data");
+  if (d == v.as_object().end() || !d->value().is_array()) return 0;
+  for (const json::value& m : d->value().as_array()) {
+    if (!m.is_object()) continue;
+    const json::object& o = m.as_object();
+    auto id = o.find("id");
+    if (id == o.end() || !id->value().is_string() || id->value().as_string() != model) continue;
+    const uint64_t w = u64At(o, "context_window");
+    return w > UINT32_MAX ? UINT32_MAX : static_cast<uint32_t>(w);
+  }
+  return 0;
+}
+
+uint32_t thinkWindow(uint32_t ceiling, uint32_t fromApi) {
+  if (fromApi == 0) return ceiling;
+  if (ceiling == 0) return fromApi;
+  return ceiling < fromApi ? ceiling : fromApi;
+}
+
 }  // namespace ces
