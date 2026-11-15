@@ -15,11 +15,19 @@
 // THINK request: preamble (after nonce) [u32 textLen][32 sha256(text)]
 // [u16 pathLen][path], body = the text (UTF-8). The path is optional
 // (pathLen 0, or absent): it names a conversation file (see ThinkFile).
+// After the path the request may carry [u8 flags]. Bit 0 asks for the report
+// (ThinkReport): what the call used and the limits of the server. A server
+// that does not know the flags byte stops reading after the path.
 // Reply: CesPlexReplyStream frames of reply text, then the signed response.
 // On CES_OK the response preamble is [u64 charged][32 sha256(all reply
-// text)][u8 appendError], so the server signature covers the full reply. On an
-// error the preamble is empty and the frames before it (if any) are a
-// partial reply.
+// text)][u8 appendError], so the server signature covers the full reply.
+// When the report was asked for, bit 7 of the appendError byte is set (the
+// status is in the low 7 bits; CES status codes are below 0x80), and the
+// preamble goes on with [u8 usageKnown][u64 promptTokens][u64 cachedTokens]
+// [u64 outputTokens][u32 maxInputBytes][u32 maxOutTokens][u32 contextTokens].
+// A server that does not know the flag never sets bit 7, so the client reads
+// the report only when it is there. On an error the preamble is empty and
+// the frames before it (if any) are a partial reply.
 //
 // The backend API is stateless, so a conversation is text. With a file the
 // server keeps it: the caller sends only the new part, and the server sends
@@ -109,6 +117,11 @@ class ThinkSink {
   // the file's balance cannot pay, FILE_NOT_FOUND, STORE_FULL, ...).
   virtual void finish(uint8_t status, uint64_t charged,
                       const std::string& text, uint8_t appendError) = 0;
+  // Called once just before finish, after the call (also one that failed or
+  // that the hold refused): what the call used (usageKnown false when the
+  // backend reported nothing), and the limits of the server. A sink that has
+  // no use for it ignores it.
+  virtual void report(const ThinkReport&) {}
 };
 
 // A call's conversation file. The file's content goes before the prompt.

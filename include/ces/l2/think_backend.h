@@ -27,6 +27,17 @@ struct ThinkUsage {
   uint64_t outputTokens = 0;   // reply tokens, reasoning tokens included
 };
 
+// What a call used, and the limits of the server, for a caller that asks
+// (THINK with the report flag): a harness uses it to keep its prompt inside
+// the model's window and to show how much of the prompt the cache served.
+struct ThinkReport {
+  bool usageKnown = false;      // false: the backend reported no usage
+  ThinkUsage usage;
+  uint32_t maxInputBytes = 0;   // think_max_input_bytes
+  uint32_t maxOutTokens = 0;    // think_max_out_tokens
+  uint32_t contextTokens = 0;   // think_context_tokens (0 = not stated)
+};
+
 struct ThinkOutcome {
   // How the handler must bill the call.
   //   kNone     the backend did no billable work (e.g. connect failed).

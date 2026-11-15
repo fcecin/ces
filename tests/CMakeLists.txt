@@ -8,6 +8,7 @@ add_executable(cestests ${TEST_SOURCES})
 target_link_libraries(cestests
   PRIVATE
     ceslib
+    ceshcore
     Boost::unit_test_framework
     Boost::filesystem
 )

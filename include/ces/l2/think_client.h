@@ -8,6 +8,7 @@
 #pragma once
 
 #include <ces/keys.h>
+#include <ces/l2/think_backend.h>   // ThinkReport
 #include <ces/types.h>
 
 #include <cstdint>
@@ -55,11 +56,16 @@ public:
   // appends the prompt and the reply to it if the signer owns it and can pay
   // the append. `appendError` (optional) gets the APPEND's status: CES_OK
   // when appended (or with no file), else its error code.
+  // `report` (optional) asks the server for the report: what the call used
+  // (the prompt tokens, the cached ones, the output tokens) and its limits.
+  // It stays default (usageKnown false, limits 0) when the server is older
+  // and does not send it.
   uint8_t think(const std::string& prompt,
                 const std::function<void(std::string_view)>& onText,
                 std::string& reply, uint64_t& charged,
                 const std::string& file = {},
-                uint8_t* appendError = nullptr);
+                uint8_t* appendError = nullptr,
+                ThinkReport* report = nullptr);
 
   class Impl;
 

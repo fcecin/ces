@@ -15,6 +15,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"
 
 #include <ces/l2/compute_client.h>
@@ -252,6 +253,7 @@ struct DialFixture {
   std::unique_ptr<CesServer> server;
   fs::path tempDir;
   uint16_t rpcPort = 0;
+  uint16_t mainPort = 0;
   std::string luajitBin;
   KeyPair ownerKey;
 
@@ -286,7 +288,8 @@ struct DialFixture {
     cfg.cesComputeWorkDir = (tempDir / "cescompute").string();
 
     server = std::make_unique<CesServer>(cfg);
-    BOOST_REQUIRE(server->start(0) > 0);
+    mainPort = server->start(0);
+    BOOST_REQUIRE(mainPort > 0);
     rpcPort = server->_rpcBoundPort();
     BOOST_REQUIRE(rpcPort > 0);
 
@@ -448,6 +451,46 @@ BOOST_AUTO_TEST_CASE(ExtSignEchoRoundtrip) {
 
 // dial against a bogus instance id → ATTACH returns INSTANCE_NOT_FOUND
 // → cesh exits 2.
+// `dial <pid> --line <text>`: one line out, one line back, then the end. No
+// stdin stream, and a time limit: a program that does not answer fails the
+// dial after --timeout instead of a wait with no end.
+BOOST_AUTO_TEST_CASE(LineMode_OneExchange) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string echo = "/h/" + ownerHex + "/echo_line.lua";
+  uploadScript(echo,
+    "ces.conn.set_listener({\n"
+    "  on_data = function(conn, data) conn:write(data) end,\n"
+    "})\n"
+    "ces.conn.run()\n");
+  uint64_t pid = launchScript(echo);
+  BOOST_REQUIRE(pid > 0);
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  const std::string cesh = "CESH_WALLET=" + ownerWalletInline(ownerKey) + " timeout -k 3 60 " +
+                           ces::e2e::findCeshBinary() + " -l fatal --server localhost --rpc-port " +
+                           std::to_string(rpcPort) + " dial ";
+  auto r = ces::e2e::runShell(cesh + std::to_string(pid) + " --line ping < /dev/null", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  BOOST_CHECK_EQUAL(r.out, "ping\n");
+  // With no --rpc-port, dial takes the port that the server announces.
+  auto a = ces::e2e::runShell("CESH_WALLET=" + ownerWalletInline(ownerKey) + " timeout -k 3 60 " +
+                              ces::e2e::findCeshBinary() + " -l fatal --server localhost:" +
+                              std::to_string(mainPort) + " dial " + std::to_string(pid) +
+                              " --line pong < /dev/null", 60);
+  BOOST_CHECK_EQUAL(a.exitCode, 0);
+  BOOST_CHECK_EQUAL(a.out, "pong\n");
+
+  const std::string mute = "/h/" + ownerHex + "/mute_line.lua";
+  uploadScript(mute,
+    "ces.conn.set_listener({ on_data = function(conn, data) end })\n"
+    "ces.conn.run()\n");
+  uint64_t mpid = launchScript(mute);
+  BOOST_REQUIRE(mpid > 0);
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, mpid));
+  r = ces::e2e::runShell(cesh + std::to_string(mpid) + " --line ping --timeout 500 < /dev/null", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 1);
+  BOOST_CHECK_MESSAGE(r.out.find("Dial failed") != std::string::npos, r.out);
+}
+
 BOOST_AUTO_TEST_CASE(UnknownInstanceExits2) {
   std::string ceshBin = ces::e2e::findCeshBinary();
   DialChild ch = spawnCeshDial(

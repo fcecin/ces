@@ -11,6 +11,10 @@
 #include <CLI/CLI.hpp>
 
 #include "dial.h"
+#include "cesh_run.h"
+#include "bootstrap_command.h"
+#include "chat/command.h"
+#include "man/command.h"
 
 #include <ces/account.h>
 #include <ces/autoexec.h>
@@ -134,11 +138,33 @@ static void setup_logger(const std::string& logLevel) {
   try { ces::setupLogger(logLevel); } catch (...) { /* tolerate */ }
 }
 
+// A destination or account argument as a 64-hex public key: a key, @N, or a
+// key name that this server knows (names are first-class on CES: one name,
+// one key). Throws with a message a person can act on.
+static std::string resolveAccountArg(const Wallet& wallet, CesClient& cc,
+                                     const std::string& arg) {
+  std::string r = wallet.resolveKey(arg);
+  auto isHex64 = [](const std::string& h) {
+    return h.size() == 64 &&
+           h.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos;
+  };
+  if (isHex64(r)) return r;
+  minx::Hash key{};
+  bool found = false;
+  ces::Bytes name(arg.begin(), arg.end());
+  if (!arg.empty() && arg[0] != '@' && cc.queryKeyNameByName(name, key, found) == CES_OK && found)
+    return minx::hashToString(key);
+  throw std::runtime_error("\"" + arg + "\" is not a key: give a public key (64 hex), @N, "
+                           "or a key name that this server knows");
+}
+
 // =============================================================================
-// MAIN
+// ceshRun: one cesh command. main() (cesh_main.cpp) calls it once; cesh chat
+// calls it again for each command (cesh_run.h).
 // =============================================================================
 
-int main(int argc, char* argv[]) {
+int ceshRun(int argc, char* argv[]) {
+  g_quiet = false;   // a second run in the same process starts clean
   blog::enable("minx");
   blog::enable("powengine");
 
@@ -208,6 +234,10 @@ int main(int argc, char* argv[]) {
 
   app.add_flag("-c,--cache-only", cacheOnly, "Lightweight PoW engine (slow)");
 
+  // Hidden: parse the command line and stop. cesh chat checks a command with it
+  // before it asks the user to approve the command.
+  bool parse_only = false;
+  app.add_flag("--parse-only", parse_only, "Parse the command line and stop")->group("");
   app.add_flag("-q,--quiet", g_quiet,
                "Silent/pipe mode: stdout is data only (raw bytes or JSON), "
                "no human messages; errors still go to stderr");
@@ -250,7 +280,7 @@ int main(int argc, char* argv[]) {
 
   std::string query_account_arg;
   auto* cmd_query = app.add_subcommand("query", "Unsigned account query");
-  cmd_query->add_option("account", query_account_arg, "Account key or @index")
+  cmd_query->add_option("account", query_account_arg, "Account: a key, @index, or a key name")
     ->required();
 
   // ---- Subcommand: squery ----
@@ -259,7 +289,7 @@ int main(int argc, char* argv[]) {
   auto* cmd_squery =
     app.add_subcommand("squery", "Signed account query (paid)");
   cmd_squery
-    ->add_option("account", squery_account_arg, "Account key or @index")
+    ->add_option("account", squery_account_arg, "Account: a key, @index, or a key name")
     ->required();
 
   // ---- Subcommand: transfer ----
@@ -268,7 +298,7 @@ int main(int argc, char* argv[]) {
   uint64_t transfer_amount_arg = 0;
   bool transfer_open = false;
   auto* cmd_transfer = app.add_subcommand("transfer", "Transfer funds (safe: fails if dest not found)");
-  cmd_transfer->add_option("dest", transfer_dest_arg, "Destination key or @index")
+  cmd_transfer->add_option("dest", transfer_dest_arg, "Destination: a key, @index, or a key name")
     ->required();
   cmd_transfer->add_option("amount", transfer_amount_arg,
                            "Amount in raw units (1 credit = 100000000 raw)")
@@ -645,8 +675,8 @@ int main(int argc, char* argv[]) {
 
   // ---- compute subcommands (L2 compute, via --rpc-port) ----
   auto* cmd_compute = app.add_subcommand(
-    "compute", "L2 compute — launch/kill/list/stat a program instance "
-               "(via --rpc-port)");
+    "compute", "Lua program instances (L2, via --rpc-port)");
+  cmd_compute->footer("Launch, kill, list and stat program instances, and make paid calls to them.");
   cmd_compute->require_subcommand(1);
 
   std::string compute_path_arg;
@@ -679,7 +709,7 @@ int main(int argc, char* argv[]) {
     "ps", "List running instances owned by the signer");
 
   auto* cmd_cst = cmd_compute->add_subcommand(
-    "stat", "Show status of an instance by pid (owner only)");
+    "stat", "Show status of an instance by pid (any signer)");
   cmd_cst->add_option("pid", compute_pid_arg,
                       "pid returned from launch")->required();
 
@@ -711,8 +741,8 @@ int main(int argc, char* argv[]) {
 
   // ---- mail subcommands (L2 outbound email, via --rpc-port) ----
   auto* cmd_mail = app.add_subcommand(
-    "mail", "L2 outbound email — relay a message via builtin:mail "
-            "(via --rpc-port). The server burns a per-MB anti-spam fee.");
+    "mail", "Outbound email (L2, via --rpc-port)");
+  cmd_mail->footer("builtin:mail relays the message. The server burns a per-MB anti-spam fee.");
   cmd_mail->require_subcommand(1);
 
   std::string mail_to_arg;
@@ -736,8 +766,9 @@ int main(int argc, char* argv[]) {
 
   // ---- think (L2 text in, text out, via --rpc-port) ----
   auto* cmd_think = app.add_subcommand(
-    "think", "Send a prompt to builtin:think and stream the reply to stdout "
-             "(via --rpc-port). The signer pays for the tokens.");
+    "think", "Language model prompt (L2, via --rpc-port)");
+  cmd_think->footer("Sends the prompt to builtin:think and streams the reply to stdout. "
+                    "The signer pays for the tokens.");
   std::vector<std::string> think_words;
   ces::Bytes think_in_data;
   std::string think_in_arg;
@@ -756,17 +787,18 @@ int main(int argc, char* argv[]) {
                         "balance pays the append)");
   bool think_verbose_arg = false;
   cmd_think->add_flag("-v,--verbose", think_verbose_arg,
-                      "Also print the charge (raw units) and the file append "
-                      "on stderr. Without it, only the reply is printed, and "
+                      "Also print on stderr the charge (raw units), the file "
+                      "append, the tokens the call used and the server's "
+                      "limits. Without it, only the reply is printed, and "
                       "stderr has only problems");
 
   // ---- dial (open a byte stream to a running compute instance) ----
   auto* cmd_dial = app.add_subcommand(
-    "dial",
-    "Open a bidirectional byte stream to a running compute instance "
-    "over /ces/lua/1 (via --rpc-port). Pipes stdin↔channel↔stdout. "
-    "stdin EOF half-closes the send side and drains the channel; "
-    "SIGINT/SIGTERM tears down with exit 130/143.");
+    "dial", "Byte stream to a program (L2, via --rpc-port)");
+  cmd_dial->footer("Opens a byte stream to the instance over /ces/lua/1: stdin to the program, "
+                   "its output to stdout. The end of stdin closes the send side and drains the "
+                   "channel. SIGINT and SIGTERM end it with exit 130 and 143. With --line, one "
+                   "line goes out and one reply line comes back.");
   uint64_t dial_instance_arg = 0;
   bool dial_verbose_arg = false;
   cmd_dial->add_option("pid", dial_instance_arg,
@@ -774,6 +806,13 @@ int main(int argc, char* argv[]) {
                        "or shown in `cesh compute ps`.")->required();
   cmd_dial->add_flag("-v,--verbose", dial_verbose_arg,
                      "Print one ATTACH-ok line to stderr on success.");
+  std::string dial_line_arg;
+  uint64_t dial_timeout_arg = 10000;
+  cmd_dial->add_option("--line", dial_line_arg,
+                       "Send this one line, print the program's one reply line, and end "
+                       "(no stdin, no stdout stream). For scripts and cesh chat.");
+  cmd_dial->add_option("--timeout", dial_timeout_arg,
+                       "With --line: how long to wait for the reply, in ms (default 10000)");
   bool dial_extsign_arg = false;
   std::string dial_pubkey_arg;
   cmd_dial->add_flag("--extsign", dial_extsign_arg,
@@ -785,6 +824,18 @@ int main(int argc, char* argv[]) {
   cmd_dial->add_option("--pubkey", dial_pubkey_arg,
                        "Client public key (64 hex) that signed the bind "
                        "(required with --extsign).");
+
+  // ---- man (the manual built into cesh; needs no server) ----
+  ManArgs man_args;
+  auto* cmd_man = addManCommand(app, man_args);
+
+  // ---- chat (a conversation that runs cesh; via --rpc-port) ----
+  ChatArgs chat_args;
+  auto* cmd_chat = addChatCommand(app, chat_args);
+
+  // ---- bootstrap (wallet, ces.pubcom.org, mining, then a shell) ----
+  BootstrapArgs bootstrap_args;
+  auto* cmd_bootstrap = addBootstrapCommand(app, bootstrap_args);
 
 #ifdef CES_HYLE
   // ---- hyle: client-side chain verbs (needs --rpc-port; --hyle build only) ----
@@ -862,7 +913,10 @@ int main(int argc, char* argv[]) {
     return app.exit(e);
   }
 
+  if (parse_only) return 0;
   setup_logger(logLevel);
+
+  if (cmd_man->parsed()) return runMan(app, man_args);
 
   // ---- Resolve server / proxy from env override ----
 
@@ -870,6 +924,11 @@ int main(int argc, char* argv[]) {
     server_arg = e;
   if (const char* e = std::getenv("CESH_PROXY"))
     proxy_arg = e;
+
+  if (cmd_chat->parsed())
+    return runChat(chat_args, ChatGlobals{server_arg, proxy_arg, server_key_arg,
+                                          wallet_read_arg, actor_arg, rpcPort_arg,
+                                          tries_arg});
 
   bool useProxy = !proxy_arg.empty();
   boost::asio::ip::udp::endpoint server_endpoint;
@@ -1000,6 +1059,22 @@ int main(int argc, char* argv[]) {
   }
   const int walletPreloaded = wallet.size();
 
+  if (cmd_bootstrap->parsed()) {
+    BootstrapEnv be;
+    be.wallet = &wallet;
+    be.walletFromEnv = !walletExplicit && std::getenv("CESH_WALLET");
+    be.walletPath = !walletLoadedPath.empty()
+      ? walletLoadedPath
+      : cesh_resolve_path(walletExplicit ? wallet_read_arg : "");
+    be.actor = actor_arg;
+    // Only a --server on the command line; $CESH_SERVER is what bootstrap sets.
+    if (app.get_option("--server")->count() > 0)
+      be.server = app.get_option("--server")->as<std::string>();
+    be.cacheOnly = cacheOnly;
+    be.tries = tries_arg;
+    return runBootstrap(bootstrap_args, be);
+  }
+
   // ---- Subcommand: keys ----
 
   if (cmd_keys->parsed()) {
@@ -1111,7 +1186,7 @@ int main(int argc, char* argv[]) {
       auto sess = makeSession();
       auto& cc = sess->client();
 
-      std::string hex = wallet.resolveKey(query_account_arg);
+      std::string hex = resolveAccountArg(wallet, cc, query_account_arg);
       minx::Hash h;
       minx::stringToHash(h, hex);
       int64_t b;
@@ -1129,6 +1204,10 @@ int main(int argc, char* argv[]) {
         } else {
           print_header("Account (Unsigned)");
           print_field("Key", hex);
+          // The reply has no "exists" flag: a key with no account reads as all
+          // zeros. A real account cannot stay at zero (the daily fee deletes it).
+          if (b == 0 && n == 0 && xa == 0 && xt == 0)
+            print_field("Account", "none (this key has no account on this server)");
           print_field("Balance", b);
           print_field("Nonce", n);
           print_field("LastXferDest", hashPrefixToString(xd));
@@ -1432,9 +1511,40 @@ int main(int argc, char* argv[]) {
       da.serverHost = da.serverHost.substr(0, colon);
     if (da.serverHost.empty()) da.serverHost = "localhost";
     da.rpcPort     = rpcPort_arg;
+    if (da.rpcPort == 0) {
+      // No --rpc-port: take the one the server announces in its handshake,
+      // as the other rpc commands do.
+      // (The main endpoint is not resolved for dial; resolve it here.)
+      try {
+        ClientSession sess(cacheOnly, clientPort, ces::Resolver::resolveUdp(server_arg),
+                           &actorKey, tries_arg);
+        da.rpcPort = sess.client().getServerRpcPort();
+      } catch (...) {}
+      if (da.rpcPort == 0) {
+        std::cerr << "Error: dial needs the server's rpc port, and the server did not "
+                     "announce one. Give --rpc-port.\n";
+        return 1;
+      }
+    }
     da.pid  = dial_instance_arg;
     da.signerKey   = actorKey;
     da.verbose     = dial_verbose_arg;
+    if (app.get_subcommand("dial")->count("--line") > 0) {
+      // One line out, one line back: no stdin or stdout stream, and a time
+      // limit, so a script (or cesh chat) can use it.
+      DialLineSession sess;
+      std::string e = sess.open(da);
+      if (e.empty()) {
+        std::string reply;
+        e = sess.request(dial_line_arg, reply, std::chrono::milliseconds(dial_timeout_arg));
+        if (e.empty()) {
+          std::cout << reply << "\n";
+          return 0;
+        }
+      }
+      std::cerr << "Dial failed: " << e << "\n";
+      return 1;
+    }
     return runDial(da);
   }
 
@@ -2149,9 +2259,9 @@ int main(int argc, char* argv[]) {
       return 0;
     };
 
-    // Shared prologue for the L2 verb handlers (file / compute / mail):
-    // require --rpc-port, strip :port from --server (that is the main CES
-    // port; the rpc port is the separate flag), and resolve the server pubkey
+    // Shared prologue for the L2 verb handlers (file / compute / mail / think):
+    // take --rpc-port or the rpc port that the server announced, strip :port
+    // from --server (that is the main CES port), and resolve the server pubkey
     // for response-sig verification with NO paid query (explicit --server-key
     // wins; otherwise reuse the key the free MINX handshake already learned
     // on connect). Returns false on a usage error (message printed).
@@ -2161,8 +2271,12 @@ int main(int argc, char* argv[]) {
       bool hasServerPk = false;
     };
     auto resolveL2Target = [&](const char* what, L2Target& out) -> bool {
+      // With no --rpc-port, use the rpc port that the server announced in the
+      // handshake of this session.
+      if (rpcPort_arg == 0) rpcPort_arg = cc.getServerRpcPort();
       if (rpcPort_arg == 0) {
-        std::cerr << "Error: " << what << " requires --rpc-port\n";
+        std::cerr << "Error: " << what << " needs the server's rpc port, and the "
+                     "server did not announce one. Give --rpc-port.\n";
         return false;
       }
       out.host = server_arg;
@@ -2183,6 +2297,19 @@ int main(int argc, char* argv[]) {
         out.hasServerPk = (out.serverPk != zero);
       }
       return true;
+    };
+
+    // A remote path for the L2 verbs: a bare name is /h/<signer>/<name>, and
+    // /h/@N/... is the home of wallet key @N.
+    auto remotePath = [&](const std::string& raw) -> std::string {
+      if (raw.rfind("/h/@", 0) == 0) {
+        size_t slash = raw.find('/', 3);
+        std::string label = raw.substr(3, slash == std::string::npos ? std::string::npos : slash - 3);
+        std::string rest = slash == std::string::npos ? "" : raw.substr(slash);
+        return "/h/" + wallet.resolveKey(label) + rest;
+      }
+      if (!raw.empty() && raw[0] == '/') return raw;
+      return "/h/" + actorKey.getPublicKeyHexStr() + "/" + raw;
     };
 
     // ---- handleDiskFile handler (L2 disk-backed file store) ----
@@ -2216,11 +2343,7 @@ int main(int argc, char* argv[]) {
         }
       }
 
-      // Helper: auto-prepend /h/<signer>/ if the path doesn't start with /.
-      auto normalizePath = [&](const std::string& raw) -> std::string {
-        if (!raw.empty() && raw[0] == '/') return raw;
-        return "/h/" + actorKey.getPublicKeyHexStr() + "/" + raw;
-      };
+      auto normalizePath = remotePath;
 
       // Helper: compute the 15-min upfront-rent minimum for a new file of
       // `size` bytes at the server's current feeFileRent.
@@ -2585,10 +2708,7 @@ int main(int argc, char* argv[]) {
       if (!resolveL2Target("compute", tgt)) return 1;
       auto& [host, serverPk, hasServerPk] = tgt;
 
-      auto normalizePath = [&](const std::string& raw) -> std::string {
-        if (!raw.empty() && raw[0] == '/') return raw;
-        return "/h/" + actorKey.getPublicKeyHexStr() + "/" + raw;
-      };
+      auto normalizePath = remotePath;
 
       CesComputeClient cc2;
       uint8_t rc = cc2.connect(host, rpcPort_arg, actorKey);
@@ -2831,12 +2951,14 @@ int main(int argc, char* argv[]) {
       uint64_t charged = 0;
       bool endsInNewline = true;
       uint8_t appendError = CES_OK;
+      ThinkReport report;
       rc = tc.think(prompt,
                     [&](std::string_view piece) {
                       std::cout << piece << std::flush;
                       endsInNewline = piece.back() == '\n';
                     },
-                    reply, charged, think_file_arg, &appendError);
+                    reply, charged, think_file_arg, &appendError,
+                    think_verbose_arg ? &report : nullptr);
       if (!endsInNewline) std::cout << "\n";
       std::cout << std::flush;
       if (rc != CES_OK) {
@@ -2856,6 +2978,16 @@ int main(int argc, char* argv[]) {
         if (!think_file_arg.empty() && appendError == CES_OK)
           std::cerr << ", file appended";
         std::cerr << "\n";
+        // What the call used and the limits of the server, when the server
+        // sends them (an older one does not).
+        if (report.usageKnown)
+          std::cerr << "tokens prompt " << report.usage.promptTokens << " cached "
+                    << report.usage.cachedTokens << " output "
+                    << report.usage.outputTokens << "\n";
+        if (report.maxInputBytes)
+          std::cerr << "limits context " << report.contextTokens << " tokens, input "
+                    << report.maxInputBytes << " bytes, output "
+                    << report.maxOutTokens << " tokens\n";
       }
       if (!think_file_arg.empty() && appendError != CES_OK) {
         std::cerr << "file not updated: " << errorString(appendError) << "\n";
@@ -2907,7 +3039,7 @@ int main(int argc, char* argv[]) {
 
     if (cmd_squery->parsed()) {
       minx::Hash t;
-      minx::stringToHash(t, wallet.resolveKey(squery_account_arg));
+      minx::stringToHash(t, resolveAccountArg(wallet, cc, squery_account_arg));
       std::vector<AccountEntry> vec;
       uint8_t rc = cc.queryAccountSigned(Account::getMapKey(t), 0, vec);
       if (rc == CES_OK && !vec.empty()) {
@@ -2929,7 +3061,7 @@ int main(int argc, char* argv[]) {
 
     else if (cmd_transfer->parsed()) {
       minx::Hash dest;
-      minx::stringToHash(dest, wallet.resolveKey(transfer_dest_arg));
+      minx::stringToHash(dest, resolveAccountArg(wallet, cc, transfer_dest_arg));
       int64_t nb;
       uint8_t rc;
       if (transfer_open)
@@ -2944,6 +3076,9 @@ int main(int argc, char* argv[]) {
         std::cout << "Success.\n";
       } else {
         std::cerr << "Transfer Failed: " << errorString(rc) << "\n";
+        if (rc == CES_ERROR_TARGET_NOT_FOUND && !transfer_open)
+          std::cerr << "Hint: the destination key has no account on this server. Add --open "
+                       "to make it (the transfer then also pays the account fee).\n";
         return 1;
       }
     }

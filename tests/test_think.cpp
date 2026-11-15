@@ -436,6 +436,37 @@ BOOST_AUTO_TEST_CASE(Think_StreamsAndChargesUsage) {
   BOOST_CHECK_EQUAL(backend->lastMaxOut, kMaxOut);
 }
 
+// A caller that asks gets the report: what the call used, and the limits of
+// the server. A caller that does not ask gets the old reply, on the same
+// channel.
+BOOST_AUTO_TEST_CASE(Think_ReportsUsageAndLimits) {
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  uint64_t charged = 0;
+  ThinkReport rep;
+  CES_REQUIRE_OK(tc.think("hi there", nullptr, reply, charged, {}, nullptr, &rep));
+  BOOST_CHECK_EQUAL(reply, "Hello, world.");
+  BOOST_CHECK_EQUAL(charged, thinkCost(fees(), backend->usage));
+  BOOST_CHECK(rep.usageKnown);
+  BOOST_CHECK_EQUAL(rep.usage.promptTokens, 100u);
+  BOOST_CHECK_EQUAL(rep.usage.cachedTokens, 40u);
+  BOOST_CHECK_EQUAL(rep.usage.outputTokens, 3u);
+  BOOST_CHECK_EQUAL(rep.maxInputBytes, kMaxInput);
+  BOOST_CHECK_EQUAL(rep.maxOutTokens, kMaxOut);
+  BOOST_CHECK_EQUAL(rep.contextTokens, 131072u);
+
+  uint8_t appendError = 0xff;
+  CES_REQUIRE_OK(tc.think("again", nullptr, reply, charged, {}, &appendError));
+  BOOST_CHECK_EQUAL(appendError, CES_OK);   // no report bit leaks into it
+
+  // A call with no usage report from the backend: the limits, no usage.
+  backend->billing = ThinkOutcome::kEstimate;
+  CES_REQUIRE_OK(tc.think("estimate", nullptr, reply, charged, {}, nullptr, &rep));
+  BOOST_CHECK(!rep.usageKnown);
+  BOOST_CHECK_EQUAL(rep.maxOutTokens, kMaxOut);
+}
+
 // One channel serves many calls.
 BOOST_AUTO_TEST_CASE(Think_ChannelLoops) {
   CesThinkClient tc;

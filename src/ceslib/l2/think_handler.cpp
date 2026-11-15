@@ -32,6 +32,8 @@ namespace ces {
 namespace {
 
 constexpr uint8_t kVerbThink = 1;
+constexpr uint8_t kThinkFlagReport = 0x01;   // request flags, bit 0
+constexpr uint8_t kThinkReportBit = 0x80;    // response appendError byte, bit 7
 constexpr uint64_t kMillion = 1'000'000;
 __extension__ typedef unsigned __int128 U128;   // exact token * fee sums
 
@@ -139,10 +141,13 @@ uint8_t readWhole(CesServer* server, const ThinkFile& f,
 }
 
 // The THINK verb's sink: reply frames on the bound channel. On OK the signed
-// preamble is [u64 charged][32 sha256(reply)][u8 appendError].
+// preamble is [u64 charged][32 sha256(reply)][u8 appendError], then the
+// report when the caller asked for it (see think_handler.h).
 class PlexSink : public ThinkSink {
  public:
-  explicit PlexSink(std::shared_ptr<CesPlexReplyStream> r) : r_(std::move(r)) {}
+  PlexSink(std::shared_ptr<CesPlexReplyStream> r, bool wantReport)
+      : r_(std::move(r)), wantReport_(wantReport) {}
+  void report(const ThinkReport& rep) override { rep_ = rep; }
   bool open() override { return !r_->dead(); }
   void piece(std::string_view t) override {
     r_->write(ces::Bytes(t.begin(), t.end()));
@@ -158,12 +163,26 @@ class PlexSink : public ThinkSink {
     minx::Hash h = ces::sha256(reinterpret_cast<const uint8_t*>(text.data()),
                                text.size());
     pre.insert(pre.end(), h.begin(), h.end());
-    ces::Buffer::put<uint8_t>(pre, appendError);
+    if (!wantReport_) {
+      ces::Buffer::put<uint8_t>(pre, appendError);
+      r_->finish(CES_OK, std::move(pre));
+      return;
+    }
+    ces::Buffer::put<uint8_t>(pre, static_cast<uint8_t>(appendError | kThinkReportBit));
+    ces::Buffer::put<uint8_t>(pre, rep_.usageKnown ? 1 : 0);
+    ces::Buffer::put<uint64_t>(pre, rep_.usage.promptTokens);
+    ces::Buffer::put<uint64_t>(pre, rep_.usage.cachedTokens);
+    ces::Buffer::put<uint64_t>(pre, rep_.usage.outputTokens);
+    ces::Buffer::put<uint32_t>(pre, rep_.maxInputBytes);
+    ces::Buffer::put<uint32_t>(pre, rep_.maxOutTokens);
+    ces::Buffer::put<uint32_t>(pre, rep_.contextTokens);
     r_->finish(CES_OK, std::move(pre));
   }
 
  private:
   std::shared_ptr<CesPlexReplyStream> r_;
+  bool wantReport_ = false;
+  ThinkReport rep_;
 };
 
 // Read and drop `left` body bytes, then finish the reply with `status`.
@@ -195,6 +214,7 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
   uint32_t textLen = 0;
   std::array<uint8_t, 32> textHash{};
   std::string path;
+  uint8_t flags = 0;
   try {
     textLen = buf.get<uint32_t>();
     textHash = buf.get<std::array<uint8_t, 32>>();
@@ -202,6 +222,7 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
       uint16_t pathLen = buf.get<uint16_t>();
       path = buf.getBytes<std::string>(pathLen);
     }
+    if (buf.remaining() > 0) flags = buf.get<uint8_t>();   // optional flags
   } catch (const std::out_of_range&) {
     reply->finishAndClose(CES_ERROR_BAD_INPUT);   // body length unknown
     return;
@@ -220,7 +241,7 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
   auto text = std::make_shared<ces::Bytes>(textLen);
   boost::asio::async_read(
     *req->stream, boost::asio::buffer(*text),
-    [req, reply, text, textHash, path, self](
+    [req, reply, text, textHash, path, flags, self](
         const boost::system::error_code& ec, std::size_t) {
       if (ec) return;   // stream dead
       minx::Hash got = ces::sha256(text->data(), text->size());
@@ -263,7 +284,8 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
       file.payByAccount = true;
       file.payerAccount = file.caller;
       self->submit(signer, std::string(text->begin(), text->end()),
-                   std::make_shared<PlexSink>(reply), std::move(file));
+                   std::make_shared<PlexSink>(reply, (flags & kThinkFlagReport) != 0),
+                   std::move(file));
     });
 }
 
@@ -500,6 +522,13 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
   // The next turn on the file may start as soon as the caller sees this one
   // end, so free the path first.
   unlock();
+  ThinkReport rep;
+  rep.usageKnown = o.billing == ThinkOutcome::kUsage;
+  if (rep.usageKnown) rep.usage = o.usage;
+  rep.maxInputBytes = cfg.thinkMaxInputBytes;
+  rep.maxOutTokens = cfg.thinkMaxOutTokens;
+  rep.contextTokens = cfg.thinkContextTokens;
+  sink.report(rep);
   sink.finish(o.status, charge, text, appendError);
 }
 

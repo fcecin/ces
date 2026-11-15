@@ -242,11 +242,33 @@ target_link_options(ces PRIVATE "-Wl,-z,noexecstack")
 target_compile_definitions(ces PRIVATE CES_GIT_HASH="${GIT_COMMIT_HASH}")
 set_target_properties(ces PROPERTIES OUTPUT_NAME "ces")
 
-file(GLOB CESH_CPP "src/cesh/*.cpp")
-add_executable(cesh ${CESH_CPP})
-target_link_libraries(cesh PRIVATE ceslib CLI11::CLI11)
+# cesh is a library, ceshcore, plus a one-line main (cesh_main.cpp). The tests
+# link ceshcore, and cesh chat runs cesh commands in-process through it
+# (cesh_run.h). ceshcore also holds the manual: the pages in src/cesh/docs/,
+# compiled in, and the code that shows them (src/cesh/man/).
+file(GLOB_RECURSE CESH_MAN_PAGES CONFIGURE_DEPENDS
+     "${CMAKE_CURRENT_SOURCE_DIR}/src/cesh/docs/*.md")
+set(CESH_MAN_GEN "${CMAKE_CURRENT_BINARY_DIR}/generated/cesh_manual_pages.cpp")
+add_custom_command(
+  OUTPUT ${CESH_MAN_GEN}
+  COMMAND ${CMAKE_COMMAND}
+          -DDOCS_DIR=${CMAKE_CURRENT_SOURCE_DIR}/src/cesh/docs
+          -DOUT=${CESH_MAN_GEN}
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/src/cesh/man/embed_docs.cmake
+  DEPENDS ${CESH_MAN_PAGES} ${CMAKE_CURRENT_SOURCE_DIR}/src/cesh/man/embed_docs.cmake
+  COMMENT "Embedding the cesh manual"
+  VERBATIM)
+file(GLOB CESH_CPP CONFIGURE_DEPENDS "src/cesh/*.cpp" "src/cesh/man/*.cpp"
+     "src/cesh/chat/*.cpp")
+list(FILTER CESH_CPP EXCLUDE REGEX "src/cesh/cesh_main\\.cpp$")
+add_library(ceshcore STATIC ${CESH_CPP} ${CESH_MAN_GEN})
+target_include_directories(ceshcore PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src/cesh)
+target_link_libraries(ceshcore PUBLIC ceslib CLI11::CLI11)
+target_compile_definitions(ceshcore PRIVATE CES_GIT_HASH="${GIT_COMMIT_HASH}")
+
+add_executable(cesh src/cesh/cesh_main.cpp)
+target_link_libraries(cesh PRIVATE ceshcore)
 target_link_options(cesh PRIVATE "-Wl,-z,noexecstack")
-target_compile_definitions(cesh PRIVATE CES_GIT_HASH="${GIT_COMMIT_HASH}")
 set_target_properties(cesh PROPERTIES OUTPUT_NAME "cesh")
 
 file(GLOB CESBENCH_CPP "src/cesbench/*.cpp")
@@ -313,8 +335,8 @@ if(CES_HYLE AND NOT CES_CLIENT_ONLY)
   # cesh links it too, for the client-side hyle verbs (build + sign ops, speak a
   # chain's line protocol). Linked to the cesh target only, never ceslib: the CES
   # client engine stays hyle-free; all hyle knowledge rides in the shell.
-  target_link_libraries(cesh PRIVATE hyle_services)
-  target_compile_definitions(cesh PRIVATE CES_HYLE=1)
+  target_link_libraries(ceshcore PUBLIC hyle_services)
+  target_compile_definitions(ceshcore PRIVATE CES_HYLE=1)
   message(STATUS "CES_HYLE ON: cesluajitd + cesh link hyle_services (+ core) from github.com/fcecin/hyle")
 endif()
 

@@ -582,6 +582,7 @@ public:
       std::chrono::steady_clock::duration frameTimeout,
       std::chrono::steady_clock::duration totalTimeout,
       size_t respFixedPreambleLen,
+      const std::function<bool(ces::Bytes&)>& readVariablePreamble,
       ces::Bytes& outPreamble) {
     if (ensureClean() != CES_OK) return CES_ERROR_INTERNAL;
     auto fail = [&](uint8_t rc) -> uint8_t {
@@ -621,6 +622,9 @@ public:
     outPreamble.clear();
     if (status == CES_OK && respFixedPreambleLen > 0 &&
         !readExact(outPreamble, respFixedPreambleLen))
+      return fail(CES_ERROR_INTERNAL);
+    if (status == CES_OK && readVariablePreamble &&
+        !readVariablePreamble(outPreamble))
       return fail(CES_ERROR_INTERNAL);
     if (!readAndVerifyTail(status, verb, outPreamble))
       return fail(CES_ERROR_INTERNAL);
@@ -836,7 +840,23 @@ uint8_t CesPlexChannel::driveStreamVerb(
     ces::Bytes& outPreamble) {
   return impl_->driveStreamVerb(verb, envelope, extraBodyToSend, onFrame,
                                 frameTimeout, totalTimeout,
-                                respFixedPreambleLen, outPreamble);
+                                respFixedPreambleLen, nullptr, outPreamble);
+}
+
+uint8_t CesPlexChannel::driveStreamVerb(
+    uint8_t verb,
+    const minx::Bytes& envelope,
+    const ces::Bytes& extraBodyToSend,
+    const std::function<bool(const ces::Bytes&)>& onFrame,
+    std::chrono::steady_clock::duration frameTimeout,
+    std::chrono::steady_clock::duration totalTimeout,
+    size_t respFixedPreambleLen,
+    const std::function<bool(ces::Bytes&)>& readVariablePreamble,
+    ces::Bytes& outPreamble) {
+  return impl_->driveStreamVerb(verb, envelope, extraBodyToSend, onFrame,
+                                frameTimeout, totalTimeout,
+                                respFixedPreambleLen, readVariablePreamble,
+                                outPreamble);
 }
 
 // ---------------------------------------------------------------------------

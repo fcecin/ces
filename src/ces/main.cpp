@@ -328,6 +328,7 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # think_fee_out         = 0         # per 1M output tokens
 # think_max_out_tokens  = 8192      # max_tokens of every call
 # think_max_input_bytes = 1048576   # largest prompt text
+# think_context_tokens  = 131072    # the model's context window, for callers
 # think_timeout_secs    = 300       # one call, end to end
 # think_max_concurrent  = 8         # calls in flight
 # Global subsidy: the price multiplier (basis points of the full price, as in
@@ -505,6 +506,7 @@ int main(int argc, char* argv[]) {
   uint64_t    optThinkFeeIn = 0, optThinkFeeCachedIn = 0, optThinkFeeOut = 0;
   uint32_t    optThinkMaxOutTokens = 8192;
   uint32_t    optThinkMaxInputBytes = 1024 * 1024;
+  uint32_t    optThinkContextTokens = 131072;
   uint32_t    optThinkTimeoutSecs = 300;
   uint32_t    optThinkMaxConcurrent = 8;
   uint64_t    optThinkSubsidyBudget = 0, optThinkSubsidyTauSecs = 0;
@@ -711,6 +713,9 @@ int main(int argc, char* argv[]) {
       "max_tokens of every builtin:think call")->default_val("8192");
     app.add_option("--thinkmaxinputbytes", optThinkMaxInputBytes,
       "Largest builtin:think prompt, bytes")->default_val("1048576");
+    app.add_option("--thinkcontexttokens", optThinkContextTokens,
+      "The model's context window in tokens, told to callers (0 = not stated)")
+      ->default_val("131072");
     app.add_option("--thinktimeoutsecs", optThinkTimeoutSecs,
       "Timeout of one builtin:think call, seconds")->default_val("300");
     app.add_option("--thinkmaxconcurrent", optThinkMaxConcurrent,
@@ -978,6 +983,8 @@ int main(int argc, char* argv[]) {
                      "--thinkmaxouttokens");
       applyIfDefault("think_max_input_bytes", optThinkMaxInputBytes,
                      "--thinkmaxinputbytes");
+      applyIfDefault("think_context_tokens", optThinkContextTokens,
+                     "--thinkcontexttokens");
       applyIfDefault("think_timeout_secs", optThinkTimeoutSecs,
                      "--thinktimeoutsecs");
       applyIfDefault("think_max_concurrent", optThinkMaxConcurrent,
@@ -1208,6 +1215,7 @@ int main(int argc, char* argv[]) {
   config.thinkFeeOut        = optThinkFeeOut;
   config.thinkMaxOutTokens  = optThinkMaxOutTokens;
   config.thinkMaxInputBytes = optThinkMaxInputBytes;
+  config.thinkContextTokens = optThinkContextTokens;
   config.thinkTimeoutSecs   = optThinkTimeoutSecs;
   config.thinkMaxConcurrent = optThinkMaxConcurrent;
   config.thinkSubsidyBudget  = optThinkSubsidyBudget;

@@ -243,6 +243,18 @@ public:
       std::chrono::steady_clock::duration totalTimeout,
       size_t respFixedPreambleLen,
       ces::Bytes& outPreamble);
+  // The same, and after the fixed preamble readVariablePreamble reads the
+  // rest of it (with readExact), so the signed trailer covers it all.
+  uint8_t driveStreamVerb(
+      uint8_t verb,
+      const minx::Bytes& envelope,
+      const ces::Bytes& extraBodyToSend,
+      const std::function<bool(const ces::Bytes& frame)>& onFrame,
+      std::chrono::steady_clock::duration frameTimeout,
+      std::chrono::steady_clock::duration totalTimeout,
+      size_t respFixedPreambleLen,
+      const std::function<bool(ces::Bytes& preamble)>& readVariablePreamble,
+      ces::Bytes& outPreamble);
 
   uint64_t boundSessionToken() const;
 

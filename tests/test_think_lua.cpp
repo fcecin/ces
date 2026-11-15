@@ -366,7 +366,13 @@ BOOST_FIXTURE_TEST_CASE(ThinkClient_FromCoroutine, ThinkLuaFixture) {
   deploy(path("t6.lua"), src);
   launch(path("t6.lua"));
   const int64_t ownerAfterLaunch = balanceOf(ownerKey.getPublicKeyAsHash());
-  BOOST_CHECK_EQUAL(beaconCode(), 77);
+  const int64_t code = beaconCode();
+  // This test failed on CI with code 0 (the program sent nothing in 60 s).
+  // The backend's call count tells which half stalled: 0 means the THINK
+  // never reached the server, 1 means its reply never reached the program.
+  BOOST_CHECK_MESSAGE(code == 77, "beacon code " << code << ", backend calls "
+                                  << backend->calls.load() << ", backend entered "
+                                  << backend->entered.load());
   BOOST_CHECK_EQUAL(balanceOf(ownerKey.getPublicKeyAsHash()), ownerAfterLaunch);
 }
 
