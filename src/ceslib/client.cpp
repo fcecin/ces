@@ -51,6 +51,12 @@ CesClient::CesClient(const boost::asio::ip::tcp::endpoint& proxyEndpoint,
   transport_->setUseDataset(useDataset);
 }
 
+minx::MinxConfig CesClient::clientConfig(const std::string& name) {
+  minx::MinxConfig c{name};
+  c.recvBuffersSize = CLIENT_RECV_BUFFERS;
+  return c;
+}
+
 CesClient::~CesClient() {
   LOGTRACE << "~CesClient";
   stop();

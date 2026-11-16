@@ -1012,14 +1012,9 @@ void fundingWorker(std::shared_ptr<Instance> inst, uint16_t corr,
   bool ok = false;
   try {
     auto ep = ces::Resolver::resolveUdp(destServer);
-    // Lean client (one round-trip): small recv ring, no PoW/spam machinery —
-    // the server-sized default would alloc ~32MB per transfer.
-    minx::MinxConfig ccfg{"fundcl"};
-    ccfg.recvBuffersSize    = 256;
-    ccfg.spamSampleRate     = 0;
-    ccfg.randomXVMsToKeep   = 0;
-    ccfg.randomXInitThreads = 0;
-    ccfg.trustLoopback      = true;
+    // A client for one round-trip, with loopback trusted.
+    minx::MinxConfig ccfg = ces::CesClient::clientConfig("fundcl");
+    ccfg.trustLoopback = true;
     ces::CesClient client(ep, /*useDataset=*/false, ccfg);
     client.setKey(serverKey);
     if (client.start(0) && client.connect()) {

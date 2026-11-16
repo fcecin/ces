@@ -153,19 +153,12 @@ int lua_ces_transfer(lua_State* L) {
   });
 }
 
-// Minx config for a single outbound round-trip from this compute instance.
-// CesClient's default is server-sized: a Minx with DEFAULT_RECV_BUFFERS_SIZE
-// (16384) x 2KB recv buffers = ~32MB allocated up front. Constructing that per
-// call inside a child capped by RLIMIT_AS throws std::bad_alloc. A client doing
-// one blocking request needs only a small recv ring and none of the server's
-// PoW/spam machinery, so size it for what it is.
+// Minx config for a single outbound round-trip from this compute instance:
+// the small recv ring of a client (a server-sized ring inside a child capped
+// by RLIMIT_AS throws std::bad_alloc), and loopback trusted.
 minx::MinxConfig luaClientConfig() {
-  minx::MinxConfig c{"luacl"};
-  c.recvBuffersSize    = 256;   // one round-trip, not a server's inbound backlog
-  c.spamSampleRate     = 0;     // a client does not spam-score its own replies
-  c.randomXVMsToKeep   = 0;     // ping/query/transfer never verify PoW
-  c.randomXInitThreads = 0;
-  c.trustLoopback      = true;
+  minx::MinxConfig c = ces::CesClient::clientConfig("luacl");
+  c.trustLoopback = true;
   return c;
 }
 
