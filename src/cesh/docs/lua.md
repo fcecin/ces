@@ -6,7 +6,9 @@ order: 4
 
 A program is a Lua file that a server runs (see [Compute](compute.md)). It
 is LuaJIT with `base`, `string`, `table`, `math` and `bit`. There is no
-`os`, `io`, `require`, `load`, `debug` or `print`.
+`os`, `io`, `require`, `load`, `debug` or `print`. LuaJIT is Lua 5.1: there
+is no `//` and no `&`, `|`, `~`, `<<` or `>>`. Use `math.floor(a / b)` and
+`bit.band`, `bit.bor`, `bit.bxor`, `bit.lshift` and `bit.rshift`.
 The API is the global table `ces`.
 
 ## The smallest service
