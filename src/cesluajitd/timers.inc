@@ -183,6 +183,34 @@ int lua_ces_spawn(lua_State* L) {
   return 0;
 }
 
+// ces.on_error(fn) sets the error handler of the program, and nil removes it.
+// deliver_error runs fn(message) in a task of its own.
+constexpr const char* kRegOnError = "ces.on_error";
+std::set<lua_State*> g_error_co;              // the tasks that run the handler
+
+int lua_ces_on_error(lua_State* L) {
+  if (!lua_isnoneornil(L, 1)) luaL_checktype(L, 1, LUA_TFUNCTION);
+  lua_settop(L, 1);
+  lua_setfield(L, LUA_REGISTRYINDEX, kRegOnError);
+  return 0;
+}
+
+// `L` is the main state. False when the program has no handler.
+bool deliver_error(lua_State* L, const std::string& msg) {
+  lua_getfield(L, LUA_REGISTRYINDEX, kRegOnError);
+  if (!lua_isfunction(L, -1)) {
+    lua_pop(L, 1);
+    return false;
+  }
+  lua_State* co = lua_newthread(L);                     // L: [fn, co]
+  g_coro_refs[co] = luaL_ref(L, LUA_REGISTRYINDEX);     // L: [fn]
+  g_error_co.insert(co);
+  lua_xmove(L, co, 1);                                  // co: [fn]
+  lua_pushlstring(co, msg.data(), msg.size());          // co: [fn, msg]
+  g_ready.push_back({co, 1});
+  return true;
+}
+
 // ces.gossip.send(msg, budget [, dest]) — flood a message across the server
 // mesh. One-way: the home server originates it and pays the flood out of its
 // own peer reserves. dest is a 32-byte server pubkey, or nil/absent to

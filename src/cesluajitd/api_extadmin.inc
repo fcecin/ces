@@ -313,12 +313,20 @@ bool dispatch_ext_frame(lua_State* L, Frame f) {
 
 // Resume one coroutine with `nargs` results already on its stack. A coroutine
 // that yields again parks (its waker re-readies it); one that finishes or errors
-// is unreferenced.
+// is unreferenced. A task error goes to the handler (ces.on_error). With no
+// handler, an error in the handler, or out of memory, the program ends.
 static void resume_coro(lua_State* mainL, lua_State* co, int nargs) {
   int r = lua_resume(co, nargs);
   if (r == LUA_YIELD) return;                  // parked again; nothing to do
-  if (r != 0)
-    host_log(3, std::string("scheduled task: ") + lua_err_str(co));
+  if (r != 0) {
+    std::string err = lua_err_str(co);
+    bool handler = g_error_co.count(co) > 0;
+    if (handler || r == LUA_ERRMEM || !deliver_error(mainL, err)) {
+      host_log(4, std::string(handler ? "error handler: " : "uncaught: ") + err);
+      flush_net_usage();
+      ::_exit(1);
+    }
+  }
 
   // An on_l2call coroutine that just finished: ship its return value (a string,
   // or empty on nil / error) back as the L2 reply for this callId.
@@ -345,6 +353,7 @@ static void resume_coro(lua_State* mainL, lua_State* co, int nargs) {
     luaL_unref(mainL, LUA_REGISTRYINDEX, it->second);
     g_coro_refs.erase(it);
   }
+  g_error_co.erase(co);
   // If this was a periodic-timer tick, free the timer so its next fire can run
   // (skip-if-busy lifts here). Matched by coroutine pointer, not the registry
   // ref, so a cancelled-and-reused ref can't clear the wrong timer.

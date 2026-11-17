@@ -155,6 +155,15 @@ using namespace cesluajitd;
 // Entry point.
 // ---------------------------------------------------------------------------
 
+// Runs the event loop after the handler took a main chunk error.
+static int run_after_error(lua_State* L) {
+  static const char kRun[] = "ces.run()\n";
+  if (luaL_loadbufferx(L, kRun, sizeof kRun - 1, "=ces.run", "t") != 0) return 1;
+  if (lua_pcall(L, 0, 0, 0) == 0) return 0;
+  host_log(4, std::string("run failed: ") + lua_err_str(L));
+  return 1;
+}
+
 int main(int argc, char** argv) {
   if (argc >= 3 && std::strcmp(argv[1], "--manifest") == 0)
     return probe_manifest(argv[2]);
@@ -266,10 +275,18 @@ int main(int argc, char** argv) {
     lua_close(L);
     return 1;
   }
+  // A main chunk error goes to the handler (ces.on_error) and the loop runs.
+  // With no handler, or out of memory, the program ends.
   int rc = 0;
-  if (lua_pcall(L, 0, 0, 0) != 0) {
-    host_log(4, std::string("run failed: ") + lua_err_str(L));
-    rc = 1;
+  if (int pr = lua_pcall(L, 0, 0, 0); pr != 0) {
+    std::string err = lua_err_str(L);
+    lua_settop(L, 0);
+    if (pr != LUA_ERRMEM && deliver_error(L, err)) {
+      rc = run_after_error(L);
+    } else {
+      host_log(4, "run failed: " + err);
+      rc = 1;
+    }
   }
   g_pool_main.shutdown();
   g_pool_client.shutdown();

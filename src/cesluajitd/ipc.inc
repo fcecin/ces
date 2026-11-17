@@ -180,6 +180,7 @@ std::deque<uint64_t>            g_conn_advance;   // relay conns with an event r
 std::map<lua_State*, int>       g_coro_refs;     // coroutine -> registry ref (keeps it alive)
 std::map<lua_State*, uint64_t>  g_l2call_co;     // on_l2call coroutine -> its callId (reply)
 static void resume_coro(lua_State* mainL, lua_State* co, int nargs);
+static void flush_net_usage();
 static void conn_advance(lua_State* mainL, uint64_t id);
 static void luarpc_advance(lua_State* mainL, uint64_t id);
 static void drain_luarpc_advance(lua_State* mainL);

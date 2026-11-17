@@ -325,6 +325,14 @@ struct DialFixture {
     cc.disconnect();
     return instId;
   }
+
+  void killScript(uint64_t pid) {
+    CesComputeClient cc;
+    cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+    CES_REQUIRE_OK(cc.kill(pid));
+    cc.disconnect();
+  }
 };
 
 std::string ownerWalletInline(const KeyPair& k) {
@@ -489,6 +497,89 @@ BOOST_AUTO_TEST_CASE(LineMode_OneExchange) {
   r = ces::e2e::runShell(cesh + std::to_string(mpid) + " --line ping --timeout 500 < /dev/null", 60);
   BOOST_CHECK_EQUAL(r.exitCode, 1);
   BOOST_CHECK_MESSAGE(r.out.find("Dial failed") != std::string::npos, r.out);
+}
+
+BOOST_AUTO_TEST_CASE(AHandlerKeepsAProgram) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  auto launch = [&](const std::string& name, const std::string& src) {
+    const std::string path = "/h/" + ownerHex + "/" + name;
+    uploadScript(path, src);
+    uint64_t pid = launchScript(path);
+    BOOST_REQUIRE(pid > 0);
+    return pid;
+  };
+  auto dial = [&](uint64_t pid, const std::string& in) {
+    return ces::e2e::runShell("printf '" + in + "' | CESH_WALLET=" + ownerWalletInline(ownerKey) +
+                              " timeout -k 1 4 " + ces::e2e::findCeshBinary() +
+                              " -l fatal --server localhost --rpc-port " + std::to_string(rpcPort) +
+                              " dial " + std::to_string(pid), 30).out;
+  };
+  auto has = [](const std::string& out, const std::string& what) {
+    BOOST_CHECK_MESSAGE(out.find(what) != std::string::npos, "no [" << what << "] in [" << out << "]");
+  };
+
+  // With no handler, a compile error or a main chunk error ends the program.
+  BOOST_CHECK(ces::waitInstanceGone(*server, launch("bad.lua", "local x = 1 // 2\n")));
+  BOOST_CHECK(ces::waitInstanceGone(*server, launch("fails.lua", "local t = nil\nt.x = 1\n")));
+
+  // A handler gets a main chunk error, and the loop runs.
+  uint64_t pid = launch("caught.lua",
+                        "ces.on_error(function(e) ces.conn.set_listener({ hello = 'caught: ' .. e .. '\\n' }) end)\n"
+                        "error('boom')\n");
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  has(dial(pid, ""), "caught: program:2: boom");
+  killScript(pid);
+
+  // With no handler, a task error ends the program.
+  pid = launch("plain.lua",
+               "ces.conn.set_listener({ on_data = function(c, d) error('bad ' .. d) end })\n"
+               "ces.run()\n");
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  dial(pid, "x");
+  BOOST_CHECK(ces::waitInstanceGone(*server, pid));
+
+  // A handler gets a task error, and the program goes on.
+  pid = launch("task.lua",
+    "local conns = {}\n"
+    "ces.on_error(function(e) for _, c in pairs(conns) do c:write('caught: ' .. e .. '\\n') end end)\n"
+    "ces.conn.set_listener({\n"
+    "  on_open = function(c) conns[c.id] = c end,\n"
+    "  on_close = function(c) conns[c.id] = nil end,\n"
+    "  on_data = function(c, d) if d:find('x') then error('bad ' .. d) end c:write('ok ' .. d .. '\\n') end,\n"
+    "})\n"
+    "ces.run()\n");
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  has(dial(pid, "x"), "caught: program:6: bad x");
+  has(dial(pid, "y"), "ok y");
+  killScript(pid);
+
+  // Out of memory ends the program, also with a handler.
+  BOOST_CHECK(ces::waitInstanceGone(*server, launch("bomb.lua",
+    "ces.on_error(function(e) ces.conn.set_listener({ hello = 'kept' }) end)\n"
+    "_G.big = string.rep('X', 1024 * 1024 * 1024)\n")));
+  pid = launch("taskbomb.lua",
+    "ces.on_error(function(e) end)\n"
+    "ces.conn.set_listener({ on_data = function(c, d) _G.big = string.rep('X', 1024 * 1024 * 1024) end })\n"
+    "ces.run()\n");
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  dial(pid, "x");
+  BOOST_CHECK(ces::waitInstanceGone(*server, pid));
+
+  // An error in the handler ends the program after one run of the handler.
+  pid = launch("again.lua",
+    "local conns = {}\n"
+    "ces.on_error(function(e) for _, c in pairs(conns) do c:write('h\\n') end error('again') end)\n"
+    "ces.conn.set_listener({\n"
+    "  on_open = function(c) conns[c.id] = c end,\n"
+    "  on_data = function(c, d) error('bad') end,\n"
+    "})\n"
+    "ces.run()\n");
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  std::string out = dial(pid, "x");
+  size_t runs = 0;
+  for (size_t at = out.find("h\n"); at != std::string::npos; at = out.find("h\n", at + 2)) runs++;
+  BOOST_CHECK_MESSAGE(runs == 1, "the handler ran " << runs << " times");
+  BOOST_CHECK(ces::waitInstanceGone(*server, pid));
 }
 
 BOOST_AUTO_TEST_CASE(UnknownInstanceExits2) {

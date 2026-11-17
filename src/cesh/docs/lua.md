@@ -41,6 +41,7 @@ ces.run()
 | `ces.sleep(ms)` | Wait, in a coroutine |
 | `ces.every(ms, fn)` | Run `fn` again and again |
 | `ces.now()` | Time in microseconds |
+| `ces.on_error(fn)` | Get each error of the program, with `fn(message)` in a task of its own |
 | `ces.exit()` | End the program now |
 
 A call that waits (`think`, `transfer`, `sleep`) runs inside `on_l2call` or
@@ -85,6 +86,14 @@ and `ESC[D` (up, down, right, left). A site can read the bytes in its own
 way. One `on_data` can carry several keys, or a part of one. A program
 that moves things on its own clock, such as a game, uses
 `ces.every(ms, fn)`.
+
+## Errors
+
+`ces.on_error(fn)` sets a handler for the errors of the program, in a task or
+in the first run. `fn(message)` runs in a task of its own, and the program
+goes on. With no handler an error ends the program, and a program of the
+server logs it. An error in the handler, a compile error and running out of
+memory end the program.
 
 ## Money
 
