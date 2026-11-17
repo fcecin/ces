@@ -8,7 +8,7 @@ The file commands use the server's rpc port (see [Servers](../basics/servers.md)
 
 | Command | What it does | Who |
 | --- | --- | --- |
-| `cesh file put <local> <remote> [--deposit RAW]` | Upload a local file. On an existing file, `--deposit` is added as a top-up | Owner |
+| `cesh file put <local> <remote> [--deposit RAW]` | Upload a local file; `-` reads stdin. On an existing file, `--deposit` is added as a top-up | Owner |
 | `cesh file get <remote> [<local>]` | Download; no `<local>` or `-` writes to stdout | Anyone |
 | `cesh file stat <remote>` | Owner, size, balance, price, times | Anyone |
 | `cesh file deposit <remote> <raw>` | Add credits to the file balance | Anyone |
@@ -23,6 +23,18 @@ The file commands use the server's rpc port (see [Servers](../basics/servers.md)
 run cesh. `file put` reads it and `file get` writes it. `file stat` and the
 other commands look only at the server: they cannot check a local file, and
 you do not need to check it first.
+
+`file put -` reads the content from stdin, which must be a pipe or a file,
+not a terminal. A shell can give the content in place:
+
+```
+cesh file put - hello.lua <<END
+function on_l2call(memo, info)
+  return "hello " .. memo
+end
+ces.run()
+END
+```
 
 ## Example
 

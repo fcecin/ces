@@ -636,7 +636,8 @@ int ceshRun(int argc, char* argv[]) {
   uint64_t df_price_arg = 0;
 
   auto* cmd_dfp = cmd_dfile->add_subcommand("put", "Upload a file");
-  cmd_dfp->add_option("local", df_local_arg, "Local file path")->required();
+  cmd_dfp->add_option("local", df_local_arg,
+                      "Local file path ('-' = stdin)")->required();
   cmd_dfp->add_option("remote", df_remote_arg,
                       "Remote path (starts with /h/, /f/, or /p/ — or bare "
                       "name, auto-prepended with /h/<signer>/)")->required();
@@ -2314,6 +2315,31 @@ int ceshRun(int argc, char* argv[]) {
 
     // ---- handleDiskFile handler (L2 disk-backed file store) ----
     auto handleDiskFile = [&]() -> int {
+      // `put` loads its content before any request, so a bad local file
+      // costs nothing. "-" is stdin, as "-" is stdout for `get`. A terminal
+      // would wait silently for Ctrl-D, so stdin must be a pipe or a file.
+      ces::Bytes putBytes;
+      if (cmd_dfp->parsed()) {
+        if (df_local_arg == "-") {
+          if (::isatty(STDIN_FILENO)) {
+            std::cerr << "Error: stdin is a terminal. Pipe the content in,"
+                         " or give a local file.\n";
+            return 1;
+          }
+          putBytes.assign(std::istreambuf_iterator<char>(std::cin),
+                          std::istreambuf_iterator<char>());
+        } else {
+          std::ifstream in(df_local_arg, std::ios::binary);
+          if (!in) {
+            std::cerr << "Error: cannot open local file: " << df_local_arg
+                      << "\n";
+            return 1;
+          }
+          putBytes.assign(std::istreambuf_iterator<char>(in),
+                          std::istreambuf_iterator<char>());
+        }
+      }
+
       L2Target tgt;
       if (!resolveL2Target("file", tgt)) return 1;
       auto& [host, serverPk, hasServerPk] = tgt;
@@ -2376,16 +2402,7 @@ int ceshRun(int argc, char* argv[]) {
 
       // ---- put ----
       if (cmd_dfp->parsed()) {
-        // Load local file fully into memory.
-        std::ifstream in(df_local_arg, std::ios::binary);
-        if (!in) {
-          std::cerr << "Error: cannot open local file: " << df_local_arg
-                    << "\n";
-          return 1;
-        }
-        ces::Bytes bytes(
-          (std::istreambuf_iterator<char>(in)),
-          std::istreambuf_iterator<char>());
+        ces::Bytes bytes = std::move(putBytes);
 
         std::string remote = normalizePath(df_remote_arg);
 

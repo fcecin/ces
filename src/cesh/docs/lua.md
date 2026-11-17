@@ -1,6 +1,6 @@
 ---
 title: Lua programs
-summary: How to write a CES program in Lua: on_l2call, ces.run(), the main ces calls, and the sandbox
+summary: How to write a CES program in Lua: on_l2call, ces.run(), the main ces calls, connections that people dial (ces.conn), and the sandbox
 order: 4
 ---
 
@@ -44,6 +44,44 @@ ces.run()
 A call that waits (`think`, `transfer`, `sleep`) runs inside `on_l2call` or
 `ces.spawn(function() ... end)`, where the program goes on serving while it
 waits.
+
+## Connections
+
+A person can dial a program and use it as a terminal: `cesh dial <pid>`,
+or a window of a site. Each dial is a connection to the program.
+
+```lua
+ces.conn.set_listener({
+  hello = "\27[2J\27[Hhello\r\n",
+  on_open = function(conn) conn:write("you are " .. conn.id .. "\r\n") end,
+  on_data = function(conn, data) conn:write(data) end,
+  on_close = function(conn) end,
+})
+ces.run()
+```
+
+- `ces.conn.set_listener(t)` lets people dial the program.
+  `ces.conn.set_listener(nil)` stops new dials. The connections that are
+  open stay.
+- `t.hello` is the first text that each connection gets. Keep it small
+  (less than 1 KB), and write a bigger first screen in `on_open`.
+- `on_open(conn)` runs for a new connection. `on_data(conn, data)` gets the
+  bytes that the person sends. `on_close(conn)` runs when the connection
+  ends.
+- `conn:write(s)` sends bytes to the person. It returns true, or nil and an
+  error. `conn:close()` ends the connection.
+- `conn.id` is a number that no other connection of the program has.
+  `conn.pubkey` is the key of the person (32 raw bytes).
+
+The bytes are those of a terminal. The program writes text and the escape
+codes of a terminal (ECMA-48, as xterm reads them). For example,
+`ESC[<row>;<col>H` moves the cursor, `ESC[2J` clears the screen, `ESC[1;33m`
+sets bold yellow, `ESC[0m` sets the colors back, and `ESC[?25l` hides the
+cursor. In Lua, ESC is `"\27"`. A key comes as the bytes that a terminal
+sends: a letter as itself, Enter as `"\r"`, and the arrow keys as
+`ESC[A`, `ESC[B`, `ESC[C` and `ESC[D` (up, down, right, left). One
+`on_data` can carry several keys, or a part of one. A program that moves
+things on its own clock, such as a game, uses `ces.every(ms, fn)`.
 
 ## Money
 

@@ -158,6 +158,22 @@ BOOST_AUTO_TEST_CASE(PutGetRoundTrip) {
   BOOST_CHECK_EQUAL(readFileStr(dst), body);
 }
 
+// `file put -` uploads what comes on stdin, as `file get <remote> -` writes
+// to stdout.
+BOOST_AUTO_TEST_CASE(PutFromStdin) {
+  std::string body = "function on_l2call(memo, info)\n  return memo\nend\nces.run()\n";
+  auto src = writeTempFile(tempDir, "piped.lua", body);
+
+  auto r = runShell(cmd("file put - /p/piped.lua") + " < " + src);
+  BOOST_REQUIRE_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "File Uploaded");
+
+  auto dst = (tempDir / "piped-out.lua").string();
+  auto r2 = runShell(cmd("file get /p/piped.lua " + dst));
+  BOOST_REQUIRE_EQUAL(r2.exitCode, 0);
+  BOOST_CHECK_EQUAL(readFileStr(dst), body);
+}
+
 BOOST_AUTO_TEST_CASE(StatShowsOwnerAndSize) {
   std::string body = "abc";
   auto local = writeTempFile(tempDir, "tiny.txt", body);
