@@ -41,6 +41,7 @@ struct DialArgs {
   // the first reply's pubkey is TOFU-accepted (logged once on stderr).
   std::optional<minx::Hash> expectedServerPk;
   bool        verbose = false;     // -v: print "ATTACH ok conn_id=N" once
+  bool        raw = false;         // --raw: a terminal on stdin sends each key at once
 
   // External-signing mode (--extsign): no wallet/private key in this process.
   // The bind + ATTACH signatures are supplied over a tiny stdio control

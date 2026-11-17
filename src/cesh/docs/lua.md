@@ -81,9 +81,11 @@ The program and the side that dials agree on what the bytes mean. On a
 terminal (`cesh dial`), they are text and the escape codes of a terminal
 (ECMA-48, as xterm reads them): `ESC[<row>;<col>H` moves the cursor,
 `ESC[2J` clears the screen, and `ESC[1;33m` sets bold yellow. In Lua, ESC
-is `"\27"`. A key comes as the bytes that the terminal sends: a letter as
-itself, Enter as `"\r"`, and the arrow keys as `ESC[A`, `ESC[B`, `ESC[C`
-and `ESC[D` (up, down, right, left). A site can read the bytes in its own
+is `"\27"`. With `cesh dial`, the terminal sends a line at Enter, and the
+program gets it with `"\n"` at its end. With `cesh dial --raw`, each key
+comes at once as the bytes that the terminal sends: a letter as itself,
+Enter as `"\r"`, and the arrow keys as `ESC[A`, `ESC[B`, `ESC[C` and
+`ESC[D` (up, down, right, left). A site can read the bytes in its own
 way. One `on_data` can carry several keys, or a part of one. A program
 that moves things on its own clock, such as a game, uses
 `ces.every(ms, fn)`.

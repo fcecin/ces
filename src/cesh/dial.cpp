@@ -35,6 +35,7 @@
 
 #include <unistd.h>           // STDIN_FILENO, STDOUT_FILENO, ::write
 #include <errno.h>
+#include <termios.h>
 
 #include <array>
 #include <chrono>
@@ -809,6 +810,35 @@ const char* attachErrorName(uint8_t s) {
 
 } // namespace
 
+// --raw: while the dial runs, the terminal on stdin sends each key at once,
+// with no echo, and Enter as "\r". Ctrl+C still ends the dial. The terminal
+// comes back as it was.
+class RawTerminal {
+public:
+  RawTerminal() {
+    if (!::isatty(STDIN_FILENO)) return;
+    fd_ = ::dup(STDIN_FILENO);   // its own copy: the pump closes stdin at its end
+    if (fd_ < 0 || ::tcgetattr(fd_, &saved_) != 0) return;
+    termios t = saved_;
+    t.c_lflag &= ~(ICANON | ECHO);
+    t.c_iflag &= ~ICRNL;
+    t.c_cc[VMIN] = 1;
+    t.c_cc[VTIME] = 0;
+    on_ = ::tcsetattr(fd_, TCSANOW, &t) == 0;
+  }
+  ~RawTerminal() {
+    if (on_) ::tcsetattr(fd_, TCSANOW, &saved_);
+    if (fd_ >= 0) ::close(fd_);
+  }
+  RawTerminal(const RawTerminal&) = delete;
+  RawTerminal& operator=(const RawTerminal&) = delete;
+
+private:
+  int fd_ = -1;
+  termios saved_{};
+  bool on_ = false;
+};
+
 int runDial(const DialArgs& args) {
   if (args.rpcPort == 0) {
     std::cerr << "Error: --rpc-port is required for `cesh dial`.\n";
@@ -919,6 +949,8 @@ int runDial(const DialArgs& args) {
     std::cout.flush();
   }
 
+  std::optional<RawTerminal> raw;
+  if (args.raw) raw.emplace();
   return dialer.runDataPump();
 }
 

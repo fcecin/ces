@@ -32,8 +32,12 @@
 #include <boost/test/unit_test.hpp>
 
 #include <fcntl.h>
+#include <poll.h>
+#include <pty.h>
 #include <signal.h>
+#include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <chrono>
@@ -580,6 +584,88 @@ BOOST_AUTO_TEST_CASE(AHandlerKeepsAProgram) {
   for (size_t at = out.find("h\n"); at != std::string::npos; at = out.find("h\n", at + 2)) runs++;
   BOOST_CHECK_MESSAGE(runs == 1, "the handler ran " << runs << " times");
   BOOST_CHECK(ces::waitInstanceGone(*server, pid));
+}
+
+// On a terminal, a plain dial sends a line at Enter, and --raw sends each key
+// at once, with no echo and Enter as "\r". The terminal comes back as it was.
+BOOST_AUTO_TEST_CASE(RawSendsEachKeyAtOnce) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/keys.lua";
+  uploadScript(path, "ces.conn.set_listener({ hello = 'ready\\n',\n"
+                     "  on_data = function(c, d) c:write('got [' .. d .. ']\\n') end })\nces.run()\n");
+  uint64_t pid = launchScript(path);
+  BOOST_REQUIRE(ces::waitInstanceListening(*server, pid));
+  const std::string cesh = ces::e2e::findCeshBinary();
+  const std::string wallet = ownerWalletInline(ownerKey);
+  const std::string port = std::to_string(rpcPort), id = std::to_string(pid);
+
+  struct Dial { pid_t pid; int master; int slave; };
+  auto dial = [&](bool raw) {
+    int master = -1, slave = -1;
+    BOOST_REQUIRE_EQUAL(::openpty(&master, &slave, nullptr, nullptr, nullptr), 0);
+    pid_t child = ::fork();
+    BOOST_REQUIRE(child >= 0);
+    if (child == 0) {
+      ::setsid();
+      ::ioctl(slave, TIOCSCTTY, 0);
+      ::dup2(slave, 0); ::dup2(slave, 1); ::dup2(slave, 2);
+      ::close(master);
+      if (slave > 2) ::close(slave);
+      ::setenv("CESH_WALLET", wallet.c_str(), 1);
+      std::vector<const char*> argv{"cesh", "-l", "fatal", "--server", "localhost", "--rpc-port",
+                                    port.c_str(), "dial", id.c_str()};
+      if (raw) argv.push_back("--raw");
+      argv.push_back(nullptr);
+      ::execv(cesh.c_str(), const_cast<char* const*>(argv.data()));
+      ::_exit(127);
+    }
+    return Dial{child, master, slave};
+  };
+  // What the terminal shows within `ms`, up to `want`.
+  auto read = [](int fd, const std::string& want, int ms) {
+    std::string got;
+    auto end = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
+    while (got.find(want) == std::string::npos && std::chrono::steady_clock::now() < end) {
+      pollfd p{fd, POLLIN, 0};
+      if (::poll(&p, 1, 50) > 0) {
+        char buf[256];
+        ssize_t n = ::read(fd, buf, sizeof buf);
+        if (n > 0) got.append(buf, static_cast<size_t>(n));
+      }
+    }
+    return got;
+  };
+  auto lflag = [](int fd) { termios t{}; ::tcgetattr(fd, &t); return t.c_lflag; };
+  auto end = [](Dial& d) {
+    BOOST_REQUIRE_EQUAL(::write(d.master, "\x03", 1), 1);     // Ctrl+C
+    int st = 0;
+    ::waitpid(d.pid, &st, 0);
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+  };
+
+  Dial raw = dial(true);
+  BOOST_REQUIRE(read(raw.master, "ready\r\n", 10000).find("ready\r\n") != std::string::npos);
+  for (int i = 0; i < 40 && (lflag(raw.slave) & ICANON); ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  BOOST_CHECK_EQUAL(lflag(raw.slave) & (ICANON | ECHO), 0u);
+  BOOST_REQUIRE_EQUAL(::write(raw.master, "q", 1), 1);
+  BOOST_CHECK_EQUAL(read(raw.master, "]\r\n", 3000), "got [q]\r\n");     // at once, with no echo
+  BOOST_REQUIRE_EQUAL(::write(raw.master, "\r", 1), 1);
+  BOOST_CHECK_EQUAL(read(raw.master, "]\r\n", 3000), "got [\r]\r\n");
+  BOOST_CHECK_EQUAL(end(raw), 130);
+  BOOST_CHECK_EQUAL(lflag(raw.slave) & (ICANON | ECHO), static_cast<tcflag_t>(ICANON | ECHO));
+  ::close(raw.master);
+  ::close(raw.slave);
+
+  Dial line = dial(false);
+  BOOST_REQUIRE(read(line.master, "ready\r\n", 10000).find("ready\r\n") != std::string::npos);
+  BOOST_REQUIRE_EQUAL(::write(line.master, "q", 1), 1);
+  BOOST_CHECK_EQUAL(read(line.master, "got", 1000), "q");          // the echo only
+  BOOST_REQUIRE_EQUAL(::write(line.master, "\r", 1), 1);
+  BOOST_CHECK(read(line.master, "]\r\n", 3000).find("got [q\r\n]") != std::string::npos);  // the line, at Enter
+  BOOST_CHECK_EQUAL(end(line), 130);
+  ::close(line.master);
+  ::close(line.slave);
+  killScript(pid);
 }
 
 BOOST_AUTO_TEST_CASE(UnknownInstanceExits2) {

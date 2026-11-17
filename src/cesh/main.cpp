@@ -799,7 +799,8 @@ int ceshRun(int argc, char* argv[]) {
   cmd_dial->footer("Opens a byte stream to the instance over /ces/lua/1: stdin to the program, "
                    "its output to stdout. The end of stdin closes the send side and drains the "
                    "channel. SIGINT and SIGTERM end it with exit 130 and 143. With --line, one "
-                   "line goes out and one reply line comes back.");
+                   "line goes out and one reply line comes back. On a terminal, a line goes out "
+                   "at Enter, and with --raw each key goes out at once.");
   uint64_t dial_instance_arg = 0;
   bool dial_verbose_arg = false;
   cmd_dial->add_option("pid", dial_instance_arg,
@@ -807,6 +808,10 @@ int ceshRun(int argc, char* argv[]) {
                        "or shown in `cesh compute ps`.")->required();
   cmd_dial->add_flag("-v,--verbose", dial_verbose_arg,
                      "Print one ATTACH-ok line to stderr on success.");
+  bool dial_raw_arg = false;
+  cmd_dial->add_flag("--raw", dial_raw_arg,
+                     "On a terminal: send each key at once, with no echo, and Enter as \\r. "
+                     "Ctrl+C still ends the dial, and the terminal comes back as it was.");
   std::string dial_line_arg;
   uint64_t dial_timeout_arg = 10000;
   cmd_dial->add_option("--line", dial_line_arg,
@@ -1530,6 +1535,7 @@ int ceshRun(int argc, char* argv[]) {
     da.pid  = dial_instance_arg;
     da.signerKey   = actorKey;
     da.verbose     = dial_verbose_arg;
+    da.raw         = dial_raw_arg;
     if (app.get_subcommand("dial")->count("--line") > 0) {
       // One line out, one line back: no stdin or stdout stream, and a time
       // limit, so a script (or cesh chat) can use it.
