@@ -11,9 +11,10 @@ Each command talks to one server. A server has two UDP ports:
 
 ## Select a server
 
-- `$CESH_SERVER`, or `--server host:port`. The default is `localhost:53830`.
+- `--server host:port`, else `$CESH_SERVER`. The default is `localhost:53830`.
   `cesh bootstrap` sets `CESH_SERVER` to the public server
-  `ces.pubcom.org:53830` in a new shell.
+  `ces.pubcom.org:53830` in a new shell. A `--server` on the command line
+  has priority over `$CESH_SERVER`.
 - The rpc port: the server announces it, and `file`, `compute`, `think` and
   `mail` use it. Give `--rpc-port N` only to use another port. `dial` needs
   `--rpc-port`.

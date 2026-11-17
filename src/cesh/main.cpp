@@ -918,11 +918,11 @@ int ceshRun(int argc, char* argv[]) {
 
   if (cmd_man->parsed()) return runMan(app, man_args);
 
-  // ---- Resolve server / proxy from env override ----
+  // ---- Resolve server / proxy: a flag on the command line, else the env ----
 
-  if (const char* e = std::getenv("CESH_SERVER"))
+  if (const char* e = std::getenv("CESH_SERVER"); e && app.get_option("--server")->count() == 0)
     server_arg = e;
-  if (const char* e = std::getenv("CESH_PROXY"))
+  if (const char* e = std::getenv("CESH_PROXY"); e && app.get_option("--proxy")->count() == 0)
     proxy_arg = e;
 
   if (cmd_chat->parsed())

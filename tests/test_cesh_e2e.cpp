@@ -320,6 +320,20 @@ BOOST_AUTO_TEST_CASE(PingSucceeds) {
   assertContains(r.out, "rpc_port=0");
 }
 
+// A --server on the command line has priority over $CESH_SERVER: the flag
+// is the choice of this one command.
+BOOST_AUTO_TEST_CASE(ServerFlagBeatsTheEnvironment) {
+  const std::string here = "localhost:" + std::to_string(serverPort);
+  auto flag = run(inTempDir("CESH_SERVER=127.0.0.1:1 " + ceshBin + " -l fatal --tries 1 --server " +
+                            here + " query " + fundedPubHex()));
+  BOOST_CHECK_EQUAL(flag.exitCode, 0);
+  assertContains(flag.out, "Balance");
+  auto env = run(inTempDir("CESH_SERVER=" + here + " " + ceshBin + " -l fatal --tries 1 query " +
+                           fundedPubHex()));
+  BOOST_CHECK_EQUAL(env.exitCode, 0);
+  assertContains(env.out, "Balance");
+}
+
 BOOST_AUTO_TEST_CASE(PingUnreachableServerReportsError) {
   // Point at a (hopefully) closed loopback UDP port. cesh will time out
   // and emit the parseable error shape.
