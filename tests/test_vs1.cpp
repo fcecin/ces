@@ -120,6 +120,10 @@ std::string pointer(uint8_t action, uint8_t button, uint16_t x, uint16_t y, uint
   return message(130, b);
 }
 
+std::string text(const std::string& t) {
+  return message(132, ces::Bytes(t.begin(), t.end()));
+}
+
 std::string focus(bool on, uint32_t time) {
   ces::Bytes b{uint8_t(on ? 1 : 0)};
   ces::Buffer::putLE<uint32_t>(b, time);
@@ -379,6 +383,8 @@ ces.conn.set_listener({ on_data = function(c, d)
       c:write('key ' .. e.action .. ' [' .. e.key .. '] ' .. mods .. ' ' .. e.time .. '\n')
     elseif e.type == 'pointer' then
       c:write('pointer ' .. e.action .. ' ' .. e.button .. ' ' .. e.x .. ' ' .. e.y .. ' ' .. e.time .. '\n')
+    elseif e.type == 'text' then
+      c:write('text [' .. e.text .. ']\n')
     else
       c:write('focus ' .. tostring(e.on) .. ' ' .. e.time .. '\n')
     end
@@ -390,7 +396,8 @@ ces.run()
   const std::string out = dial(pid, key(1, 1, 1000, "ArrowLeft") + key(3, 0, 1001, "a") +
                                     key(2, 2 | 8, 4294967295u, " ") + key(1, 4, 7, "\xc3\xa7") +
                                     pointer(1, 2, 0, 0, 8) + pointer(3, 0, 79, 24, 9) +
-                                    pointer(2, 1, 1, 2, 12) + focus(false, 10) + focus(true, 11));
+                                    pointer(2, 1, 1, 2, 12) + text("ls -l\n\xc3\xa7") + focus(false, 10) +
+                                    focus(true, 11));
   BOOST_CHECK_EQUAL(out,
                     "key down [ArrowLeft] S 1000\n"
                     "key repeat [a]  1001\n"
@@ -399,6 +406,7 @@ ces.run()
                     "pointer down 2 1 1 8\n"
                     "pointer move 0 80 25 9\n"
                     "pointer up 1 2 3 12\n"
+                    "text [ls -l\n\xc3\xa7]\n"
                     "focus false 10\n"
                     "focus true 11\n");
   kill(pid);

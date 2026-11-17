@@ -19,8 +19,9 @@
 -- Positions start at 1, writes stop at the right edge, and colors are
 -- 0xRRGGBB. Events are {type = "key", action = "down"|"up"|"repeat", key,
 -- time, shift, ctrl, alt, meta}, {type = "pointer", action =
--- "down"|"up"|"move", button, x, y, time} and {type = "focus", on, time}.
--- key is the browser's key name, and time is the viewer's clock in ms.
+-- "down"|"up"|"move", button, x, y, time}, {type = "focus", on, time} and
+-- {type = "text", text}. key is the browser's key name, and time is the
+-- viewer's clock in ms. A text event is a line or a paste.
 --
 --   local keys = vs1.keys(170, 50, function(conn, key) end)
 --   keys:feed(conn, e)                       -- each event
@@ -43,6 +44,7 @@
 --              8 meta][u32 time][name]
 --   130 pointer [u8 action 1 down 2 up 3 move][u8 button][u16 x][u16 y][u32 time]
 --   131 focus  [u8 on][u32 time]
+--   132 text   UTF-8, a line or a paste, with "\n" for Enter
 -- Positions in messages start at 0. A viewer message over 4096 bytes drops
 -- what VS1 holds from that viewer.
 local vs1 = {}
@@ -190,6 +192,8 @@ function vs1.events(conn, data)
         x = byte(b, 3) + byte(b, 4) * 256 + 1, y = byte(b, 5) + byte(b, 6) * 256 + 1, time = at32(b, 7)}
     elseif kind == 131 and n >= 5 then
       list[#list + 1] = {type = "focus", on = byte(b, 1) == 1, time = at32(b, 2)}
+    elseif kind == 132 then
+      list[#list + 1] = {type = "text", text = b}
     end
     i = i + 5 + n
   end
