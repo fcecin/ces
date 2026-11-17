@@ -14,6 +14,8 @@
 #include <CLI/CLI.hpp>
 #include <toml++/toml.hpp>
 
+#include <ces/util/server_key_file.h>
+
 #include <ces/cesco.h>
 #include <ces/webadmin.h>
 #include <ces/util/ctrlc.h>
@@ -76,6 +78,10 @@ port = )" << DEFAULT_PORT << R"(
 # real, usable key, not a shared placeholder. Replace it only if you already
 # have one (e.g. from ces --genkeypair).
 server_key = ")" << freshServerKey << R"("
+
+# Or keep the key out of this file: server_key_file names a file that holds
+# it, as the hex alone or as server_key = "<hex>". Set one of the two.
+# server_key_file = ""
 
 # Minimum proof-of-work difficulty: the per-solution hash floor. Higher
 # mints scarcer credit and costs more CPU per solution.
@@ -431,6 +437,7 @@ int main(int argc, char* argv[]) {
   int optTaskThreads = defaultOptTaskThreads;
   if (optTaskThreads < 1) optTaskThreads = 1;
   std::string optConfigFile;
+  std::string optServerKeyFile;
   std::string optServerName;
   uint64_t optPeerTarget = DEFAULT_PEER_TARGET;
   uint64_t optPeerPowInboundReciprocationBps = DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS;
@@ -538,6 +545,9 @@ int main(int argc, char* argv[]) {
     app.add_option("-k,--serverkey", optServerPrivKey,
       "Server key (32-byte hex)")
       ->default_val(DEFAULT_PRIV_KEY_HEX_STR);
+    app.add_option("--serverkeyfile", optServerKeyFile,
+      "File that holds the server key: the hex alone, or server_key = \"<hex>\"")
+      ->default_val("");
     app.add_option("--minacc", optMinAcc,
       "Reserved account DB store capacity")
       ->default_val(std::to_string(DEFAULT_MIN_ACC));
@@ -878,6 +888,11 @@ int main(int argc, char* argv[]) {
       applyIfDefault("data_dir", optDataDir, "--datadir");
       applyIfDefault("port", optServerPort, "--port");
       applyIfDefault("server_key", optServerPrivKey, "--serverkey");
+      applyIfDefault("server_key_file", optServerKeyFile, "--serverkeyfile");
+      if (tbl["server_key"] && tbl["server_key_file"]) {
+        std::cerr << "Error: the config sets server_key and server_key_file. Keep one.\n";
+        return 1;
+      }
       applyIfDefault("min_difficulty", optMinDiff, "--mindiff");
       applyIfDefault("pow_delay", optPoWDelay, "--powdelay");
       applyIfDefault("spend_slot_size", optSpendSlotSize, "--spendslotsize");
@@ -1114,6 +1129,15 @@ int main(int argc, char* argv[]) {
   }
 
   LOGINFO << "ces start" << VAL("version", CES_GIT_HASH);
+
+  // The key file gives the key, unless -k gives it on the command line.
+  if (!optServerKeyFile.empty() && app["--serverkey"]->count() == 0) {
+    optServerPrivKey = ces::readServerKeyFile(optServerKeyFile);
+    if (optServerPrivKey.empty()) {
+      std::cerr << "Error: no server key in server_key_file " << optServerKeyFile << "\n";
+      return 1;
+    }
+  }
 
   minx::Hash serverPrivKey;
   if (optServerPrivKey.size() != 64) {

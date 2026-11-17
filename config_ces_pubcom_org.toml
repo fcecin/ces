@@ -1,6 +1,6 @@
 # config_ces_pubcom_org.toml -- the live config for the public CES node
-# (ces.pubcom.org). It carries no private key: server_key is left unset and
-# provided at launch with -k, so no key ever sits in this committed file.
+# (ces.pubcom.org). It carries no private key: server_key_file names the file
+# on the box that holds it.
 #
 # Seeded from `ces --config` (every current option at its default); comments
 # mark only the values this node overrides, with why.
@@ -9,10 +9,9 @@ log_level = "info"
 data_dir = "./data"
 port = 53830
 
-# server_key is intentionally unset so no key is committed. Provide the real key
-# at launch with -k. Without it, ces uses the well-known sample key and logs a
-# loud boot warning (it will not silently run a real key).
-# server_key = "<provide with -k>"
+# The server key is in private-key-config.toml on the box (mode 600), never in
+# this file.
+server_key_file = "./private-key-config.toml"
 
 # Public address advertised to peers for discovery.
 server_name = "ces.pubcom.org:53830"
