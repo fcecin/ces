@@ -233,6 +233,18 @@ BOOST_AUTO_TEST_CASE(KeysGenSaveAndLoad) {
   assertContains(r2.out, "[@0]");
 }
 
+// -w with a bare file name saves in the current directory.
+BOOST_AUTO_TEST_CASE(KeysGenSavesABareFileName) {
+  auto r = run(cmdNoWallet("keys gen -w bare_wallet.dat"));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "Saved wallet to bare_wallet.dat");
+  BOOST_CHECK(fs::exists(tempDir / "bare_wallet.dat"));
+
+  auto fresh = run(cmd("keys gen -w bare_fresh.dat"));
+  BOOST_CHECK_EQUAL(fresh.exitCode, 0);
+  BOOST_CHECK(fs::exists(tempDir / "bare_fresh.dat"));
+}
+
 BOOST_AUTO_TEST_CASE(KeysGenNoSaveWarns) {
   auto r = run(cmd("keys gen"));
   BOOST_CHECK_EQUAL(r.exitCode, 0);
