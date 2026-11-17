@@ -38,6 +38,7 @@
 --   1 mode     [u8 1][u16 cols][u16 rows], all cells a space, 0xaaaaaa on 0
 --   2 frame    runs of [u16 x][u16 y][u16 n] and n x [u32 code][u24 fg][u24 bg]
 --   3 title    UTF-8
+--   128 keepalive  no body, skipped
 --   129 key    [u8 action 1 down 2 up 3 repeat][u8 mods 1 shift 2 ctrl 4 alt
 --              8 meta][u32 time][name]
 --   130 pointer [u8 action 1 down 2 up 3 move][u8 button][u16 x][u16 y][u32 time]

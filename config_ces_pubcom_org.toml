@@ -130,7 +130,7 @@ max_channels_per_peer = 4
 max_reorder_bytes_per_channel = -1
 max_reorder_msgs_per_channel = -1
 # Long idle window for interactive dial terminals (humans pause between commands).
-channel_idle_secs = 180
+channel_idle_secs = 600
 
 # Autolaunched /s/ extensions (their .lua sources live in the file store's /s/ zone).
 [extension]
