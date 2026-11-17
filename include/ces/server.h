@@ -574,20 +574,21 @@ struct CesConfig {
   uint16_t    thinkSubsidyFloorBp = 10000;
 
   // L2 compute program UDP port range: [computePortBase, computePortBase
-  // + computePortCount - 1]. Each launched child binds its outbound CES
-  // client to a port the server allocates statically from this range. The
+  // + computePortCount - 1]. Each launched child gets two ports that the
+  // server allocates statically from this range: one for its outbound CES
+  // client and one for its inbound CesPlex host (/ces/luarpc/1). The
   // child never picks its own (ephemeral) port: a firewalled L2 host opens
   // only known ports, and an OS-assigned egress port is neither reachable
   // nor configurable. The server owns the whole lifecycle — it tracks
-  // which ports are free, assigns one at LAUNCH, hands it to the child in
-  // the bootstrap frame, and frees it when the instance dies. Port
+  // which ports are free, assigns them at LAUNCH, hands them to the child in
+  // the bootstrap frame, and frees them when the instance dies. Port
   // allocation is best-effort: a spent range leaves the instance with port
   // 0 (local-only), but the LAUNCH still succeeds — the instance stays
   // reachable via the server's own rpc port (/ces/lua/1 relay).
   //
   // Base and count are independent of computeMaxInstances on purpose:
   // ports and instance slots are orthogonal resources. Size the range to
-  // your firewall opening; a count below computeMaxInstances simply means
+  // your firewall opening; a count below 2 x computeMaxInstances means
   // the instances past the range run local-only (no outbound network).
   //
   // computePortBase == 0 = no range: instances launch local-only — their

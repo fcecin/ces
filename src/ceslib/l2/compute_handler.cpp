@@ -508,9 +508,10 @@ inline std::size_t launchSlotsInUse(ComputeHandler& H) {
   return n;
 }
 
-// L2 compute program port allocator. Each running instance gets one UDP
-// port for its child's outbound CES client, claimed from the configured
-// range [computePortBase, computePortBase + computePortCount - 1]. The
+// L2 compute program port allocator. Each running instance gets two UDP
+// ports from the configured range [computePortBase, computePortBase +
+// computePortCount - 1]: one for its child's outbound CES client and one
+// for its inbound CesPlex host (/ces/luarpc/1). The
 // server owns the whole lifecycle — no child picks its own port — so a
 // firewalled L2 host can open exactly this range. Strand-only (rpcTaskIO_).
 //

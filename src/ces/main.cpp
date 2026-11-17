@@ -242,14 +242,15 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # compute_max_instances    = 0
 #
 # L2 compute program UDP port range: [compute_port_base,
-# compute_port_base + compute_port_count - 1]. Each instance binds its
-# outbound CES client to a server-assigned port from this range — the
-# child never picks an ephemeral port (a firewalled L2 host opens only
-# known ports). Base and count are independent of compute_max_instances;
-# open exactly [base, base+count-1] at the firewall to match. base = 0 =
-# no range: instances run local-only and their outbound network verbs
-# fail with "networking disabled". An exhausted range is NOT a launch
-# failure — those instances just run local-only too.
+# compute_port_base + compute_port_count - 1]. Each instance gets two
+# server-assigned ports from this range, for its outbound CES client and
+# its inbound CesPlex host. The child never picks an ephemeral port (a
+# firewalled L2 host opens only known ports). Base and count are
+# independent of compute_max_instances: 2 x compute_max_instances ports
+# serve every instance. Open exactly [base, base+count-1] at the firewall
+# to match. base = 0 = no range: instances run local-only and their
+# outbound network verbs fail with "networking disabled". An exhausted
+# range is NOT a launch failure — those instances just run local-only too.
 # compute_port_base        = 0
 # compute_port_count       = 0
 #
