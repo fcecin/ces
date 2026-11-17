@@ -73,15 +73,16 @@ ces.run()
 - `conn.id` is a number that no other connection of the program has.
   `conn.pubkey` is the key of the person (32 raw bytes).
 
-The bytes are those of a terminal. The program writes text and the escape
-codes of a terminal (ECMA-48, as xterm reads them). For example,
-`ESC[<row>;<col>H` moves the cursor, `ESC[2J` clears the screen, `ESC[1;33m`
-sets bold yellow, `ESC[0m` sets the colors back, and `ESC[?25l` hides the
-cursor. In Lua, ESC is `"\27"`. A key comes as the bytes that a terminal
-sends: a letter as itself, Enter as `"\r"`, and the arrow keys as
-`ESC[A`, `ESC[B`, `ESC[C` and `ESC[D` (up, down, right, left). One
-`on_data` can carry several keys, or a part of one. A program that moves
-things on its own clock, such as a game, uses `ces.every(ms, fn)`.
+The program and the side that dials agree on what the bytes mean. On a
+terminal (`cesh dial`), they are text and the escape codes of a terminal
+(ECMA-48, as xterm reads them): `ESC[<row>;<col>H` moves the cursor,
+`ESC[2J` clears the screen, and `ESC[1;33m` sets bold yellow. In Lua, ESC
+is `"\27"`. A key comes as the bytes that the terminal sends: a letter as
+itself, Enter as `"\r"`, and the arrow keys as `ESC[A`, `ESC[B`, `ESC[C`
+and `ESC[D` (up, down, right, left). A site can read the bytes in its own
+way. One `on_data` can carry several keys, or a part of one. A program
+that moves things on its own clock, such as a game, uses
+`ces.every(ms, fn)`.
 
 ## Money
 
