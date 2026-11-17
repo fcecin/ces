@@ -97,11 +97,15 @@ constexpr uint16_t METHOD_PEER_BAN         = 0x0237;
 constexpr uint16_t METHOD_SERVER_SIGN      = 0x0238;
 constexpr uint16_t METHOD_SERVER_INFO      = 0x0239;
 constexpr uint16_t METHOD_THINK            = 0x0240;  // ces.think
+constexpr uint16_t METHOD_LOAD             = 0x0241;  // ces.load
 
 constexpr uint8_t STATUS_OK               = 0x00;
 constexpr uint8_t STATUS_NOT_CONNECTED    = 0x01;
 constexpr uint8_t STATUS_INSUFFICIENT_BAL = 0x02;
+constexpr uint8_t STATUS_DENIED           = 0x03;
 constexpr uint8_t STATUS_BUCKET_FULL      = 0x04;
+constexpr uint8_t STATUS_NOT_FOUND        = 0x05;  // no such loadable
+constexpr uint8_t STATUS_TOO_BIG          = 0x06;  // loadable over kLoadableMaxBytes
 constexpr uint8_t STATUS_INTERNAL         = 0xFF;
 
 // Byte widths of fixed wire fields shared with the host. This TU has no

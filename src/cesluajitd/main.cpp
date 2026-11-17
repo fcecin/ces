@@ -100,6 +100,7 @@ extern "C" {
 #include <ces/keys.h>
 #include <ces/l2/compute_client.h>
 #include <ces/l2/file_client.h>
+#include <ces/l2/loadable.h>
 #include <ces/l2/think_client.h>
 #include <ces/protocol.h>
 #include <ces/types.h>

@@ -770,8 +770,78 @@ void install_ces_err_table(lua_State* L) {
   lua_setfield(L, -2, "err");   // ces.err = {...}  (ces table is at -2)
 }
 
+// The fetch of ces.load. Blocks, also in a task, and returns the compiled
+// file or nil and the reason.
+int lua_ces_load_fetch(lua_State* L) {
+  size_t n = 0;
+  const char* p = luaL_checklstring(L, 1, &n);
+  const std::string path(p, n);
+  auto fail = [L](const std::string& why) {
+    lua_pushnil(L);
+    lua_pushlstring(L, why.data(), why.size());
+    return 2;
+  };
+  if (!ces::isLoadablePath(path)) return fail("not a path of a loadable: " + path);
+  std::vector<uint8_t> args;
+  put_u16(args, static_cast<uint16_t>(n));
+  args.insert(args.end(), path.begin(), path.end());
+  Frame reply;
+  uint16_t corr = send_api_call(METHOD_LOAD, args);
+  if (corr == 0 || !wait_for_reply(corr, reply) || reply.body.empty())
+    return fail("no reply from the server for " + path);
+  if (reply.body[0] == STATUS_NOT_FOUND) return fail("no loadable " + path);
+  if (reply.body[0] == STATUS_TOO_BIG)
+    return fail(path + " is bigger than " + std::to_string(ces::kLoadableMaxBytes) + " bytes");
+  if (reply.body[0] != STATUS_OK) return fail("the server cannot read " + path);
+  const char* src = reinterpret_cast<const char*>(reply.body.data() + 1);
+  const size_t len = reply.body.size() - 1;
+  if (len > 0 && static_cast<unsigned char>(src[0]) == 0x1b)
+    return fail(path + " is bytecode, not Lua text");
+  const std::string chunk = "=" + path;
+  if (luaL_loadbufferx(L, src, len, chunk.c_str(), "t") != 0) {
+    lua_pushnil(L);
+    lua_insert(L, -2);                           // nil, then the compile error
+    return 2;
+  }
+  return 1;
+}
+
+// ces.load(path) runs a loadable once and returns its value, or true for nil.
+static const char kLoadLua[] =
+  "local fetch, done, loading = ...\n"
+  "local error, pcall, type = error, pcall, type\n"
+  "return function(path)\n"
+  "  if type(path) ~= 'string' then error('ces.load: the path is not a string', 2) end\n"
+  "  local v = done[path]\n"
+  "  if v == loading then\n"
+  "    error('ces.load: ' .. path .. ' is loading', 2)\n"
+  "  end\n"
+  "  if v ~= nil then return v end\n"
+  "  done[path] = loading\n"
+  "  local got, fn, err = pcall(fetch, path)\n"
+  "  if not (got and fn) then\n"
+  "    done[path] = nil\n"
+  "    error('ces.load: ' .. tostring(got and err or fn), 2)\n"
+  "  end\n"
+  "  local ok, r = pcall(fn)\n"
+  "  if not ok then done[path] = nil; error(r, 0) end\n"
+  "  if r == nil then r = true end\n"
+  "  done[path] = r\n"
+  "  return r\n"
+  "end\n";
+
 void install_ces_api(lua_State* L) {
   lua_newtable(L);
+  if (luaL_loadbufferx(L, kLoadLua, sizeof kLoadLua - 1, "=ces.load", "t") != 0) {
+    host_log(4, std::string("ces.load: ") + lua_err_str(L));
+    lua_pop(L, 1);
+  } else {
+    lua_pushcfunction(L, guarded<lua_ces_load_fetch>);
+    lua_newtable(L);                             // done: path -> what it returned
+    lua_newtable(L);                             // the mark of a load in progress
+    lua_call(L, 3, 1);
+    lua_setfield(L, -2, "load");
+  }
   lua_pushcfunction(L, guarded<lua_ces_now>);           lua_setfield(L, -2, "now");
   lua_pushcfunction(L, guarded<lua_ces_sha256>);        lua_setfield(L, -2, "sha256");
   lua_pushcfunction(L, guarded<lua_ces_log>);           lua_setfield(L, -2, "log");

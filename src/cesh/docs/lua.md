@@ -42,6 +42,7 @@ ces.run()
 | `ces.every(ms, fn)` | Run `fn` again and again |
 | `ces.now()` | Time in microseconds |
 | `ces.on_error(fn)` | Get each error of the program, with `fn(message)` in a task of its own |
+| `ces.load(path)` | Run a loadable of the server one time, and get its value |
 | `ces.exit()` | End the program now |
 
 A call that waits (`think`, `transfer`, `sleep`) runs inside `on_l2call` or
@@ -94,6 +95,21 @@ in the first run. `fn(message)` runs in a task of its own, and the program
 goes on. With no handler an error ends the program, and a program of the
 server logs it. An error in the handler, a compile error and running out of
 memory end the program.
+
+## Loadables
+
+A loadable is a Lua file under `/s/loadables/` on the server.
+`ces.load(path)` runs it and returns its value, and later calls return the
+same value.
+
+```lua
+local vs1 = ces.load("vs1/vs1.lua")
+```
+
+The path is relative to `/s/loadables/`. The call waits for the server, so
+load at the top of the program. `vs1/vs1.lua` is VS1, screens of character
+cells for programs that people dial, and its docs are at the top of the file
+(`cesh file get /s/loadables/vs1/vs1.lua`).
 
 ## Money
 

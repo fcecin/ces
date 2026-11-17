@@ -47,6 +47,7 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/compute_lua_handler.h>
 #include <ces/l2/file_handler.h>
+#include <ces/l2/loadable.h>
 #include <ces/l2/mail_handler.h>
 #include <ces/l2/peer_handler.h>
 #include <ces/l2/think_handler.h>
@@ -264,6 +265,8 @@ constexpr uint16_t kApiMethodServerSign    = 0x0238;
 // billed to its program account. Args: [u32 len][prompt] then optionally
 // [u16 pathLen][path]. Reply: [u8 CES status][u64 charged][u8 appendError].
 constexpr uint16_t kApiMethodThink         = 0x0240;
+// ces.load(path). Body [u16 len][path], reply [u8 status][file].
+constexpr uint16_t kApiMethodLoad          = 0x0241;
 
 // Authentic-asset content layout (a compute-SDK concept, opaque to the
 // server): first 32 bytes are the program-identity hash
@@ -298,6 +301,8 @@ constexpr uint8_t kApiStatusNotConnected  = 0x01;
 constexpr uint8_t kApiStatusInsufficient  = 0x02;
 constexpr uint8_t kApiStatusDenied        = 0x03;  // privileged API, non-/s/ caller
 constexpr uint8_t kApiStatusBucketFull    = 0x04;  // bucket at capacity, put refused
+constexpr uint8_t kApiStatusNotFound      = 0x05;  // no such loadable
+constexpr uint8_t kApiStatusTooBig        = 0x06;  // loadable over kLoadableMaxBytes
 constexpr uint8_t kApiStatusInternal      = 0xFF;
 
 constexpr uint32_t kIpcMaxFrameLen = 2 * 1024 * 1024;   // 2 MB safety cap
@@ -2036,6 +2041,33 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       ces::Buffer::put<uint64_t>(body, p.totalOutboundPoW);
     }
     sendApiReplyWithBody(inst, corr_id, kApiStatusOk, body);
+    return;
+  }
+
+  // ces.load(path) -> the file at kLoadablesDir/path.
+  if (method == kApiMethodLoad) {
+    if (mlen < 2) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    uint16_t n = ces::Buffer::peek<uint16_t>(mbody);
+    if (mlen < 2u + n) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    std::string_view path(reinterpret_cast<const char*>(mbody + 2), n);
+    CesServer* server = inst->owner->server_;
+    if (!server) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    if (!ces::isLoadablePath(path)) { sendApiReply(inst, corr_id, kApiStatusDenied); return; }
+    std::error_code ec;
+    const std::filesystem::path file =
+      std::filesystem::path(server->_config().cesFileStoreDir) / ces::kLoadablesDir / path;
+    if (!std::filesystem::is_regular_file(file, ec)) {
+      sendApiReply(inst, corr_id, kApiStatusNotFound); return;
+    }
+    const uintmax_t size = std::filesystem::file_size(file, ec);
+    if (ec) { sendApiReply(inst, corr_id, kApiStatusInternal); return; }
+    if (size > ces::kLoadableMaxBytes) { sendApiReply(inst, corr_id, kApiStatusTooBig); return; }
+    ces::Bytes text(static_cast<size_t>(size));
+    std::ifstream f(file, std::ios::binary);
+    if (!f.read(reinterpret_cast<char*>(text.data()), static_cast<std::streamsize>(size))) {
+      sendApiReply(inst, corr_id, kApiStatusInternal); return;
+    }
+    sendApiReplyWithBody(inst, corr_id, kApiStatusOk, text);
     return;
   }
 

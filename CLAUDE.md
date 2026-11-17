@@ -89,6 +89,9 @@ extensions/         committed catalog of operator-deployable /s/ Lua
                     discovery.md); the default extensions_dir. Install
                     copies one into a server's /s/. discovery.lua is a
                     built cesdk bundle (source: cesdk apps/discovery).
+loadables/          Lua files that programs run with `ces.load(path)`
+                    (vs1/vs1.lua). Deployed by hand into
+                    <storeDir>/s/loadables/. See loadables/README.md.
 tests/              Boost.Test suites compiled into one cestests binary
                     (filter by suite name). test_common.h = CesFixture
                     (in-process server+client, 10B prefunded).
@@ -282,6 +285,8 @@ Coroutine contexts (calls yield; the VM keeps serving others): `ces.spawn(fn)`; 
 `ces.sleep(ms)` (coroutine only) parks for `ms`; `ces.sleep(0)` is the voluntary yield (return to the run loop, service pending inbound, resume).
 
 `ces.on_error(fn)` sets the error handler. Errors in tasks and in the main chunk go to `fn(message)` in a new task, and the program goes on. With no handler the program ends (`uncaught:` in the log of a /s/ program), and an error in the handler, a compile error or out of memory end it too. Tests: `CeshDialE2E/AHandlerKeepsAProgram`.
+
+`ces.load(path)` runs `/s/loadables/<path>` once per program and returns its value. The child sends `kApiMethodLoad` and blocks for the reply, also in a task. The supervisor checks the path (`l2/loadable.h`) and reads at most `kLoadableMaxBytes` from disk. Tests: `LoadableTests`, `LoadableE2E`, `Vs1E2E`.
 
 `ces.exit()` ends the instance at once, from any context, and does not return. A `pcall` cannot catch it. The process sends the channel usage that it has queued (`flush_net_usage`) and calls `_exit(0)`. The server sees the IPC socket close and removes the instance. Files and balances do not change. Without it, `ces.run()` returns only when the IPC socket dies, so a program stops only when its balance is gone or its owner kills it. Tests: `ComputeLuaTests/Exit_*`.
 
