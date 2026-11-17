@@ -29,6 +29,17 @@ endif()
 # E2E tests need the binaries they shell out to, plus the compute
 # child stub (the handler fork+execs cescompmockd).
 add_dependencies(cestests cesh cesc cesproxy cescompmockd cesluajitd)
+# The ceshd wire tests use its client side (src/ceshd/ceshd.cpp). The E2E
+# tests start ceshd, so they build only when ceshd builds (CES_CESHD).
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_sources(cestests PRIVATE ${CMAKE_SOURCE_DIR}/src/ceshd/ceshd.cpp)
+  target_include_directories(cestests PRIVATE ${CMAKE_SOURCE_DIR}/src/ceshd)
+  if(TARGET ceshd)
+    add_dependencies(cestests ceshd)
+    target_sources(cestests PRIVATE ${CMAKE_SOURCE_DIR}/src/ceshd/jail.cpp)
+    target_compile_definitions(cestests PRIVATE CES_CESHD=1)
+  endif()
+endif()
 if(Qt6_FOUND)
   add_dependencies(cestests cesqt)
 endif()

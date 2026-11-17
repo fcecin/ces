@@ -271,6 +271,31 @@ target_link_libraries(cesh PRIVATE ceshcore)
 target_link_options(cesh PRIVATE "-Wl,-z,noexecstack")
 set_target_properties(cesh PROPERTIES OUTPUT_NAME "cesh")
 
+# ceshd runs cesh commands for many people. A request carries the cesh
+# environment (the wallet, a server), the arguments, and the stdin, stdout
+# and stderr of the command. A confined child runs the command through
+# ceshcore (src/ceshd/ceshd.h). It needs Linux: Landlock, pidfd and
+# close_range. The jail needs the Landlock TCP rules (ABI 4, Linux 6.7) in
+# the kernel headers. With older headers the build skips ceshd.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles("
+    #include <linux/landlock.h>
+    int main() {
+      landlock_ruleset_attr a{};
+      a.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP | LANDLOCK_ACCESS_NET_CONNECT_TCP;
+      return a.handled_access_net == 0;
+    }" CES_LANDLOCK_TCP)
+  if(CES_LANDLOCK_TCP)
+    add_executable(ceshd src/ceshd/main.cpp src/ceshd/ceshd.cpp src/ceshd/jail.cpp)
+    target_link_libraries(ceshd PRIVATE ceshcore)
+    target_link_options(ceshd PRIVATE "-Wl,-z,noexecstack")
+    set_target_properties(ceshd PROPERTIES OUTPUT_NAME "ceshd")
+  else()
+    message(STATUS "ceshd: not built, the kernel headers have no Landlock TCP rules (Linux 6.7)")
+  endif()
+endif()
+
 file(GLOB CESBENCH_CPP "src/cesbench/*.cpp")
 add_executable(cesbench ${CESBENCH_CPP})
 target_link_libraries(cesbench PRIVATE ceslib CLI11::CLI11)
