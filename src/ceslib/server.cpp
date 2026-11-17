@@ -1362,7 +1362,7 @@ uint16_t CesServer::start(uint16_t serverPort) {
   dailyTaskStartTimer();
   replyStartTimer();
   cronStartTimer();
-  // Top up the server's own account to near-INT64_MAX. Runs once
+  // Set the server's own account to 2^46 raw units. Runs once
   // per boot, before any other strand work that might read or
   // mutate account state. See topUpServerAccount() for rationale.
   postLogic( [this]() { topUpServerAccount(); });

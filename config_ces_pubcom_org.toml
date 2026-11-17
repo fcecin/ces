@@ -25,17 +25,18 @@ pow_delay = 120
 
 spend_slot_size = 3600
 no_pow_engine = false
-cache_only_pow = false
+# Verify with the RandomX cache (about 256 MB), not the full dataset (about
+# 2.5 GB). Other CES servers share this box.
+cache_only_pow = true
 
 # Pinned to a fixed value (not auto-derived from the host core count).
-threads = 4
+threads = 2
 
-# Capacity for a large-RAM node: 2^26 accounts (~4.9 GB) / 2^23 assets
-# (~2.4 GB), reserving 2^20 of each at boot.
-min_accounts = 1048576
-max_accounts = 67108864
-min_assets = 1048576
-max_assets = 8388608
+# 2^22 accounts and 2^20 assets at most, with 2^16 of each reserved at boot.
+min_accounts = 65536
+max_accounts = 4194304
+min_assets = 65536
+max_assets = 1048576
 
 # Batch writes under production load instead of flushing every change.
 flush_value = 10000
@@ -56,6 +57,7 @@ peer_target = 0
 peer_pow_inbound_reciprocation_bps = 10000
 
 max_peer_reserve_disturbance = 100000
+settlement_max_retries = 7
 gossip_fanout_degree = 6
 
 # Enable the CesPlex / L2 stack (file/lua/compute/peer) + SYS_RPC on this UDP
@@ -70,8 +72,8 @@ rpc_response_timeout_ms = 30000
 rpc_rudp_bytes_per_second = 4294967295
 rpc_rudp_burst_bytes = 4294967295
 
-# 256 MiB metered user storage (/h/ /f/ /p/); /s/ is unmetered and always served.
-file_store_max_bytes = 268435456
+# 40 GiB metered user storage (/h/ /f/ /p/); /s/ is unmetered and always served.
+file_store_max_bytes = 42949672960
 file_store_dir = ""
 # Extension catalog for the dashboard's install button (deployed next to ces).
 extensions_dir = "./extensions"
@@ -81,10 +83,14 @@ fee_file_rent = -1
 fee_file_write = -1
 fee_file_read = -1
 
-# Compute on: 4 concurrent Lua instances (resource cap ~1 GB RAM, ~2 cores
-# worst-case). The child binary is auto-discovered next to ces.
-compute_max_instances = 4
+# Compute on: 24 Lua instances of at most 256 MiB each (6 GiB at most). The
+# extensions run under the same limit and reach about 210 MB of address
+# space. The child binary is auto-discovered next to ces.
+compute_max_instances = 24
+compute_process_mem_max = 268435456
 # A fixed UDP range for instance ports, so a firewall can open exactly these.
+# Each instance and each extension takes two ports (its client and its rpc
+# host).
 compute_port_base = 53900
 compute_port_count = 100
 
@@ -107,6 +113,7 @@ think_fee_cached_in   = 12000000000
 think_fee_out         = 2400000000000
 think_max_out_tokens  = 4096
 think_max_input_bytes = 1048576
+think_context_tokens  = 131072    # ceiling on the model's window told to callers (128K)
 think_timeout_secs    = 300
 think_max_concurrent  = 8
 # Global subsidy: up to 99.99% off while nobody thinks. Worst case 2000
@@ -140,3 +147,22 @@ peerfunder = 1
 monitor = 1
 cwb = 1
 vellum = 1
+
+# The fc network on this box (fc/deploy/README.md): its ledger and the
+# network servers net1 to net4. The reserve of a peer here is the trust of
+# this server in that peer.
+[[peers]]
+key = "b51a30d7fb6175a0e4be17dd06e8e67ba996cf95ffaf04068c8c9904bed3aad2"
+address = "ces.pubcom.org:54000"
+[[peers]]
+key = "a70b5835c697e0f74d1fd6e70aa7dddbef70e62c1ad9aee85f15666ed183bbea"
+address = "ces.pubcom.org:55000"
+[[peers]]
+key = "8975e245e8ebcacf20cf1dc6c2adcea6744b4c21e8e868cccfc76f470d63bab8"
+address = "ces.pubcom.org:56000"
+[[peers]]
+key = "fa0add8b6e55f3bb3d4bc724b15348bc3943a75282ea5d202f826b8e73ccde4e"
+address = "ces.pubcom.org:57000"
+[[peers]]
+key = "c787e64dff867d449b3a10f98905a9cadaff9c2993c06400b6b5c991c3ec1f8c"
+address = "ces.pubcom.org:58000"
