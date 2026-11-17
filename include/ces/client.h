@@ -21,11 +21,14 @@ namespace ces {
 
 class CesClient : public minx::MinxListener {
 public:
-  /** The Minx config of a client: a recv ring of CLIENT_RECV_BUFFERS. The
-   *  Minx default (DEFAULT_RECV_BUFFERS_SIZE, ~32MB allocated up front) is
-   *  sized for the inbound backlog of a server. A client has one or two
-   *  requests in flight. */
+  /** The Minx config of a client: a recv ring of CLIENT_RECV_BUFFERS and a
+   *  spam filter CLIENT_SPAM_FILTER_WIDTH wide. The Minx defaults are sized
+   *  for a server: a ring for an inbound backlog (DEFAULT_RECV_BUFFERS_SIZE,
+   *  ~32MB) and a filter for many addresses (DEFAULT_SPAM_FILTER_WIDTH,
+   *  ~12MB), both written up front. A client has one or two requests in
+   *  flight, to a few servers. */
   static constexpr size_t CLIENT_RECV_BUFFERS = 256;
+  static constexpr size_t CLIENT_SPAM_FILTER_WIDTH = 1024;
   static minx::MinxConfig clientConfig(const std::string& name = "cl");
 
   /** Construct in UDP mode (direct connection to server). A caller that

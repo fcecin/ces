@@ -54,6 +54,7 @@ CesClient::CesClient(const boost::asio::ip::tcp::endpoint& proxyEndpoint,
 minx::MinxConfig CesClient::clientConfig(const std::string& name) {
   minx::MinxConfig c{name};
   c.recvBuffersSize = CLIENT_RECV_BUFFERS;
+  c.spamFilterWidth = CLIENT_SPAM_FILTER_WIDTH;
   return c;
 }
 

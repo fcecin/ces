@@ -3,8 +3,8 @@
 // then costs `tries` waits, not `tries` squared. The test counts the
 // datagrams that reach a silent UDP socket, so it does not depend on time.
 //
-// The default recv ring of a CesClient is the small ring of a client, so many
-// clients in one process cost little.
+// The default config of a CesClient has the small recv ring and the narrow
+// spam filter of a client, so many clients in one process cost little.
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
@@ -71,16 +71,18 @@ BOOST_AUTO_TEST_CASE(Connect_SilentServer_SendsTriesGetInfos) {
 BOOST_AUTO_TEST_CASE(DefaultClient_HasSmallRecvRing) {
   BOOST_CHECK_LT(CesClient::clientConfig().recvBuffersSize,
                  minx::MinxConfig::DEFAULT_RECV_BUFFERS_SIZE);
+  BOOST_CHECK_LT(CesClient::clientConfig().spamFilterWidth,
+                 minx::MinxConfig::DEFAULT_SPAM_FILTER_WIDTH);
   auto rss = [] {
     std::ifstream f("/proc/self/statm");
     size_t pages = 0, resident = 0;
     f >> pages >> resident;
     return resident * static_cast<size_t>(sysconf(_SC_PAGESIZE));
   };
-  // Minx writes each buffer of the ring when it builds it. A server-sized
-  // ring is about 32MB for each client. Each Minx also writes its spam filter
-  // tables (about 12MB), so a client with the small ring grows about 12MB, and
-  // a client with the server-sized ring about 47MB.
+  // Minx writes each buffer of the ring and its spam filter tables when it
+  // builds them. A server-sized ring is about 32MB, and a server-sized filter
+  // about 12MB. A client with the small ring and the narrow filter grows
+  // about 1MB (the ring, and the stacks of its threads).
   constexpr size_t kClients = 16;
   const size_t before = rss();
   std::vector<std::unique_ptr<CesClient>> clients;
@@ -89,7 +91,7 @@ BOOST_AUTO_TEST_CASE(DefaultClient_HasSmallRecvRing) {
       asio::ip::udp::endpoint(asio::ip::address_v6::loopback(), 9), false));
   const size_t after = rss();
   const size_t grew = after > before ? after - before : 0;
-  BOOST_CHECK_LT(grew, kClients * 24 * 1024 * 1024);
+  BOOST_CHECK_LT(grew, kClients * 4 * 1024 * 1024);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
