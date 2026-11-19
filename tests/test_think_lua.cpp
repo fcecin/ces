@@ -55,7 +55,7 @@ struct LuaScriptBackend : ThinkBackend {
   std::atomic<bool> block{false};
   std::atomic<bool> release{false};
   std::atomic<bool> entered{false};
-  ThinkOutcome run(const std::string&, uint32_t,
+  ThinkOutcome run(const ThinkInput&, uint32_t,
                    const std::atomic<bool>& stop,
                    const std::function<bool(std::string_view)>& onText)
       override {

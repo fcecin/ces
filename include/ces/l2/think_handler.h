@@ -1,16 +1,15 @@
-// think_handler.h - builtin:think, text in, text out.
+// think_handler.h - builtin:think, the language model of a server.
 //
-// Two front doors share one core (submit): the THINK verb on /ces/think/1,
-// paid by the bound signer, and the ces.think host call from a compute
-// instance, paid by the file's program account. The caller of submit names
-// the payer, and each front door takes it from an authenticated source (the
-// bind signature, or the server's own instance record), never from the
-// request.
+// Three callers use submit. The THINK and CHAT verbs on /ces/think/1 bill the
+// bound signer. The ces.think host call of a compute instance bills the
+// program account of its file. Each caller takes the payer from an
+// authenticated source (the bind signature, or the instance record of the
+// server), and never from the request.
 //
-// A CesPlex handler with one verb (THINK). The signer sends one prompt text.
-// The server streams the reply text back as it arrives from the backend
-// model, then sends one status byte (0 = the reply is complete). The model,
-// its limits and its prices are server config. The client picks nothing.
+// THINK sends a prompt text. CHAT sends a chat request, with messages and the
+// tools that the model can call. The server streams the reply text as the
+// model writes it, then sends one status byte (0 = the reply is complete).
+// The server config sets the model, its limits and its prices.
 //
 // THINK request: preamble (after nonce) [u32 textLen][32 sha256(text)]
 // [u16 pathLen][path], body = the text (UTF-8). The path is optional
@@ -29,8 +28,17 @@
 // the report only when it is there. On an error the preamble is empty and
 // the frames before it (if any) are a partial reply.
 //
-// The backend API is stateless, so a conversation is text. With a file the
-// server keeps it: the caller sends only the new part, and the server sends
+// CHAT request: preamble (after nonce) [u32 len][32 sha256(body)][u8 flags],
+// body = a chat request (JSON, see thinkChatCheck). The flags are those of
+// THINK. CHAT has no conversation file, so the caller sends all the messages
+// each time. The reply is the THINK reply. On CES_OK the preamble then has
+// [u32 len][JSON], after the report if the caller asked for it. The JSON
+// (thinkChatEndJson) holds the tool calls, the reasoning and the finish
+// reason, and the server signature covers it. A server older than CHAT drops
+// the channel at the unknown verb, and charges nothing.
+//
+// The backend API is stateless, so a THINK conversation is text. With a file
+// the server keeps it: the caller sends only the new part, and the server sends
 // the backend the file's content plus that part, then appends the part and
 // the reply. Without a file the caller sends the whole transcript. The
 // backend's prompt cache bills a repeated long prefix at the cached price.
@@ -122,6 +130,9 @@ class ThinkSink {
   // backend reported nothing), and the limits of the server. A sink that has
   // no use for it ignores it.
   virtual void report(const ThinkReport&) {}
+  // Called once in a chat call, after report and before finish, with the
+  // tool calls, the reasoning and the finish reason of the reply.
+  virtual void chatEnd(const ThinkChatEnd&) {}
 };
 
 // A call's conversation file. The file's content goes before the prompt.
@@ -183,7 +194,8 @@ class ThinkHandler : public CesPlexHandler {
 
   // Run one call billed to `payer`: check, hold, call the backend on a
   // worker thread, settle. Every outcome, refusals included, ends in one
-  // sink->finish. The caller decides who `payer` is and must have
+  // sink->finish. A chat input with a file, or with a request that
+  // thinkChatCheck refuses, gets CES_ERROR_BAD_INPUT. The caller decides who `payer` is and must have
   // authenticated it: the bound signer for THINK, the instance's program
   // account for ces.think.
   // With a file that the caller owns, at most one call runs on a path at a
@@ -191,7 +203,7 @@ class ThinkHandler : public CesPlexHandler {
   // the same transcript. A caller who does not own the file cannot append
   // to it, so its call takes no lock. The /m/ mail zone is refused
   // (NOT_OWNER), as on the wire.
-  void submit(const ThinkPayer& payer, std::string prompt,
+  void submit(const ThinkPayer& payer, ThinkInput input,
               std::shared_ptr<ThinkSink> sink, ThinkFile file = {});
 
  private:
@@ -203,11 +215,11 @@ class ThinkHandler : public CesPlexHandler {
   void reapLocked();   // join finished jobs; mu_ held
   // One call, on its worker thread.
   void run(Job& job, ThinkBackend& backend, const ThinkPayer& payer,
-           std::string prompt, const ThinkFile& file, ThinkSink& sink);
+           ThinkInput input, const ThinkFile& file, ThinkSink& sink);
   // The part of run() between the file read and the append: hold, backend,
   // settle. Sets `text`, `charge` and returns the outcome.
   ThinkOutcome callAndSettle(Job& job, ThinkBackend& backend,
-                             const ThinkPayer& payer, const std::string& input,
+                             const ThinkPayer& payer, const ThinkInput& input,
                              ThinkSink& sink, std::string& text,
                              uint64_t& charge);
 

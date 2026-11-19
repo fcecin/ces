@@ -123,7 +123,9 @@ asio::awaitable<void> exchange(Stream& s, const ThinkHttpsBackend::Impl& im,
     }
     if (c.parser.done() || c.stop->load()) break;
   }
-  c.out.outBytes = c.parser.textBytes() + c.parser.reasoningBytes();
+  c.out.outBytes = c.parser.textBytes() + c.parser.reasoningBytes() +
+                   c.parser.toolBytes();
+  c.out.chat = c.parser.chatEnd();
   if (c.parser.hasUsage()) {
     c.out.usage = c.parser.usage();
     c.out.billing = ThinkOutcome::kUsage;
@@ -275,7 +277,7 @@ ThinkHttpsBackend::ThinkHttpsBackend(ThinkHttpsConfig cfg)
 ThinkHttpsBackend::~ThinkHttpsBackend() = default;
 
 ThinkOutcome ThinkHttpsBackend::run(
-    const std::string& prompt, uint32_t maxOut, const std::atomic<bool>& stop,
+    const ThinkInput& input, uint32_t maxOut, const std::atomic<bool>& stop,
     const std::function<bool(std::string_view)>& onText) {
   ThinkOutcome fail;
   fail.status = CES_ERROR_DISABLED;
@@ -290,7 +292,7 @@ ThinkOutcome ThinkHttpsBackend::run(
       ioc,
       callAsync(*impl_, impl_->ctx.get(), deadline,
                 "Bearer " + cfg_.apiKey,
-                thinkRequestJson(cfg_.model, prompt, maxOut, cfg_.reasoning),
+                thinkRequestJson(cfg_.model, input, maxOut, cfg_.reasoning),
                 c),
       [&c, deadline](std::exception_ptr e) {
         c.finished = true;

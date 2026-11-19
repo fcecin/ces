@@ -1699,7 +1699,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
     payer.source = inst->sourceName;
     std::memcpy(payer.owner.data(), inst->ownerPk.data(), 32);
     th->submit(payer,
-               std::string(reinterpret_cast<const char*>(mbody + 4), plen),
+               ThinkInput{std::string(reinterpret_cast<const char*>(mbody + 4), plen)},
                std::make_shared<InstanceThinkSink>(
                    inst, corr_id, inst->peer->get_executor()),
                std::move(file));

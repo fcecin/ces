@@ -39,10 +39,11 @@ struct EchoBackend : ThinkBackend {
   std::mutex mu;
   std::string lastInput;
 
-  ThinkOutcome run(const std::string& input, uint32_t,
+  ThinkOutcome run(const ThinkInput& in, uint32_t,
                    const std::atomic<bool>& stop,
                    const std::function<bool(std::string_view)>& onText)
       override {
+    const std::string& input = in.text;
     ++calls;
     {
       std::lock_guard<std::mutex> lk(mu);

@@ -9,6 +9,8 @@
 #include "man/manual.h"
 #include "man/markdown.h"
 
+#include <boost/json.hpp>
+
 #include <termios.h>
 #include <unistd.h>
 
@@ -204,13 +206,14 @@ int runChat(const ChatArgs& args, ChatGlobals g) {
   Hooks hooks;
   // When the terminal UI runs, it shows the activity; the plain mode shows "…".
   auto uiOn = std::make_shared<bool>(false);
-  hooks.think = [=](const std::string& prompt) {
+  hooks.think = [=](const std::string& request) {
     if (styled && !*uiOn) std::cout << dim << "…" << off << "\r" << std::flush;
     auto a = globalArgs;
     a.push_back("think");
-    a.push_back("-v");   // the charge goes to stderr as "charged N"
+    a.push_back("--chat");   // stdout gets the content and the tool calls as one JSON object
+    a.push_back("-v");       // the charge goes to stderr as "charged N"
     a.push_back("--in");
-    a.push_back("text:" + prompt);
+    a.push_back("text:" + request);
     CeshResult r = ceshCapture(a);
     if (styled && !*uiOn) std::cout << "\x1b[2K\r" << std::flush;
     static const std::regex charged("charged ([0-9]+)");
@@ -229,8 +232,22 @@ int runChat(const ChatArgs& args, ChatGlobals g) {
       t.maxOutTokens = static_cast<uint32_t>(std::strtoul(m[3].str().c_str(), nullptr, 10));
     }
     t.ok = r.code == 0;
-    t.text = r.out;
     t.error = r.err.empty() ? "exit " + std::to_string(r.code) : r.err;
+    if (t.ok) {
+      boost::system::error_code ec;
+      boost::json::value v = boost::json::parse(r.out, ec);
+      const boost::json::object* o = !ec && v.is_object() ? &v.as_object() : nullptr;
+      auto text = [&](const char* k) {
+        const boost::json::value* x = o ? o->if_contains(k) : nullptr;
+        return x && x->is_string() ? std::string(x->as_string()) : std::string();
+      };
+      const boost::json::value* calls = o ? o->if_contains("tool_calls") : nullptr;
+      t.ok = o != nullptr;
+      t.text = text("content");
+      t.reasoning = text("reasoning_content");
+      if (calls && calls->is_array() && !calls->as_array().empty()) t.toolCalls = boost::json::serialize(*calls);
+      if (!t.ok) t.error = "the answer is not JSON";
+    }
     return t;
   };
   hooks.run = [](const std::vector<std::string>& a) { return ceshCapture(a); };

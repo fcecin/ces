@@ -2,6 +2,8 @@
 
 #include <ces/util/fileperm.h>
 
+#include <boost/json.hpp>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -303,33 +305,6 @@ bool splitLine(const std::string& line, std::vector<std::string>& out) {
   return true;
 }
 
-// The execution marker. It is in no markdown, shell or template language, so
-// it never appears by accident; the user never sees it.
-const char* const kExecMarker = "%%CESH-EXEC%%";
-
-namespace {
-
-// The command after the marker, when `line` starts with it (after spaces).
-bool execLine(const std::string& line, std::string& command) {
-  std::string t = trim(line);
-  const std::string marker = kExecMarker;
-  if (t.rfind(marker, 0) != 0) return false;
-  command = trim(t.substr(marker.size()));
-  if (command.rfind("cesh ", 0) == 0) command = trim(command.substr(5));
-  return true;
-}
-
-}  // namespace
-
-std::vector<std::string> commandLines(const std::string& reply) {
-  std::vector<std::string> out;
-  std::istringstream in(reply);
-  std::string line, command;
-  while (std::getline(in, line))
-    if (execLine(line, command) && !command.empty()) out.push_back(command);
-  return out;
-}
-
 std::string printable(const std::string& text) {
   std::string o;
   o.reserve(text.size());
@@ -368,31 +343,7 @@ bool userCommand(const std::string& userLine, std::string& line) {
   return true;
 }
 
-std::string proseOf(const std::string& reply) {
-  // Drop the marker lines; keep at most one blank line where they were.
-  std::string out;
-  int blanks = 0;
-  std::istringstream in(reply);
-  std::string line, command;
-  while (std::getline(in, line)) {
-    if (execLine(line, command)) continue;
-    if (trim(line).empty()) {
-      if (++blanks > 1) continue;
-    } else {
-      blanks = 0;
-    }
-    out += line + "\n";
-  }
-  return trim(out);
-}
-
 namespace {
-
-bool imitatesChat(const std::string& line) {
-  std::string t = trim(line);
-  return t.rfind("RESULT of", 0) == 0 || t.rfind("YOU:", 0) == 0 || t.rfind("USER:", 0) == 0 ||
-         t.rfind("CHAT:", 0) == 0;
-}
 
 // Credits from raw units, with the trailing zeros cut.
 std::string credits(int64_t raw) {
@@ -405,69 +356,6 @@ std::string credits(int64_t raw) {
 }
 
 }  // namespace
-
-CleanReply cleanReply(const std::string& reply) {
-  CleanReply c;
-  std::string prose;
-  // A model sometimes starts its reply with the transcript's own label
-  // ("YOU: ..."): that is an echo at the start, not an imitation. Take it off.
-  std::string body = reply;
-  {
-    size_t a = body.find_first_not_of(" \t\r\n");
-    if (a != std::string::npos) {
-      std::string head = body.substr(a, 4);
-      for (auto& ch : head) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
-      if (head == "YOU:") body = body.substr(a + 4);
-    }
-  }
-  std::istringstream in(body);
-  std::string line, command;
-  bool afterCommand = false;
-  while (std::getline(in, line)) {
-    if (imitatesChat(line)) {
-      c.fabricated = true;
-      std::string rest = line + "\n";
-      while (std::getline(in, line)) rest += line + "\n";
-      c.dropped += rest;
-      break;
-    }
-    if (execLine(line, command)) {
-      afterCommand = true;
-      if (command.empty()) continue;
-      std::string body;
-      std::string bare = command;
-      shellCommand(bare);
-      if (bare == "write" || bare.rfind("write ", 0) == 0) {
-        // The content: the lines up to a line "%%CESH-END%%".
-        bool ended = false;
-        while (std::getline(in, line)) {
-          if (trim(line) == "%%CESH-END%%") { ended = true; break; }
-          body += line + "\n";
-        }
-        if (!ended) {
-          c.unterminated = true;
-          break;
-        }
-      }
-      c.commands.push_back(command);
-      c.bodies.push_back(body);
-      continue;
-    }
-    if (afterCommand) {
-      if (!trim(line).empty()) c.dropped += line + "\n";
-      continue;
-    }
-    prose += line + "\n";
-  }
-  c.prose = proseOf(prose);
-  c.kept = c.prose;
-  for (size_t i = 0; i < c.commands.size(); ++i) {
-    c.kept += std::string("\n") + kExecMarker + " " + c.commands[i];
-    if (!c.bodies[i].empty()) c.kept += "\n" + c.bodies[i] + "%%CESH-END%%";
-  }
-  c.kept = trim(c.kept);
-  return c;
-}
 
 // ---- Memory ----
 
@@ -513,39 +401,134 @@ std::string Memory::text() const {
   return o;
 }
 
+// ---- Tool calls ----
+
+namespace json = boost::json;
+
+// The one tool of the model.
+const char* const kTool = R"({"type":"function","function":{"name":"cesh",
+"description":"Run one cesh command, or one of the chat's own commands: ls, read <name>, write <name> (with content), remember <name>: <text>, forget <name>. You get what it printed.",
+"parameters":{"type":"object","properties":{
+"command":{"type":"string","description":"The command, without the word cesh, such as: query @0"},
+"content":{"type":"string","description":"For write: the text of the file."}},
+"required":["command"]}}})";
+
+std::vector<ToolCall> toolCallsOf(const std::string& text) {
+  std::vector<ToolCall> out;
+  boost::system::error_code ec;
+  json::value v = json::parse(text, ec);
+  if (ec || !v.is_array()) return out;
+  for (const json::value& c : v.as_array()) {
+    if (!c.is_object()) continue;
+    ToolCall t;
+    const json::object& o = c.as_object();
+    if (const json::value* id = o.if_contains("id"); id && id->is_string()) t.id = std::string(id->as_string());
+    if (t.id.empty()) continue;   // a call with no id cannot get its result
+    const json::value* fn = o.if_contains("function");
+    const json::object* f = fn && fn->is_object() ? &fn->as_object() : nullptr;
+    const json::value* name = f ? f->if_contains("name") : nullptr;
+    const json::value* args = f ? f->if_contains("arguments") : nullptr;
+    json::value a;
+    if (!name || !name->is_string() || name->as_string() != "cesh") {
+      t.error = "there is no tool " +
+                (name && name->is_string() ? "\"" + std::string(name->as_string()) + "\"" : std::string("of that name")) +
+                ": the one tool is cesh";
+    } else if (!args || !args->is_string() || (a = json::parse(args->as_string(), ec), ec) || !a.is_object()) {
+      t.error = "the arguments are not a JSON object";
+    } else {
+      const json::value* cmd = a.as_object().if_contains("command");
+      const json::value* content = a.as_object().if_contains("content");
+      if (cmd && cmd->is_string()) t.command = trim(std::string(cmd->as_string()));
+      if (t.command.rfind("cesh ", 0) == 0) t.command = trim(t.command.substr(5));
+      if (content && content->is_string()) t.content = std::string(content->as_string());
+      if (t.command.empty()) t.error = "the arguments have no command";
+    }
+    out.push_back(std::move(t));
+  }
+  return out;
+}
+
+std::string chatRequest(const std::string& system, const std::vector<Message>& messages, bool tools) {
+  json::array ms;
+  ms.push_back(json::object{{"role", "system"}, {"content", system}});
+  std::vector<std::string> waiting;   // the calls that have no result yet
+  auto close = [&] {
+    for (auto& id : waiting)
+      ms.push_back(json::object{{"role", "tool"}, {"tool_call_id", id}, {"content", "did not run"}});
+    waiting.clear();
+  };
+  auto user = [&](const std::string& content) {
+    json::object& last = ms.back().as_object();
+    if (last.at("role").as_string() == "user")
+      last["content"] = std::string(last.at("content").as_string()) + "\n\n" + content;
+    else
+      ms.push_back(json::object{{"role", "user"}, {"content", content}});
+  };
+  for (const Message& m : messages) {
+    if (m.role == "tool") {
+      auto it = std::find(waiting.begin(), waiting.end(), m.toolCallId);
+      if (it != waiting.end()) {
+        waiting.erase(it);
+        ms.push_back(json::object{{"role", "tool"}, {"tool_call_id", m.toolCallId}, {"content", m.content}});
+      } else {
+        close();
+        user("[chat] " + m.content);   // its call was folded or cut
+      }
+      continue;
+    }
+    close();
+    if (m.role == "assistant") {
+      json::object a{{"role", "assistant"}, {"content", m.content}};
+      if (!m.reasoning.empty()) a["reasoning_content"] = m.reasoning;
+      boost::system::error_code ec;
+      json::value calls = m.toolCalls.empty() ? json::value() : json::parse(m.toolCalls, ec);
+      if (!ec && calls.is_array() && !calls.as_array().empty()) {
+        for (const json::value& c : calls.as_array())
+          if (c.is_object() && c.as_object().if_contains("id"))
+            waiting.push_back(std::string(c.as_object().at("id").as_string()));
+        a["tool_calls"] = std::move(calls);
+      }
+      ms.push_back(std::move(a));
+    } else {
+      user(m.content);
+    }
+  }
+  close();
+  json::object req{{"messages", std::move(ms)}};
+  if (tools) {
+    static const json::value tool = json::parse(kTool);
+    req["tools"] = json::array{tool};
+  }
+  return json::serialize(req);
+}
+
 // ---- Chat ----
 
 namespace {
 
 const char* kRules = R"(You are cesh chat, the assistant inside cesh, the wallet and command line of CES.
 CES is a network of sovereign ledgers. The user holds keys in a cesh wallet and acts on servers through cesh.
-You help the user, and you act for the user by running cesh commands.
+You help the user, and you act for the user by running cesh commands with the cesh tool.
 
 How you act:
-- To run a cesh command, write a line that starts with %%CESH-EXEC%% and then the command, without the word "cesh". One command per line:
-%%CESH-EXEC%% query @0
-%%CESH-EXEC%% man errors
+- To run a cesh command, call the cesh tool with the command, without the word "cesh", such as query @0 or man errors. One reply can call it more than once.
 - The user sees each command and its output. The manual pages that you read (man) go to you only.
-- When the user's line can be done with cesh commands ("my balance", "call program 8 with hi", or a line that is already a command), write only the command lines, with no words. The output is the answer: when the commands succeed, the turn ends. When the line is already a correct command, run it as it is. When it needs a fix, run the fixed command, and say nothing about the fix.
-- When you need the results to go on (a task of more steps, or a question that you answer from the output), write one short sentence before the first commands: what you will do, not what you will find. Then the results of each step come back to you as RESULT entries, until you write a reply with no commands. In that last reply, write only what the output does not already show. No words at all is a correct last reply.
+- When the user's line can be done with cesh commands ("my balance", "call program 8 with hi", or a line that is already a command), call the tool and write no words. The output is the answer: when the commands succeed, the turn ends. When the line is already a correct command, run it as it is. When it needs a fix, run the fixed command, and say nothing about the fix.
+- When you need the results to go on (a task of more steps, or a question that you answer from the output), write one short sentence with your first calls: what you will do, not what you will find. The results of each step come back to you, until you write a reply with no calls. In that last reply, write only what the output does not already show. No words at all is a correct last reply.
 - A command that fails comes back to you: fix it, or say in a few words why it failed.
-- A %%CESH-EXEC%% line is the only thing that runs. Everything else that you write is shown as it is: markdown code blocks are text, and nothing in them runs. Do not write commands for the user to type: run them. The chat asks the user before each action.
-- After your %%CESH-EXEC%% lines, stop and end your reply. Only the chat writes RESULT and CHAT lines: never write one yourself, and never guess a result.
+- Only the tool runs commands. Everything that you write is shown as it is: markdown code blocks are text, and nothing in them runs. Do not write commands for the user to type: run them. The chat asks the user before each action.
 - A manual page or a file that you read stays in the conversation. Do not read one twice.
 - Reads (man, query, ping, file stat, compute ps, ...) run at once.
 - All other commands (transfers, uploads, deposits, launches, keys, names, ...) run only if the user says yes, and the chat asks the user before each one. So when the user asks you to do something, do it. Do not ask the user whether to go ahead; the chat does that.
-- You can manage the user's keys: keys list, keys gen, keys add, keys export. You never see a private key, and the chat keeps it that way: keys list gives you the public keys, keys gen saves the new key in the wallet file and tells you its public key, keys add asks the user for the key itself (write only `keys add`, never a key), and keys export shows the private keys to the user only. Never write a private key in a command or in your reply.
+- You can manage the user's keys: keys list, keys gen, keys add, keys export. You never see a private key, and the chat keeps it that way: keys list gives you the public keys, keys gen saves the new key in the wallet file and tells you its public key, keys add asks the user for the key itself (run only `keys add`, never with a key), and keys export shows the private keys to the user only. Never write a private key in a command or in your reply.
 - Amounts are raw units: 1 credit = 100000000 raw.
 - When you are not sure of a fact or a syntax, read the manual first: `man <page>`, `man <command>` or `man --search <word>`. Do not guess a command.
 - When a command fails, read the error in the manual (`man errors`) before you explain it.
-- You have one local directory for files, the scratch. You see nothing else on the user's disk. %%CESH-EXEC%% ls lists it, %%CESH-EXEC%% read <name> reads a file. To write a file, put its content on the lines after the command, then a line %%CESH-END%%:
-%%CESH-EXEC%% write hello.lua
-ces.run()
-%%CESH-END%%
-  The user approves each write. Names are flat (no directories). cesh commands that take a local file (file put, file get, --in file:, --out) use these names, so you can read what a command wrote. A command's printed output (compute call prints the program's reply) comes back to you in its RESULT.
+- You have one local directory for files, the scratch. You see nothing else on the user's disk. The command ls lists it, and read <name> reads a file. To write a file, run write <name> with the text of the file in content. The user approves each write. Names are flat (no directories). cesh commands that take a local file (file put, file get, --in file:, --out) use these names, so you can read what a command wrote. A command's printed output (compute call prints the program's reply) comes back to you as its result.
 - Before you write a Lua program, read `man lua`: a program needs on_l2call and ces.run().
 - To talk to a running program: dial <pid> --line <text> sends one line and gives you its one reply line (the plain interactive dial does not run here).
-- To keep a fact about the user for later chats: %%CESH-EXEC%% remember <name>: <text>. To drop one: %%CESH-EXEC%% forget <name>. The user approves each one.
+- To keep a fact about the user for later chats, run remember <name>: <text>. To drop one, run forget <name>. The user approves each one.
+- The chat itself writes the user messages that start with [chat].
 - Answer in plain, short words.)";
 
 }  // namespace
@@ -572,18 +555,53 @@ std::string Chat::notesText() const {
   return notes.empty() ? "(none)\n" : notes;
 }
 
-std::string Chat::prompt() const {
+std::string Chat::system() const {
   // The notes as they were when the chat started (or at the last fold): a
   // note saved or dropped since is in the conversation, so the start of the
-  // prompt does not change and the model's cache keeps serving it.
+  // request does not change and the model's cache keeps serving it.
   const std::string& notes = notes_;
   return std::string(kRules) +
          "\n\n## The manual (open a page with `man <path>`)\n\n" + opt_.manualIndex +
          "\n## The user's notes\n\n" + notes +
          "\n## This session\n\n" + opt_.context +
          (summary_.empty() ? std::string()
-                           : "\n\n## Earlier in this conversation (a summary)\n\n" + summary_) +
-         "\n\n## The conversation\n\n" + transcript_ + "YOU:";
+                           : "\n\n## Earlier in this conversation (a summary)\n\n" + summary_);
+}
+
+std::string Chat::request() const { return chatRequest(system(), messages_); }
+
+namespace {
+
+// The first `n` messages as text, one "ROLE: content" block each.
+std::string textOf(const std::vector<Message>& messages, size_t n) {
+  std::string t;
+  for (size_t i = 0; i < n && i < messages.size(); ++i) {
+    const Message& m = messages[i];
+    std::string role = m.role;
+    for (auto& ch : role) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    t += role + ": " + m.content;
+    for (const ToolCall& c : toolCallsOf(m.toolCalls)) {
+      t += "\nRAN: " + (c.error.empty() ? c.command : "(" + c.error + ")");
+      if (!c.content.empty()) t += "\n" + c.content;
+    }
+    t += "\n\n";
+  }
+  return t;
+}
+
+}  // namespace
+
+std::string Chat::transcript() const { return textOf(messages_, messages_.size()); }
+
+void Chat::note(const std::string& text) { messages_.push_back({"user", "[chat] " + text, "", "", ""}); }
+
+size_t Chat::messageBytes(size_t from) const {
+  size_t n = 0;
+  for (size_t i = from; i < messages_.size(); ++i) {
+    const Message& m = messages_[i];
+    n += m.content.size() + m.toolCalls.size() + m.reasoning.size() + m.toolCallId.size() + 40;
+  }
+  return n;
 }
 
 std::vector<std::string> Chat::withGlobals(const std::vector<std::string>& args) const {
@@ -951,7 +969,7 @@ ContextUse Chat::context() const {
     if (lastCachedTokens_ >= 0)
       u.cachedPercent = static_cast<int>(lastCachedTokens_ * 100 / lastPromptTokens_);
   } else {
-    u.promptTokens = tokensOf(prompt().size());
+    u.promptTokens = tokensOf(request().size());
   }
   return u;
 }
@@ -970,16 +988,16 @@ std::string contextText(const ContextUse& u) {
 
 bool Chat::fit() {
   const uint64_t room = roomTokens();
-  if (tokensOf(prompt().size()) * 100 <= room * static_cast<uint64_t>(opt_.compactAt)) return true;
+  if (tokensOf(request().size()) * 100 <= room * static_cast<uint64_t>(opt_.compactAt)) return true;
   compact();
-  if (tokensOf(prompt().size()) <= room) return true;
+  if (tokensOf(request().size()) <= room) return true;
   // One turn alone is too big to fold: cut its oldest part, so the newest
   // results still reach the model.
-  const size_t head = prompt().size() - transcript_.size();
+  const size_t head = chatRequest(system(), {}).size();
   const size_t roomBytes = static_cast<size_t>(static_cast<double>(room) * bytesPerTokenOr3());
   if (roomBytes <= head + 1024) return false;   // the start alone fills it
   cutOldest((roomBytes - head) * opt_.keepPercent / 100);
-  return tokensOf(prompt().size()) <= room;
+  return tokensOf(request().size()) <= room;
 }
 
 namespace {
@@ -997,23 +1015,23 @@ bool Chat::compact() {
   // the prompt (the rules, the notes, the summary) leaves for them; the
   // current turn (the last one) always stays.
   const double roomBytes = static_cast<double>(roomTokens()) * bytesPerTokenOr3();
-  const double headBytes = static_cast<double>(prompt().size() - transcript_.size());
+  const double headBytes = static_cast<double>(chatRequest(system(), {}).size());
   const size_t keepBytes = roomBytes > headBytes
                                ? static_cast<size_t>((roomBytes - headBytes) * opt_.keepPercent / 100)
                                : 0;
   size_t cut = starts.back();
   for (size_t k = starts.size() - 1; k-- > 0;) {
-    if (transcript_.size() - starts[k] > keepBytes) break;
+    if (messageBytes(starts[k]) > keepBytes) break;
     cut = starts[k];
   }
   if (cut == 0) return false;
-  const std::string folded = transcript_.substr(0, cut);
+  const std::string folded = textOf(messages_, cut);
 
   emit("compact", "start");
-  std::string ask = std::string(kCompactRules);
-  if (!summary_.empty()) ask += "\n\n## The summary so far\n\n" + summary_;
-  ask += "\n\n## The part to fold\n\n" + folded + "\n## The summary\n\n";
-  ThinkReply r = think(ask, false);
+  std::string ask;
+  if (!summary_.empty()) ask += "## The summary so far\n\n" + summary_ + "\n\n";
+  ask += "## The part to fold\n\n" + folded;
+  ThinkReply r = think(chatRequest(kCompactRules, {{"user", ask, "", "", ""}}, false), false);
   if (r.charged >= 0) {
     spent_ += r.charged;
     emit("cost", std::to_string(r.charged));
@@ -1039,20 +1057,28 @@ bool Chat::compact() {
 }
 
 void Chat::cutOldest(size_t keepBytes) {
-  if (transcript_.size() <= keepBytes) return;
-  size_t cut = transcript_.size() - keepBytes;
-  size_t nl = transcript_.find('\n', cut);
-  if (nl != std::string::npos) cut = nl + 1;
+  // Drop the oldest messages until the rest fits, and keep the newest one.
+  size_t cut = 0;
+  while (cut + 1 < messages_.size() && messageBytes(cut) > keepBytes) ++cut;
+  const bool tooBig = messageBytes(cut) > keepBytes;
+  if (tooBig) {
+    // When the newest one alone is too big, keep its last lines.
+    std::string& t = messages_[cut].content;
+    size_t nl = t.find('\n', t.size() > keepBytes ? t.size() - keepBytes : 0);
+    t = "[... the start was cut]\n" + (nl == std::string::npos ? std::string() : t.substr(nl + 1));
+  }
+  if (cut == 0 && !tooBig) return;
   dropFront(cut);
-  const std::string note = "CHAT: the older part of this turn was cut; it did not fit in the model's window\n\n";
-  transcript_ = note + transcript_;
   // The turn that was cut goes on from the note.
-  for (auto& t : turns_) t += note.size();
+  messages_.insert(messages_.begin(),
+                   Message{"user", "[chat] the older part of this turn was cut; it did not fit in the "
+                                   "model's window", "", "", ""});
+  for (auto& t : turns_) ++t;
   turns_.insert(turns_.begin(), 0);
 }
 
 void Chat::dropFront(size_t n) {
-  transcript_.erase(0, n);
+  messages_.erase(messages_.begin(), messages_.begin() + static_cast<std::ptrdiff_t>(n));
   std::vector<size_t> kept;
   for (size_t t : turns_)
     if (t >= n) kept.push_back(t - n);
@@ -1060,8 +1086,8 @@ void Chat::dropFront(size_t n) {
 }
 
 void Chat::turn(const std::string& userLine) {
-  turns_.push_back(transcript_.size());
-  transcript_ += "USER: " + userLine + "\n\n";
+  turns_.push_back(messages_.size());
+  messages_.push_back({"user", userLine, "", "", ""});
   declined_ = false;
   {
     // The user's own command runs as it is, as in a terminal, with no model
@@ -1069,9 +1095,9 @@ void Chat::turn(const std::string& userLine) {
     std::string own;
     if (userCommand(userLine, own)) {
       const size_t before = seen_;
-      transcript_ += runLine(own);
+      note(trim(runLine(own)));
       if (seen_ != before) {
-        transcript_ += "CHAT: the user ran that command; the user saw it and its output\n\n";
+        note("the user ran that command; the user saw it and its output");
         return;
       }
     }
@@ -1083,9 +1109,9 @@ void Chat::turn(const std::string& userLine) {
       show("(the conversation does not fit in the model's window; start a new chat)");
       return;
     }
-    const std::string p = prompt();
-    emit("prompt", p);
-    ThinkReply r = think(p);
+    const std::string req = request();
+    emit("prompt", req);
+    ThinkReply r = think(req);
     if (r.ok) emit("reply", r.text);
     if (r.charged >= 0) {
       spent_ += r.charged;
@@ -1093,63 +1119,54 @@ void Chat::turn(const std::string& userLine) {
     }
     if (!r.ok) {
       show("(think failed: " + trim(r.error) + ")");
-      transcript_ += "CHAT: the model call failed: " + oneLine(r.error) + "\n\n";
+      note("the model call failed: " + oneLine(r.error));
       return;
     }
-    CleanReply c = cleanReply(r.text);
-    transcript_ += "YOU: " + c.kept + "\n\n";
-    if (!c.prose.empty()) show(c.prose);
-    if (r.charged >= 0) {
-      if (opt_.showCost)
-        show("(" + credits(r.charged) + " credits for this answer, " + credits(spent_) +
-             " for this chat · " + contextText(context()) + ")");
-      transcript_ += "CHAT: that answer cost the signer " + credits(r.charged) + " credits; this chat has cost " +
-                     credits(spent_) + " credits\n\n";
-    }
-    if (!c.dropped.empty()) emit("drop", c.dropped);
-    if (c.fabricated) {
-      transcript_ += "CHAT: your reply was cut at a line that imitates the chat. Only the chat "
-                     "writes RESULT, CHAT, YOU and USER lines. Nothing after that line ran. Run the commands "
-                     "and wait for their results.\n\n";
-      if (c.commands.empty()) continue;
-    } else if (!c.dropped.empty()) {
-      transcript_ += "CHAT: the text after your commands was removed; write it in your next reply, "
-                     "after the results come back\n\n";
-    }
-    if (c.unterminated)
-      transcript_ += "CHAT: your write had no %%CESH-END%% line after its content, so it did not run, "
-                     "and nothing after it ran\n\n";
-    auto lines = c.commands;
-    auto bodies = c.bodies;
-    if (lines.empty()) {
-      return;
-    }
-    if (lines.size() > opt_.maxCommands) {
-      transcript_ += "CHAT: only the first " + std::to_string(opt_.maxCommands) +
-                     " commands of a reply run\n\n";
-      lines.resize(opt_.maxCommands);
-      bodies.resize(opt_.maxCommands);
-    }
+    const std::string prose = trim(r.text);
+    std::vector<ToolCall> calls = toolCallsOf(r.toolCalls);
+    messages_.push_back({"assistant", prose, calls.empty() ? "" : r.toolCalls, r.reasoning, ""});
+    if (!prose.empty()) show(prose);
     // A reply of commands with no words is the answer: when each command
     // succeeds, the user has the output, and the turn ends. A turn where the
     // model said what it will do is a task of steps: it goes on until the
     // model ends it.
-    task = task || !c.prose.empty();
-    bool settled = !task && !c.fabricated && !c.unterminated;
-    for (size_t k = 0; k < lines.size(); ++k) {
-      if (stopped()) return;
-      transcript_ += runLine(lines[k], k < bodies.size() ? bodies[k] : std::string());
-      settled = settled && ok_;
+    if (!calls.empty()) task = task || !prose.empty();
+    bool settled = !task;
+    // The results go right after the reply, and the chat's notes after them.
+    for (size_t k = 0; k < calls.size(); ++k) {
+      const ToolCall& c = calls[k];
+      std::string result;
+      if (!c.error.empty()) {
+        result = "not run; " + c.error;
+        settled = false;
+      } else if (k >= opt_.maxCommands) {
+        result = "not run; only the first " + std::to_string(opt_.maxCommands) + " commands of a reply run";
+        settled = false;
+      } else if (stopped()) {
+        result = "not run; the user stopped the chat";
+      } else {
+        result = trim(runLine(c.command, c.content));
+        settled = settled && ok_;
+      }
+      messages_.push_back({"tool", result, "", "", c.id});
     }
+    if (r.charged >= 0) {
+      if (opt_.showCost)
+        show("(" + credits(r.charged) + " credits for this answer, " + credits(spent_) +
+             " for this chat · " + contextText(context()) + ")");
+      note("that answer cost the signer " + credits(r.charged) + " credits; this chat has cost " +
+           credits(spent_) + " credits");
+    }
+    if (calls.empty() || stopped()) return;
     if (declined_) {
       // The user's no ends the turn: the model waits for the next line
       // instead of asking again.
-      transcript_ += "CHAT: the user said no, so the turn ended. Wait for the user's next line, "
-                     "and do not run the declined command again unless the user asks.\n\n";
+      note("the user said no, so the turn ended. Wait for the user's next line, "
+           "and do not run the declined command again unless the user asks.");
       return;
     }
     if (settled) {
-      transcript_ += "CHAT: your commands succeeded and the user saw their output, so the turn ended\n\n";
+      note("your commands succeeded and the user saw their output, so the turn ended");
       return;
     }
   }

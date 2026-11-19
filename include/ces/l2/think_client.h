@@ -1,14 +1,15 @@
 // think_client.h - blocking client for the L2 think protocol (/ces/think/1).
 //
-// One verb (THINK): send a prompt text, get the reply text as a stream. A
-// thin wrapper over a CesPlexChannel, the same shape as CesMailClient. Pure
-// wire, so it is built in every configuration and works against any server
+// THINK sends a prompt text, and CHAT sends a chat request with messages and
+// tools. Both stream the reply text, and CHAT also gets the tool calls at the
+// end. The client wraps a CesPlexChannel, as CesMailClient does. It has only
+// wire code, so every configuration builds it, and it works with any server
 // that mounts builtin:think. The bound signer pays (see think_handler.h).
 
 #pragma once
 
 #include <ces/keys.h>
-#include <ces/l2/think_backend.h>   // ThinkReport
+#include <ces/l2/think_backend.h>   // ThinkReport, ThinkChatEnd
 #include <ces/types.h>
 
 #include <cstdint>
@@ -66,6 +67,17 @@ public:
                 const std::string& file = {},
                 uint8_t* appendError = nullptr,
                 ThinkReport* report = nullptr);
+
+  // CHAT: send `request`, a chat request (JSON with messages and tools, see
+  // thinkChatCheck). onText (may be empty) gets each piece of the reply text
+  // as it arrives, and `reply` gets the whole text. On CES_OK, `end` gets the
+  // tool calls, the reasoning and the finish reason. The server signed them
+  // and the text. A server older than CHAT drops the channel, so the call
+  // fails and costs nothing. `charged` and `report` work as for think.
+  uint8_t chat(const std::string& request,
+               const std::function<void(std::string_view)>& onText,
+               std::string& reply, ThinkChatEnd& end, uint64_t& charged,
+               ThinkReport* report = nullptr);
 
   class Impl;
 

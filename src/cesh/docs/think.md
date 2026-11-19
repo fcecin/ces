@@ -1,6 +1,6 @@
 ---
 title: Think
-summary: cesh think syntax, what a call costs, the hold before a call, and conversation files
+summary: cesh think syntax, chat requests with tools, what a call costs, the hold before a call, and conversation files
 order: 5
 ---
 
@@ -9,6 +9,7 @@ The operator chooses the model and the prices. The signer pays.
 
 ```
 cesh think <words...> [--file <path>] [-v]
+cesh think --chat [--in <request>] [-v]
 ```
 
 - The prompt is the words, or `--in <file>`, or stdin.
@@ -21,6 +22,42 @@ cesh think <words...> [--file <path>] [-v]
   model the content of the file and then the new text. After the reply, it
   appends the new text and the reply to the file. The signer must own the
   file, and the file balance pays for the growth.
+
+## Chat requests
+
+With `--chat`, the input is a chat request in JSON. It has the messages,
+each with its role, and the tools that the model can call. A program that
+runs the tools sends the whole conversation each time.
+
+```
+cesh think --chat --in 'text:{"messages":[
+  {"role":"system","content":"You work in a shell."},
+  {"role":"user","content":"What is in my home?"}],
+ "tools":[{"type":"function","function":{"name":"shell",
+  "description":"Run one command.","parameters":{"type":"object",
+  "properties":{"command":{"type":"string"}},"required":["command"]}}}]}'
+```
+
+- The roles are `system`, `user`, `assistant` and `tool`. An `assistant`
+  message has `content`, `tool_calls` or both, and it can have
+  `reasoning_content`. A `tool` message has the `tool_call_id` of the call
+  that it answers, and the result in `content`.
+- A tool has `type` "function" and a `function` with a `name`, a
+  `description` and `parameters` (a JSON schema). `tool_choice` is
+  optional, with the value "auto", "none", "required" or one function.
+- cesh and the server refuse other fields, and cesh gives the reason.
+- When the model is done, stdout gets the answer as one JSON object,
+  `{"content":"...","tool_calls":[...],"finish_reason":"..."}`. Each tool
+  call has an `id`, and its `function` has a `name` and the `arguments`
+  text, which is usually JSON. `finish_reason` is "tool_calls" when the
+  model waits for the results, and "length" when the answer reached the
+  longest reply.
+- To go on, add the answer as an `assistant` message (without
+  `finish_reason`) and one `tool` message for each call, and send it all
+  again. With reasoning on, each `assistant` message needs its
+  `reasoning_content` back.
+- `--chat` takes no `--file`. A server older than chat requests drops the
+  connection, and the call costs nothing.
 
 ## What it costs
 

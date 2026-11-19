@@ -26,6 +26,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include <atomic>
+#include <future>
 #include <chrono>
 #include <mutex>
 #include <string>
@@ -53,19 +54,22 @@ struct ScriptBackend : ThinkBackend {
   std::atomic<int> calls{0};
   std::mutex mu;
   std::string lastPrompt;
+  bool lastChat = false;
   uint32_t lastMaxOut = 0;
+  ThinkChatEnd chat;               // ThinkOutcome::chat to report
   uint32_t window = 0;             // what contextWindow() states
 
   uint32_t contextWindow() override { return window; }
 
-  ThinkOutcome run(const std::string& prompt, uint32_t maxOut,
+  ThinkOutcome run(const ThinkInput& input, uint32_t maxOut,
                    const std::atomic<bool>& stop,
                    const std::function<bool(std::string_view)>& onText)
       override {
     ++calls;
     {
       std::lock_guard<std::mutex> lk(mu);
-      lastPrompt = prompt;
+      lastPrompt = input.text;
+      lastChat = input.chat;
       lastMaxOut = maxOut;
     }
     entered = true;
@@ -97,6 +101,7 @@ struct ScriptBackend : ThinkBackend {
     o.status = status;
     o.billing = billing;
     o.usage = usage;
+    o.chat = chat;
     return o;
   }
 };
@@ -242,6 +247,36 @@ const std::string kSse =
   "\"prompt_cache_hit_tokens\":32,\"prompt_cache_miss_tokens\":4}}\n\n"
   "data: [DONE]\n\n";
 
+// A stream that ends in two tool calls, with the arguments of the first in
+// parts, as the API sends them.
+const std::string kToolSse =
+  R"(data: {"choices":[{"index":0,"delta":{"role":"assistant","content":"Let me look."},"finish_reason":null}]})" "\n\n"
+  R"(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"shell","arguments":""}}]},"finish_reason":null}]})" "\n\n"
+  R"(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"command\":"}}]},"finish_reason":null}]})" "\n\n"
+  R"(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"ls -l\"}"}}]},"finish_reason":null}]})" "\n\n"
+  R"(data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"call_b","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}]},"finish_reason":null}]})" "\n\n"
+  R"(data: {"choices":[{"index":0,"delta":{"content":null,"tool_calls":null},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":50,"completion_tokens":20}})" "\n\n"
+  "data: [DONE]\n\n";
+
+// The two calls of kToolSse, joined.
+const std::string kToolCalls =
+  R"([{"id":"call_a","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls -l\"}"}},)"
+  R"({"id":"call_b","type":"function","function":{"name":"shell","arguments":"{\"command\":\"pwd\"}"}}])";
+
+const std::string kChatRequest =
+  R"({"messages":[{"role":"system","content":"Be short."},{"role":"user","content":"hi"}],)"
+  R"("tools":[{"type":"function","function":{"name":"shell"}}]})";
+
+// A sink that keeps the status of finish.
+struct StatusSink : ThinkSink {
+  std::promise<uint8_t> done;
+  bool open() override { return true; }
+  void piece(std::string_view) override {}
+  void finish(uint8_t status, uint64_t, const std::string&, uint8_t) override {
+    done.set_value(status);
+  }
+};
+
 }  // namespace
 
 // ===========================================================================
@@ -340,7 +375,7 @@ BOOST_AUTO_TEST_CASE(Sse_UnboundedEventIsMalformed) {
 }
 
 BOOST_AUTO_TEST_CASE(RequestJson_FieldsAndEscapes) {
-  std::string j = thinkRequestJson("deepseek-flash", "say \"hi\"\n", 77, false);
+  std::string j = thinkRequestJson("deepseek-flash", {"say \"hi\"\n"}, 77, false);
   BOOST_CHECK(j.find("\"model\":\"deepseek-flash\"") != std::string::npos);
   BOOST_CHECK(j.find("\"role\":\"user\"") != std::string::npos);
   BOOST_CHECK(j.find("\"content\":\"say \\\"hi\\\"\\n\"") != std::string::npos);
@@ -348,7 +383,7 @@ BOOST_AUTO_TEST_CASE(RequestJson_FieldsAndEscapes) {
   BOOST_CHECK(j.find("\"stream\":true") != std::string::npos);
   BOOST_CHECK(j.find("\"include_usage\":true") != std::string::npos);
   BOOST_CHECK(j.find("\"type\":\"disabled\"") != std::string::npos);
-  BOOST_CHECK(thinkRequestJson("m", "x", 1, true).find("\"type\":\"enabled\"") !=
+  BOOST_CHECK(thinkRequestJson("m", {"x"}, 1, true).find("\"type\":\"enabled\"") !=
               std::string::npos);
 }
 
@@ -430,6 +465,141 @@ BOOST_AUTO_TEST_CASE(Prices_RoundUpAndHoldCoversUsage) {
   // Huge values clamp, never wrap.
   ThinkFees big{UINT64_MAX, UINT64_MAX, UINT64_MAX};
   BOOST_CHECK_EQUAL(thinkHold(big, UINT32_MAX, UINT32_MAX), UINT64_MAX);
+}
+
+// The tool call deltas join into whole calls, by index, in any split.
+BOOST_AUTO_TEST_CASE(Sse_JoinsToolCalls) {
+  for (size_t step : {kToolSse.size(), size_t(1), size_t(9)}) {
+    ThinkSseParser p;
+    std::string text;
+    for (size_t i = 0; i < kToolSse.size(); i += step)
+      BOOST_REQUIRE(p.feed(std::string_view(kToolSse).substr(i, step),
+                           [&](std::string_view t) {
+                             text.append(t);
+                             return true;
+                           }));
+    BOOST_CHECK_EQUAL(text, "Let me look.");
+    BOOST_CHECK(p.done());
+    const ThinkChatEnd e = p.chatEnd();
+    BOOST_CHECK_EQUAL(e.toolCalls, kToolCalls);
+    BOOST_CHECK_EQUAL(e.finishReason, "tool_calls");
+    BOOST_CHECK(e.reasoning.empty());
+    BOOST_CHECK_EQUAL(p.toolBytes(), 46u);   // the names and the arguments
+  }
+  // A plain reply has no calls, and keeps its reasoning.
+  ThinkSseParser p;
+  BOOST_REQUIRE(p.feed(kSse, [](std::string_view) { return true; }));
+  const ThinkChatEnd e = p.chatEnd();
+  BOOST_CHECK(e.toolCalls.empty());
+  BOOST_CHECK_EQUAL(e.reasoning, "We need");
+  BOOST_CHECK_EQUAL(e.finishReason, "stop");
+}
+
+BOOST_AUTO_TEST_CASE(Sse_BadToolDeltaIsMalformed) {
+  for (std::string ev : {
+           R"(data: {"choices":[{"delta":{"tool_calls":{"index":0}}}]})",
+           R"(data: {"choices":[{"delta":{"tool_calls":[7]}}]})",
+           R"(data: {"choices":[{"delta":{"tool_calls":[{"index":-1}]}}]})",
+           R"(data: {"choices":[{"delta":{"tool_calls":[{"index":100000}]}}]})"}) {
+    ThinkSseParser p;
+    BOOST_CHECK_MESSAGE(!p.feed(ev + "\n\n", [](std::string_view) { return true; }), ev);
+  }
+}
+
+// The check keeps the known fields of a chat request, in a fixed order. A
+// second check leaves the clean form as it is.
+BOOST_AUTO_TEST_CASE(ChatCheck_KeepsTheKnownFieldsInOrder) {
+  const std::string req =
+    R"({"tool_choice":"auto","tools":[{"function":{"parameters":{"type":"object"},)"
+    R"("name":"shell","description":"Run it."},"type":"function"}],)"
+    R"("messages":[{"content":"Be short.","role":"system"},{"role":"user","content":"hi"},)"
+    R"({"role":"assistant","content":null,"reasoning_content":"think","tool_calls":)"
+    R"([{"type":"function","id":"c1","function":{"arguments":"{}","name":"shell"}}]},)"
+    R"({"role":"tool","tool_call_id":"c1","content":"ok"},)"
+    R"({"role":"assistant","content":"done","tool_calls":[]}]})";
+  std::string out, why;
+  BOOST_REQUIRE_MESSAGE(thinkChatCheck(req, out, &why), why);
+  BOOST_CHECK_EQUAL(out,
+    R"({"messages":[{"role":"system","content":"Be short."},{"role":"user","content":"hi"},)"
+    R"({"role":"assistant","content":null,"reasoning_content":"think","tool_calls":)"
+    R"([{"id":"c1","type":"function","function":{"name":"shell","arguments":"{}"}}]},)"
+    R"({"role":"tool","tool_call_id":"c1","content":"ok"},)"
+    R"({"role":"assistant","content":"done"}],)"
+    R"("tools":[{"type":"function","function":{"name":"shell","description":"Run it.",)"
+    R"("parameters":{"type":"object"}}}],"tool_choice":"auto"})");
+  std::string again;
+  BOOST_REQUIRE(thinkChatCheck(out, again));
+  BOOST_CHECK_EQUAL(again, out);
+  // One function as the tool choice.
+  BOOST_CHECK(thinkChatCheck(
+    R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"function","function":{"name":"f"}}})",
+    out));
+}
+
+BOOST_AUTO_TEST_CASE(ChatCheck_RefusesWithAReason) {
+  const std::vector<std::pair<std::string, std::string>> bad = {
+    {"not json", "not JSON"},
+    {"[1]", "not a JSON object"},
+    {R"({"messages":[]})", "no messages"},
+    {R"({"tools":[]})", "no messages"},
+    {R"({"messages":[{"role":"user","content":"hi"}],"model":"x"})", "other than messages"},
+    {R"({"messages":[{"role":"user"}]})", "user message has no content"},
+    {R"({"messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]})", "no content text"},
+    {R"({"messages":[{"role":"user","content":"hi","name":"x"}]})", "unknown field"},
+    {R"({"messages":[{"role":"robot","content":"hi"}]})", "unknown role \"robot\""},
+    {R"({"messages":["hi"]})", "not an object"},
+    {R"({"messages":[{"role":"assistant"}]})", "no content and no tool calls"},
+    {R"({"messages":[{"role":"assistant","content":7}]})", "content is not text"},
+    {R"({"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","function":{"name":"a b","arguments":"{}"}}]}]})", "bad name"},
+    {R"({"messages":[{"role":"assistant","content":null,"tool_calls":[{"id":"c","function":{"name":"f","arguments":{}}}]}]})", "no arguments text"},
+    {R"({"messages":[{"role":"assistant","content":null,"tool_calls":[{"function":{"name":"f","arguments":"{}"}}]}]})", "no id"},
+    {R"({"messages":[{"role":"tool","content":"x"}]})", "no tool_call_id"},
+    {R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"f","parameters":[]}}]})", "parameters is not an object"},
+    {R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"web","function":{"name":"f"}}]})", "type is not"},
+    {R"({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":")" + std::string(65, 'n') + R"("}}]})", "bad name"},
+    {R"({"messages":[{"role":"user","content":"hi"}],"tool_choice":"always"})", "tool_choice"},
+  };
+  for (const auto& [req, want] : bad) {
+    std::string out, why;
+    BOOST_CHECK_MESSAGE(!thinkChatCheck(req, out, &why), req);
+    BOOST_CHECK_MESSAGE(why.find(want) != std::string::npos, req + " -> " + why);
+  }
+}
+
+BOOST_AUTO_TEST_CASE(RequestJson_ChatSendsTheMessagesAndTools) {
+  std::string clean;
+  BOOST_REQUIRE(thinkChatCheck(kChatRequest, clean));
+  BOOST_CHECK_EQUAL(thinkRequestJson("m", {clean, true}, 50, false),
+    R"({"model":"m","messages":[{"role":"system","content":"Be short."},)"
+    R"({"role":"user","content":"hi"}],"tools":[{"type":"function","function":)"
+    R"({"name":"shell"}}],"max_tokens":50,"stream":true,"stream_options":)"
+    R"({"include_usage":true},"thinking":{"type":"disabled"}})");
+}
+
+BOOST_AUTO_TEST_CASE(ChatEnd_JsonBothWays) {
+  ThinkChatEnd e;
+  e.toolCalls = kToolCalls;
+  e.finishReason = "tool_calls";
+  const std::string j = thinkChatEndJson(e);
+  BOOST_CHECK_EQUAL(j, R"({"tool_calls":)" + kToolCalls + R"(,"finish_reason":"tool_calls"})");
+  ThinkChatEnd back;
+  BOOST_REQUIRE(thinkChatEndParse(j, back));
+  BOOST_CHECK_EQUAL(back.toolCalls, kToolCalls);
+  BOOST_CHECK_EQUAL(back.finishReason, "tool_calls");
+  BOOST_CHECK(back.reasoning.empty());
+  // No calls is an empty array, and the reasoning is there only when set.
+  ThinkChatEnd plain;
+  plain.finishReason = "stop";
+  plain.reasoning = "r";
+  BOOST_CHECK_EQUAL(thinkChatEndJson(plain),
+                    R"({"tool_calls":[],"reasoning_content":"r","finish_reason":"stop"})");
+  BOOST_CHECK_EQUAL(thinkChatReplyJson("hi", plain),
+                    R"({"content":"hi","tool_calls":[],"reasoning_content":"r","finish_reason":"stop"})");
+  BOOST_REQUIRE(thinkChatEndParse(R"({"tool_calls":[],"finish_reason":"stop"})", back));
+  BOOST_CHECK(back.toolCalls.empty());
+  BOOST_CHECK(!thinkChatEndParse("[]", back));
+  BOOST_CHECK(!thinkChatEndParse(R"({"tool_calls":{}})", back));
+  BOOST_CHECK(!thinkChatEndParse(R"({"finish_reason":1})", back));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -620,6 +790,97 @@ BOOST_AUTO_TEST_CASE(Think_StopWithCallInFlight) {
   BOOST_CHECK(waitBalance(before));
 }
 
+// The backend gets the clean form of a chat request. The text streams, and
+// the tool calls and the finish reason come back signed.
+BOOST_AUTO_TEST_CASE(Chat_StreamsTheTextAndSignsTheToolCalls) {
+  backend->chat.toolCalls = kToolCalls;
+  backend->chat.finishReason = "tool_calls";
+  CesThinkClient tc;
+  open(tc);
+  const int64_t before = balance();
+  std::vector<std::string> got;
+  std::string reply;
+  ThinkChatEnd end;
+  uint64_t charged = 0;
+  CES_REQUIRE_OK(tc.chat(kChatRequest,
+                         [&](std::string_view t) { got.emplace_back(t); },
+                         reply, end, charged));
+  BOOST_CHECK_EQUAL(reply, "Hello, world.");
+  BOOST_CHECK_EQUAL(got.size(), 3u);
+  BOOST_CHECK_EQUAL(end.toolCalls, kToolCalls);
+  BOOST_CHECK_EQUAL(end.finishReason, "tool_calls");
+  BOOST_CHECK_EQUAL(charged, thinkCost(fees(), backend->usage));
+  BOOST_CHECK(waitBalance(before - static_cast<int64_t>(charged)));
+  std::string clean;
+  BOOST_REQUIRE(thinkChatCheck(kChatRequest, clean));
+  std::lock_guard<std::mutex> lk(backend->mu);
+  BOOST_CHECK(backend->lastChat);
+  BOOST_CHECK_EQUAL(backend->lastPrompt, clean);
+}
+
+// CHAT with the report gets both, and THINK and CHAT share one channel.
+BOOST_AUTO_TEST_CASE(Chat_ReportAndThinkOnOneChannel) {
+  backend->chat.finishReason = "stop";
+  backend->chat.reasoning = "r";
+  CesThinkClient tc;
+  open(tc);
+  std::string reply;
+  ThinkChatEnd end;
+  uint64_t charged = 0;
+  ThinkReport rep;
+  CES_REQUIRE_OK(tc.chat(kChatRequest, nullptr, reply, end, charged, &rep));
+  BOOST_CHECK(rep.usageKnown);
+  BOOST_CHECK_EQUAL(rep.usage.promptTokens, 100u);
+  BOOST_CHECK_EQUAL(rep.maxOutTokens, kMaxOut);
+  BOOST_CHECK(end.toolCalls.empty());
+  BOOST_CHECK_EQUAL(end.reasoning, "r");
+  BOOST_CHECK_EQUAL(end.finishReason, "stop");
+  CES_REQUIRE_OK(tc.think("plain", nullptr, reply, charged, {}, nullptr, &rep));
+  BOOST_CHECK_EQUAL(reply, "Hello, world.");
+  BOOST_CHECK_EQUAL(rep.maxOutTokens, kMaxOut);
+  {
+    std::lock_guard<std::mutex> lk(backend->mu);
+    BOOST_CHECK(!backend->lastChat);
+    BOOST_CHECK_EQUAL(backend->lastPrompt, "plain");
+  }
+  CES_REQUIRE_OK(tc.chat(kChatRequest, nullptr, reply, end, charged));
+  BOOST_CHECK_EQUAL(end.reasoning, "r");
+  BOOST_CHECK_EQUAL(backend->calls.load(), 3);
+}
+
+// The server refuses a bad chat request before the backend runs, and charges
+// nothing. The channel stays open.
+BOOST_AUTO_TEST_CASE(Chat_BadRequestIsFree) {
+  CesThinkClient tc;
+  open(tc);
+  const int64_t before = balance();
+  std::string reply;
+  ThinkChatEnd end;
+  uint64_t charged = 0;
+  for (const std::string& bad :
+       {std::string("hello"), std::string(R"({"messages":[]})"),
+        std::string(R"({"messages":[{"role":"user","content":"hi"}],"model":"other"})"),
+        std::string("{\"messages\":[{\"role\":\"user\",\"content\":\"\xff\"}]}"),
+        std::string(kMaxInput + 1, ' '), std::string()})
+    BOOST_CHECK_EQUAL(tc.chat(bad, nullptr, reply, end, charged), CES_ERROR_BAD_INPUT);
+  BOOST_CHECK_EQUAL(backend->calls.load(), 0);
+  BOOST_CHECK_EQUAL(balance(), before);
+  CES_REQUIRE_OK(tc.chat(kChatRequest, nullptr, reply, end, charged));
+}
+
+// A chat input has no conversation file.
+BOOST_AUTO_TEST_CASE(Chat_WithAFileIsRefused) {
+  auto sink = std::make_shared<StatusSink>();
+  auto done = sink->done.get_future();
+  ThinkFile file;
+  file.path = "/h/conversation";
+  server->thinkHandler()->submit(ownerKey.getPublicKeyAsHash(),
+                                 ThinkInput{kChatRequest, true}, sink, file);
+  BOOST_REQUIRE(done.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+  BOOST_CHECK_EQUAL(done.get(), CES_ERROR_BAD_INPUT);
+  BOOST_CHECK_EQUAL(backend->calls.load(), 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 BOOST_FIXTURE_TEST_SUITE(ThinkBrokeTests, ThinkBrokeFixture)
@@ -796,6 +1057,8 @@ struct FakeChatServer {
   int gapMs = 0;
   std::atomic<int> requests{0};
   std::atomic<bool> stopping{false};
+  std::mutex mu;
+  std::string lastBody;   // the body of the last request
   std::thread th;
 
   void start() { th = std::thread([this] { serve(); }); }
@@ -826,6 +1089,11 @@ struct FakeChatServer {
       auto cl = head.find("Content-Length: ");
       if (cl != std::string::npos) len = std::stoul(head.substr(cl + 16));
       if (in.size() < len) asio::read(s, in, asio::transfer_exactly(len - in.size()), ec);
+      {
+        std::lock_guard<std::mutex> lk(mu);
+        lastBody.assign(asio::buffers_begin(in.data()),
+                        asio::buffers_begin(in.data()) + std::min(len, in.size()));
+      }
       ++requests;
       std::string resp =
           "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
@@ -881,7 +1149,7 @@ BOOST_AUTO_TEST_CASE(Https_CompleteStream) {
   BOOST_REQUIRE(b.valid());
   std::atomic<bool> stop{false};
   std::string text;
-  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view t) {
+  ThinkOutcome o = b.run({"hi"}, 10, stop, [&](std::string_view t) {
     text.append(t);
     return true;
   });
@@ -890,6 +1158,32 @@ BOOST_AUTO_TEST_CASE(Https_CompleteStream) {
   BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kUsage);
   BOOST_CHECK_EQUAL(o.usage.promptTokens, 36u);
   BOOST_CHECK_EQUAL(srv.requests.load(), 1);
+}
+
+// A chat call sends the messages and the tools, and joins the tool calls.
+BOOST_AUTO_TEST_CASE(Https_ChatSendsTheToolsAndJoinsTheCalls) {
+  FakeChatServer srv;
+  srv.parts = sseEvents(kToolSse);
+  srv.start();
+  auto b = makeBackend(srv);
+  std::string clean;
+  BOOST_REQUIRE(thinkChatCheck(kChatRequest, clean));
+  std::atomic<bool> stop{false};
+  std::string text;
+  ThinkOutcome o = b.run({clean, true}, 10, stop, [&](std::string_view t) {
+    text.append(t);
+    return true;
+  });
+  CES_CHECK_OK(o.status);
+  BOOST_CHECK_EQUAL(text, "Let me look.");
+  BOOST_CHECK_EQUAL(o.chat.toolCalls, kToolCalls);
+  BOOST_CHECK_EQUAL(o.chat.finishReason, "tool_calls");
+  BOOST_CHECK_EQUAL(o.outBytes, 12u + 46u);   // the text and the tool calls
+  std::lock_guard<std::mutex> lk(srv.mu);
+  BOOST_CHECK_MESSAGE(srv.lastBody.find(
+      R"("messages":[{"role":"system","content":"Be short."},{"role":"user","content":"hi"}],)"
+      R"("tools":[{"type":"function","function":{"name":"shell"}}])") != std::string::npos,
+      srv.lastBody);
 }
 
 // A stream that ends without "[DONE]" is not a complete reply.
@@ -901,7 +1195,7 @@ BOOST_AUTO_TEST_CASE(Https_NoDoneIsNotSuccess) {
   srv.start();
   auto b = makeBackend(srv);
   std::atomic<bool> stop{false};
-  ThinkOutcome o = b.run("hi", 10, stop,
+  ThinkOutcome o = b.run({"hi"}, 10, stop,
                          [](std::string_view) { return true; });
   BOOST_CHECK_NE(o.status, CES_OK);
   BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kUsage);   // still billed by usage
@@ -917,7 +1211,7 @@ BOOST_AUTO_TEST_CASE(Https_ClosedSinkStillReadsUsage) {
   auto b = makeBackend(srv);
   std::atomic<bool> stop{false};
   int n = 0;
-  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view) {
+  ThinkOutcome o = b.run({"hi"}, 10, stop, [&](std::string_view) {
     ++n;
     return false;
   });
@@ -934,7 +1228,7 @@ BOOST_AUTO_TEST_CASE(Https_StopBeforeStartSendsNothing) {
   srv.start();
   auto b = makeBackend(srv);
   std::atomic<bool> stop{true};
-  ThinkOutcome o = b.run("hi", 10, stop,
+  ThinkOutcome o = b.run({"hi"}, 10, stop,
                          [](std::string_view) { return true; });
   BOOST_CHECK_NE(o.status, CES_OK);
   BOOST_CHECK_EQUAL(o.billing, ThinkOutcome::kNone);
@@ -952,7 +1246,7 @@ BOOST_AUTO_TEST_CASE(Https_StopWhileStreaming) {
   auto b = makeBackend(srv);
   std::atomic<bool> stop{false};
   const auto t0 = std::chrono::steady_clock::now();
-  ThinkOutcome o = b.run("hi", 10, stop, [&](std::string_view) {
+  ThinkOutcome o = b.run({"hi"}, 10, stop, [&](std::string_view) {
     stop = true;
     return true;
   });

@@ -15,6 +15,7 @@ namespace ces {
 namespace {
 
 constexpr uint8_t kVerbThink = 1;
+constexpr uint8_t kVerbChat = 2;
 constexpr const char* kThinkProto = "/ces/think/1";
 // The longest wait for one reply frame. The server sends a keepalive at
 // least every 20 s while a call runs, so a longer silence means it is gone.
@@ -62,6 +63,99 @@ void CesThinkClient::setServerPubkey(const minx::Hash& pk) {
   else impl_->owned.setServerPubkey(pk);
 }
 
+namespace {
+
+// What one THINK or CHAT asks for, and where its answer goes.
+struct Call {
+  uint8_t verb = kVerbThink;
+  ces::Bytes body;
+  ces::Bytes preTail;   // the preamble after [u32 len][32 hash]
+  const std::function<void(std::string_view)>* onText = nullptr;
+  std::string* reply = nullptr;
+  uint64_t* charged = nullptr;
+  uint8_t* appendError = nullptr;
+  ThinkReport* report = nullptr;
+  ThinkChatEnd* end = nullptr;   // CHAT
+};
+
+uint8_t drive(CesPlexChannel& chan, Call& c) {
+  minx::Hash h = ces::sha256(c.body.data(), c.body.size());
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(c.body.size()));
+  pre.insert(pre.end(), h.begin(), h.end());
+  pre.insert(pre.end(), c.preTail.begin(), c.preTail.end());
+  auto env = chan.buildEnvelope(c.verb, pre);
+
+  std::string& reply = *c.reply;
+  ces::Bytes outPre;
+  uint8_t rc = chan.driveStreamVerb(
+      c.verb, env, c.body,
+      [&](const ces::Bytes& frame) {
+        if (reply.size() + frame.size() > kMaxReply) return false;
+        std::string_view piece(reinterpret_cast<const char*>(frame.data()),
+                               frame.size());
+        reply.append(piece);
+        if (*c.onText) (*c.onText)(piece);
+        return true;
+      },
+      kFrameTimeout, kTotalTimeout, kOkPreamble,
+      [&](ces::Bytes& p) {
+        if (p.size() != kOkPreamble) return true;
+        ces::Bytes rest;
+        // Bit 7 of the last fixed byte says that the report follows. A server
+        // that does not know the flag never sets it.
+        if (p[40] & kReportBit) {
+          if (!chan.readExact(rest, kReportLen)) return false;
+          p.insert(p.end(), rest.begin(), rest.end());
+        }
+        if (c.end) {   // CHAT: [u32 len][the end of the reply]
+          if (!chan.readExact(rest, 4)) return false;
+          p.insert(p.end(), rest.begin(), rest.end());
+          const uint32_t n = ces::Buffer::peek<uint32_t>(rest.data());
+          if (n > kMaxReply || !chan.readExact(rest, n)) return false;
+          p.insert(p.end(), rest.begin(), rest.end());
+        }
+        return true;
+      },
+      outPre);
+  if (rc != CES_OK) return rc;
+  if (outPre.size() < kOkPreamble) return CES_ERROR_INTERNAL;
+  const bool hasReport = (outPre[40] & kReportBit) != 0;
+  size_t off = kOkPreamble + (hasReport ? kReportLen : 0);
+  if (outPre.size() < off) return CES_ERROR_INTERNAL;
+  std::string_view endJson;
+  if (c.end) {
+    if (outPre.size() < off + 4) return CES_ERROR_INTERNAL;
+    const uint32_t n = ces::Buffer::peek<uint32_t>(outPre.data() + off);
+    off += 4;
+    if (outPre.size() != off + n) return CES_ERROR_INTERNAL;
+    endJson = std::string_view(reinterpret_cast<const char*>(outPre.data() + off), n);
+    off += n;
+  }
+  if (outPre.size() != off) return CES_ERROR_INTERNAL;
+  *c.charged = ces::Buffer::peek<uint64_t>(outPre.data());
+  minx::Hash got = ces::sha256(
+      reinterpret_cast<const uint8_t*>(reply.data()), reply.size());
+  if (std::memcmp(got.data(), outPre.data() + 8, 32) != 0)
+    return CES_ERROR_INTERNAL;
+  if (c.end && !thinkChatEndParse(endJson, *c.end)) return CES_ERROR_INTERNAL;
+  if (c.appendError) *c.appendError = static_cast<uint8_t>(outPre[40] & ~kReportBit);
+  if (hasReport && c.report) {
+    const uint8_t* r = outPre.data() + kOkPreamble;
+    c.report->usageKnown = r[0] != 0;
+    c.report->usage.promptTokens = ces::Buffer::peek<uint64_t>(r + 1);
+    c.report->usage.cachedTokens = ces::Buffer::peek<uint64_t>(r + 9);
+    c.report->usage.outputTokens = ces::Buffer::peek<uint64_t>(r + 17);
+    c.report->maxInputBytes = ces::Buffer::peek<uint32_t>(r + 25);
+    c.report->maxOutTokens = ces::Buffer::peek<uint32_t>(r + 29);
+    c.report->contextTokens = ces::Buffer::peek<uint32_t>(r + 33);
+  }
+  return CES_OK;
+}
+
+}  // namespace
+
 uint8_t CesThinkClient::think(
     const std::string& prompt,
     const std::function<void(std::string_view)>& onText, std::string& reply,
@@ -74,61 +168,40 @@ uint8_t CesThinkClient::think(
   if (!impl_->chan) return CES_ERROR_INTERNAL;
   if (prompt.empty() || prompt.size() > UINT32_MAX || file.size() > 1024)
     return CES_ERROR_BAD_INPUT;
+  Call c;
+  c.verb = kVerbThink;
+  c.body.assign(prompt.begin(), prompt.end());
+  ces::Buffer::put<uint16_t>(c.preTail, static_cast<uint16_t>(file.size()));
+  c.preTail.insert(c.preTail.end(), file.begin(), file.end());
+  if (report) ces::Buffer::put<uint8_t>(c.preTail, kFlagReport);
+  c.onText = &onText;
+  c.reply = &reply;
+  c.charged = &charged;
+  c.appendError = appendError;
+  c.report = report;
+  return drive(*impl_->chan, c);
+}
 
-  ces::Bytes body(prompt.begin(), prompt.end());
-  minx::Hash h = ces::sha256(body.data(), body.size());
-  ces::Bytes pre;
-  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
-  ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(body.size()));
-  pre.insert(pre.end(), h.begin(), h.end());
-  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(file.size()));
-  pre.insert(pre.end(), file.begin(), file.end());
-  if (report) ces::Buffer::put<uint8_t>(pre, kFlagReport);
-  auto env = impl_->chan->buildEnvelope(kVerbThink, pre);
-
-  ces::Bytes outPre;
-  uint8_t rc = impl_->chan->driveStreamVerb(
-      kVerbThink, env, body,
-      [&](const ces::Bytes& frame) {
-        if (reply.size() + frame.size() > kMaxReply) return false;
-        std::string_view piece(reinterpret_cast<const char*>(frame.data()),
-                               frame.size());
-        reply.append(piece);
-        if (onText) onText(piece);
-        return true;
-      },
-      kFrameTimeout, kTotalTimeout, kOkPreamble,
-      [&](ces::Bytes& p) {
-        // Bit 7 of the last fixed byte says that the report follows. A server
-        // that does not know the flag never sets it.
-        if (p.size() != kOkPreamble || !(p[40] & kReportBit)) return true;
-        ces::Bytes rest;
-        if (!impl_->chan->readExact(rest, kReportLen)) return false;
-        p.insert(p.end(), rest.begin(), rest.end());
-        return true;
-      },
-      outPre);
-  if (rc != CES_OK) return rc;
-  const bool hasReport =
-      outPre.size() == kOkPreamble + kReportLen && (outPre[40] & kReportBit);
-  if (outPre.size() != kOkPreamble && !hasReport) return CES_ERROR_INTERNAL;
-  charged = ces::Buffer::peek<uint64_t>(outPre.data());
-  minx::Hash got = ces::sha256(
-      reinterpret_cast<const uint8_t*>(reply.data()), reply.size());
-  if (std::memcmp(got.data(), outPre.data() + 8, 32) != 0)
-    return CES_ERROR_INTERNAL;
-  if (appendError) *appendError = static_cast<uint8_t>(outPre[40] & ~kReportBit);
-  if (hasReport && report) {
-    const uint8_t* r = outPre.data() + kOkPreamble;
-    report->usageKnown = r[0] != 0;
-    report->usage.promptTokens = ces::Buffer::peek<uint64_t>(r + 1);
-    report->usage.cachedTokens = ces::Buffer::peek<uint64_t>(r + 9);
-    report->usage.outputTokens = ces::Buffer::peek<uint64_t>(r + 17);
-    report->maxInputBytes = ces::Buffer::peek<uint32_t>(r + 25);
-    report->maxOutTokens = ces::Buffer::peek<uint32_t>(r + 29);
-    report->contextTokens = ces::Buffer::peek<uint32_t>(r + 33);
-  }
-  return CES_OK;
+uint8_t CesThinkClient::chat(
+    const std::string& request,
+    const std::function<void(std::string_view)>& onText, std::string& reply,
+    ThinkChatEnd& end, uint64_t& charged, ThinkReport* report) {
+  reply.clear();
+  end = ThinkChatEnd{};
+  charged = 0;
+  if (report) *report = ThinkReport{};
+  if (!impl_->chan) return CES_ERROR_INTERNAL;
+  if (request.empty() || request.size() > UINT32_MAX) return CES_ERROR_BAD_INPUT;
+  Call c;
+  c.verb = kVerbChat;
+  c.body.assign(request.begin(), request.end());
+  ces::Buffer::put<uint8_t>(c.preTail, report ? kFlagReport : 0);
+  c.onText = &onText;
+  c.reply = &reply;
+  c.charged = &charged;
+  c.report = report;
+  c.end = &end;
+  return drive(*impl_->chan, c);
 }
 
 }  // namespace ces

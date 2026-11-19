@@ -36,7 +36,7 @@ class ThinkHttpsBackend : public ThinkBackend {
   ~ThinkHttpsBackend() override;
   // False when the base URL does not parse or TLS setup failed.
   bool valid() const { return valid_; }
-  ThinkOutcome run(const std::string& prompt, uint32_t maxOut,
+  ThinkOutcome run(const ThinkInput& input, uint32_t maxOut,
                    const std::atomic<bool>& stop,
                    const std::function<bool(std::string_view)>& onText)
       override;

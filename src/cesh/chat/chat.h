@@ -1,13 +1,13 @@
 // cesh chat: a conversation that also operates cesh.
 //
-// The user talks, and the chat sends the conversation to builtin:think (text
-// in, text out). When a line of the reply starts with the execution marker
-// (kExecMarker, "%%CESH-EXEC%%"), the chat runs the cesh command after it,
-// through cesh itself, in this process, and gives the results back to the
-// model in the next turn. The marker is in no other language, so markdown
-// stays text for the user. The model learns cesh from the manual
-// that is built into cesh (`man`), and keeps the user's notes in a local
-// memory file.
+// The user talks, and the chat sends the conversation to builtin:think as a
+// chat request. The rules are the system message. The lines of the user, the
+// replies of the model and the results follow it as messages. The model runs
+// a command with its one tool, `cesh`. The chat runs the command through
+// cesh, in this process, and sends the result back as the tool message of
+// the call. Nothing that the model writes as text runs. The model learns cesh
+// from the built-in manual (`man`), and keeps the notes of the user in a
+// local memory file.
 //
 // The chat, not the model, decides what runs: a fixed table classifies each
 // command (classify). Reads run at once. All other commands run only after
@@ -64,16 +64,6 @@ std::string publicKeysOf(const std::string& keysListPublicOut);
 // (except inside '...'). Returns false on an open quote.
 bool splitLine(const std::string& line, std::vector<std::string>& out);
 
-// The line prefix that runs a command. Nothing else runs.
-extern const char* const kExecMarker;
-
-// The commands of the marker lines of a reply, in order. A "cesh " after the
-// marker is removed.
-std::vector<std::string> commandLines(const std::string& reply);
-
-// The reply without its marker lines, for the user. All else stays.
-std::string proseOf(const std::string& reply);
-
 // Text that is safe to print on a terminal: each control character (C0, DEL,
 // C1) except a line break and a tab becomes '?'. A command's output can have
 // bytes from a remote program (compute call), and an escape sequence must not
@@ -104,9 +94,39 @@ private:
   std::map<std::string, std::string> notes_;
 };
 
+// One message of the conversation, as the model API takes it.
+struct Message {
+  std::string role;         // "user", "assistant" or "tool"
+  std::string content;
+  std::string toolCalls;    // the JSON array of the tool calls of an assistant message, or ""
+  std::string reasoning;    // the reasoning of an assistant message, which the API needs back
+  std::string toolCallId;   // the call that a tool message answers
+};
+
+// One tool call of a reply, with its command and the content of a `write`.
+struct ToolCall {
+  std::string id;
+  std::string command;   // without "cesh " in front
+  std::string content;
+  std::string error;     // why it cannot run, or "" when it can
+};
+
+// The tool calls of a reply, from the JSON array that the server sent.
+std::vector<ToolCall> toolCallsOf(const std::string& json);
+
+// The chat request of `system` and `messages` as JSON {"messages","tools"},
+// with the `cesh` tool when `tools` is true. Two user messages in a row
+// become one. A tool message with no call before it becomes a user message.
+// A call with no tool message gets one that says "did not run". So the model
+// API accepts every request.
+std::string chatRequest(const std::string& system, const std::vector<Message>& messages,
+                        bool tools = true);
+
 struct ThinkReply {
   bool ok = false;
   std::string text;
+  std::string toolCalls;   // the JSON array of the tool calls of the reply, or "" for none
+  std::string reasoning;   // the reasoning of the reply, or "" for none
   std::string error;
   int64_t charged = -1;   // raw units that the call cost the signer; -1 = not known
   // What the call used, when the server reports it (-1 = not known).
@@ -133,26 +153,9 @@ struct ContextUse {
 // line. A "~" marks an estimate.
 std::string contextText(const ContextUse& u);
 
-// A model reply, split for the user and the transcript (cleanReply).
-struct CleanReply {
-  std::string prose;                    // what the user sees: the text before the first command
-  std::vector<std::string> commands;    // the commands to run
-  std::string kept;                     // the reply as the transcript keeps it
-  std::vector<std::string> bodies;      // per command: the content of a `write`, or ""
-  std::string dropped;                  // text that the chat removed, if any
-  bool fabricated = false;              // the reply imitated the chat's own entries
-  bool unterminated = false;            // a `write` had no end marker: it does not run
-};
-
-// Split a reply. Text after the first command line is dropped: the model
-// must stop and wait for the results. A line that starts as the chat's own
-// entries do ("RESULT of", "YOU:", "USER:", "CHAT:") is an imitation: the
-// reply is cut there, and nothing after it runs. A `write <name>` takes the
-// lines after it, up to a line "%%CESH-END%%", as its content.
-CleanReply cleanReply(const std::string& reply);
-
 struct Hooks {
-  std::function<ThinkReply(const std::string& prompt)> think;
+  // One model call with a chat request (chatRequest).
+  std::function<ThinkReply(const std::string& request)> think;
   std::function<CeshResult(const std::vector<std::string>& args)> run;
   std::function<bool(std::string& line)> readLine;       // false at the end of input
   std::function<void(const std::string& text)> show;     // to the user
@@ -205,10 +208,13 @@ public:
   // One line from the user, and every model call and command it leads to.
   void turn(const std::string& userLine);
 
-  // The full prompt for the next model call.
-  std::string prompt() const;
+  // The chat request for the next model call, and its system message.
+  std::string request() const;
+  std::string system() const;
 
-  const std::string& transcript() const { return transcript_; }
+  const std::vector<Message>& messages() const { return messages_; }
+  // The messages as text, one "ROLE: content" block each, as the fold reads them.
+  std::string transcript() const;
   const std::string& summary() const { return summary_; }
   const Memory& memory() const { return memory_; }
   ContextUse context() const;
@@ -232,8 +238,12 @@ private:
   std::string runMemory(const std::vector<std::string>& args, const std::string& line);
   std::vector<std::string> withGlobals(const std::vector<std::string>& args) const;
   // One model call: the usage and the limits go into the chat. `answer`:
-  // the call answers the conversation, so the status shows its prompt.
-  ThinkReply think(const std::string& prompt, bool answer = true);
+  // the call answers the conversation, so the status shows its size.
+  ThinkReply think(const std::string& request, bool answer = true);
+  // A user message from the chat itself, which starts with "[chat]".
+  void note(const std::string& text);
+  // About the bytes of the messages from `from` on, in the request.
+  size_t messageBytes(size_t from = 0) const;
   uint64_t tokensOf(size_t bytes) const;   // an estimate from the last call
   double bytesPerTokenOr3() const { return bytesPerToken_ > 0 ? bytesPerToken_ : 3.0; }
   uint64_t roomTokens() const;
@@ -242,13 +252,13 @@ private:
   bool fit();
   bool compact();
   void cutOldest(size_t keepBytes);   // the floor when the model cannot fold
-  // Take the first `n` bytes off the transcript, and the turns that start in them.
+  // Take the first `n` messages off, and the turns that start in them.
   void dropFront(size_t n);
 
   Options opt_;
   Hooks hooks_;
   Memory memory_;
-  std::string transcript_;
+  std::vector<Message> messages_;
   int64_t spent_ = 0;   // raw units of the model calls of this chat
   bool declined_ = false;   // the user said no in this turn
   // The last line ran and succeeded, and its output went to the user (not a
@@ -262,8 +272,7 @@ private:
   // or at the last fold. A change since is in the conversation.
   std::string notes_;
   std::string summary_;   // the older turns, folded by compaction
-  // Where each turn starts in the transcript. Kept here, not searched for:
-  // a command's output can hold a line that starts "USER: ".
+  // The message where each turn starts.
   std::vector<size_t> turns_;
   // The window, as the last call reported it, and how the last prompt went.
   uint32_t window_ = 0, inputMax_ = 0, outMax_ = 0;

@@ -786,6 +786,11 @@ int ceshRun(int argc, char* argv[]) {
                         "goes before the prompt, and the server appends the "
                         "prompt and the reply to it (when you own it and its "
                         "balance pays the append)");
+  bool think_chat_arg = false;
+  cmd_think->add_flag("--chat", think_chat_arg,
+                      "The input is a chat request in JSON, with messages and "
+                      "tools. stdout gets the answer as one JSON object with "
+                      "content, tool_calls and finish_reason. See cesh man think");
   bool think_verbose_arg = false;
   cmd_think->add_flag("-v,--verbose", think_verbose_arg,
                       "Also print on stderr the charge (raw units), the file "
@@ -2961,6 +2966,18 @@ int ceshRun(int argc, char* argv[]) {
         std::cerr << "Error: empty prompt\n";
         return 1;
       }
+      if (think_chat_arg) {
+        // Check the request here too, so that a mistake gets its reason.
+        std::string clean, why;
+        if (!think_file_arg.empty()) {
+          std::cerr << "Error: --chat takes no --file\n";
+          return 1;
+        }
+        if (!thinkChatCheck(prompt, clean, &why)) {
+          std::cerr << "Error: not a chat request: " << why << "\n";
+          return 1;
+        }
+      }
 
       CesThinkClient tc;
       uint8_t rc = tc.connect(host, rpcPort_arg, actorKey);
@@ -2975,17 +2992,26 @@ int ceshRun(int argc, char* argv[]) {
       bool endsInNewline = true;
       uint8_t appendError = CES_OK;
       ThinkReport report;
-      rc = tc.think(prompt,
-                    [&](std::string_view piece) {
-                      std::cout << piece << std::flush;
-                      endsInNewline = piece.back() == '\n';
-                    },
-                    reply, charged, think_file_arg, &appendError,
-                    think_verbose_arg ? &report : nullptr);
-      if (!endsInNewline) std::cout << "\n";
+      ThinkChatEnd end;
+      if (think_chat_arg) {
+        // stdout gets one JSON object, after the whole answer.
+        rc = tc.chat(prompt, nullptr, reply, end, charged,
+                     think_verbose_arg ? &report : nullptr);
+        if (rc == CES_OK) std::cout << thinkChatReplyJson(reply, end) << "\n";
+      } else {
+        rc = tc.think(prompt,
+                      [&](std::string_view piece) {
+                        std::cout << piece << std::flush;
+                        endsInNewline = piece.back() == '\n';
+                      },
+                      reply, charged, think_file_arg, &appendError,
+                      think_verbose_arg ? &report : nullptr);
+        if (!endsInNewline) std::cout << "\n";
+      }
       std::cout << std::flush;
       if (rc != CES_OK) {
-        std::cerr << "THINK Failed: " << errorString(rc) << "\n";
+        std::cerr << (think_chat_arg ? "CHAT" : "THINK") << " Failed: "
+                  << errorString(rc) << "\n";
         if (rc == CES_ERROR_ORIGIN_NOT_FOUND ||
             rc == CES_ERROR_INSUFFICIENT_BALANCE)
           std::cerr << "the signer " << actorKey.getPublicKeyHexStr()

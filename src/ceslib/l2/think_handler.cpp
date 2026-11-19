@@ -32,6 +32,7 @@ namespace ces {
 namespace {
 
 constexpr uint8_t kVerbThink = 1;
+constexpr uint8_t kVerbChat = 2;
 constexpr uint8_t kThinkFlagReport = 0x01;   // request flags, bit 0
 constexpr uint8_t kThinkReportBit = 0x80;    // response appendError byte, bit 7
 constexpr uint64_t kMillion = 1'000'000;
@@ -142,14 +143,16 @@ uint8_t readWhole(CesServer* server, const ThinkFile& f,
   return CES_OK;
 }
 
-// The THINK verb's sink: reply frames on the bound channel. On OK the signed
-// preamble is [u64 charged][32 sha256(reply)][u8 appendError], then the
-// report when the caller asked for it (see think_handler.h).
+// The sink of THINK and CHAT writes reply frames on the bound channel. On OK
+// the signed preamble is [u64 charged][32 sha256(reply)][u8 appendError],
+// then the report if the caller asked for it, then for CHAT the end of the
+// reply (see think_handler.h).
 class PlexSink : public ThinkSink {
  public:
-  PlexSink(std::shared_ptr<CesPlexReplyStream> r, bool wantReport)
-      : r_(std::move(r)), wantReport_(wantReport) {}
+  PlexSink(std::shared_ptr<CesPlexReplyStream> r, bool wantReport, bool chat)
+      : r_(std::move(r)), wantReport_(wantReport), chat_(chat) {}
   void report(const ThinkReport& rep) override { rep_ = rep; }
+  void chatEnd(const ThinkChatEnd& end) override { end_ = end; }
   bool open() override { return !r_->dead(); }
   void piece(std::string_view t) override {
     r_->write(ces::Bytes(t.begin(), t.end()));
@@ -165,26 +168,32 @@ class PlexSink : public ThinkSink {
     minx::Hash h = ces::sha256(reinterpret_cast<const uint8_t*>(text.data()),
                                text.size());
     pre.insert(pre.end(), h.begin(), h.end());
-    if (!wantReport_) {
-      ces::Buffer::put<uint8_t>(pre, appendError);
-      r_->finish(CES_OK, std::move(pre));
-      return;
+    ces::Buffer::put<uint8_t>(
+        pre, static_cast<uint8_t>(wantReport_ ? appendError | kThinkReportBit
+                                              : appendError));
+    if (wantReport_) {
+      ces::Buffer::put<uint8_t>(pre, rep_.usageKnown ? 1 : 0);
+      ces::Buffer::put<uint64_t>(pre, rep_.usage.promptTokens);
+      ces::Buffer::put<uint64_t>(pre, rep_.usage.cachedTokens);
+      ces::Buffer::put<uint64_t>(pre, rep_.usage.outputTokens);
+      ces::Buffer::put<uint32_t>(pre, rep_.maxInputBytes);
+      ces::Buffer::put<uint32_t>(pre, rep_.maxOutTokens);
+      ces::Buffer::put<uint32_t>(pre, rep_.contextTokens);
     }
-    ces::Buffer::put<uint8_t>(pre, static_cast<uint8_t>(appendError | kThinkReportBit));
-    ces::Buffer::put<uint8_t>(pre, rep_.usageKnown ? 1 : 0);
-    ces::Buffer::put<uint64_t>(pre, rep_.usage.promptTokens);
-    ces::Buffer::put<uint64_t>(pre, rep_.usage.cachedTokens);
-    ces::Buffer::put<uint64_t>(pre, rep_.usage.outputTokens);
-    ces::Buffer::put<uint32_t>(pre, rep_.maxInputBytes);
-    ces::Buffer::put<uint32_t>(pre, rep_.maxOutTokens);
-    ces::Buffer::put<uint32_t>(pre, rep_.contextTokens);
+    if (chat_) {
+      const std::string end = thinkChatEndJson(end_);
+      ces::Buffer::put<uint32_t>(pre, static_cast<uint32_t>(end.size()));
+      pre.insert(pre.end(), end.begin(), end.end());
+    }
     r_->finish(CES_OK, std::move(pre));
   }
 
  private:
   std::shared_ptr<CesPlexReplyStream> r_;
   bool wantReport_ = false;
+  bool chat_ = false;
   ThinkReport rep_;
+  ThinkChatEnd end_;
 };
 
 // Read and drop `left` body bytes, then finish the reply with `status`.
@@ -206,12 +215,14 @@ void drainThenFinish(std::shared_ptr<CesPlexRequest> req,
     });
 }
 
-// THINK. The prompt streams as the request body (hash-committed in the
-// preamble, like mail SEND). Preamble (after nonce): [u32 textLen][32 hash]
-// then optionally [u16 pathLen][path] (the conversation file).
+// THINK and CHAT. The prompt or the chat request streams as the request body
+// (hash-committed in the preamble, like mail SEND). Preamble (after nonce):
+// [u32 textLen][32 hash], then for THINK optionally [u16 pathLen][path] (the
+// conversation file) and [u8 flags], and for CHAT [u8 flags].
 void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
                    ThinkHandler* self) {
   auto reply = std::make_shared<CesPlexReplyStream>(req);
+  const bool chat = req->verb == kVerbChat;
   ces::Buffer buf(std::move(pre));
   uint32_t textLen = 0;
   std::array<uint8_t, 32> textHash{};
@@ -220,11 +231,15 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
   try {
     textLen = buf.get<uint32_t>();
     textHash = buf.get<std::array<uint8_t, 32>>();
-    if (buf.remaining() > 0) {   // optional conversation file
-      uint16_t pathLen = buf.get<uint16_t>();
-      path = buf.getBytes<std::string>(pathLen);
+    if (chat) {
+      flags = buf.get<uint8_t>();
+    } else {
+      if (buf.remaining() > 0) {   // optional conversation file
+        uint16_t pathLen = buf.get<uint16_t>();
+        path = buf.getBytes<std::string>(pathLen);
+      }
+      if (buf.remaining() > 0) flags = buf.get<uint8_t>();   // optional flags
     }
-    if (buf.remaining() > 0) flags = buf.get<uint8_t>();   // optional flags
   } catch (const std::out_of_range&) {
     reply->finishAndClose(CES_ERROR_BAD_INPUT);   // body length unknown
     return;
@@ -243,7 +258,7 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
   auto text = std::make_shared<ces::Bytes>(textLen);
   boost::asio::async_read(
     *req->stream, boost::asio::buffer(*text),
-    [req, reply, text, textHash, path, flags, self](
+    [req, reply, text, textHash, path, flags, chat, self](
         const boost::system::error_code& ec, std::size_t) {
       if (ec) return;   // stream dead
       minx::Hash got = ces::sha256(text->data(), text->size());
@@ -285,8 +300,8 @@ void dispatchThink(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
       std::memcpy(file.caller.data(), signer.data(), 32);
       file.payByAccount = true;
       file.payerAccount = file.caller;
-      self->submit(signer, std::string(text->begin(), text->end()),
-                   std::make_shared<PlexSink>(reply, (flags & kThinkFlagReport) != 0),
+      self->submit(signer, ThinkInput{std::string(text->begin(), text->end()), chat},
+                   std::make_shared<PlexSink>(reply, (flags & kThinkFlagReport) != 0, chat),
                    std::move(file));
     });
 }
@@ -360,7 +375,7 @@ void ThinkHandler::serve(std::shared_ptr<minx::RudpStream> stream,
   ThinkHandler* self = this;
   CesPlexProtocol proto;
   proto.accepts = [this](uint8_t verb) {
-    return !stopped_.load() && verb == kVerbThink;
+    return !stopped_.load() && (verb == kVerbThink || verb == kVerbChat);
   };
   proto.dispatch = [self](std::shared_ptr<CesPlexRequest> req,
                           ces::Bytes pre) {
@@ -409,17 +424,24 @@ void ThinkHandler::reapLocked() {
   }
 }
 
-void ThinkHandler::submit(const ThinkPayer& payer, std::string prompt,
+void ThinkHandler::submit(const ThinkPayer& payer, ThinkInput input,
                           std::shared_ptr<ThinkSink> sink, ThinkFile file) {
   const auto& cfg = server_->_config();
   if (stopped_.load() || !enabled()) {
     sink->finish(CES_ERROR_DISABLED, 0, {}, CES_OK);
     return;
   }
-  if (prompt.empty() || prompt.size() > cfg.thinkMaxInputBytes ||
-      !thinkValidUtf8(prompt)) {
-    sink->finish(CES_ERROR_BAD_INPUT, 0, {}, CES_OK);
-    return;
+  auto refuse = [&] { sink->finish(CES_ERROR_BAD_INPUT, 0, {}, CES_OK); };
+  if (input.text.empty() || input.text.size() > cfg.thinkMaxInputBytes ||
+      !thinkValidUtf8(input.text))
+    return refuse();
+  if (input.chat) {
+    // The backend gets the checked request, with only its known fields.
+    std::string clean;
+    if (!file.path.empty() || !thinkChatCheck(input.text, clean) ||
+        clean.size() > cfg.thinkMaxInputBytes)
+      return refuse();
+    input.text = std::move(clean);
   }
   // The /m/ zone is private: no status may tell anyone else whether a file
   // there exists, as for the wire STAT. Its owner, as the THINK signer, may
@@ -456,10 +478,10 @@ void ThinkHandler::submit(const ThinkPayer& payer, std::string prompt,
   // the settle, the append. Every exit ends in one sink->finish.
   try {
     job->thread = std::thread([this, job, sink, backend, payer,
-                               prompt = std::move(prompt),
+                               input = std::move(input),
                                file = std::move(file)]() mutable {
       try {
-        run(*job, *backend, payer, std::move(prompt), file, *sink);
+        run(*job, *backend, payer, std::move(input), file, *sink);
       } catch (const std::exception& e) {
         LOGERROR << "think: call failed" << SVAR(e.what());
         sink->finish(CES_ERROR_INTERNAL, 0, {}, CES_OK);
@@ -476,15 +498,16 @@ void ThinkHandler::submit(const ThinkPayer& payer, std::string prompt,
 }
 
 void ThinkHandler::run(Job& job, ThinkBackend& backend,
-                       const ThinkPayer& payer, std::string prompt,
+                       const ThinkPayer& payer, ThinkInput input,
                        const ThinkFile& file, ThinkSink& sink) {
   CesServer* server = server_;
   const auto& cfg = server->_config();
 
-  // The backend gets the file's content, then the new text. Only the owner
-  // can append, so only the owner's call locks the path, from the read to
-  // the append.
-  std::string input;
+  // With a file, the backend gets the file's content, then the new text.
+  // Only the owner can append, so only the owner's call locks the path, from
+  // the read to the append. A chat input has no file (submit checks it).
+  const std::string prompt = input.text;
+  std::string past;
   bool locked = false;
   auto unlock = [&] {
     if (!locked) return;
@@ -505,17 +528,17 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
       else locked = busyPaths_.insert(file.path).second;
     }
     if (rc == CES_OK)
-      rc = readWhole(server, file, st, cfg.thinkMaxInputBytes, input);
-    if (rc == CES_OK && (input.size() + prompt.size() > cfg.thinkMaxInputBytes ||
-                         !thinkValidUtf8(input)))
+      rc = readWhole(server, file, st, cfg.thinkMaxInputBytes, past);
+    if (rc == CES_OK && (past.size() + prompt.size() > cfg.thinkMaxInputBytes ||
+                         !thinkValidUtf8(past)))
       rc = CES_ERROR_BAD_INPUT;
     if (rc != CES_OK) {
       unlock();
       sink.finish(rc, 0, {}, CES_OK);
       return;
     }
+    input.text = past + prompt;
   }
-  input += prompt;
 
   std::string text;
   uint64_t charge = 0;
@@ -542,12 +565,13 @@ void ThinkHandler::run(Job& job, ThinkBackend& backend,
   rep.maxOutTokens = cfg.thinkMaxOutTokens;
   rep.contextTokens = thinkWindow(cfg.thinkContextTokens, backend.contextWindow());
   sink.report(rep);
+  if (input.chat) sink.chatEnd(o.chat);
   sink.finish(o.status, charge, text, appendError);
 }
 
 ThinkOutcome ThinkHandler::callAndSettle(Job& job, ThinkBackend& backend,
                                          const ThinkPayer& payer,
-                                         const std::string& input,
+                                         const ThinkInput& input,
                                          ThinkSink& sink, std::string& text,
                                          uint64_t& charge) {
   CesServer* server = server_;
@@ -561,9 +585,10 @@ ThinkOutcome ThinkHandler::callAndSettle(Job& job, ThinkBackend& backend,
   // reserved as heat now, so calls in flight together cannot take more than
   // the budget, and a long prompt does not reserve for a worst case that
   // does not come.
-  const uint64_t fullHold = thinkHold(fees, input.size(), maxOut);
+  const uint64_t inBytes = input.text.size();
+  const uint64_t fullHold = thinkHold(fees, inBytes, maxOut);
   const uint64_t expected =
-      std::min(fullHold, thinkExpected(fees, input.size(), maxOut));
+      std::min(fullHold, thinkExpected(fees, inBytes, maxOut));
   uint64_t reserved = 0;
   const uint16_t mult = subsidy_->reserve(expected, reserved);  // 10000 = full
   const uint64_t hold = fullHold - reserved;
@@ -610,7 +635,7 @@ ThinkOutcome ThinkHandler::callAndSettle(Job& job, ThinkBackend& backend,
   if (o.billing == ThinkOutcome::kUsage) {
     full = thinkCost(fees, o.usage);
   } else if (o.billing == ThinkOutcome::kEstimate) {
-    full = thinkEstimate(fees, input.size(),
+    full = thinkEstimate(fees, inBytes,
                          std::max<uint64_t>(o.outBytes, text.size()));
   }
   if (full > fullHold) full = fullHold;

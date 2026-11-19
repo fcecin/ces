@@ -1,5 +1,6 @@
-// cesh chat (src/cesh/chat/): the command table, line splitting, the execution
-// marker lines, the note file, and the turn loop with scripted hooks.
+// cesh chat (src/cesh/chat/): the command table, line splitting, the tool
+// calls and the chat request, the note file, and the turn loop with scripted
+// hooks.
 // `CeshChatE2ETests` runs the real `cesh chat` binary against a server whose
 // think backend is a script, so the model's commands run through cesh.
 
@@ -17,6 +18,7 @@
 #include <ces/l2/think_handler.h>
 #include <ces/server.h>
 
+#include <boost/json.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
@@ -36,15 +38,71 @@ Kind kindOf(const std::string& line) {
   return classify(a);
 }
 
+// A scripted reply of the model: its words, and the commands that it runs,
+// each with the content of a write ("" for the others).
+struct Say {
+  Say(const char* t) : text(t) {}
+  Say(std::string t) : text(std::move(t)) {}
+  Say(std::string t, const std::vector<std::string>& commands) : text(std::move(t)) {
+    for (auto& c : commands) calls.push_back({c, ""});
+  }
+  std::string text;
+  std::vector<std::pair<std::string, std::string>> calls;
+};
+
+// A reply that writes `content` to the scratch file `name`.
+Say writes(std::string text, const std::string& name, const std::string& content) {
+  Say s(std::move(text));
+  s.calls.push_back({"write " + name, content});
+  return s;
+}
+
+namespace json = boost::json;
+
+// A chat request as text: "ROLE: content" for each message, and a "RAN:"
+// line for each tool call. `system` gets the system message.
+std::string asText(const std::string& request, std::string* system = nullptr) {
+  std::string t;
+  const json::value req = json::parse(request);
+  for (const json::value& m : req.at("messages").as_array()) {
+    const json::object& o = m.as_object();
+    std::string role(o.at("role").as_string());
+    const json::value& c = o.at("content");
+    std::string content = c.is_string() ? std::string(c.as_string()) : "";
+    if (role == "system" && system) *system = content;
+    for (auto& ch : role) ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    t += role + ": " + content;
+    if (const json::value* calls = o.if_contains("tool_calls"))
+      for (const json::value& call : calls->as_array())
+        t += "\nRAN: " + std::string(call.at("function").at("arguments").as_string());
+    t += "\n\n";
+  }
+  return t;
+}
+
+// The messages of `next` start with all the messages of `prev`, so the model's
+// prompt cache serves them.
+bool grows(const std::string& prev, const std::string& next) {
+  const json::value p = json::parse(prev), n = json::parse(next);
+  const json::array& a = p.at("messages").as_array();
+  const json::array& b = n.at("messages").as_array();
+  if (b.size() < a.size()) return false;
+  for (size_t i = 0; i < a.size(); ++i)
+    if (a[i] != b[i]) return false;
+  return true;
+}
+
 // Hooks that follow a script: the model's replies in order, and the user's
 // answers to the confirm questions.
 struct Script {
-  std::vector<std::string> replies;
+  std::vector<Say> replies;
   std::vector<bool> answers;
   size_t thinks = 0, asks = 0;
   std::vector<std::vector<std::string>> ran;
   std::vector<std::string> shown;
-  std::vector<std::string> prompts;
+  std::vector<std::string> prompts;    // the requests as text (asText)
+  std::vector<std::string> requests;   // as JSON
+  size_t calls = 0;                    // tool calls made
   bool badSyntax = false;
   size_t badParses = 0;   // the first N syntax checks fail
   std::string out = "Balance: 42\n";   // what each command prints
@@ -61,16 +119,18 @@ struct Script {
 
   Hooks hooks() {
     Hooks h;
-    h.think = [this](const std::string& p) {
+    h.think = [this](const std::string& req) {
       ThinkReply r;
       if (report) {
-        r.promptTokens = static_cast<int64_t>(p.size() / 4);
+        r.promptTokens = static_cast<int64_t>(req.size() / 4);
         r.cachedTokens = r.promptTokens / 4;
         r.contextTokens = window;
         r.maxOutTokens = maxOut;
         r.maxInputBytes = 1024 * 1024;
       }
-      if (p.rfind("You fold the older part", 0) == 0) {
+      std::string system;
+      std::string text = asText(req, &system);
+      if (system.rfind("You fold the older part", 0) == 0) {
         ++folds;
         r.ok = !foldFails;
         r.text = foldFails ? "" : summary;
@@ -78,9 +138,20 @@ struct Script {
         r.charged = 5;
         return r;
       }
-      prompts.push_back(p);
+      prompts.push_back(text);
+      requests.push_back(req);
       r.ok = true;
-      r.text = replies[std::min(thinks, replies.size() - 1)];
+      const Say& say = replies[std::min(thinks, replies.size() - 1)];
+      r.text = say.text;
+      json::array a;
+      for (auto& [command, content] : say.calls) {
+        json::object args{{"command", command}};
+        if (!content.empty()) args["content"] = content;
+        a.push_back(json::object{{"id", "c" + std::to_string(++calls)}, {"type", "function"},
+                                 {"function", json::object{{"name", "cesh"},
+                                                           {"arguments", json::serialize(args)}}}});
+      }
+      if (!a.empty()) r.toolCalls = json::serialize(a);
       ++thinks;
       return r;
     };
@@ -211,19 +282,51 @@ BOOST_AUTO_TEST_CASE(SplitLine_QuotesAndEscapes) {
   BOOST_CHECK(a[1].empty());
 }
 
-BOOST_AUTO_TEST_CASE(Marker_OnlyMarkerLinesRun) {
-  std::string reply =
-    "I will check.\n%%CESH-EXEC%% query @0\n  %%CESH-EXEC%% cesh ping\n"
-    "To make a key, type this yourself:\n```cesh\ncesh keys gen 1 -w ~/.cesh/CESH_WALLET\n```\n"
-    "A marker inside a line, %%CESH-EXEC%% mine, does not run.\n%%CESH-EXEC%%\nDone.";
-  auto lines = commandLines(reply);
-  std::vector<std::string> want = {"query @0", "ping"};
-  BOOST_CHECK_EQUAL_COLLECTIONS(lines.begin(), lines.end(), want.begin(), want.end());
-  std::string prose = proseOf(reply);
-  BOOST_CHECK(has(prose, "I will check.\nTo make a key"));   // marker lines are gone
-  BOOST_CHECK(has(prose, "```cesh\ncesh keys gen 1"));        // the code block stays
-  BOOST_CHECK(has(prose, "A marker inside a line"));
-  BOOST_CHECK(!has(prose, "query @0"));
+BOOST_AUTO_TEST_CASE(ToolCalls_TheCommandAndItsContent) {
+  auto calls = toolCallsOf(R"([
+    {"id":"a","type":"function","function":{"name":"cesh","arguments":"{\"command\":\"cesh query @0\"}"}},
+    {"id":"b","type":"function","function":{"name":"cesh","arguments":"{\"command\":\"write a.lua\",\"content\":\"ces.run()\\n\"}"}},
+    {"id":"c","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}},
+    {"id":"d","type":"function","function":{"name":"cesh","arguments":"not json"}},
+    {"id":"e","type":"function","function":{"name":"cesh","arguments":"{\"cmd\":\"ping\"}"}},
+    {"type":"function","function":{"name":"cesh","arguments":"{\"command\":\"ping\"}"}}])");
+  BOOST_REQUIRE_EQUAL(calls.size(), 5u);   // the call with no id cannot get its result
+  BOOST_CHECK_EQUAL(calls[0].command, "query @0");
+  BOOST_CHECK(calls[0].error.empty());
+  BOOST_CHECK_EQUAL(calls[1].command, "write a.lua");
+  BOOST_CHECK_EQUAL(calls[1].content, "ces.run()\n");
+  BOOST_CHECK_EQUAL(calls[2].error, "there is no tool \"shell\": the one tool is cesh");
+  BOOST_CHECK_EQUAL(calls[3].error, "the arguments are not a JSON object");
+  BOOST_CHECK_EQUAL(calls[4].error, "the arguments have no command");
+  BOOST_CHECK(toolCallsOf("").empty());
+  BOOST_CHECK(toolCallsOf("{}").empty());
+}
+
+// chatRequest makes requests that the model API accepts. User messages in a
+// row become one, a result with no call (folded or cut) becomes a note, and a
+// call with no result gets one.
+BOOST_AUTO_TEST_CASE(ChatRequest_IsAlwaysWellFormed) {
+  const std::string call = R"([{"id":"x","type":"function","function":{"name":"cesh","arguments":"{}"}}])";
+  std::vector<Message> ms = {{"tool", "RESULT of an old call", "", "", "gone"},
+                             {"user", "hi", "", "", ""},
+                             {"user", "[chat] a note", "", "", ""},
+                             {"assistant", "", call, "r", ""},
+                             {"user", "next", "", "", ""}};
+  json::value v = json::parse(chatRequest("SYS", ms));
+  json::array want = {
+    json::object{{"role", "system"}, {"content", "SYS"}},
+    json::object{{"role", "user"}, {"content", "[chat] RESULT of an old call\n\nhi\n\n[chat] a note"}},
+    json::object{{"role", "assistant"}, {"content", ""}, {"reasoning_content", "r"},
+                 {"tool_calls", json::parse(call)}},
+    json::object{{"role", "tool"}, {"tool_call_id", "x"}, {"content", "did not run"}},
+    json::object{{"role", "user"}, {"content", "next"}}};
+  BOOST_CHECK_EQUAL(json::serialize(v.at("messages")), json::serialize(want));
+  BOOST_CHECK_EQUAL(v.at("tools").as_array().size(), 1u);
+  BOOST_CHECK_EQUAL(v.at("tools").at(0).at("function").at("name").as_string(), "cesh");
+  BOOST_CHECK(!json::parse(chatRequest("SYS", ms, false)).as_object().contains("tools"));
+  // ces's own check takes it.
+  std::string clean;
+  BOOST_CHECK(ces::thinkChatCheck(chatRequest("SYS", ms), clean));
 }
 
 BOOST_AUTO_TEST_CASE(Memory_SaveLoadSetErase) {
@@ -249,7 +352,7 @@ BOOST_AUTO_TEST_CASE(Memory_SaveLoadSetErase) {
 
 BOOST_AUTO_TEST_CASE(Turn_ReadRunsAtOnceWithGlobals) {
   Script s;
-  s.replies = {"Let me look.\n%%CESH-EXEC%% query @0", "You have 42."};
+  s.replies = {Say("Let me look.", {"query @0"}), "You have 42."};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("what is my balance?");
   BOOST_CHECK_EQUAL(s.thinks, 2u);
@@ -259,13 +362,13 @@ BOOST_AUTO_TEST_CASE(Turn_ReadRunsAtOnceWithGlobals) {
   BOOST_CHECK_EQUAL_COLLECTIONS(s.ran[0].begin(), s.ran[0].end(), want.begin(), want.end());
   // The second model call sees the result.
   BOOST_CHECK(has(s.prompts[1], "RESULT of `query @0`: exit 0\nBalance: 42"));
-  BOOST_CHECK(has(chat.transcript(), "YOU: You have 42."));
+  BOOST_CHECK(has(chat.transcript(), "ASSISTANT: You have 42."));
   BOOST_CHECK(std::find(s.shown.begin(), s.shown.end(), "You have 42.") != s.shown.end());
 }
 
 BOOST_AUTO_TEST_CASE(Turn_GlobalsNotRepeated) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% --server other:9 query @0", "ok"};
+  s.replies = {Say("", {"--server other:9 query @0"}), "ok"};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("x");
   BOOST_REQUIRE_EQUAL(s.ran.size(), 1u);
@@ -278,7 +381,7 @@ BOOST_AUTO_TEST_CASE(Turn_GlobalsNotRepeated) {
 
 BOOST_AUTO_TEST_CASE(Turn_ActionNeedsYes) {
   Script s;
-  s.replies = {"Sending.\n%%CESH-EXEC%% transfer @1 100", "Not sent."};
+  s.replies = {Say("Sending.", {"transfer @1 100"}), "Not sent."};
   s.answers = {false};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("send 100 raw to @1");
@@ -287,7 +390,7 @@ BOOST_AUTO_TEST_CASE(Turn_ActionNeedsYes) {
   BOOST_CHECK(has(chat.transcript(), "not run; the user said no"));
 
   Script y;
-  y.replies = {"%%CESH-EXEC%% transfer @1 100", "Sent."};
+  y.replies = {Say("", {"transfer @1 100"}), "Sent."};
   y.answers = {true};
   Chat chat2(testOptions(), y.hooks(), Memory());
   chat2.turn("send it");
@@ -300,7 +403,7 @@ BOOST_AUTO_TEST_CASE(Turn_ActionNeedsYes) {
 BOOST_AUTO_TEST_CASE(Turn_BadSyntaxNeverReachesTheUser) {
   Script s;
   s.badSyntax = true;
-  s.replies = {"%%CESH-EXEC%% transfer 2 --to @1", "Let me read the manual."};
+  s.replies = {Say("", {"transfer 2 --to @1"}), "Let me read the manual."};
   s.answers = {true};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("send 2 to @1");
@@ -315,19 +418,19 @@ BOOST_AUTO_TEST_CASE(Turn_BadSyntaxNeverReachesTheUser) {
 // the same question in a loop.
 BOOST_AUTO_TEST_CASE(Turn_NoEndsTheTurn) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% transfer @1 100"};   // it would ask again and again
+  s.replies = {Say("", {"transfer @1 100"})};   // it would ask again and again
   s.answers = {false, false, false};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("send 100 raw to @1");
   BOOST_CHECK_EQUAL(s.thinks, 1u);
   BOOST_CHECK_EQUAL(s.asks, 1u);
-  BOOST_CHECK(has(chat.transcript(), "CHAT: the user said no, so the turn ended"));
+  BOOST_CHECK(has(chat.transcript(), "[chat] the user said no, so the turn ended"));
 }
 
 // A stop (the user quit) ends the turn at once.
 BOOST_AUTO_TEST_CASE(Turn_StopEndsAtOnce) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% ping\n%%CESH-EXEC%% ping"};
+  s.replies = {Say("", {"ping", "ping"})};
   bool stop = false;
   Hooks h = s.hooks();
   h.stopped = [&] { return stop; };
@@ -379,7 +482,7 @@ BOOST_AUTO_TEST_CASE(Scratch_IsTheOnlyLocalPlace) {
   BOOST_CHECK(!out("file put w backup").empty());
 
   Script s;
-  s.replies = {"%%CESH-EXEC%% file put " + cesh + "/CESH_WALLET backup.txt", "ok"};
+  s.replies = {Say("", {"file put " + cesh + "/CESH_WALLET backup.txt"}), "ok"};
   s.answers = {true};
   Options o = testOptions();
   o.scratchDir = scratch;
@@ -390,40 +493,13 @@ BOOST_AUTO_TEST_CASE(Scratch_IsTheOnlyLocalPlace) {
   BOOST_CHECK(has(chat.transcript(), "outside the scratch"));
 }
 
-BOOST_AUTO_TEST_CASE(CleanReply_WriteTakesABody) {
-  CleanReply c = cleanReply(
-    "I'll write it.\n%%CESH-EXEC%% write hello.lua\nfunction on_l2call(m) return 'hi' end\n\nces.run()\n"
-    "%%CESH-END%%\n%%CESH-EXEC%% ls\n");
-  BOOST_REQUIRE_EQUAL(c.commands.size(), 2u);
-  BOOST_REQUIRE_EQUAL(c.bodies.size(), 2u);
-  BOOST_CHECK_EQUAL(c.commands[0], "write hello.lua");
-  BOOST_CHECK_EQUAL(c.bodies[0], "function on_l2call(m) return 'hi' end\n\nces.run()\n");
-  BOOST_CHECK_EQUAL(c.commands[1], "ls");
-  BOOST_CHECK(c.bodies[1].empty());
-  BOOST_CHECK_EQUAL(c.prose, "I'll write it.");   // the body is not prose
-  // A body with no end marker does not run.
-  c = cleanReply("%%CESH-EXEC%% write x.lua\nprint(1)\n");
-  BOOST_CHECK(c.unterminated);
-  BOOST_CHECK(c.commands.empty());
-}
-
-BOOST_AUTO_TEST_CASE(CleanReply_ShellWriteTakesABody) {
-  CleanReply c = cleanReply("%%CESH-EXEC%% $ write a.lua\nces.run()\n%%CESH-END%%\n");
-  BOOST_REQUIRE_EQUAL(c.commands.size(), 1u);
-  BOOST_CHECK_EQUAL(c.commands[0], "$ write a.lua");
-  BOOST_CHECK_EQUAL(c.bodies[0], "ces.run()\n");
-  BOOST_CHECK(!c.unterminated);
-}
-
 BOOST_AUTO_TEST_CASE(Files_WriteReadLs) {
   auto dir = makeUniqueTempDir("chatscratch");
   const std::string scratch = dir.string();
   Script s;
-  s.replies = {"I will write it.\n%%CESH-EXEC%% write hello.lua\nlocal a = 1\nces.run()\n%%CESH-END%%",
-               "Written.",
-               "I will look.\n%%CESH-EXEC%% read hello.lua\n%%CESH-EXEC%% ls\n%%CESH-EXEC%% read ../x\n"
-               "%%CESH-EXEC%% write sub/x.lua\nx\n%%CESH-END%%",
-               "Done."};
+  Say look("I will look.", {"read hello.lua", "ls", "read ../x"});
+  look.calls.push_back({"write sub/x.lua", "x\n"});
+  s.replies = {writes("I will write it.", "hello.lua", "local a = 1\nces.run()\n"), "Written.", look, "Done."};
   s.answers = {true};
   Options o = testOptions();
   o.scratchDir = scratch;
@@ -436,7 +512,7 @@ BOOST_AUTO_TEST_CASE(Files_WriteReadLs) {
   BOOST_CHECK(fs::status(scratch + "/hello.lua").permissions() ==
               (fs::perms::owner_read | fs::perms::owner_write));
   chat.turn("show it");
-  const std::string& t = chat.transcript();
+  const std::string t = chat.transcript();
   BOOST_CHECK(has(t, "RESULT of `read hello.lua`: 2 lines\nlocal a = 1\nces.run()"));
   BOOST_CHECK(has(t, "hello.lua  22 bytes"));
   BOOST_CHECK(has(t, "RESULT of `read ../x`: not run; a file name"));     // no paths
@@ -446,7 +522,7 @@ BOOST_AUTO_TEST_CASE(Files_WriteReadLs) {
 
 BOOST_AUTO_TEST_CASE(Turn_RefusedNeverRunsOrAsks) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% dial 3", "Run it yourself."};
+  s.replies = {Say("", {"dial 3"}), "Run it yourself."};
   s.answers = {true};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("dial my program");
@@ -482,7 +558,7 @@ bool transcriptLeaks(const Chat& c) {
 
 BOOST_AUTO_TEST_CASE(Keys_ListGivesPublicKeysOnly) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% keys list", "You have one key."};
+  s.replies = {Say("", {"keys list"}), "You have one key."};
   Chat chat(testOptions(), keyHooks(s), Memory());
   chat.turn("what keys do I have?");
   BOOST_CHECK_EQUAL(s.asks, 0u);
@@ -493,7 +569,7 @@ BOOST_AUTO_TEST_CASE(Keys_ListGivesPublicKeysOnly) {
 
 BOOST_AUTO_TEST_CASE(Keys_GenSavesToTheWalletFile) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% keys gen 1", "Done."};
+  s.replies = {Say("", {"keys gen 1"}), "Done."};
   s.answers = {true};
   Options o = testOptions();
   o.walletPath = "/home/u/.cesh/CESH_WALLET";
@@ -511,7 +587,7 @@ BOOST_AUTO_TEST_CASE(Keys_GenSavesToTheWalletFile) {
 
 BOOST_AUTO_TEST_CASE(Keys_GenWithEnvWalletDoesNotRun) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% keys gen 1", "ok"};
+  s.replies = {Say("", {"keys gen 1"}), "ok"};
   s.answers = {true};
   Options o = testOptions();   // no walletPath: keys from $CESH_WALLET
   Chat chat(o, keyHooks(s), Memory());
@@ -522,7 +598,7 @@ BOOST_AUTO_TEST_CASE(Keys_GenWithEnvWalletDoesNotRun) {
 
 BOOST_AUTO_TEST_CASE(Keys_AddAsksTheUserForTheKey) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% keys add", "Added."};
+  s.replies = {Say("", {"keys add"}), "Added."};
   s.answers = {true};
   Options o = testOptions();
   o.walletPath = "/w";
@@ -536,7 +612,7 @@ BOOST_AUTO_TEST_CASE(Keys_AddAsksTheUserForTheKey) {
 
 BOOST_AUTO_TEST_CASE(Keys_ExportGoesToTheUserOnly) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% keys export", "Shown to you."};
+  s.replies = {Say("", {"keys export"}), "Shown to you."};
   s.answers = {true};
   Chat chat(testOptions(), keyHooks(s), Memory());
   chat.turn("back up my keys");
@@ -548,44 +624,23 @@ BOOST_AUTO_TEST_CASE(Keys_ExportGoesToTheUserOnly) {
   for (auto& p : s.prompts) BOOST_CHECK(!has(p, kPriv));
 }
 
-BOOST_AUTO_TEST_CASE(CleanReply_ProseBeforeCommandsOnly) {
-  CleanReply c = cleanReply("I check.\n%%CESH-EXEC%% query @0\nYour balance is 9 credits.\n");
-  BOOST_CHECK_EQUAL(c.prose, "I check.");
-  BOOST_REQUIRE_EQUAL(c.commands.size(), 1u);
-  BOOST_CHECK_EQUAL(c.commands[0], "query @0");
-  BOOST_CHECK(has(c.dropped, "Your balance is 9 credits."));   // a guess before the result
-  BOOST_CHECK(!c.fabricated);
-  BOOST_CHECK_EQUAL(c.kept, "I check.\n%%CESH-EXEC%% query @0");
-}
-
-// "YOU:" at the very start is an echo of the label: it goes, and the reply runs.
-BOOST_AUTO_TEST_CASE(CleanReply_LeadingLabelIsNotAnImitation) {
-  CleanReply c = cleanReply("You: I'll check.\n%%CESH-EXEC%% query @0\n");
-  BOOST_CHECK(!c.fabricated);
-  BOOST_CHECK_EQUAL(c.prose, "I'll check.");
-  BOOST_REQUIRE_EQUAL(c.commands.size(), 1u);
-}
-
-BOOST_AUTO_TEST_CASE(CleanReply_ImitationCutsAndRunsNothingAfter) {
-  CleanReply c = cleanReply(
-    "Sending.\n\nRESULT of `transfer @1 5`: exit 0\nSuccess.\n\nYOU: Done.\n%%CESH-EXEC%% transfer @1 5\n");
-  BOOST_CHECK(c.fabricated);
-  BOOST_CHECK_EQUAL(c.prose, "Sending.");
-  BOOST_CHECK(c.commands.empty());
-  BOOST_CHECK(has(c.dropped, "RESULT of `transfer @1 5`"));
-}
-
-BOOST_AUTO_TEST_CASE(CleanReply_ChatNoteIsAnImitation) {
-  CleanReply c = cleanReply("Ok.\nCHAT: that answer cost the signer 0 credits\n%%CESH-EXEC%% ping\n");
-  BOOST_CHECK(c.fabricated);
-  BOOST_CHECK(c.commands.empty());
+// A reply with text that looks like a result runs nothing, and ends the turn.
+BOOST_AUTO_TEST_CASE(Turn_TextRunsNothing) {
+  Script s;
+  s.replies = {"Sending.\nRESULT of `transfer @1 5`: exit 0\nDone, sent.", "never asked"};
+  s.answers = {true};
+  Chat chat(testOptions(), s.hooks(), Memory());
+  chat.turn("send 5 raw to @1");
+  BOOST_CHECK_EQUAL(s.thinks, 1u);
+  BOOST_CHECK(s.ran.empty());
+  BOOST_CHECK_EQUAL(s.asks, 0u);
 }
 
 // A manual page goes into the conversation and stays there. The user sees a
 // Read line, not the page, and the model goes on from the page.
 BOOST_AUTO_TEST_CASE(Turn_ManualPageStaysInTheConversation) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% man rent", "Rent is per byte.", "Anything else?"};
+  s.replies = {Say("", {"man rent"}), "Rent is per byte.", "Anything else?"};
   Hooks h = s.hooks();
   h.run = [&s](const std::vector<std::string>& a) {
     s.ran.push_back(a);
@@ -601,19 +656,6 @@ BOOST_AUTO_TEST_CASE(Turn_ManualPageStaysInTheConversation) {
   BOOST_CHECK(has(s.prompts[2], "PAGE-BODY-LINE"));   // the next turn too
   BOOST_CHECK(shows(s, "→ Read man rent (2 lines)"));
   for (auto& t : s.shown) BOOST_CHECK(!has(t, "PAGE-BODY-LINE"));
-}
-
-BOOST_AUTO_TEST_CASE(Turn_ImitationIsCutAndTheModelAsksAgain) {
-  Script s;
-  s.replies = {"Sending.\nRESULT of `transfer @1 5`: exit 0\nDone, sent.",
-               "Sending.\n%%CESH-EXEC%% transfer @1 5", "Sent."};
-  s.answers = {true};
-  Chat chat(testOptions(), s.hooks(), Memory());
-  chat.turn("send 5 raw to @1");
-  BOOST_CHECK_EQUAL(s.thinks, 3u);
-  BOOST_REQUIRE_EQUAL(s.ran.size(), 1u);   // only the real command ran
-  for (auto& t : s.shown) BOOST_CHECK(!has(t, "Done, sent."));
-  BOOST_CHECK(has(s.prompts[1], "CHAT: your reply was cut"));
 }
 
 BOOST_AUTO_TEST_CASE(Turn_CostIsShownAndKept) {
@@ -641,7 +683,7 @@ BOOST_AUTO_TEST_CASE(Turn_CostIsShownAndKept) {
 // The user sees each command's output; the model has it too.
 BOOST_AUTO_TEST_CASE(Turn_ReadOutputIsShown) {
   Script s;
-  s.replies = {"I will read it.\n%%CESH-EXEC%% query @0", "You have 42."};
+  s.replies = {Say("I will read it.", {"query @0"}), "You have 42."};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("balance?");
   BOOST_CHECK(std::find(s.shown.begin(), s.shown.end(), "Balance: 42") != s.shown.end());
@@ -653,7 +695,7 @@ BOOST_AUTO_TEST_CASE(Turn_ReadOutputIsShown) {
 BOOST_AUTO_TEST_CASE(Turn_EmptyOutputIsSaid) {
   Script s;
   s.out = "";
-  s.replies = {"%%CESH-EXEC%% compute call 8 0 --in text:hi", "It replied with nothing."};
+  s.replies = {Say("", {"compute call 8 0 --in text:hi"}), "It replied with nothing."};
   s.answers = {true};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("call it");
@@ -667,7 +709,7 @@ BOOST_AUTO_TEST_CASE(Turn_EmptyOutputIsSaid) {
 // reply from the model.
 BOOST_AUTO_TEST_CASE(Turn_CommandsWithNoWordsAreTheAnswer) {
   Script s;
-  s.replies = {"%%CESH-EXEC%% query @0", "this reply must not come"};
+  s.replies = {Say("", {"query @0"}), "this reply must not come"};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("my balance");
   BOOST_CHECK_EQUAL(s.thinks, 1u);
@@ -679,7 +721,7 @@ BOOST_AUTO_TEST_CASE(Turn_CommandsWithNoWordsAreTheAnswer) {
 
   // An action still asks first.
   Script a;
-  a.replies = {"%%CESH-EXEC%% transfer @0 bob 5"};
+  a.replies = {Say("", {"transfer @0 bob 5"})};
   a.answers = {true};
   Chat chat2(testOptions(), a.hooks(), Memory());
   chat2.turn("send bob 5 raw");
@@ -692,7 +734,7 @@ BOOST_AUTO_TEST_CASE(Turn_CommandsWithNoWordsAreTheAnswer) {
 // command failed, and after a manual page.
 BOOST_AUTO_TEST_CASE(Turn_ResultsGoBackWhenTheModelGoesOn) {
   Script w;
-  w.replies = {"I will check it first.\n%%CESH-EXEC%% query @0", "You have 42."};
+  w.replies = {Say("I will check it first.", {"query @0"}), "You have 42."};
   Chat chat(testOptions(), w.hooks(), Memory());
   chat.turn("can I pay 40?");
   BOOST_CHECK_EQUAL(w.thinks, 2u);
@@ -700,8 +742,8 @@ BOOST_AUTO_TEST_CASE(Turn_ResultsGoBackWhenTheModelGoesOn) {
 
   // A task goes on after a later step with no words, until the model ends it.
   Script t;
-  t.replies = {"I will upload it, then launch it.\n%%CESH-EXEC%% file put a.lua a.lua",
-               "%%CESH-EXEC%% compute launch a.lua", "%%CESH-EXEC%% compute call 1 0 --in bob", ""};
+  t.replies = {Say("I will upload it, then launch it.", {"file put a.lua a.lua"}),
+               Say("", {"compute launch a.lua"}), Say("", {"compute call 1 0 --in bob"}), ""};
   t.answers = {true, true, true};
   Chat chatT(testOptions(), t.hooks(), Memory());
   chatT.turn("upload, launch and call it");
@@ -710,13 +752,13 @@ BOOST_AUTO_TEST_CASE(Turn_ResultsGoBackWhenTheModelGoesOn) {
 
   Script f;
   f.code = 1;
-  f.replies = {"%%CESH-EXEC%% query @9", "There is no key @9."};
+  f.replies = {Say("", {"query @9"}), "There is no key @9."};
   Chat chatF(testOptions(), f.hooks(), Memory());
   chatF.turn("balance of @9");
   BOOST_CHECK_EQUAL(f.thinks, 2u);
 
   Script m;
-  m.replies = {"%%CESH-EXEC%% man compute", "%%CESH-EXEC%% compute ps"};
+  m.replies = {Say("", {"man compute"}), Say("", {"compute ps"})};
   Chat chatM(testOptions(), m.hooks(), Memory());
   chatM.turn("my programs");
   BOOST_CHECK_EQUAL(m.thinks, 2u);
@@ -729,7 +771,7 @@ BOOST_AUTO_TEST_CASE(Turn_ResultsGoBackWhenTheModelGoesOn) {
 BOOST_AUTO_TEST_CASE(Turn_BadSyntaxGoesBackToTheModel) {
   Script s;
   s.badParses = 1;
-  s.replies = {"%%CESH-EXEC%% query --to @0", "%%CESH-EXEC%% query @0"};
+  s.replies = {Say("", {"query --to @0"}), Say("", {"query @0"})};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("my balance");
   BOOST_CHECK_EQUAL(s.thinks, 2u);
@@ -773,7 +815,7 @@ BOOST_AUTO_TEST_CASE(Turn_UserCommandRunsWithNoModelCall) {
 
   // A plain line is the model's to read, also when it looks like a command.
   Script p;
-  p.replies = {"%%CESH-EXEC%% query @0"};
+  p.replies = {Say("", {"query @0"})};
   Chat chat3(testOptions(), p.hooks(), Memory());
   chat3.turn("query @0");
   BOOST_CHECK_EQUAL(p.thinks, 1u);
@@ -793,7 +835,7 @@ BOOST_AUTO_TEST_CASE(Output_HasNoControlCharacters) {
   BOOST_CHECK_EQUAL(printable("ç€ ok"), "ç€ ok");             // UTF-8 stays
   Script s;
   s.out = "hi\x1b]0;owned\x07\n";
-  s.replies = {"%%CESH-EXEC%% compute call 8 0 --in text:x"};
+  s.replies = {Say("", {"compute call 8 0 --in text:x"})};
   s.answers = {true};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("call 8");
@@ -803,7 +845,7 @@ BOOST_AUTO_TEST_CASE(Output_HasNoControlCharacters) {
 
 BOOST_AUTO_TEST_CASE(Turn_StopsAfterMaxThinks) {
   Script s;
-  s.replies = {"Once more.\n%%CESH-EXEC%% ping"};   // the model asks again and again
+  s.replies = {Say("Once more.", {"ping"})};   // the model asks again and again
   Options o = testOptions();
   o.maxThinks = 3;
   Chat chat(o, s.hooks(), Memory());
@@ -817,14 +859,14 @@ BOOST_AUTO_TEST_CASE(Turn_RememberAndForget) {
   auto dir = makeUniqueTempDir("chatmem2");
   std::string path = (dir / "m.md").string();
   Script s;
-  s.replies = {"I will save it.\n%%CESH-EXEC%% remember box: ces.pubcom.org:53830", "Saved.",
-               "I will drop it.\n%%CESH-EXEC%% forget box", "Gone."};
+  s.replies = {Say("I will save it.", {"remember box: ces.pubcom.org:53830"}), "Saved.",
+               Say("I will drop it.", {"forget box"}), "Gone."};
   s.answers = {true, true};
   Chat chat(testOptions(), s.hooks(), Memory(path));
   chat.turn("remember my box");
   BOOST_CHECK(s.ran.empty());   // a note is not a cesh command
   BOOST_CHECK_EQUAL(chat.memory().notes().at("box"), "ces.pubcom.org:53830");
-  // The start of the prompt keeps the notes it began with; the change is in
+  // The start of the request keeps the notes it began with; the change is in
   // the conversation.
   BOOST_CHECK(has(s.prompts.back(), "## The user's notes\n\n(none)"));
   BOOST_CHECK(has(s.prompts.back(), "saved; the notes now have box: ces.pubcom.org:53830"));
@@ -840,7 +882,7 @@ BOOST_AUTO_TEST_CASE(Turn_RememberAndForget) {
 BOOST_AUTO_TEST_CASE(Turn_RememberTakesFreeText) {
   auto dir = makeUniqueTempDir("chatmem3");
   Script s;
-  s.replies = {"%%CESH-EXEC%% remember ana: ana's key is \"a1d9\": the one from the meetup", "Saved."};
+  s.replies = {Say("", {"remember ana: ana's key is \"a1d9\": the one from the meetup"}), "Saved."};
   s.answers = {true};
   Chat chat(testOptions(), s.hooks(), Memory((dir / "m.md").string()));
   chat.turn("remember ana");
@@ -861,37 +903,35 @@ BOOST_AUTO_TEST_CASE(Turn_ThinkFailureIsShown) {
   BOOST_CHECK(has(s.shown.back(), "think failed: THINK Failed: CES_ERROR_INSUFFICIENT_BALANCE"));
 }
 
-BOOST_AUTO_TEST_CASE(Prompt_HasRulesManualNotesAndContext) {
+BOOST_AUTO_TEST_CASE(Request_HasRulesManualNotesContextAndTheTool) {
   Script s;
   Chat chat(testOptions(), s.hooks(), Memory());
-  std::string p = chat.prompt();
-  BOOST_CHECK(has(p, "You are cesh chat"));
-  BOOST_CHECK(has(p, "money/transfer  Send credits"));
-  BOOST_CHECK(has(p, "## The user's notes\n\n(none)"));
-  BOOST_CHECK(has(p, "Server: test"));
-  BOOST_CHECK(p.size() >= 3 && p.substr(p.size() - 4) == "YOU:");
+  std::string system;
+  asText(chat.request(), &system);
+  BOOST_CHECK(has(system, "You are cesh chat"));
+  BOOST_CHECK(has(system, "money/transfer  Send credits"));
+  BOOST_CHECK(has(system, "## The user's notes\n\n(none)"));
+  BOOST_CHECK(has(system, "Server: test"));
+  BOOST_CHECK(has(chat.request(), R"("tools":[{"type":"function","function":{"name":"cesh")"));
 }
 
-// The prompt only grows at its end within a turn and across turns, so the
+// The request only grows at its end within a turn and across turns, so the
 // model's prompt cache serves its start: nothing trims it a little at a time.
-BOOST_AUTO_TEST_CASE(Prompt_GrowsOnlyAtItsEnd) {
+BOOST_AUTO_TEST_CASE(Request_GrowsOnlyAtItsEnd) {
   Script s;
-  s.replies = {"I will read it.\n%%CESH-EXEC%% query @0", "You have 42.", std::string(300, 'x')};
+  s.replies = {Say("I will read it.", {"query @0"}), "You have 42.", std::string(300, 'x')};
   Chat chat(testOptions(), s.hooks(), Memory());
   chat.turn("balance?");
   for (int i = 0; i < 20; ++i) chat.turn("more " + std::to_string(i));
-  BOOST_REQUIRE_GE(s.prompts.size(), 3u);
-  for (size_t i = 1; i < s.prompts.size(); ++i) {
-    const std::string& prev = s.prompts[i - 1];
-    const std::string head = prev.substr(0, prev.size() - 4);   // less "YOU:"
-    BOOST_CHECK_MESSAGE(s.prompts[i].rfind(head, 0) == 0, "prompt " << i);
-  }
+  BOOST_REQUIRE_GE(s.requests.size(), 3u);
+  for (size_t i = 1; i < s.requests.size(); ++i)
+    BOOST_CHECK_MESSAGE(grows(s.requests[i - 1], s.requests[i]), "request " << i);
   BOOST_CHECK_EQUAL(s.folds, 0u);   // far from the window: nothing folds
 }
 
 // The history is linear: a manual page, a file read and a saved note go
-// into the conversation and stay; no part of the prompt is edited or taken
-// out. Each prompt starts with the one before it, so the cache serves it.
+// into the conversation and stay; no part of the request is edited or taken
+// out. Each request starts with the one before it, so the cache serves it.
 BOOST_AUTO_TEST_CASE(Prompt_IsLinearThroughPagesFilesAndNotes) {
   auto dir = makeUniqueTempDir("chatlinear");
   {
@@ -899,9 +939,9 @@ BOOST_AUTO_TEST_CASE(Prompt_IsLinearThroughPagesFilesAndNotes) {
     f << "a file line\n";
   }
   Script s;
-  s.replies = {"I will read the page.\n%%CESH-EXEC%% man rent",
-               "I will read the file.\n%%CESH-EXEC%% read notes.txt",
-               "I will save it.\n%%CESH-EXEC%% remember box: x1",
+  s.replies = {Say("I will read the page.", {"man rent"}),
+               Say("I will read the file.", {"read notes.txt"}),
+               Say("I will save it.", {"remember box: x1"}),
                "Done.", "Fine."};
   s.answers = {true};
   Options o = testOptions();
@@ -909,11 +949,9 @@ BOOST_AUTO_TEST_CASE(Prompt_IsLinearThroughPagesFilesAndNotes) {
   Chat chat(o, s.hooks(), Memory((dir / "m.md").string()));
   chat.turn("read, then save");
   chat.turn("and now?");
-  BOOST_REQUIRE_GE(s.prompts.size(), 5u);
-  for (size_t i = 1; i < s.prompts.size(); ++i) {
-    const std::string& prev = s.prompts[i - 1];
-    BOOST_CHECK_MESSAGE(s.prompts[i].rfind(prev.substr(0, prev.size() - 4), 0) == 0, "prompt " << i);
-  }
+  BOOST_REQUIRE_GE(s.requests.size(), 5u);
+  for (size_t i = 1; i < s.requests.size(); ++i)
+    BOOST_CHECK_MESSAGE(grows(s.requests[i - 1], s.requests[i]), "request " << i);
   BOOST_CHECK(has(s.prompts.back(), "a file line"));
   BOOST_CHECK(std::any_of(s.shown.begin(), s.shown.end(),
                           [](const std::string& t) { return t == "→ Read notes.txt (1 line)"; }));
@@ -936,8 +974,8 @@ BOOST_AUTO_TEST_CASE(Compaction_FoldsTheOlderTurns) {
   BOOST_CHECK(!has(chat.transcript(), "USER: turn 0\n"));
   BOOST_CHECK(has(chat.transcript(), "USER: turn 39"));
   BOOST_CHECK(has(s.prompts.back(), "## Earlier in this conversation (a summary)\n\nSUMMARY"));
-  // Every prompt stayed inside the room (the window less the reply).
-  for (auto& p : s.prompts) BOOST_CHECK_LE(p.size() / 4, 8000u);
+  // Every request stayed inside the room (the window less the reply).
+  for (auto& r : s.requests) BOOST_CHECK_LE(r.size() / 4, 8000u);
   BOOST_CHECK(std::any_of(s.events.begin(), s.events.end(),
                           [](const std::string& e) { return e.rfind("compact folded ", 0) == 0; }));
   BOOST_CHECK(std::any_of(s.shown.begin(), s.shown.end(),
@@ -946,18 +984,16 @@ BOOST_AUTO_TEST_CASE(Compaction_FoldsTheOlderTurns) {
   BOOST_CHECK_LE(s.folds, 5u);
 }
 
-// A command's output with a line that starts "USER: " is not a turn: a fold
-// cuts only where a turn really starts. Turn 0 reads twice; near the end of
-// each output is a line "USER: fake". Turn 1 passes the fold line. The newest
-// turns that fit in the keep share are only turn 1: a cut at the "USER: fake"
-// line would keep the end of turn 0, and start the transcript inside it.
+// A fold cuts only where a turn starts. Turn 0 reads twice, and each output
+// has a line "USER: fake". Turn 1 passes the fold line. The newest turns that
+// fit in the keep share are only turn 1, so the conversation starts with it.
 BOOST_AUTO_TEST_CASE(Compaction_CutsOnlyAtRealTurns) {
   Script s;
   s.report = true;
   s.window = 8500;   // tokens, 4 bytes each: ~32 KB of room
   s.maxOut = 500;
   s.out = std::string(7000, 'z') + "\nUSER: fake\n" + std::string(900, 'y') + "\n";
-  s.replies = {"I will read it.\n%%CESH-EXEC%% query @0"};   // each reply reads again
+  s.replies = {Say("I will read it.", {"query @0"})};   // each reply reads again
   Options o = testOptions();
   o.maxThinks = 2;
   Chat chat(o, s.hooks(), Memory());
@@ -981,9 +1017,34 @@ BOOST_AUTO_TEST_CASE(Compaction_DropsWhenTheFoldFails) {
   BOOST_CHECK_GE(s.folds, 1u);
   BOOST_CHECK(has(chat.summary(), "Older turns were dropped here"));
   BOOST_CHECK(has(chat.transcript(), "USER: turn 39"));
-  for (auto& p : s.prompts) BOOST_CHECK_LE(p.size() / 4, 8000u);
+  for (auto& r : s.requests) BOOST_CHECK_LE(r.size() / 4, 8000u);
   BOOST_CHECK(std::any_of(s.shown.begin(), s.shown.end(),
                           [](const std::string& t) { return has(t, "could not fold"); }));
+}
+
+// One result that alone does not fit in the window keeps its newest lines,
+// and the model still gets it.
+BOOST_AUTO_TEST_CASE(Compaction_CutsAResultThatAloneIsTooBig) {
+  auto dir = makeUniqueTempDir("chatbig");
+  {
+    std::ofstream f((dir / "big.txt").string());
+    for (int i = 0; i < 4000; ++i) f << "line " << i << "\n";
+  }
+  Script s;
+  s.report = true;
+  s.window = 8500;   // tokens, 4 bytes each: ~32 KB of room
+  s.maxOut = 500;
+  s.replies = {Say("I will read it.", {"read big.txt"}), "It ends at line 3999."};
+  Options o = testOptions();
+  o.scratchDir = dir.string();
+  Chat chat(o, s.hooks(), Memory());
+  chat.turn("read big.txt");
+  BOOST_REQUIRE_EQUAL(s.prompts.size(), 2u);
+  BOOST_CHECK(has(s.prompts[1], "[chat] the older part of this turn was cut"));
+  BOOST_CHECK(has(s.prompts[1], "[... the start was cut]\nline "));
+  BOOST_CHECK(has(s.prompts[1], "line 3999\n"));
+  BOOST_CHECK(!has(s.prompts[1], "line 0\n"));
+  for (auto& r : s.requests) BOOST_CHECK_LE(r.size() / 4, 8000u);
 }
 
 // The status numbers: the last prompt's tokens as the server counted them,
@@ -998,7 +1059,7 @@ BOOST_AUTO_TEST_CASE(Context_FromTheReport) {
   chat.turn("hi");
   ContextUse u = chat.context();
   BOOST_CHECK(!u.estimated);
-  BOOST_CHECK_EQUAL(u.promptTokens, s.prompts.back().size() / 4);
+  BOOST_CHECK_EQUAL(u.promptTokens, s.requests.back().size() / 4);
   BOOST_CHECK_EQUAL(u.windowTokens, 99000u);
   BOOST_CHECK_EQUAL(u.cachedPercent, 24);   // a quarter, rounded down
   BOOST_CHECK(std::any_of(s.events.begin(), s.events.end(), [&](const std::string& e) {
@@ -1063,21 +1124,37 @@ namespace {
 
 // A model that answers each call with the next reply of its script.
 struct SeqBackend : ces::ThinkBackend {
-  std::vector<std::string> replies;
+  // The replies in order: the words, and the cesh commands that each runs.
+  std::vector<std::pair<std::string, std::vector<std::string>>> replies;
+  ces::ThinkChatEnd chat;          // the end of a reply that runs no command
   std::mutex mu;
   std::vector<std::string> prompts;
+  std::vector<bool> chats;         // which calls were chat requests
 
-  ces::ThinkOutcome run(const std::string& prompt, uint32_t,
+  ces::ThinkOutcome run(const ces::ThinkInput& input, uint32_t,
                         const std::atomic<bool>&,
                         const std::function<bool(std::string_view)>& onText) override {
-    std::string reply;
+    const std::string& prompt = input.text;
+    std::pair<std::string, std::vector<std::string>> reply;
     {
       std::lock_guard<std::mutex> lk(mu);
       reply = replies[std::min(prompts.size(), replies.size() - 1)];
       prompts.push_back(prompt);
+      chats.push_back(input.chat);
     }
     ces::ThinkOutcome o;
-    onText(reply);
+    o.chat = chat;
+    if (!reply.second.empty()) {
+      json::array calls;
+      for (auto& c : reply.second)
+        calls.push_back(json::object{
+            {"id", "c" + std::to_string(calls.size() + 1)}, {"type", "function"},
+            {"function", json::object{{"name", "cesh"},
+                                      {"arguments", json::serialize(json::object{{"command", c}})}}}});
+      o.chat.toolCalls = json::serialize(calls);
+      o.chat.finishReason = "tool_calls";
+    }
+    if (!reply.first.empty()) onText(reply.first);
     o.status = ces::CES_OK;
     o.billing = ces::ThinkOutcome::kUsage;
     o.usage = ces::ThinkUsage{100, 0, 10};
@@ -1113,8 +1190,8 @@ struct ChatServerFixture {
     server = std::make_unique<ces::CesServer>(cfg);
     mainPort = server->start(0);
     BOOST_REQUIRE(server->thinkHandler() != nullptr);
-    backend->replies = {"I will read your balance.\n%%CESH-EXEC%% query @0",
-                        "Your account is there. Done."};
+    backend->replies = {{"I will read your balance.", {"query @0"}},
+                        {"Your account is there. Done.", {}}};
     server->thinkHandler()->_testSetBackend(backend);
     server->_brr(key.getPublicKeyAsHash(), 10'000'000'000);
     BOOST_REQUIRE(ces::waitUntil([&] {
@@ -1147,9 +1224,9 @@ BOOST_AUTO_TEST_CASE(Chat_RunsAReadAndAnswers) {
 
   std::lock_guard<std::mutex> lk(backend->mu);
   BOOST_REQUIRE_EQUAL(backend->prompts.size(), 2u);
-  BOOST_CHECK(has(backend->prompts[0], "USER: what is my balance?"));
+  BOOST_CHECK(has(backend->prompts[0], R"({"role":"user","content":"what is my balance?"})"));
   BOOST_CHECK(has(backend->prompts[0], "money/transfer  "));       // the manual index
-  BOOST_CHECK(has(backend->prompts[0], "Wallet keys (label and public key):\n@0 " +
+  BOOST_CHECK(has(backend->prompts[0], "Wallet keys (label and public key):\\n@0 " +
                                         key.getPublicKeyHexStr()));
   // No part of the private key goes to the model.
   const std::string privHex = "00" + key.getPrivateKeyHexStr();
@@ -1183,9 +1260,8 @@ BOOST_AUTO_TEST_CASE(Chat_CtrlC_EndsIt) {
 // process; each client call is one message.
 BOOST_AUTO_TEST_CASE(Socket_SayAskYesQuit) {
   ces::KeyPair dest;
-  backend->replies = {"Sending one credit.\n%%CESH-EXEC%% transfer " + dest.getPublicKeyHexStr() +
-                          " 100000000 --open",
-                      "Sent."};
+  backend->replies = {{"Sending one credit.", {"transfer " + dest.getPublicKeyHexStr() + " 100000000 --open"}},
+                      {"Sent.", {}}};
   const std::string sock = (dir / "chat.sock").string();
   ces::e2e::RunResult server{};
   std::thread t([&] {
@@ -1198,7 +1274,7 @@ BOOST_AUTO_TEST_CASE(Socket_SayAskYesQuit) {
   auto r1 = ces::e2e::runShell(client + "say send one credit", 60);
   BOOST_CHECK_EQUAL(r1.exitCode, 0);
   BOOST_CHECK_MESSAGE(has(r1.out, "prompt "), r1.out);                     // --trace
-  BOOST_CHECK_MESSAGE(has(r1.out, "\\nUSER: send one credit"), r1.out);
+  BOOST_CHECK_MESSAGE(has(r1.out, R"({"role":"user","content":"send one credit"})"), r1.out);
   BOOST_CHECK_MESSAGE(has(r1.out, "reply Sending one credit."), r1.out);
   BOOST_CHECK_MESSAGE(has(r1.out, "cost "), r1.out);
   BOOST_CHECK_MESSAGE(has(r1.out, "run action transfer " + dest.getPublicKeyHexStr()), r1.out);
@@ -1229,8 +1305,8 @@ BOOST_AUTO_TEST_CASE(Socket_SayAskYesQuit) {
 // --yolo: an action runs with no question, and the user still sees it.
 BOOST_AUTO_TEST_CASE(Socket_YoloSkipsTheQuestion) {
   ces::KeyPair dest;
-  backend->replies = {"%%CESH-EXEC%% transfer " + dest.getPublicKeyHexStr() + " 100000000 --open",
-                      "Sent."};
+  backend->replies = {{"", {"transfer " + dest.getPublicKeyHexStr() + " 100000000 --open"}},
+                      {"Sent.", {}}};
   const std::string sock = (dir / "y.sock").string();
   ces::e2e::RunResult server{};
   std::thread t([&] {
@@ -1252,7 +1328,7 @@ BOOST_AUTO_TEST_CASE(Socket_YoloSkipsTheQuestion) {
 // The user's own command runs with no model call, and its output reaches the
 // socket (not the chat's own stdout).
 BOOST_AUTO_TEST_CASE(Socket_OwnCommandShowsItsOutput) {
-  backend->replies = {"no model call is expected"};
+  backend->replies = {{"no model call is expected", {}}};
   size_t callsBefore;
   {
     std::lock_guard<std::mutex> lk(backend->mu);
@@ -1278,6 +1354,50 @@ BOOST_AUTO_TEST_CASE(Socket_OwnCommandShowsItsOutput) {
   ces::e2e::runShell(client + "quit", 30);
   t.join();
   BOOST_CHECK_MESSAGE(!has(server.out, "status=ok"), server.out);
+}
+
+// cesh think --chat sends a chat request and prints the answer as one JSON
+// object on stdout, from --in or from stdin.
+BOOST_AUTO_TEST_CASE(Think_ChatPrintsOneJsonObject) {
+  backend->replies = {{"Looking.", {}}};
+  backend->chat.toolCalls =
+      R"([{"id":"c1","type":"function","function":{"name":"shell","arguments":"{\"command\":\"ls\"}"}}])";
+  backend->chat.finishReason = "tool_calls";
+  const std::string req =
+      R"({"messages":[{"role":"user","content":"what is here?"}],)"
+      R"("tools":[{"type":"function","function":{"name":"shell"}}]})";
+  {
+    std::ofstream f(dir / "req.json");
+    f << req;
+  }
+  const std::string want =
+      R"({"content":"Looking.","tool_calls":[{"id":"c1","type":"function","function":)"
+      R"({"name":"shell","arguments":"{\"command\":\"ls\"}"}}],"finish_reason":"tool_calls"})"
+      "\n";
+  auto r = ces::e2e::runShell(ceshPrefix() + " think --chat --in file:" +
+                                  (dir / "req.json").string() + " 2>/dev/null", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  BOOST_CHECK_EQUAL(r.out, want);
+  r = ces::e2e::runShell(ceshPrefix() + " think --chat < " + (dir / "req.json").string() +
+                             " 2>/dev/null", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  BOOST_CHECK_EQUAL(r.out, want);
+  std::lock_guard<std::mutex> lk(backend->mu);
+  BOOST_REQUIRE_EQUAL(backend->chats.size(), 2u);
+  BOOST_CHECK(backend->chats[0] && backend->chats[1]);
+  BOOST_CHECK(has(backend->prompts[0], R"("content":"what is here?")"));
+}
+
+// A wrong request gets its reason, and nothing goes to the server.
+BOOST_AUTO_TEST_CASE(Think_ChatRefusesABadRequest) {
+  auto r = ces::e2e::runShell(ceshPrefix() + " think --chat --in 'text:{\"messages\":[]}'", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 1);
+  BOOST_CHECK_MESSAGE(has(r.out, "not a chat request: the request has no messages"), r.out);
+  r = ces::e2e::runShell(ceshPrefix() + " think --chat --file /h/x --in 'text:{}'", 60);
+  BOOST_CHECK_EQUAL(r.exitCode, 1);
+  BOOST_CHECK_MESSAGE(has(r.out, "--chat takes no --file"), r.out);
+  std::lock_guard<std::mutex> lk(backend->mu);
+  BOOST_CHECK(backend->prompts.empty());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
