@@ -239,7 +239,10 @@ public:
   // frame or a keepalive, so a slow producer can take longer than the usual
   // verb timeout. `totalTimeout` bounds the whole reply. When onFrame
   // returns false the verb ends with CES_ERROR_INTERNAL and the channel is
-  // reset. Returns the status byte, or CES_ERROR_INTERNAL on a wire failure.
+  // reset. Returns the status byte. A failed read or write returns
+  // CES_ERROR_TIMEOUT (no reply in time) or CES_ERROR_CONNECTION_LOST (the
+  // channel closed), and a reply that breaks the protocol returns
+  // CES_ERROR_INTERNAL.
   uint8_t driveStreamVerb(
       uint8_t verb,
       const minx::Bytes& envelope,
@@ -324,8 +327,8 @@ public:
   // fixed preamble (respFixedPreambleLen) + run readVariablePreamble →
   // verify the server-signed trailer → on OK read a response body whose
   // length respBodyLen() derives from the preamble. Returns the status
-  // byte (or CES_ERROR_INTERNAL on a wire failure). Unused hooks: pass
-  // nullptr / {} / 0.
+  // byte, or the codes of driveStreamVerb for a failure on the wire. Unused
+  // hooks: pass nullptr / {} / 0.
   uint8_t driveVerb(
       uint8_t verb,
       const minx::Bytes& envelope,

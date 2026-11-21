@@ -419,6 +419,17 @@ public:
 
   void markDirty() { streamDirty_ = true; }
 
+  // Record why a read or write failed, for stepRc.
+  bool ioFailed(uint8_t rc) {
+    ioRc_ = rc;
+    return false;
+  }
+  // The code of a failed step of a verb: the reason of the failed read or
+  // write, else CES_ERROR_INTERNAL (a reply that breaks the protocol).
+  uint8_t stepRc() const {
+    return ioRc_ != CES_OK ? ioRc_ : CES_ERROR_INTERNAL;
+  }
+
   uint8_t ensureClean() {
     if (!streamDirty_) return CES_OK;
     streamDirty_ = false;
@@ -429,7 +440,7 @@ public:
   // are advisory (logged, returns true); returns false only on read error.
   bool readAndVerifyTail(uint8_t status, uint8_t verb,
                          const ces::Bytes& preamble) {
-    if (!stream_) return false;
+    if (!stream_) return ioFailed(CES_ERROR_CONNECTION_LOST);
     // Heap-owned so a late read after a wait_for timeout can't write into
     // a freed stack buffer (the async read isn't cancelled on timeout).
     auto tail =
@@ -444,8 +455,9 @@ public:
           run->set_value(!ec);
         });
     });
-    if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
-    if (!fut.get()) return false;
+    if (fut.wait_for(kVerbTimeout) != std::future_status::ready)
+      return ioFailed(CES_ERROR_TIMEOUT);
+    if (!fut.get()) return ioFailed(CES_ERROR_CONNECTION_LOST);
 
     // Trailer: [u64 time_us][u64 req_sig_hash][sha256 digest][sig].
     constexpr size_t kReqSigHashOff = ces::CES_PLEX_TIME_US_SIZE;
@@ -507,7 +519,7 @@ public:
 
   bool readExactFor(ces::Bytes& out, size_t n,
                     std::chrono::steady_clock::duration timeout) {
-    if (!stream_) return false;
+    if (!stream_) return ioFailed(CES_ERROR_CONNECTION_LOST);
     // Heap-owned (see readAndVerifyTail): survives a post-timeout late read.
     auto buf = std::make_shared<ces::Bytes>(n);
     auto run = std::make_shared<std::promise<bool>>();
@@ -521,8 +533,9 @@ public:
             run->set_value(!ec);
           });
       });
-    if (fut.wait_for(timeout) != std::future_status::ready) return false;
-    if (!fut.get()) return false;
+    if (fut.wait_for(timeout) != std::future_status::ready)
+      return ioFailed(CES_ERROR_TIMEOUT);
+    if (!fut.get()) return ioFailed(CES_ERROR_CONNECTION_LOST);
     out = std::move(*buf);
     return true;
   }
@@ -560,7 +573,9 @@ public:
       const ces::Bytes& extraBodyToSend,
       ces::Bytes& outPreamble,
       ces::Bytes& outBody) {
-    if (ensureClean() != CES_OK) return CES_ERROR_INTERNAL;
+    const uint8_t clean = ensureClean();
+    if (clean != CES_OK) return clean;
+    ioRc_ = CES_OK;
 
     auto fail = [&](uint8_t rc) -> uint8_t {
       markDirty();
@@ -568,13 +583,13 @@ public:
     };
 
     ces::Bytes verbByte{verb};
-    if (!writeAll(verbByte)) return fail(CES_ERROR_INTERNAL);
-    if (!writeAll(envelope)) return fail(CES_ERROR_INTERNAL);
+    if (!writeAll(verbByte)) return fail(stepRc());
+    if (!writeAll(envelope)) return fail(stepRc());
     if (!extraBodyToSend.empty() && !writeAll(extraBodyToSend))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
 
     ces::Bytes statusBuf;
-    if (!readExact(statusBuf, 1)) return fail(CES_ERROR_INTERNAL);
+    if (!readExact(statusBuf, 1)) return fail(stepRc());
     uint8_t status = statusBuf[0];
 
     outPreamble.clear();
@@ -582,20 +597,20 @@ public:
     if (status == CES_OK) {
       if (respFixedPreambleLen > 0 &&
           !readExact(outPreamble, respFixedPreambleLen))
-        return fail(CES_ERROR_INTERNAL);
+        return fail(stepRc());
       if (readVariablePreamble && !readVariablePreamble(outPreamble))
-        return fail(CES_ERROR_INTERNAL);
+        return fail(stepRc());
     }
 
     if (!readAndVerifyTail(status, verb, outPreamble))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
 
     if (status != CES_OK) return status;
 
     if (respBodyLen) {
       uint64_t bodyLen = respBodyLen(outPreamble);
       if (bodyLen > 0 && !readExact(outBody, bodyLen))
-        return fail(CES_ERROR_INTERNAL);
+        return fail(stepRc());
     }
     return CES_OK;
   }
@@ -610,16 +625,18 @@ public:
       size_t respFixedPreambleLen,
       const std::function<bool(ces::Bytes&)>& readVariablePreamble,
       ces::Bytes& outPreamble) {
-    if (ensureClean() != CES_OK) return CES_ERROR_INTERNAL;
+    const uint8_t clean = ensureClean();
+    if (clean != CES_OK) return clean;
+    ioRc_ = CES_OK;
     auto fail = [&](uint8_t rc) -> uint8_t {
       markDirty();
       return rc;
     };
     ces::Bytes verbByte{verb};
-    if (!writeAll(verbByte)) return fail(CES_ERROR_INTERNAL);
-    if (!writeAll(envelope)) return fail(CES_ERROR_INTERNAL);
+    if (!writeAll(verbByte)) return fail(stepRc());
+    if (!writeAll(envelope)) return fail(stepRc());
     if (!extraBodyToSend.empty() && !writeAll(extraBodyToSend))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
 
     const auto end = std::chrono::steady_clock::now() + totalTimeout;
     auto wait = [&]() {
@@ -631,35 +648,35 @@ public:
         return fail(CES_ERROR_TIMEOUT);
       ces::Bytes lenBuf;
       if (!readExactFor(lenBuf, 4, wait()))
-        return fail(CES_ERROR_INTERNAL);
+        return fail(stepRc());
       uint32_t len = ces::Buffer::peek<uint32_t>(lenBuf.data());
       if (len == 0) break;
       if (len == kCesPlexKeepAlive) continue;
       if (len > kMaxStreamFrame) return fail(CES_ERROR_INTERNAL);
       ces::Bytes frame;
       if (!readExactFor(frame, len, wait()))
-        return fail(CES_ERROR_INTERNAL);
+        return fail(stepRc());
       if (onFrame && !onFrame(frame)) return fail(CES_ERROR_INTERNAL);
     }
 
     ces::Bytes statusBuf;
-    if (!readExact(statusBuf, 1)) return fail(CES_ERROR_INTERNAL);
+    if (!readExact(statusBuf, 1)) return fail(stepRc());
     uint8_t status = statusBuf[0];
     outPreamble.clear();
     if (status == CES_OK && respFixedPreambleLen > 0 &&
         !readExact(outPreamble, respFixedPreambleLen))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
     if (status == CES_OK && readVariablePreamble &&
         !readVariablePreamble(outPreamble))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
     if (!readAndVerifyTail(status, verb, outPreamble))
-      return fail(CES_ERROR_INTERNAL);
+      return fail(stepRc());
     return status;
   }
 
 private:
   bool writeAllImpl(std::shared_ptr<minx::Bytes> buf) {
-    if (!stream_) return false;
+    if (!stream_) return ioFailed(CES_ERROR_CONNECTION_LOST);
     auto run = std::make_shared<std::promise<bool>>();
     auto fut = run->get_future();
     auto strm = stream_;
@@ -670,11 +687,12 @@ private:
           run->set_value(!ec);
         });
     });
-    if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
-    return fut.get();
+    if (fut.wait_for(kVerbTimeout) != std::future_status::ready)
+      return ioFailed(CES_ERROR_TIMEOUT);
+    return fut.get() || ioFailed(CES_ERROR_CONNECTION_LOST);
   }
   bool writeAllImpl(std::shared_ptr<ces::Bytes> buf) {
-    if (!stream_) return false;
+    if (!stream_) return ioFailed(CES_ERROR_CONNECTION_LOST);
     auto run = std::make_shared<std::promise<bool>>();
     auto fut = run->get_future();
     auto strm = stream_;
@@ -685,8 +703,9 @@ private:
           run->set_value(!ec);
         });
     });
-    if (fut.wait_for(kVerbTimeout) != std::future_status::ready) return false;
-    return fut.get();
+    if (fut.wait_for(kVerbTimeout) != std::future_status::ready)
+      return ioFailed(CES_ERROR_TIMEOUT);
+    return fut.get() || ioFailed(CES_ERROR_CONNECTION_LOST);
   }
 
   // Parse + verify the signed bind reply. On OK, stash sessionToken and
@@ -756,23 +775,28 @@ private:
         *stream_, boost::asio::buffer(*bindReq),
         [this, bindReq, clientDigest, run]
         (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { run->set_value(CES_ERROR_INTERNAL); return; }
+          if (ec) { run->set_value(CES_ERROR_UNREACHABLE); return; }
           auto reply = std::make_shared<
             std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
           boost::asio::async_read(
             *stream_, boost::asio::buffer(*reply),
             [this, reply, clientDigest, run]
             (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) { run->set_value(CES_ERROR_INTERNAL); return; }
+              if (ec2) { run->set_value(CES_ERROR_UNREACHABLE); return; }
               run->set_value(parseBindReply(*reply, *clientDigest));
             });
         });
     });
     if (fut.wait_for(kConnectTimeout) != std::future_status::ready) {
-      LOGERROR << "cesplexclient: bind handshake timed out";
-      return CES_ERROR_INTERNAL;
+      LOGWARNING << "cesplexclient: bind handshake timed out" << SVAR(peer_)
+                 << SVAR(protocol_);
+      return CES_ERROR_UNREACHABLE;
     }
     uint8_t rc = fut.get();
+    if (rc == CES_ERROR_UNREACHABLE) {
+      LOGWARNING << "cesplexclient: the server did not open the channel"
+                 << SVAR(peer_) << SVAR(protocol_);
+    }
     LOGDEBUG << "cesplexclient: bind complete"
              << VAR(int(rc)) << VAR(channel_) << SVAR(protocol_);
     return rc;
@@ -795,6 +819,7 @@ private:
 
   bool streamDirty_ = false;
   uint32_t closeBeforeSelect_ = 0;  // old channel to RST in doSelect before rebind
+  uint8_t ioRc_ = CES_OK;           // why the last read or write failed
 };
 
 // ---- CesPlexChannel public forwards ----
@@ -905,9 +930,9 @@ public:
     boost::asio::ip::address addr;
     auto results = res.resolve(host, std::to_string(rpcPort), ec);
     if (ec || results.empty()) {
-      LOGERROR << "cesplexclient: resolve failed"
-               << SVAR(host) << SVAR(ec.message());
-      return CES_ERROR_INTERNAL;
+      LOGWARNING << "cesplexclient: resolve failed"
+                 << SVAR(host) << SVAR(ec.message());
+      return CES_ERROR_UNREACHABLE;
     }
     addr = results.begin()->endpoint().address();
     if (addr.is_v4()) {

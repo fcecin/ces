@@ -766,6 +766,8 @@ void install_ces_err_table(lua_State* L) {
     {"NOT_LISTENING", ces::CES_ERROR_NOT_LISTENING},
     {"IMMUTABLE", ces::CES_ERROR_IMMUTABLE},
     {"BAD_INPUT", ces::CES_ERROR_BAD_INPUT},
+    {"UNREACHABLE", ces::CES_ERROR_UNREACHABLE},
+    {"CONNECTION_LOST", ces::CES_ERROR_CONNECTION_LOST},
   };
   for (const auto& e : kErrs) {
     lua_pushinteger(L, e.code);

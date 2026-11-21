@@ -40,8 +40,11 @@ These are the common codes.
 | --- | --- | --- |
 | `CES_ERROR_DISABLED` | The server has this service off | Use another server |
 | `CES_ERROR_QUEUE_FULL` | The server is busy, or a call on the same file is in progress | Try again later |
+| `CES_ERROR_PROTO_REJECTED` | The server does not run that service, for example a file store or compute | Use a server that runs it |
+| `CES_ERROR_UNREACHABLE` | No server answered at that address | Check the address and the port, then try again |
+| `CES_ERROR_CONNECTION_LOST` | The connection to the server closed during the command | Try again |
 | `CES_ERROR_TIMEOUT` | No reply in time | Try again |
 | `CES_ERROR_UNKNOWN_PEER` | The destination server is not a peer of this server | Use a server that peers with it |
 | `CES_ERROR_KEYNAME_TAKEN` | Another key has that name | Choose another name |
 | `CES_ERROR_KEYNAME_NOT_FOUND` | No key has that name | Check the name |
-| `CES_ERROR_INTERNAL` | A fault in the server | Try again; tell the operator if it stays |
+| `CES_ERROR_INTERNAL` | A fault in the server, or a reply that cesh cannot read | Try again; tell the operator if it stays |

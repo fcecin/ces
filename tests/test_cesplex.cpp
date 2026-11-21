@@ -39,6 +39,7 @@
 
 #include <boost/asio/executor_work_guard.hpp>
 #include <boost/asio/io_context.hpp>
+#include <boost/asio/ip/udp.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/read.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -1945,6 +1946,36 @@ BOOST_AUTO_TEST_CASE(DisconnectFreesTheServerSlot) {
   BOOST_REQUIRE_EQUAL(serverRudpPeers(*fx.server), 1u);
   c.disconnect();
   BOOST_CHECK(serverRudpEmpties(*fx.server));
+}
+
+// A port where no server listens gives UNREACHABLE.
+BOOST_AUTO_TEST_CASE(NoServerIsUnreachable) {
+  uint16_t port = 0;
+  {
+    boost::asio::io_context io;
+    boost::asio::ip::udp::socket s(
+      io, boost::asio::ip::udp::endpoint(boost::asio::ip::udp::v4(), 0));
+    port = s.local_endpoint().port();
+  }
+  ces::KeyPair signer;
+  ces::CesPlexClient c;
+  CES_CHECK_RC_EQ(c.connect("127.0.0.1", port, "/ces/file/1", signer),
+                  CES_ERROR_UNREACHABLE);
+}
+
+// A verb on a channel that ended gives CONNECTION_LOST.
+BOOST_AUTO_TEST_CASE(VerbOnAnEndedChannelIsConnectionLost) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), fx.rpcPort);
+  ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+  CES_REQUIRE_OK(ch.select(to, "/ces/file/1", signer));
+  ch.close();
+  CES_CHECK_RC_EQ(statMissing(ch), CES_ERROR_CONNECTION_LOST);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
