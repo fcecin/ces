@@ -107,12 +107,15 @@ struct CeshComputeFixture {
 
   // `cesh --server localhost --rpc-port <rpc> -l fatal compute call <args>`
   // with the owner wallet inline via CESH_WALLET.
-  RunResult ceshCall(const std::string& args) {
+  RunResult ceshCall(const std::string& args) { return ceshCompute("call " + args); }
+
+  // `cesh ... compute <args>`, as the owner.
+  RunResult ceshCompute(const std::string& args) {
     std::string wallet = "00" + ownerKey.getPrivateKeyHexStr();
     std::string cmd = "CESH_WALLET=\"" + wallet + "\" " + ceshBin +
                       " --server localhost:" + std::to_string(mainPort) +
                       " --rpc-port " + std::to_string(rpcPort) +
-                      " -l fatal compute call " + args;
+                      " -l fatal compute " + args;
     return runShell(cmd);
   }
 
@@ -130,6 +133,26 @@ struct CeshComputeFixture {
 }  // namespace
 
 BOOST_FIXTURE_TEST_SUITE(CeshComputeE2E, CeshComputeFixture)
+
+// compute stat prints the program key, which pays for the program's work and
+// signs as the program.
+BOOST_AUTO_TEST_CASE(StatPrintsTheProgramKey) {
+  std::string path = "/h/" + ownerHex() + "/key.lua";
+  uploadScript(path,
+    "local function hex(s) return (s:gsub('.', function(c) "
+    "return string.format('%02x', c:byte()) end)) end\n"
+    "function on_l2call() return hex(ces.program_pubkey()) end\nces.run()\n");
+  uint64_t pid = launchScript(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));  // child loop
+  RunResult k = ceshCall(std::to_string(pid) + " 0 --in text:key");
+  BOOST_REQUIRE_EQUAL(k.exitCode, 0);
+  BOOST_REQUIRE_GE(k.out.size(), 64u);
+  const std::string key = k.out.substr(0, 64);
+  RunResult r = ceshCompute("stat " + std::to_string(pid));
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertContains(r.out, "ProgramKey:", "stat");
+  assertContains(r.out, key, "stat");
+}
 
 // Raw reply on stdout: the program echoes the memo, so the reply is "pong:hi".
 BOOST_AUTO_TEST_CASE(CallReplyRaw) {

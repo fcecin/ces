@@ -2839,6 +2839,7 @@ int ceshRun(int argc, char* argv[]) {
             print_field("RssBytes",    e.rssBytes);
             print_field("ClientPort",  e.clientPort);
             print_field("RpcPort",     e.rpcPort);
+            print_field("ProgramKey",  ces::bytesToHex(e.programPubkey));
             std::cout << "  --\n";
           }
         }
@@ -2866,6 +2867,7 @@ int ceshRun(int argc, char* argv[]) {
         print_field("RssBytes",    info.rssBytes);
         print_field("ClientPort",  info.clientPort);
         print_field("RpcPort",     info.rpcPort);
+        print_field("ProgramKey",  ces::bytesToHex(info.programPubkey));
         std::cout << std::endl;
         return 0;
       }

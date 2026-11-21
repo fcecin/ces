@@ -25,7 +25,7 @@ takes a path on the server.
 | --- | --- | --- |
 | `cesh compute launch <path>` | Start a new instance of the source file; prints its pid | Owner of the file |
 | `cesh compute ps` | List your running instances | Signer |
-| `cesh compute stat <pid>` | Uptime, CPU, memory and ports of an instance | Anyone |
+| `cesh compute stat <pid>` | Uptime, CPU, memory, ports and the program key of an instance | Anyone |
 | `cesh compute instances <path>` | The pids that run a source file | Anyone |
 | `cesh compute kill <pid>` | Stop an instance | Owner |
 
