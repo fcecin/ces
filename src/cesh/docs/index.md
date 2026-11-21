@@ -27,8 +27,8 @@ The server charges a small fee for most signed operations.
 - New here? Run `cesh bootstrap`. It makes a wallet if you have none, connects
   to `ces.pubcom.org`, mines credits until you press Ctrl+C, and opens a shell
   where cesh uses that server.
-- [Credits](basics/credits.md): the unit of money, and raw units.
+- [Credits](basics/credits.md): the unit of CES, and raw units.
 - [Keys and the wallet](basics/keys.md): `@0`, `-a`, and where keys live.
 - [Servers](basics/servers.md): `--server`, `--rpc-port`, and `ping`.
 - [Errors](basics/errors.md): what each error code means and what to do.
-- [Send credits](money/transfer.md): the most common operation.
+- [Send credits](transfers/transfer.md): the most common operation.

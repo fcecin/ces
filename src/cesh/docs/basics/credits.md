@@ -1,10 +1,10 @@
 ---
 title: Credits
-summary: The unit of money, raw units (1 credit = 100000000 raw), and how to write amounts
+summary: The credit, raw units (1 credit = 100000000 raw), and how to write amounts
 order: 1
 ---
 
-The money of CES is the credit. Each server keeps the balances of its own
+CES counts in credits. Each server keeps the balances of its own
 accounts.
 
 ## Raw units
@@ -31,4 +31,4 @@ The output of the commands also shows raw units, for example
 - The operator of a server can credit an account.
 
 A credit on one server is not a credit on another server. To move credits to
-a key on a peer server, see [Cross-server transfers](../money/cross.md).
+a key on a peer server, see [Cross-server transfers](../transfers/cross.md).

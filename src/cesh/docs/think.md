@@ -1,6 +1,6 @@
 ---
 title: Think
-summary: cesh think syntax, chat requests with tools, what a call costs, the hold before a call, and conversation files
+summary: cesh think syntax, chat requests with tools, what a call costs and the credits it needs, and conversation files
 order: 5
 ---
 
@@ -61,9 +61,10 @@ cesh think --chat --in 'text:{"messages":[
 
 ## What it costs
 
-- Before the call, the server holds the most that the call can cost: one
-  token for each byte of the prompt, plus the largest reply. The balance must
-  cover the hold, else the call fails with `CES_ERROR_INSUFFICIENT_BALANCE`.
+- Before the call, the server takes the most that the call can cost: one
+  token for each byte of the prompt, plus the largest reply. So the balance
+  must have that much, else the call fails with
+  `CES_ERROR_INSUFFICIENT_BALANCE`.
 - After the call, the server keeps the real cost of the tokens and gives the
   rest back.
 - A call that fails before the model does work costs nothing.

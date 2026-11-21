@@ -196,7 +196,7 @@ size_t commandsRun(const Script& s) {
 
 Options testOptions() {
   Options o;
-  o.manualIndex = "index  Start\n  money/transfer  Send credits\n";
+  o.manualIndex = "index  Start\n  transfers/transfer  Send credits\n";
   o.context = "Server: test";
   o.globals = {{{"--server"}, "localhost:1"}, {{"--rpc-port"}, "2"}};
   return o;
@@ -909,7 +909,7 @@ BOOST_AUTO_TEST_CASE(Request_HasRulesManualNotesContextAndTheTool) {
   std::string system;
   asText(chat.request(), &system);
   BOOST_CHECK(has(system, "You are cesh chat"));
-  BOOST_CHECK(has(system, "money/transfer  Send credits"));
+  BOOST_CHECK(has(system, "transfers/transfer  Send credits"));
   BOOST_CHECK(has(system, "## The user's notes\n\n(none)"));
   BOOST_CHECK(has(system, "Server: test"));
   BOOST_CHECK(has(chat.request(), R"("tools":[{"type":"function","function":{"name":"cesh")"));
@@ -1225,7 +1225,7 @@ BOOST_AUTO_TEST_CASE(Chat_RunsAReadAndAnswers) {
   std::lock_guard<std::mutex> lk(backend->mu);
   BOOST_REQUIRE_EQUAL(backend->prompts.size(), 2u);
   BOOST_CHECK(has(backend->prompts[0], R"({"role":"user","content":"what is my balance?"})"));
-  BOOST_CHECK(has(backend->prompts[0], "money/transfer  "));       // the manual index
+  BOOST_CHECK(has(backend->prompts[0], "transfers/transfer  "));       // the manual index
   BOOST_CHECK(has(backend->prompts[0], "Wallet keys (label and public key):\\n@0 " +
                                         key.getPublicKeyHexStr()));
   // No part of the private key goes to the model.

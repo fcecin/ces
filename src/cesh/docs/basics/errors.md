@@ -7,7 +7,7 @@ order: 4
 A failed command prints a code such as `CES_ERROR_INSUFFICIENT_BALANCE`.
 These are the common codes.
 
-## Accounts and money
+## Accounts and credits
 
 | Code | Meaning | What to do |
 | --- | --- | --- |

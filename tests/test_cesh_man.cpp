@@ -320,7 +320,7 @@ BOOST_AUTO_TEST_CASE(Cesh_ManCommand) {
   BOOST_CHECK_EQUAL(r.exitCode, 0);
   BOOST_CHECK(contains(r.out, "--deposit"));
 
-  r = ces::e2e::runShell(cesh + " man --search hold", 30);
+  r = ces::e2e::runShell(cesh + " man --search tokens", 30);
   BOOST_CHECK_EQUAL(r.exitCode, 0);
   BOOST_CHECK(contains(r.out, "think:"));
 

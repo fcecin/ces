@@ -1,5 +1,5 @@
 ---
-title: Money
+title: Transfers
 summary: Accounts, transfers on one server, and transfers to a key on another server
 order: 2
 ---
