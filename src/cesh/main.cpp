@@ -80,6 +80,26 @@ void print_header(const std::string& title) {
   std::cout << "\n=== " << title << " ===\n";
 }
 
+// The same host:port, with the host in any case.
+bool sameEndpoint(const std::string& a, const std::string& b) {
+  return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](char x, char y) {
+    return std::tolower(static_cast<unsigned char>(x)) ==
+           std::tolower(static_cast<unsigned char>(y));
+  });
+}
+
+// A failed connect to one of the server's services, with what the code means
+// when a person can do something about it.
+void printConnectFailed(const std::string& service, uint8_t rc) {
+  std::cerr << "Error: " << service << " connect failed: " << errorString(rc)
+            << "\n";
+  if (rc == CES_ERROR_PROTO_REJECTED)
+    std::cerr << "this server does not run the " << service
+              << " service; use a server that runs it\n";
+  else if (rc == CES_ERROR_UNREACHABLE)
+    std::cerr << "no server answered at that address\n";
+}
+
 void print_field(const std::string& key, const std::string& val) {
   if (g_quiet) return;
   std::cout << std::left << std::setw(16) << (key + ":") << val << "\n";
@@ -2410,8 +2430,7 @@ int ceshRun(int argc, char* argv[]) {
 
       uint8_t rc = cfc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
-        std::cerr << "Error: file-store connect failed: "
-                  << errorString(rc) << "\n";
+        printConnectFailed("file-store", rc);
         return 1;
       }
       if (hasServerPk) cfc.setServerPubkey(serverPk);
@@ -2750,8 +2769,7 @@ int ceshRun(int argc, char* argv[]) {
 
       uint8_t rc = cc2.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
-        std::cerr << "Error: compute connect failed: "
-                  << errorString(rc) << "\n";
+        printConnectFailed("compute", rc);
         return 1;
       }
       if (hasServerPk) cc2.setServerPubkey(serverPk);
@@ -2915,7 +2933,7 @@ int ceshRun(int argc, char* argv[]) {
 
       uint8_t rc = mc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
-        std::cerr << "Error: mail connect failed: " << errorString(rc) << "\n";
+        printConnectFailed("mail", rc);
         return 1;
       }
       if (hasServerPk) mc.setServerPubkey(serverPk);
@@ -2989,7 +3007,7 @@ int ceshRun(int argc, char* argv[]) {
 
       uint8_t rc = tc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
-        std::cerr << "Error: think connect failed: " << errorString(rc) << "\n";
+        printConnectFailed("think", rc);
         return 1;
       }
       if (hasServerPk) tc.setServerPubkey(serverPk);
@@ -3173,6 +3191,15 @@ int ceshRun(int argc, char* argv[]) {
         std::cout << "Success.\n";
       } else {
         std::cerr << "Cross-Transfer Failed: " << errorString(rc) << "\n";
+        if (rc == CES_ERROR_UNKNOWN_PEER) {
+          if (sameEndpoint(cross_server_arg, server_arg))
+            std::cerr << cross_server_arg << " is the server that this command"
+                         " uses; a cross goes to another server, and"
+                         " cesh transfer pays a key on this one\n";
+          else
+            std::cerr << "this server does not peer with " << cross_server_arg
+                      << ", so the credit cannot go there directly\n";
+        }
         return 1;
       }
     }
