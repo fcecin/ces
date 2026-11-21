@@ -73,6 +73,7 @@
 #include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <pwd.h>
 #include <string>
 #include <sys/resource.h>

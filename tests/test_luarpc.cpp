@@ -11,6 +11,7 @@
 // connect (dial out) + serve (accept) + conn:write + on_data, both ways.
 
 #include "test_common.h"
+#include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"   // ces::e2e::findBinary
 
 #include <ces/account.h>
@@ -58,7 +59,9 @@ struct LuaRpcFixture {
   uint16_t rpcPort = 0;
   KeyPair ownerKey;
 
-  explicit LuaRpcFixture(uint16_t portCount = 16) {
+  // memMax: the address-space cap of each program (compute_process_mem_max),
+  // 0 for the default.
+  explicit LuaRpcFixture(uint16_t portCount = 16, uint64_t memMax = 0) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("luarpc");
@@ -80,6 +83,7 @@ struct LuaRpcFixture {
     cfg.feeComputeSlotSec = 1;
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cesluajitd");
     cfg.cesComputeWorkDir = (dir / "cescompute").string();
+    if (memMax != 0) cfg.computeProcessMemMax = memMax;
 
     server = std::make_unique<CesServer>(cfg);
     mainPort = server->start(0);
@@ -143,6 +147,12 @@ struct LuaRpcFixture {
 // outbound clients must fail permanently.
 struct LuaNoPortFixture : LuaRpcFixture {
   LuaNoPortFixture() : LuaRpcFixture(0) {}
+};
+
+// Each program may map at most 64 MB. The cap counts what the runtime
+// reserves (threads, buffers, malloc arenas), and that must leave room for Lua.
+struct LuaSmallCapFixture : LuaRpcFixture {
+  LuaSmallCapFixture() : LuaRpcFixture(16, 64ull * 1024 * 1024) {}
 };
 
 }  // namespace
@@ -746,6 +756,41 @@ BOOST_FIXTURE_TEST_CASE(FileClientVerbsFromCoroutineYield, LuaRpcFixture) {
     bal = balanceOf(beaconPk);
     if (bal < 34) std::this_thread::sleep_for(std::chrono::milliseconds(50));
   }
+  BOOST_CHECK_EQUAL(bal, 34);
+}
+
+// A program that dials with a client stays inside a 64 MB address-space cap.
+// When the runtime reserved server-sized buffers, 8 MB thread stacks and
+// 64 MB malloc arenas, one dial took 170 MB of the 256 MB default cap, and on
+// a box that maps a little more, the dial failed or the program died.
+BOOST_FIXTURE_TEST_CASE(FileClientFitsASmallCap, LuaSmallCapFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string rpc = std::to_string(rpcPort);
+  const auto serverPk = server->_serverKeyPair().getPublicKeyAsHash();
+
+  const std::string path = "/h/" + ownerHex + "/smallcap.lua";
+  const std::string src =
+    "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
+    "ces.spawn(function()\n"
+    "  local fc = ces.file_client('127.0.0.1:" + rpc + "', '"
+      + luaBytes(serverPk.data(), 32) + "')\n"
+    "  if not fc then ces.transfer(B, 2); return end\n"
+    "  if not fc:create('/p/smallcap', 5, 0, 100000000) then ces.transfer(B,3); return end\n"
+    "  if not fc:write('/p/smallcap', 0, 'hello') then ces.transfer(B,4); return end\n"
+    "  if fc:read('/p/smallcap', 0, 5) ~= 'hello' then ces.transfer(B,5); return end\n"
+    "  fc:close()\n"
+    "  ces.transfer(B, 33)\n"
+    "end)\n"
+    "ces.run()\n";
+  const auto progPk = deploy(path, src);
+  server->_brr(progPk, 100'000'000'000ull);
+  launch(path);
+
+  int64_t bal = 1;
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal != 1; });
   BOOST_CHECK_EQUAL(bal, 34);
 }
 

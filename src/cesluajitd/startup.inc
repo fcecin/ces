@@ -54,14 +54,23 @@ bool drop_privileges_if_root(const char* user_name) {
   return true;
 }
 
+// The stack of each thread that the runtime starts. These threads run network
+// code, which needs much less than the 8 MB default of RLIMIT_STACK.
+constexpr size_t kThreadStackBytes = 2 * 1024 * 1024;
+
 void apply_rlimits(size_t mem_max_bytes) {
-  // Cap glibc's per-thread malloc arenas. Each new thread otherwise gets its
-  // own 64 MB virtual arena, and the transient CesClient behind the outbound
-  // networking APIs (ces.ping / ces.remote_*) spawns IO threads per call --
-  // a few of those reserve enough address space to trip RLIMIT_AS and throw
-  // std::bad_alloc. Two arenas is plenty for a mostly single-threaded VM and
-  // keeps outbound networking inside the documented mem ceiling.
-  mallopt(M_ARENA_MAX, 2);
+  // RLIMIT_AS counts the address space that the runtime reserves, not only
+  // the memory of Lua, so keep the reserves small. Each glibc arena after the
+  // first reserves 64 MB, and maps 128 MB while glibc makes it. So all threads
+  // share one arena: LuaJIT keeps the Lua heap in its own allocator, and the
+  // other threads allocate little. Each thread also reserves its stack.
+  mallopt(M_ARENA_MAX, 1);
+  pthread_attr_t attr;
+  if (pthread_attr_init(&attr) == 0) {
+    pthread_attr_setstacksize(&attr, kThreadStackBytes);
+    pthread_setattr_default_np(&attr);   // the threads made after this call
+    pthread_attr_destroy(&attr);
+  }
   // Hard ceilings that cannot be raised from inside Lua. RLIMIT_AS is
   // the merciless memory cap (from the server's compute_process_mem_max):
   // the kernel denies any allocation past it, so a runaway or malicious

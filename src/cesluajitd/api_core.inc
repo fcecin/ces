@@ -434,6 +434,11 @@ void luarpc_ensure_endpoint() {
     minxCfg.spamThreshold = std::numeric_limits<uint16_t>::max();
     minxCfg.spamSampleRate = 512;
     minxCfg.trustLoopback = true;
+    // A program's endpoint serves a few dials, not the traffic of a server.
+    // The server sizes of the receive ring and the spam filter take about
+    // 44 MB of the program's RLIMIT_AS.
+    minxCfg.recvBuffersSize = 1024;
+    minxCfg.spamFilterWidth = ces::CesClient::CLIENT_SPAM_FILTER_WIDTH;
 
     minx::RudpConfig rudpCfg{};
     rudpCfg.baseTickInterval = std::chrono::milliseconds(1);
