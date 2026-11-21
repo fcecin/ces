@@ -427,7 +427,8 @@ public:
   // The code of a failed step of a verb: the reason of the failed read or
   // write, else CES_ERROR_INTERNAL (a reply that breaks the protocol).
   uint8_t stepRc() const {
-    return ioRc_ != CES_OK ? ioRc_ : CES_ERROR_INTERNAL;
+    if (ioRc_ != CES_OK) return ioRc_;
+    return CES_ERROR_INTERNAL;
   }
 
   // A failed reselect leaves the channel dirty, so the next try opens it
