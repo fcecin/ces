@@ -1963,7 +1963,8 @@ BOOST_AUTO_TEST_CASE(NoServerIsUnreachable) {
                   CES_ERROR_UNREACHABLE);
 }
 
-// A verb on a channel that ended gives CONNECTION_LOST.
+// A verb on a channel that ended gives CONNECTION_LOST. The next verb opens a
+// new channel and signs for it.
 BOOST_AUTO_TEST_CASE(VerbOnAnEndedChannelIsConnectionLost) {
   CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
   PlexTestPeer peer;
@@ -1976,6 +1977,26 @@ BOOST_AUTO_TEST_CASE(VerbOnAnEndedChannelIsConnectionLost) {
   CES_REQUIRE_OK(ch.select(to, "/ces/file/1", signer));
   ch.close();
   CES_CHECK_RC_EQ(statMissing(ch), CES_ERROR_CONNECTION_LOST);
+  CES_CHECK_RC_EQ(statMissing(ch), CES_ERROR_FILE_NOT_FOUND);
+}
+
+// A verb that cannot open a new channel gives UNREACHABLE, also when the
+// envelope tried to open it first.
+BOOST_AUTO_TEST_CASE(VerbWithNoServerLeftIsUnreachable) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), fx.rpcPort);
+  ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+  CES_REQUIRE_OK(ch.select(to, "/ces/file/1", signer));
+  ch.close();
+  CES_CHECK_RC_EQ(statMissing(ch), CES_ERROR_CONNECTION_LOST);
+  fx.server->stop(false);
+  fx.server.reset();
+  CES_CHECK_RC_EQ(statMissing(ch), CES_ERROR_UNREACHABLE);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

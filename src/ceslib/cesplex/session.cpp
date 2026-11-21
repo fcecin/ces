@@ -430,10 +430,13 @@ public:
     return ioRc_ != CES_OK ? ioRc_ : CES_ERROR_INTERNAL;
   }
 
+  // A failed reselect leaves the channel dirty, so the next try opens it
+  // again and returns why it failed.
   uint8_t ensureClean() {
     if (!streamDirty_) return CES_OK;
-    streamDirty_ = false;
-    return reselect();
+    const uint8_t rc = reselect();
+    streamDirty_ = rc != CES_OK;
+    return rc;
   }
 
   // Read + verify the server-signed response trailer. Hash/sig failures
@@ -542,6 +545,10 @@ public:
 
   minx::Bytes buildEnvelope(uint8_t verb,
                             std::span<const uint8_t> preamble) {
+    // The signature covers the session token, so open the new channel
+    // first when the old one failed. If that fails too, the verb's own
+    // ensureClean returns the code.
+    (void)ensureClean();
     // Prepend an 8-byte per-op salt so two ops with identical (verb,
     // preamble) still sign differently — otherwise the server's sig-dedup
     // treats a repeated query as a replay and skips its fee. The salt is
