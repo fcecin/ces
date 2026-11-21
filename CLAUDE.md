@@ -97,6 +97,7 @@ tests/              Boost.Test suites compiled into one cestests binary
                     (in-process server+client, 10B prefunded).
 tools/cesnet.mjs    network orchestrator (init/up/down/destroy)
 tools/cesnetbot.mjs parallel traffic simulator + conservation check
+tools/cesnet_proc.mjs process helpers that both tools share
 cesweb/             L3 HTTP gateway (Node) serving CES files plus a /dev
                     terminal via the cesh CLI; self-contained, own CLAUDE.md
 ```
@@ -479,6 +480,7 @@ CesFixture (`tests/test_common.h`): in-process server plus CesClient plus temp d
 Network simulator:
 - `tools/cesnet.mjs`: local multi-server topology. `init N` creates N workspaces; `up`/`down`/`destroy`. Workspaces persist across up/down with a manifest plus PID file.
 - `tools/cesnetbot.mjs`: traffic on top of cesnet. K simulated users, parallel local and cross-server transfers, then verifies credit conservation: sum of all accounts plus vostro/reserve equals total minted. Drift is a bug.
+- `tools/cesnet_proc.mjs`: the process helpers of both tools. A stop waits until the server ends, and a start waits until the server answers. They do not wait for a guessed time.
 
 ```bash
 ./cesnet init 3 && ./cesnet up

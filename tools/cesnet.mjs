@@ -5,10 +5,11 @@
 // Manages persistent network workspaces: directories containing server configs,
 // keys, data, and runtime state. A workspace survives up/down cycles.
 
-import { execSync, spawn, spawnSync } from "node:child_process";
-import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, openSync, closeSync } from "node:fs";
+import { execSync, spawnSync } from "node:child_process";
+import { mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isAlive, launchServer, stopServers, waitServerUp } from "./cesnet_proc.mjs";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MANIFEST = "cesnet.json";
@@ -37,14 +38,6 @@ function genKeypair(cesBin) {
   const pub = out.match(/Public Key:\s*(\w+)/)?.[1];
   if (!priv || !pub) throw new Error("Failed to parse genkeypair output");
   return { priv, pub };
-}
-
-function sleep(ms) {
-  spawnSync("sleep", [String(ms / 1000)]);
-}
-
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 function findStrayProcesses() {
@@ -129,19 +122,6 @@ peer_miner_interval = 2
 
 ${peers}
 `.trim();
-}
-
-function launchServer(cesBin, dir, idx) {
-  const configFile = join(dir, `server${idx}.toml`);
-  const logFile = join(dir, `server${idx}.log`);
-  const logFd = openSync(logFile, "a");
-  const child = spawn(cesBin, ["--config", configFile, "-x"], {
-    stdio: ["ignore", logFd, logFd],
-    detached: true,
-  });
-  child.unref();
-  closeSync(logFd);
-  return child.pid;
 }
 
 // ---- Commands ----
@@ -273,32 +253,16 @@ function cmdUp(args) {
 
   savePids(dir, pids);
 
-  // Probe: verify all servers are responding
-  let allOk = false;
-  for (let attempt = 1; attempt <= 5; attempt++) {
-    sleep(1000);
-    let ok = 0;
-    for (let i = 0; i < manifest.servers.length; i++) {
-      if (!isAlive(pids[i])) continue;
-      try {
-        execSync(
-          `${ceshBin()} --server 127.0.0.1:${manifest.servers[i].port} query ${manifest.servers[i].pub}`,
-          { stdio: "ignore", timeout: 3000 }
-        );
-        ok++;
-      } catch {}
-    }
-    if (ok === manifest.servers.length) {
-      allOk = true;
-      break;
-    }
-    console.log(`  Waiting for servers... (${ok}/${manifest.servers.length} ready)`);
+  // Wait until each server answers. A server that ends or does not answer
+  // makes the start fail, and its log tells why.
+  const down = manifest.servers.filter(
+    (s, i) => !waitServerUp(ceshBin(), pids[i], s.port, s.pub));
+  if (down.length) {
+    for (const s of down)
+      console.error(`  server${s.index} did not answer: see ${join(dir, `server${s.index}.log`)}`);
+    process.exit(1);
   }
-
-  if (allOk)
-    console.log("Network started. All servers responding.");
-  else
-    console.log("Network started. Warning: not all servers responded to probe.");
+  console.log("Network started. All servers responding.");
 }
 
 function cmdDown() {
@@ -311,16 +275,12 @@ function cmdDown() {
     return;
   }
 
-  for (const pid of pids) {
-    try {
-      process.kill(pid, "SIGTERM");
-      console.log(`  Stopped pid ${pid}`);
-    } catch {
-      console.log(`  pid ${pid} already dead`);
-    }
+  const stuck = stopServers(pids);
+  if (stuck.length) {
+    console.error(`  These servers did not stop: ${stuck.join(" ")}`);
+    process.exit(1);
   }
-
-  sleep(1000);
+  for (const pid of pids) console.log(`  Stopped pid ${pid}`);
   clearPids(dir);
   console.log("Network stopped. Workspace preserved.");
 }
@@ -397,8 +357,10 @@ function cmdCredit(args) {
 
   if (wasRunning) {
     console.log(`  Stopping server${idx} (pid ${pids[idx]})...`);
-    try { process.kill(pids[idx], "SIGTERM"); } catch {}
-    sleep(500);
+    if (stopServers([pids[idx]]).length) {
+      console.error(`  server${idx} did not stop`);
+      process.exit(1);
+    }
   }
 
   console.log(`  Crediting ${amount} to ${pubkey.slice(0, 16)}...`);
@@ -409,6 +371,11 @@ function cmdCredit(args) {
     const newPid = launchServer(cesBin(), dir, idx);
     pids[idx] = newPid;
     savePids(dir, pids);
+    const s = manifest.servers[idx];
+    if (!waitServerUp(ceshBin(), newPid, s.port, s.pub)) {
+      console.error(`  server${idx} did not answer: see ${join(dir, `server${idx}.log`)}`);
+      process.exit(1);
+    }
     console.log(`  Restarted server${idx} (pid ${newPid})`);
   }
 
@@ -422,12 +389,11 @@ function cmdDestroy() {
     process.exit(1);
   }
 
-  // Kill any running servers
-  const pids = loadPids(dir) || [];
-  for (const pid of pids) {
-    try { process.kill(pid, "SIGTERM"); } catch {}
+  // Stop the servers before the delete. Kill a server that does not stop,
+  // because its data goes away with the workspace.
+  for (const pid of stopServers(loadPids(dir) || [])) {
+    try { process.kill(pid, "SIGKILL"); } catch {}
   }
-  if (pids.length) sleep(1000);
 
   rmSync(dir, { recursive: true, force: true });
   console.log(`Destroyed workspace: ${dir}`);

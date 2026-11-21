@@ -6,9 +6,11 @@
 // (local and cross-server). Verifies balance conservation at the end.
 
 import { execSync, spawn as nodeSpawn, spawnSync } from "node:child_process";
-import { readFileSync, writeFileSync, existsSync, openSync, closeSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { SERVER_WAIT_LIMIT_MS, isAlive, launchServer, sleep, stopServers,
+         waitServerUp } from "./cesnet_proc.mjs";
 
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MANIFEST = "cesnet.json";
@@ -30,14 +32,6 @@ function findBinary(name) {
     if (existsSync(p)) return p;
   }
   throw new Error(`Cannot find ${name} binary. Run build.sh first.`);
-}
-
-function sleep(ms) {
-  spawnSync("sleep", [String(ms / 1000)]);
-}
-
-function isAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
 function loadManifest(dir) {
@@ -198,8 +192,10 @@ async function main() {
 
     if (wasRunning) {
       process.stdout.write(`\r  Crediting: stopping server${sIdx}...`);
-      try { process.kill(pids[sIdx], "SIGTERM"); } catch {}
-      sleep(500);
+      if (stopServers([pids[sIdx]]).length) {
+        console.error(`\nserver${sIdx} did not stop.`);
+        process.exit(1);
+      }
     }
 
     for (const u of users) {
@@ -212,22 +208,19 @@ async function main() {
 
     if (wasRunning) {
       process.stdout.write(`\r  Crediting: restarting server${sIdx}...          `);
-      const logFile = join(dir, `server${sIdx}.log`);
-      const logFd = openSync(logFile, "a");
-      const child = nodeSpawn(cesBin(), ["--config", configFile, "-x"], {
-        stdio: ["ignore", logFd, logFd],
-        detached: true,
-      });
-      child.unref();
-      closeSync(logFd);
-      pids[sIdx] = child.pid;
+      pids[sIdx] = launchServer(cesBin(), dir, sIdx);
     }
   }
 
   if (pids.length) {
     writeFileSync(pidFile, JSON.stringify(pids));
     process.stdout.write(`\r  Waiting for servers to restart...               `);
-    sleep(1000);
+    const down = servers.filter((s) => !waitServerUp(ceshBin(), pids[s.index], s.port, s.pub));
+    if (down.length) {
+      for (const s of down)
+        console.error(`\nserver${s.index} did not answer: see ${join(dir, `server${s.index}.log`)}`);
+      process.exit(1);
+    }
   }
   console.log(`\r  Credited ${botUsers.length} users across ${serverKeys.length} servers.       `);
 
@@ -241,17 +234,16 @@ async function main() {
   // A cross-transfer can transiently fail with UNKNOWN_PEER while the origin
   // server's peer miner hasn't probed the destination peer yet (reachability is
   // set asynchronously, and a missed probe is only retried every
-  // peer_miner_interval). Retry such failures briefly so the test isn't flaky on
-  // a startup / re-probe race — settlement still has to conserve credits to pass.
+  // peer_miner_interval). Send the transfer again until the probe succeeds or
+  // the wait limit passes. Settlement still has to conserve credits to pass.
   const asleep = (ms) => new Promise((res) => setTimeout(res, ms));
   const execOp = async (op) => {
     let r = await op.run();
-    let tries = 0;
+    const end = Date.now() + SERVER_WAIT_LIMIT_MS;
     while (!r.ok && op.type === "cross" &&
-           /unknown.?peer/i.test(r.err) && tries < 8) {
-      await asleep(1500);
+           /unknown.?peer/i.test(r.err) && Date.now() < end) {
+      await asleep(500);
       r = await op.run();
-      tries++;
     }
     return r;
   };
@@ -329,8 +321,9 @@ async function main() {
     n * USER_CREDIT_INIT +
     botUsers.length * USER_CREDIT;
 
-  // Wait for async settlement, then verify conservation.
-  // Polls every 2s for up to 60s. Final poll result IS the verification.
+  // Cross transfers settle after they return. Sum the balances until the sum
+  // is the minted total, or until the wait limit passes. The last sum is the
+  // result of the check.
   //
   // Each server's OWN account on ITSELF is excluded from the sum: it's
   // the operator's bottomless reserve (auto-topped near INT64_MAX
@@ -349,12 +342,15 @@ async function main() {
     return sum;
   }
 
-  let totalBalance = 0;
-  for (let attempt = 0; attempt < 30; attempt++) {
-    sleep(2000);
+  process.stdout.write("  Verifying...");
+  const verifyStart = Date.now();
+  let totalBalance = sumAllBalances();
+  while (totalBalance !== totalMintedAll &&
+         Date.now() - verifyStart < SERVER_WAIT_LIMIT_MS) {
+    sleep(500);
     totalBalance = sumAllBalances();
-    process.stdout.write(`\r  Verifying... ${attempt * 2}s (${totalBalance}/${totalMintedAll})`);
-    if (totalBalance === totalMintedAll) break;
+    const secs = Math.round((Date.now() - verifyStart) / 1000);
+    process.stdout.write(`\r  Verifying... ${secs}s (${totalBalance}/${totalMintedAll})`);
   }
   console.log(totalBalance === totalMintedAll ? " ok." : " timeout.");
 
