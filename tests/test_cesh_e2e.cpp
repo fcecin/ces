@@ -5,6 +5,7 @@
  * and checks exit codes and output.
  */
 
+#include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"
 
 #include <ces/cesproxy.h>
@@ -16,6 +17,8 @@
 #include <regex>
 
 using namespace ces::e2e;
+using ces::kTestWaitLimit;
+using ces::waitUntil;
 
 // Make `run()` an alias for runShell() so existing call sites keep working.
 inline RunResult run(const std::string& cmd) { return runShell(cmd); }
@@ -1407,8 +1410,7 @@ BOOST_AUTO_TEST_CASE(SigtermPreservesData) {
     uint16_t port = 0;
     std::regex ansiRe("\\x1b\\[[0-9;]*m");
     std::regex portRe("boundPort=(\\d+)");
-    for (int i = 0; i < 100 && port == 0; ++i) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    waitUntil([&] {
       std::ifstream logFile(logPath);
       std::string line;
       while (std::getline(logFile, line)) {
@@ -1417,7 +1419,8 @@ BOOST_AUTO_TEST_CASE(SigtermPreservesData) {
         if (std::regex_search(clean, m, portRe))
           port = static_cast<uint16_t>(std::stoi(m[1].str()));
       }
-    }
+      return port != 0;
+    }, kTestWaitLimit, std::chrono::milliseconds(100));
     BOOST_REQUIRE_MESSAGE(port > 0, "Server did not report bound port");
     BOOST_TEST_MESSAGE("Server bound to port " + std::to_string(port));
     return {pid, port};
@@ -1609,11 +1612,7 @@ BOOST_AUTO_TEST_CASE(CescoLiveSnapshot) {
   BOOST_TEST_MESSAGE("Started ces pid=" + std::to_string(pid));
 
   // Wait for admin socket to appear
-  bool sockReady = false;
-  for (int i = 0; i < 100 && !sockReady; ++i) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    sockReady = fs::exists(sockPath);
-  }
+  const bool sockReady = waitUntil([&] { return fs::exists(sockPath); });
   BOOST_REQUIRE_MESSAGE(sockReady, "Admin socket did not appear: " + sockPath);
 
   // Send "snapshot" via the admin socket using socat

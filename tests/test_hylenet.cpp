@@ -10,6 +10,7 @@
 
 #include "test_ext_common.h"
 #include "test_lua_conn_common.h"
+#include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"
 
 #include <ces/keys.h>
@@ -675,15 +676,13 @@ BOOST_AUTO_TEST_CASE(NetRentStarvesAKeyAndAnyoneReapsIt) {
   // A rip needs no signature, sequence, or funds -- the culler is a stranger who never paid.
   ces::KeyPair cullerCes = ces::KeyPair::generate();
   hyle::KeyPair culler = hyleKeyOf(cullerCes);
-  bool reaped = false;
-  for (int i = 0; i < 80 && !reaped; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  // Each try submits a rip on one node, then reads the entry on another until
+  // the chain commits it.
+  const bool reaped = waitUntil([&] {
     nc.cmd(0, "submit " + encEntry(hyle::services::make_entry_rip(sv("doomed"), culler.pub)));
-    for (int j = 0; j < 10 && !reaped; j++) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      reaped = nc.cmd(3, "entry doomed") == "err not_found";
-    }
-  }
+    return waitUntil([&] { return nc.cmd(3, "entry doomed") == "err not_found"; },
+                     std::chrono::seconds(1), std::chrono::milliseconds(50));
+  }, kTestWaitLimit, std::chrono::milliseconds(250));
   BOOST_REQUIRE_MESSAGE(reaped, "the starved entry was never reaped");
   // The rip and its bounty land in the same block. Read the bounty on the SAME node that saw the
   // reap (node 3) so both reflect one committed view, and poll: a cross-node read can lag a block

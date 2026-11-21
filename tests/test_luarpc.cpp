@@ -176,11 +176,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
   // 2. The server's rpc port (server-side allocation is immediate); then a
   //    grace period for the child to actually bind its endpoint.
   uint16_t serverRpc = 0;
-  for (int i = 0; i < 100 && serverRpc == 0; i++) {
-    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
-    if (serverRpc == 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { serverRpc = server->computeHandler()->testInstanceRpcPort(serverId); return serverRpc != 0; });
   BOOST_REQUIRE_MESSAGE(serverRpc != 0, "echo server got no rpc port");
   std::this_thread::sleep_for(std::chrono::seconds(2));  // endpoint bind
 
@@ -202,10 +198,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramToProgramEcho, LuaRpcFixture) {
 
   // 4. Observe: the beacon reaches 1 + 7 = 8.
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -225,10 +218,7 @@ BOOST_FIXTURE_TEST_CASE(DirectCloseDeliversEveryQueuedWrite, LuaRpcFixture) {
   const auto serverPk = deploy(serverPath, serverSrc);
   const uint64_t serverId = launch(serverPath);
   uint16_t serverRpc = 0;
-  for (int i = 0; i < 100 && serverRpc == 0; i++) {
-    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
-    if (serverRpc == 0) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { serverRpc = server->computeHandler()->testInstanceRpcPort(serverId); return serverRpc != 0; });
   BOOST_REQUIRE_MESSAGE(serverRpc != 0, "burst server got no rpc port");
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -257,10 +247,7 @@ BOOST_FIXTURE_TEST_CASE(DirectCloseDeliversEveryQueuedWrite, LuaRpcFixture) {
   launch(clientPath);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 4; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -280,18 +267,15 @@ BOOST_FIXTURE_TEST_CASE(InstanceCleanShutdownNoCrash, LuaRpcFixture) {
   deploy(path, src);
   const uint64_t id = launch(path);
 
-  // Drive the supervisor synchronously until it reaps the exited child. Bounded:
-  // the program has no run loop, so it exits promptly. testForceTick runs one
-  // supervisor pass (waitpid + accounting) on the CesPlex strand and blocks.
-  bool reaped = false;
-  for (int i = 0; i < 100 && !reaped; ++i) {
+  // Drive the supervisor until it reaps the exited child: the program has no
+  // run loop, so it exits. testForceTick runs one supervisor pass (waitpid +
+  // accounting) on the CesPlex strand and blocks.
+  const bool reaped = waitUntil([&] {
     server->computeHandler()->testForceTick();
-    bool present = false;
     for (const auto& s : server->computeHandler()->snapshot())
-      if (s.pid == id) { present = true; break; }
-    reaped = !present;
-    if (!reaped) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+      if (s.pid == id) return false;
+    return true;
+  });
   BOOST_REQUIRE_MESSAGE(reaped, "instance never exited / was reaped");
   BOOST_CHECK_EQUAL(server->computeHandler()->crashedCount(), 0u);
 }
@@ -312,10 +296,7 @@ BOOST_FIXTURE_TEST_CASE(PeerMeshDeniedForUserProgram, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 4; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
   BOOST_CHECK_EQUAL(bal, 4);
 }
 
@@ -335,10 +316,7 @@ BOOST_FIXTURE_TEST_CASE(RequestFundsDeniedForUserProgram, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 4; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
   BOOST_CHECK_EQUAL(bal, 4);
 }
 
@@ -366,10 +344,7 @@ BOOST_FIXTURE_TEST_CASE(GossipBudgetBeyondInt64NeverMints, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 100 && bal < 4; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
   BOOST_CHECK(bal != 8);
 }
 
@@ -395,10 +370,7 @@ BOOST_FIXTURE_TEST_CASE(ServerSignDeniedForUserProgram, LuaRpcFixture) {
 
   // Observe: beacon reaches 1 + 3 = 4 (denied path); a bypass would have made it 1 + 7.
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 4; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 4) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
   BOOST_CHECK_EQUAL(bal, 4);   // ran AND was denied; 8 would mean the /s/ gate was bypassed
 }
 
@@ -430,10 +402,7 @@ BOOST_FIXTURE_TEST_CASE(GossipDeliveredToProgram, LuaRpcFixture) {
   server->originateGossip(payload, 1'000'000, Hash{});
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -460,10 +429,7 @@ BOOST_FIXTURE_TEST_CASE(GossipSendFromProgram, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -498,10 +464,7 @@ BOOST_FIXTURE_TEST_CASE(GossipMetadataDelivered, LuaRpcFixture) {
   server->originateGossip(payload, 1'000'000, Hash{});
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -530,10 +493,7 @@ BOOST_FIXTURE_TEST_CASE(GossipSinkCreditsProgramAccount, LuaRpcFixture) {
   BOOST_REQUIRE_EQUAL(client->gossip(payload, budget, progPk), CES_OK);
 
   int64_t bal = before;
-  for (int i = 0; i < 200 && bal <= before; i++) {
-    bal = balanceOf(progPk);
-    if (bal <= before) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(progPk); return bal > before; });
   BOOST_CHECK_GT(bal, before);                  // the multicast payment landed
   BOOST_CHECK_LE(bal - before, static_cast<int64_t>(budget));  // <= budget (skim)
   BOOST_CHECK_GE(server->gossipSinkCount(), 1u);
@@ -558,11 +518,7 @@ BOOST_FIXTURE_TEST_CASE(ConnectFromCoroutineYields, LuaRpcFixture) {
   const uint64_t serverId = launch(serverPath);
 
   uint16_t serverRpc = 0;
-  for (int i = 0; i < 100 && serverRpc == 0; i++) {
-    serverRpc = server->computeHandler()->testInstanceRpcPort(serverId);
-    if (serverRpc == 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { serverRpc = server->computeHandler()->testInstanceRpcPort(serverId); return serverRpc != 0; });
   BOOST_REQUIRE_MESSAGE(serverRpc != 0, "echo server got no rpc port");
   std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -583,10 +539,7 @@ BOOST_FIXTURE_TEST_CASE(ConnectFromCoroutineYields, LuaRpcFixture) {
   launch(clientPath);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -614,12 +567,13 @@ BOOST_FIXTURE_TEST_CASE(ConnectTimeoutFailsFast, LuaRpcFixture) {
   server->_brr(progPk, 1'000'000'000);
   launch(path);
 
+  // The bind ends at its own 300 ms limit, long before the 60 s idle GC.
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 14; i++) {   // ~10s budget << 60s idle-GC
-    bal = balanceOf(beaconPk);
-    if (bal < 14) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  const auto t0 = std::chrono::steady_clock::now();
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 14; });
   BOOST_CHECK_EQUAL(bal, 14);
+  BOOST_CHECK_LT(std::chrono::duration_cast<std::chrono::seconds>(
+                     std::chrono::steady_clock::now() - t0).count(), 30);
 }
 
 // Main-port verbs (ces.ping / remote_account_read / remote_transfer) called
@@ -657,10 +611,7 @@ BOOST_FIXTURE_TEST_CASE(MainPortVerbsFromCoroutineYield, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 8; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
@@ -712,10 +663,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramFileClient, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 78; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 78) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 78; });
   BOOST_CHECK_EQUAL(bal, 78);
 }
 
@@ -752,10 +700,7 @@ BOOST_FIXTURE_TEST_CASE(FileClientVerbsFromCoroutineYield, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 34; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 34) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 34; });
   BOOST_CHECK_EQUAL(bal, 34);
 }
 
@@ -837,10 +782,7 @@ BOOST_FIXTURE_TEST_CASE(SharedHandleConcurrentVerbAndCloseNoUAF, LuaRpcFixture) 
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 56; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 56) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 56; });
   BOOST_CHECK_EQUAL(bal, 56);
 }
 
@@ -886,10 +828,7 @@ BOOST_FIXTURE_TEST_CASE(ProgramComputeClient, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 300 && bal < 10; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 10) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 10; });
   BOOST_CHECK_EQUAL(bal, 10);
 }
 
@@ -965,10 +904,7 @@ BOOST_FIXTURE_TEST_CASE(FileClientErrors, LuaRpcFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 45; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 45) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 45; });
   BOOST_CHECK_EQUAL(bal, 45);
 }
 
@@ -993,10 +929,7 @@ BOOST_FIXTURE_TEST_CASE(FileClientNoRpcPort, LuaNoPortFixture) {
   launch(path);
 
   int64_t bal = 0;
-  for (int i = 0; i < 200 && bal < 67; i++) {
-    bal = balanceOf(beaconPk);
-    if (bal < 67) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 67; });
   BOOST_CHECK_EQUAL(bal, 67);
 }
 

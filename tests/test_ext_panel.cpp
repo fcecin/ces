@@ -6,6 +6,7 @@
 // `mene`), so the inline source below requires nothing.
 
 #include "test_ext_common.h"
+#include "test_compute_wait.h"   // waitUntil
 
 #include <ces/extension_manager.h>
 #include <ces/l2/compute_handler.h>
@@ -296,10 +297,10 @@ BOOST_AUTO_TEST_CASE(PanelRenderEventAndErrors) {
     "{\"on\":\"savecfg\",\"value\":{\"pace\":\"777\"}}", frame));
   BOOST_TEST(frame.find("cfg-saved") != std::string::npos);
   std::string conf;
-  for (int i = 0; i < 50 && conf.find("pace = 777") == std::string::npos; i++) {
+  waitUntil([&] {
     conf = extensionConfigGet(n.server.get(), "paneltest");
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+    return conf.find("pace = 777") != std::string::npos;
+  }, kTestWaitLimit, std::chrono::milliseconds(100));
   BOOST_TEST(conf.find("pace = 777") != std::string::npos);
 
   stopExt(n);
@@ -375,12 +376,10 @@ BOOST_AUTO_TEST_CASE(NoPanelIsCleanlyUnavailable) {
 
   // Wait for registration via the status lane...
   std::vector<std::pair<std::string, std::string>> kv;
-  bool up = false;
-  for (int i = 0; i < 200 && !up; i++) {
+  const bool up = waitUntil([&] {
     kv.clear();
-    up = extensionStatus(n.server.get(), "nopanel", kv);
-    if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-  }
+    return extensionStatus(n.server.get(), "nopanel", kv);
+  }, kTestWaitLimit, std::chrono::milliseconds(100));
   BOOST_REQUIRE_MESSAGE(up, "extension never registered");
 
   // ...then the panel lane reports unavailable (no toast, no frame).

@@ -6,6 +6,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"
 
 #include "ceshd.h"
@@ -203,12 +204,8 @@ struct CeshdFixture : E2EServerFixture {
     int rc = ::posix_spawn(&x.pid, argv[0], &fa, nullptr, argv.data(), envp);
     posix_spawn_file_actions_destroy(&fa);
     BOOST_REQUIRE_EQUAL(rc, 0);
-    bool ready = false;
-    for (int i = 0; i < 500 && !ready; ++i) {
-      ready = contains(readFile(x.log), "ceshd: ready");
-      if (!ready)
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
+    const bool ready =
+        waitUntil([&] { return contains(readFile(x.log), "ceshd: ready"); });
     BOOST_REQUIRE_MESSAGE(ready, "ceshd did not start: " + readFile(x.log));
     return x;
   }
@@ -538,12 +535,7 @@ BOOST_AUTO_TEST_CASE(ClientLeavingStopsTheCommand) {
   std::string o, er;
   drain(out[0], err[0], o, er, 10);
   BOOST_CHECK_LT(std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - t0).count(), 5);
-  bool gone = false;
-  for (int i = 0; i < 200 && !gone; ++i) {
-    gone = fs::is_empty(d.scratch);
-    if (!gone)
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-  }
+  const bool gone = waitUntil([&] { return fs::is_empty(d.scratch); });
   BOOST_CHECK(gone);
 }
 

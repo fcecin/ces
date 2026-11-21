@@ -8,12 +8,14 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"   // waitUntil
 
 #include <ces/util/smtp.h>
 
 #include <boost/asio.hpp>
 #include <boost/test/unit_test.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -29,7 +31,7 @@ struct MockSmtp {
   std::thread th;
   uint16_t port = 0;
   std::string authUserB64, authPassB64, mailFrom, rcptTo, data;
-  bool completed = false;
+  std::atomic<bool> completed{false};   // the mock's thread sets it
 
   MockSmtp() : acc(io, tcp::endpoint(tcp::v4(), 0)) {
     port = acc.local_endpoint().port();
@@ -115,8 +117,7 @@ BOOST_AUTO_TEST_CASE(Submit_WithAuth_DeliversEnvelopeAndBody) {
                      nullptr, &err);
   BOOST_CHECK_MESSAGE(ok, "smtpSend failed: " << err);
 
-  for (int i = 0; i < 100 && !mock.completed; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  waitUntil([&] { return mock.completed.load(); });
 
   BOOST_CHECK(mock.completed);
   BOOST_CHECK_EQUAL(mock.mailFrom, "MAIL FROM:<relay@ces>");
@@ -142,8 +143,7 @@ BOOST_AUTO_TEST_CASE(Submit_WithAttachment_SendsMimeMultipart) {
   bool ok = smtpSend(cfg, "u@example.com", "Subj", "Text body", &att, &err);
   BOOST_CHECK_MESSAGE(ok, "smtpSend failed: " << err);
 
-  for (int i = 0; i < 100 && !mock.completed; ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  waitUntil([&] { return mock.completed.load(); });
 
   BOOST_CHECK(mock.completed);
   BOOST_CHECK(mock.data.find("multipart/mixed") != std::string::npos);

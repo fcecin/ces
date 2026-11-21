@@ -16,15 +16,18 @@ namespace ces {
 
 inline constexpr std::chrono::seconds kTestWaitLimit{60};
 
-// Poll `cond` until it is true or `limit` passes.
+// Poll `cond` every `every` until it is true or `limit` passes. A probe that
+// costs more (a process, a connection) polls less often.
 template <class F>
 bool waitUntil(F&& cond,
-               std::chrono::steady_clock::duration limit = kTestWaitLimit) {
+               std::chrono::steady_clock::duration limit = kTestWaitLimit,
+               std::chrono::steady_clock::duration every =
+                   std::chrono::milliseconds(10)) {
   const auto end = std::chrono::steady_clock::now() + limit;
   for (;;) {
     if (cond()) return true;
     if (std::chrono::steady_clock::now() >= end) return false;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    std::this_thread::sleep_for(every);
   }
 }
 

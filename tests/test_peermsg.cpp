@@ -18,6 +18,7 @@
 // reply is addressed to `from`, so correct from-routing is asserted implicitly.
 
 #include "test_common.h"
+#include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"   // ces::e2e::findBinary
 
 #include <ces/account.h>
@@ -224,10 +225,7 @@ BOOST_AUTO_TEST_CASE(PeerSendListenRoundTrip) {
 
   // Observe the round trip land on the beacon.
   int64_t bal = 0;
-  for (int i = 0; i < 300 && bal < 8; i++) {
-    bal = a.balanceOf(beaconPk);
-    if (bal < 8) std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  waitUntil([&] { bal = a.balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
 }
 

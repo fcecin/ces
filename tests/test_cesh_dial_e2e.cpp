@@ -644,8 +644,7 @@ BOOST_AUTO_TEST_CASE(RawSendsEachKeyAtOnce) {
 
   Dial raw = dial(true);
   BOOST_REQUIRE(read(raw.master, "ready\r\n", 10000).find("ready\r\n") != std::string::npos);
-  for (int i = 0; i < 40 && (lflag(raw.slave) & ICANON); ++i)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return !(lflag(raw.slave) & ICANON); });
   BOOST_CHECK_EQUAL(lflag(raw.slave) & (ICANON | ECHO), 0u);
   BOOST_REQUIRE_EQUAL(::write(raw.master, "q", 1), 1);
   BOOST_CHECK_EQUAL(read(raw.master, "]\r\n", 3000), "got [q]\r\n");     // at once, with no echo

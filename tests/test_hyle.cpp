@@ -24,6 +24,7 @@
 
 #include "test_ext_common.h"
 #include "test_lua_conn_common.h"
+#include "test_compute_wait.h"   // waitUntil
 
 #include <hyle/core/crypto.h>
 #include <hyle/services/ops.h>
@@ -43,6 +44,8 @@
 using ces::exttest::ExtNode;
 using ces::exttest::startExtNode;
 using ces::exttest::stopExt;
+using ces::kTestWaitLimit;
+using ces::waitUntil;
 
 namespace {
 
@@ -144,7 +147,7 @@ struct HyleFixture {
     node.server->_brr(userKey.getPublicKeyAsHash(), 10'000'000'000);
     node.server->_drainLogic();
 
-    for (int i = 0; i < 150 && pid == 0; i++) {
+    waitUntil([&] {
       CesComputeClient cc;
       cc.setServerPubkey(node.server->_serverKeyPair().getPublicKeyAsHash());
       std::vector<CesComputeClient::InstanceInfo> insts;
@@ -152,8 +155,8 @@ struct HyleFixture {
           cc.instances("/s/hylesolo.lua", insts) == CES_OK && !insts.empty())
         pid = insts[0].pid;
       cc.disconnect();
-      if (pid == 0) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+      return pid != 0;
+    }, kTestWaitLimit, std::chrono::milliseconds(100));
     BOOST_REQUIRE_MESSAGE(pid != 0, "hylesolo extension never launched");
 
     peer = std::make_unique<PlexLuaPeer>();
@@ -297,8 +300,8 @@ BOOST_AUTO_TEST_CASE(FaucetSudoMintsToTheBoundCaller) {
   BOOST_TEST(HyleFixture::numField(f.cmd("info"), "sudo_minted") == 0u);
 
   BOOST_REQUIRE(f.faucet(10000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   BOOST_TEST(f.balOf(f.user.pub) == 10000u);
   const std::string i2 = f.cmd("info");
@@ -328,11 +331,8 @@ BOOST_AUTO_TEST_CASE(PaidCallBuysHyleFromTheExtension) {
   BOOST_TEST(std::string(reply.begin(), reply.end()).rfind("ok ", 0) == 0u);
 
   // Poll the buyer's hyle account (line protocol) until the credit commits.
-  bool credited = false;
-  for (int i = 0; i < 120 && !credited; i++) {
-    if (f.balOf(f.user.pub) == buy) credited = true;
-    else std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+  const bool credited = waitUntil([&] { return f.balOf(f.user.pub) == buy; },
+                                  kTestWaitLimit, std::chrono::milliseconds(50));
   BOOST_TEST(credited);
 }
 
@@ -341,8 +341,8 @@ BOOST_AUTO_TEST_CASE(PaidCallBuysHyleFromTheExtension) {
 BOOST_AUTO_TEST_CASE(SignerPublishesAndUpdatesAKeyValue) {
   HyleFixture f;
   BOOST_REQUIRE(f.faucet(10000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   BOOST_REQUIRE(f.submitApplied(encEntry(hyle::services::make_entry_put(
       f.user, sv("greeting"), f.seqOf(f.user.pub), /*fund=*/500, sv("hello"), sv(kChain)))));
@@ -365,8 +365,8 @@ BOOST_AUTO_TEST_CASE(SignerPublishesAndUpdatesAKeyValue) {
 BOOST_AUTO_TEST_CASE(AStrangerCannotOverwriteYourKey) {
   HyleFixture f;
   BOOST_REQUIRE(f.faucet(10000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   BOOST_REQUIRE(f.submitApplied(encEntry(hyle::services::make_entry_put(
       f.user, sv("mine"), f.seqOf(f.user.pub), 0, sv("v1"), sv(kChain)))));
@@ -398,8 +398,8 @@ BOOST_AUTO_TEST_CASE(AStrangerCannotOverwriteYourKey) {
 BOOST_AUTO_TEST_CASE(OwnershipIsGivenAwayAndTheNewOwnerDeletes) {
   HyleFixture f;
   BOOST_REQUIRE(f.faucet(10000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   ces::KeyPair heirCes;
   const hyle::KeyPair heir = hyleKeyOf(heirCes);
@@ -429,8 +429,8 @@ BOOST_AUTO_TEST_CASE(OwnershipIsGivenAwayAndTheNewOwnerDeletes) {
 BOOST_AUTO_TEST_CASE(AnyoneCanFundSomeoneElsesKey) {
   HyleFixture f;
   BOOST_REQUIRE(f.faucet(10000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   BOOST_REQUIRE(f.submitApplied(encEntry(hyle::services::make_entry_put(
       f.user, sv("shared"), f.seqOf(f.user.pub), /*fund=*/100, sv("data"), sv(kChain)))));
@@ -453,8 +453,8 @@ BOOST_AUTO_TEST_CASE(AnyoneCanFundSomeoneElsesKey) {
 BOOST_AUTO_TEST_CASE(RentStarvesAKeyAndAnyoneMayReapIt) {
   HyleFixture f(/*rentRate=*/1000);
   BOOST_REQUIRE(f.faucet(50000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   // footprint = 1 + name + 64 + payload; at rate 1000 this drains thousands per second
   BOOST_REQUIRE(f.submitApplied(encEntry(hyle::services::make_entry_put(
@@ -465,15 +465,12 @@ BOOST_AUTO_TEST_CASE(RentStarvesAKeyAndAnyoneMayReapIt) {
   ces::KeyPair cullerCes;
   const hyle::KeyPair culler = hyleKeyOf(cullerCes);
 
-  bool reaped = false;
-  for (int i = 0; i < 40 && !reaped; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  // Each try submits a rip, then reads the entry until the chain commits it.
+  const bool reaped = waitUntil([&] {
     f.cmd("submit " + encEntry(hyle::services::make_entry_rip(sv("doomed"), culler.pub)));
-    for (int j = 0; j < 10 && !reaped; j++) {
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-      reaped = f.cmd("entry doomed") == "err not_found";
-    }
-  }
+    return waitUntil([&] { return f.cmd("entry doomed") == "err not_found"; },
+                     std::chrono::seconds(1), std::chrono::milliseconds(50));
+  }, kTestWaitLimit, std::chrono::milliseconds(250));
   BOOST_TEST(reaped);
   BOOST_TEST(f.balOf(culler.pub) == 10u);  // rip_bounty, paid to a key that never signed
 }
@@ -663,18 +660,18 @@ BOOST_AUTO_TEST_CASE(TheProgramFacingSurfaceOfTheBinding) {
   // ATTACH closes the channel, so each attempt needs a fresh one.
   std::unique_ptr<PlexLuaPeer> peer;
   PlexLuaPeer::AttachResult r{};
-  for (int i = 0; i < 40 && r.status != CES_OK; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  waitUntil([&] {
     peer = std::make_unique<PlexLuaPeer>();
-    if (peer->start() == 0) continue;
+    if (peer->start() == 0) return false;
     uint64_t token = 0;
     if (!peer->bind(n.rpcPort, user, token)) {
       peer->stop();
-      continue;
+      return false;
     }
     r = peer->attach(user, token, pid);
     if (r.status != CES_OK) peer->stop();
-  }
+    return r.status == CES_OK;
+  }, kTestWaitLimit, std::chrono::milliseconds(250));
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   PlexLineReader lines(*peer);
@@ -764,15 +761,11 @@ BOOST_AUTO_TEST_CASE(PayCesReceiveHyle) {
   BOOST_TEST(std::string(reply.begin(), reply.end()) == "ok");
 
   // Poll the buyer's hyle balance (a value-0 query call) until the credit lands.
-  bool credited = false;
-  for (int i = 0; i < 100 && !credited; i++) {
+  const bool credited = waitUntil([&] {
     ces::Bytes q;
-    if (cc.call(pid, 0, ces::Bytes{'q'}, q) == CES_OK &&
-        std::string(q.begin(), q.end()) == std::to_string(buy))
-      credited = true;
-    else
-      std::this_thread::sleep_for(std::chrono::milliseconds(50));
-  }
+    return cc.call(pid, 0, ces::Bytes{'q'}, q) == CES_OK &&
+           std::string(q.begin(), q.end()) == std::to_string(buy);
+  }, kTestWaitLimit, std::chrono::milliseconds(50));
   cc.disconnect();
   BOOST_TEST(credited);
 
@@ -997,8 +990,8 @@ BOOST_AUTO_TEST_CASE(CeshRipsAStarvedEntry) {
                          std::to_string(f.pid) + " ";
 
   BOOST_REQUIRE(f.faucet(50000));
-  for (int i = 0; i < 60 && f.balOf(f.user.pub) == 0; i++)
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  waitUntil([&] { return f.balOf(f.user.pub) != 0; }, kTestWaitLimit,
+            std::chrono::milliseconds(50));
 
   // A small fund against a live footprint drains thousands per second: the entry starves in
   // seconds. Fund is charged to the owner up front, so capture the balance after the put.
@@ -1007,12 +1000,10 @@ BOOST_AUTO_TEST_CASE(CeshRipsAStarvedEntry) {
   e2e::assertContains(e2e::runExpect(ph + "entry doomed").out, "Owner", "the entry exists");
   const uint64_t before = f.balOf(f.user.pub);
 
-  bool reaped = false;
-  for (int i = 0; i < 40 && !reaped; i++) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+  const bool reaped = waitUntil([&] {
     e2e::runShell(ph + "rip doomed");
-    reaped = e2e::runShell(ph + "entry doomed").out.find("not_found") != std::string::npos;
-  }
+    return e2e::runShell(ph + "entry doomed").out.find("not_found") != std::string::npos;
+  }, kTestWaitLimit, std::chrono::milliseconds(250));
   BOOST_TEST(reaped, "the shell's rip verb reaped the starved entry");
   // The culler (this wallet's hyle identity) collected the bounty; a rip refunds the owner nothing.
   BOOST_TEST(f.balOf(f.user.pub) == before + 10);
