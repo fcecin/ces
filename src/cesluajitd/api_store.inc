@@ -22,29 +22,21 @@ bool store_path_arg(lua_State* L, std::string& out) {
   return true;
 }
 
-// db:create(initial_deposit [, price_per_kb]) → true, file_balance | nil, err
+// db:create() → true | nil, err
+//   A store has no balance and no read price: each key pays its own rent
+//   (db:put's deposit, db:deposit), and only programs read it.
 int lua_ces_store_create(lua_State* L) {
   std::string path;
   if (!store_path_arg(L, path)) {
     lua_pushnil(L); lua_pushstring(L, "bad store handle"); return 2;
   }
-  lua_Number dep_n = luaL_optnumber(L, 2, 0);
-  lua_Number ppk_n = luaL_optnumber(L, 3, 0);
-  if (dep_n < 0 || ppk_n < 0 || dep_n > 9.2233720368547e18 || ppk_n > 9.2233720368547e18) {
-    lua_pushnil(L); lua_pushstring(L, "bad args"); return 2;
-  }
   std::vector<uint8_t> args;
-  put_u64(args, uint64_t(ppk_n));
-  put_u64(args, uint64_t(dep_n));
   put_name(args, path.data(), path.size());
   return io_call(L, METHOD_KV_CREATE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
   if (st != STATUS_OK) return push_file_err(L, st);
-  if (reply.body.size() < 9) return push_file_err(L, STATUS_INTERNAL);
-  uint64_t fb = get_u64(reply.body.data() + 1);
   lua_pushboolean(L, 1);
-  lua_pushnumber(L, double(fb));
-  return 2;
+  return 1;
   });
 }
 

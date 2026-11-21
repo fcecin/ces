@@ -380,7 +380,7 @@ local author_cache = {}      -- name -> list
 local function kv_open()
   if kv_ready then return true end
   if not kv then return false end
-  kv:create(0)               -- idempotent; /s/ is unmetered, no deposit needed
+  kv:create()                -- first boot creates it; later boots no-op
   kv_ready = true
   return true
 end

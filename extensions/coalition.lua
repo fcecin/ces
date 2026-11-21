@@ -280,7 +280,7 @@ local function params_hash() return ces.sha256(params_blob()) end
 -- Persistence: the installed coalition survives restart.
 -- ---------------------------------------------------------------------------
 local store = ces.store and ces.store("/s/coalition.kv") or nil
-if store then store:create(0) end
+if store then store:create() end
 
 -- The published record a consumer extension reads (see lib/coalition_read):
 -- [fp 32][formed_at u64][maturity_ms u64][u16 n][members...], members ascending. The

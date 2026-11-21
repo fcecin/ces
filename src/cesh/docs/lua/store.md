@@ -12,7 +12,7 @@ stops.
 | Call | Returns |
 | --- | --- |
 | `local db = ces.store(path)` | A handle. It keeps no state: a new handle on the same path sees the same data |
-| `db:create()` | `true, 0`. Makes the store. When a file is at that path, it fails with `PATH_CONFLICT` |
+| `db:create()` | `true`. Makes the store. When a file is at that path, it fails with `PATH_CONFLICT` |
 | `db:put(key, value [, deposit])` | `true, key_balance, store_size`. `deposit` raw goes into the key's balance |
 | `db:get(key)` | The value, or a single `nil` for a key that is not there. `nil, code` is an error |
 | `db:erase(key)` | `true`, also for a key that is not there |

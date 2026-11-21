@@ -2431,12 +2431,7 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
       break;
     }
     case kApiMethodKvCreate: {
-      // [u64 price_per_kb][u64 initial_deposit][u16 namelen][name]
-      if (mlen < sizeof(uint64_t) * 2) {
-        sendApiReply(inst, corr_id, kApiStatusInternal); return;
-      }
-      req.pricePerKb     = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
-      req.initialDeposit = ces::Buffer::peek<uint64_t>(mbody + off); off += 8;
+      // [u16 namelen][name]. A store has no balance and no read price.
       if (!parseName(mbody, mlen, off, req.name)) {
         sendApiReply(inst, corr_id, kApiStatusInternal); return;
       }
@@ -2581,10 +2576,6 @@ void handleChildApiCall(std::shared_ptr<Instance> inst,
         case kApiMethodFileResize: {
           ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
           ces::Buffer::put<uint64_t>(tail, resp.size);
-          break;
-        }
-        case kApiMethodKvCreate: {
-          ces::Buffer::put<uint64_t>(tail, resp.fileBalance);
           break;
         }
         case kApiMethodKvPut: {

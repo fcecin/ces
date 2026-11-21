@@ -240,7 +240,7 @@ BOOST_AUTO_TEST_CASE(StoreRoundTrip) {
     local pfx = ces.client_recv()
     local e = {}
     local db = ces.store("/h/OWNER/rt.kv")
-    if not db:create(2000000000) then e[#e+1] = "create" end
+    if not db:create() then e[#e+1] = "create" end
     local k0 = db:keys()
     if type(k0) ~= "table" or #k0 ~= 0 then e[#e+1] = "keys0" end
     if not db:put("k1", "v1")  then e[#e+1] = "put1" end
@@ -280,7 +280,7 @@ BOOST_AUTO_TEST_CASE(StorePersistsAcrossRestart) {
     local pfx, cmd = ces.client_recv()
     local db = ces.store("/h/OWNER/persist.kv")
     if cmd == "put" then
-      db:create(2000000000)            -- first launch creates it
+      db:create()            -- first launch creates it
       local ok = db:put("alpha", "hello-kv")
       ces.client_send(pfx, ok and "put_ok" or "put_fail")
     elseif cmd == "get" then
@@ -329,7 +329,7 @@ BOOST_AUTO_TEST_CASE(GetDistinguishesAbsentFromError) {
     local v0, err0 = db:get("x")
     if v0 ~= nil then e[#e+1] = "v0" end
     if type(err0) ~= "number" then e[#e+1] = "noerrcode" end
-    db:create(2000000000)
+    db:create()
     -- existing store, missing key -> (nil) with NO error
     local v1, err1 = db:get("missing")
     if v1 ~= nil then e[#e+1] = "v1" end
@@ -363,7 +363,7 @@ BOOST_AUTO_TEST_CASE(PutDepositBalances) {
     local pfx = ces.client_recv()
     local e = {}
     local db = ces.store("/h/OWNER/fund.kv")
-    db:create(0)
+    db:create()
     local ok, bal = db:put("k", "v", 5000)        -- seed cell balance 5000
     if not ok then e[#e+1] = "put" end
     if bal ~= 5000 then e[#e+1] = "bal:" .. tostring(bal) end
@@ -397,7 +397,7 @@ BOOST_AUTO_TEST_CASE(RangeFromLua) {
     local pfx = ces.client_recv()
     local e = {}
     local db = ces.store("/h/OWNER/lr.kv")
-    db:create(0)
+    db:create()
     db:put("b", "2", 1000000000)        -- inserted out of order
     db:put("a", "1", 1000000000)
     db:put("c", "3", 1000000000)
