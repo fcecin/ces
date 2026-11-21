@@ -364,8 +364,9 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # "/ces/think/1"   = "builtin:think"
 
 # Transport caps on the rpc_port's RUDP (a TOML sub-table). max_channels_per_peer
-# is a CES opinion (default 2 — cesh/cesqt typically want a long-lived stream
-# open while issuing other ops). The two reorder caps bound per-channel
+# is the most channels that one peer (one IP and port) keeps open at one time.
+# cesh and cesqt often keep a stream open while they send other operations,
+# so a peer needs more than one channel. The two reorder caps bound per-channel
 # reassembly; -1 = leave the library default (currently 1 MB / 1024 messages).
 # channel_idle_secs: a channel idle this long is GC'd; raise it for long-lived
 # interactive dial terminals where a human pauses between commands.
