@@ -8,8 +8,9 @@
 //
 // A handle is a Lua table {id, <verb methods>, close}. The C++ channel+client
 // live in a registry keyed by id (Lua-thread-only). Verb methods block the Lua
-// thread on the round-trip (the endpoint strand is separate). close() destroys
-// the channel ON the endpoint strand (its RudpStream is touched there).
+// thread on the round-trip (the endpoint strand is separate). close() ends the
+// channel and destroys it ON the endpoint strand (its RudpStream is touched
+// there).
 // ---------------------------------------------------------------------------
 
 // inflight: an offloaded verb is running on a worker thread (set/cleared only on
@@ -136,8 +137,9 @@ LuaComputeClientEntry* compute_entry(uint64_t id) {
   return it == g_compute_clients.end() ? nullptr : &it->second;
 }
 
-// Destroy a registry entry's channel/client on the endpoint strand (its
-// RudpStream is touched there). Generic over the two entry maps.
+// End a registry entry's channel and destroy the channel/client on the
+// endpoint strand (its RudpStream is touched there). Generic over the entry
+// maps.
 template <typename Map>
 void client_close(Map& reg, uint64_t id) {
   auto it = reg.find(id);
@@ -145,7 +147,9 @@ void client_close(Map& reg, uint64_t id) {
   auto entry = std::move(it->second);
   reg.erase(it);
   if (g_luarpc_io)
-    boost::asio::post(*g_luarpc_io, [e = std::move(entry)]() { (void)e; });
+    boost::asio::post(*g_luarpc_io, [e = std::move(entry)]() {
+      if (e.ch) e.ch->close();   // the program closed the handle
+    });
   // else: no endpoint → entry destroyed here (harmless; can't really happen).
 }
 

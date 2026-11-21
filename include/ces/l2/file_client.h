@@ -6,8 +6,8 @@
 //
 // The class is blocking: each verb posts to internal threads, waits for
 // completion, returns. One instance talks to exactly one server over
-// exactly one RUDP channel (opened at connect, closed at disconnect /
-// destructor). Callers that need parallelism use multiple instances.
+// exactly one RUDP channel (opened at connect, ended at disconnect). Callers
+// that need parallelism use multiple instances.
 //
 // Response signature verification: call setServerPubkey() with the
 // operator's pubkey (fetched via `server-info` or provided by the
@@ -70,7 +70,9 @@ public:
   // exclusive with connect(); the caller owns the channel's lifetime.
   void attach(CesPlexChannel& channel);
 
-  // Tear down the channel and I/O threads. Safe to call more than once.
+  // Tear down the channel and I/O threads. Safe to call more than once. It
+  // first ends the channel with the server (HS_CLOSE), and the destructor
+  // tears down without it.
   void disconnect();
 
   // Provide the server's 32-byte public key so response signatures can

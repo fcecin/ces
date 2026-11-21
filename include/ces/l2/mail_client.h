@@ -38,7 +38,9 @@ public:
   // bound. Mutually exclusive with connect().
   void attach(CesPlexChannel& channel);
 
-  // Tear down the channel and I/O threads. Safe to call more than once.
+  // Tear down the channel and I/O threads. Safe to call more than once. It
+  // first ends the channel with the server (HS_CLOSE), and the destructor
+  // tears down without it.
   void disconnect();
 
   // Provide the server's 32-byte public key so the response signature can be

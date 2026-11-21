@@ -25,6 +25,7 @@
 #include "test_echo_handler.h"
 
 #include <ces/cesplex/mux.h>
+#include <ces/cesplex/session.h>
 #include <ces/l2/file_handler.h>
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>
@@ -192,6 +193,7 @@ public:
   };
 
   boost::asio::io_context& taskIO() { return taskIO_; }
+  minx::Rudp* rudp() { return rudp_.get(); }
 
   // Step 3: signed bind handshake. `signer` is the principal pubkey
   // the channel will be bound to; the bind preamble is signed by it.
@@ -386,6 +388,37 @@ struct CesPlexFixture {
     fs::remove_all(tempDir, ec);
   }
 };
+
+// The peers that the server's rpc Rudp holds, read on the Rudp's thread.
+size_t serverRudpPeers(CesServer& s) {
+  std::promise<size_t> p;
+  auto f = p.get_future();
+  boost::asio::post(s._rpcTaskIOExecutor(),
+                    [&] { p.set_value(s._rpcRudp()->peerCount()); });
+  return f.get();
+}
+
+// Wait at most 2 s for the server's rpc Rudp to hold no peer.
+bool serverRudpEmpties(CesServer& s) {
+  for (int i = 0; i < 200; ++i) {
+    if (serverRudpPeers(s) == 0) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return false;
+}
+
+// A STAT of a file that does not exist, over `ch`.
+uint8_t statMissing(ces::CesPlexChannel& ch) {
+  constexpr uint8_t kVerbStat = 0x04;
+  const std::string name = "/f/nothing";
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
+  pre.insert(pre.end(), name.begin(), name.end());
+  auto env = ch.buildEnvelope(kVerbStat, pre);
+  ces::Bytes resp;
+  return ch.driveVerb(kVerbStat, env, 0, nullptr, resp);
+}
 
 } // namespace
 
@@ -1859,6 +1892,59 @@ BOOST_AUTO_TEST_CASE(AcceptInboundRejectsDuplicateCoords) {
   BOOST_CHECK_EQUAL(plex._pendingSessionCount(), 2u);
 
   io.stop();
+}
+
+// A channel that the owner closes frees its slot on the server. The server
+// holds at most max_channels_per_peer channels for one address. Channels from
+// one port that end without HS_CLOSE fill those slots, and the next select
+// gets no answer.
+BOOST_AUTO_TEST_CASE(ClosedChannelsFreeTheirSlots) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), fx.rpcPort);
+  const size_t n = fx.server->_config().rpcRudpMaxChannelsPerPeer + 2;
+  for (size_t i = 0; i < n; ++i) {
+    ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+    CES_REQUIRE_OK(ch.select(to, "/ces/file/1", signer));
+    CES_REQUIRE_RC_EQ(statMissing(ch), CES_ERROR_FILE_NOT_FOUND);
+    ch.close();
+  }
+  BOOST_CHECK(serverRudpEmpties(*fx.server));
+}
+
+// The destructor of a channel sends nothing, so the server keeps the slot.
+BOOST_AUTO_TEST_CASE(DestroyingAChannelSendsNothing) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), fx.rpcPort);
+  {
+    ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+    CES_REQUIRE_OK(ch.select(to, "/ces/file/1", signer));
+  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_CHECK_EQUAL(serverRudpPeers(*fx.server), 1u);
+}
+
+// A client that disconnects sends HS_CLOSE, so the server frees its slot at
+// once, before the idle GC.
+BOOST_AUTO_TEST_CASE(DisconnectFreesTheServerSlot) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  ces::CesPlexClient c;
+  CES_REQUIRE_OK(c.connect("localhost", fx.rpcPort, "/ces/file/1", signer));
+  BOOST_REQUIRE_EQUAL(serverRudpPeers(*fx.server), 1u);
+  c.disconnect();
+  BOOST_CHECK(serverRudpEmpties(*fx.server));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

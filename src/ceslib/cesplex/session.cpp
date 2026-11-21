@@ -367,6 +367,32 @@ public:
 
   void reset() { stream_.reset(); }
 
+  // End the channel: send HS_CLOSE and free its slot in the Rudp, then
+  // reset(). A server keeps the channel of a client that goes away without
+  // HS_CLOSE until the idle GC, and one address has few slots (rpc_rudp
+  // max_channels_per_peer). So a client that opens a channel for each call,
+  // from a port that the kernel gives again, runs out of slots.
+  void close() {
+    if (channel_ != 0 && rudp_) {
+      auto end = [rudp = rudp_, peer = peer_, ch = channel_] {
+        rudp->closeChannel(peer, ch);
+      };
+      channel_ = 0;
+      if (taskIO_.get_executor().running_in_this_thread()) {
+        end();
+      } else if (!taskIO_.stopped()) {
+        auto done = std::make_shared<std::promise<void>>();
+        auto fut = done->get_future();
+        boost::asio::post(taskIO_, [end, done] {
+          end();
+          done->set_value();
+        });
+        fut.wait_for(std::chrono::seconds(1));
+      }
+    }
+    reset();
+  }
+
   void setServerPubkey(const minx::Hash& pk) {
     serverPk_ = pk;
     hasServerPk_ = true;
@@ -786,6 +812,8 @@ uint8_t CesPlexChannel::select(const minx::SockAddr& peer,
 
 void CesPlexChannel::reset() { impl_->reset(); }
 
+void CesPlexChannel::close() { impl_->close(); }
+
 void CesPlexChannel::setServerPubkey(const minx::Hash& pk) {
   impl_->setServerPubkey(pk);
 }
@@ -938,6 +966,13 @@ public:
     return chan_->select(peer, protocol, signerKey);
   }
 
+  // The end that the owner asks for: close the channel while the threads
+  // run, so the HS_CLOSE goes out before the socket closes.
+  void disconnect() {
+    if (chan_) chan_->close();
+    stop();
+  }
+
   void stop() {
     if (!minx_) return;
     if (tickTimer_) {
@@ -1036,7 +1071,7 @@ uint8_t CesPlexClient::connect(const std::string& host, uint16_t rpcPort,
   return impl_->connect(host, rpcPort, protocol, signerKey);
 }
 
-void CesPlexClient::disconnect() { impl_->stop(); }
+void CesPlexClient::disconnect() { impl_->disconnect(); }
 
 CesPlexChannel* CesPlexClient::channel() { return impl_->channel(); }
 

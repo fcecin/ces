@@ -199,6 +199,12 @@ public:
   // Drop the bound stream (teardown).
   void reset();
 
+  // End the channel: send HS_CLOSE to the server and free the channel's slot
+  // in the Rudp, then reset(). The owner calls it when it is done with the
+  // channel, and the destructor sends nothing. From a thread other than the
+  // task io_context's, it waits at most 1 s for that thread.
+  void close();
+
   // Provide the server pubkey so response signatures verify (else each
   // response logs one LOGERROR and is treated as unverifiable).
   void setServerPubkey(const minx::Hash& pk);
@@ -293,7 +299,9 @@ public:
   uint8_t connect(const std::string& host, uint16_t rpcPort,
                   const std::string& protocol, const KeyPair& signerKey);
 
-  // Tear down the channel + I/O threads. Safe to call more than once.
+  // Tear down the channel + I/O threads. Safe to call more than once. It
+  // first closes the channel (CesPlexChannel::close), and the destructor
+  // tears down without it.
   void disconnect();
 
   // Provide the server pubkey so response signatures verify (else each

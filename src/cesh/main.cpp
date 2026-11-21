@@ -2324,6 +2324,17 @@ int ceshRun(int argc, char* argv[]) {
       return "/h/" + actorKey.getPublicKeyHexStr() + "/" + raw;
     };
 
+    // The clients of the L2 commands. The command runs, and then its client
+    // ends the channel with the server (ended).
+    CesFileClient cfc;
+    CesComputeClient cc2;
+    CesMailClient mc;
+    CesThinkClient tc;
+    auto ended = [](int code, auto& client) {
+      client.disconnect();
+      return code;
+    };
+
     // ---- handleDiskFile handler (L2 disk-backed file store) ----
     auto handleDiskFile = [&]() -> int {
       // `put` loads its content before any request, so a bad local file
@@ -2397,7 +2408,6 @@ int ceshRun(int argc, char* argv[]) {
         return static_cast<uint64_t>(owed);
       };
 
-      CesFileClient cfc;
       uint8_t rc = cfc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
         std::cerr << "Error: file-store connect failed: "
@@ -2738,7 +2748,6 @@ int ceshRun(int argc, char* argv[]) {
 
       auto normalizePath = remotePath;
 
-      CesComputeClient cc2;
       uint8_t rc = cc2.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
         std::cerr << "Error: compute connect failed: "
@@ -2904,7 +2913,6 @@ int ceshRun(int argc, char* argv[]) {
       if (!resolveL2Target("mail", tgt)) return 1;
       auto& [host, serverPk, hasServerPk] = tgt;
 
-      CesMailClient mc;
       uint8_t rc = mc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
         std::cerr << "Error: mail connect failed: " << errorString(rc) << "\n";
@@ -2979,7 +2987,6 @@ int ceshRun(int argc, char* argv[]) {
         }
       }
 
-      CesThinkClient tc;
       uint8_t rc = tc.connect(host, rpcPort_arg, actorKey);
       if (rc != CES_OK) {
         std::cerr << "Error: think connect failed: " << errorString(rc) << "\n";
@@ -3303,19 +3310,19 @@ int ceshRun(int argc, char* argv[]) {
 
     // ---- file (L2, disk) ----
 
-    else if (cmd_dfile->parsed()) return handleDiskFile();
+    else if (cmd_dfile->parsed()) return ended(handleDiskFile(), cfc);
 
     // ---- compute (L2 program instances) ----
 
-    else if (cmd_compute->parsed()) return handleCompute();
+    else if (cmd_compute->parsed()) return ended(handleCompute(), cc2);
 
     // ---- mail (L2 outbound email) ----
 
-    else if (cmd_mail->parsed()) return handleMail();
+    else if (cmd_mail->parsed()) return ended(handleMail(), mc);
 
     // ---- think (L2 text in, text out) ----
 
-    else if (cmd_think->parsed()) return handleThink();
+    else if (cmd_think->parsed()) return ended(handleThink(), tc);
 
     // ---- autoexec ----
 
