@@ -16,6 +16,8 @@
 #include <fstream>
 #include <sys/wait.h>
 #include <regex>
+#include <set>
+#include <sstream>
 
 using namespace ces::e2e;
 using ces::kTestWaitLimit;
@@ -1340,7 +1342,7 @@ BOOST_AUTO_TEST_CASE(MultiServerTransfers) {
   // (its amount stays in the vostro). So check the logs of the 5 servers: no
   // server gave up a settlement. (The text comes from the settlement
   // callbacks in src/ceslib/server.cpp.)
-  int gaveUp = 0, logs = 0;
+  int gaveUp = 0, logs = 0, noEffect = 0;
   for (const auto& e : fs::recursive_directory_iterator(workDir)) {
     const std::string name = e.path().filename().string();
     if (!e.is_regular_file() || name.rfind("server", 0) != 0 ||
@@ -1350,9 +1352,12 @@ BOOST_AUTO_TEST_CASE(MultiServerTransfers) {
     std::ifstream in(e.path());
     for (std::string line; std::getline(in, line);)
       if (line.find("settlement GAVE UP") != std::string::npos) ++gaveUp;
+      else if (line.find("has no effect in this build of ces") != std::string::npos)
+        ++noEffect;
   }
   BOOST_CHECK_EQUAL(logs, 5);
   BOOST_CHECK_EQUAL(gaveUp, 0);
+  BOOST_CHECK_EQUAL(noEffect, 0);  // each key that cesnet writes is read
 }
 
 BOOST_AUTO_TEST_SUITE_END()
@@ -1829,6 +1834,132 @@ BOOST_AUTO_TEST_CASE(ConfigDumpRoundTrips) {
   assertContains(boot.out, "ces starting server",
                  "ces must load its own --config dump");
   assertNotContains(boot.out, "Config parse error");
+  boost::system::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// `ces --config <file> --genpubkey <hex>` loads the file and exits before the
+// server starts. Its output holds the warnings of the loader.
+static RunResult loadConfigOnly(const std::string& ces, const fs::path& cfg) {
+  return runShell("\"" + ces + "\" --config \"" + cfg.string() +
+                  "\" --genpubkey "
+                  "1f2320380c9315d45a62f0c0b0ffe468eb04218d271a180ef3af60505bdbb347",
+                  /*timeoutSecs=*/20);
+}
+
+static const std::string kNoEffect = "has no effect in this build of ces";
+
+// The template with each commented `# key = value` line made live, in place,
+// unless its section already has that key live. `server_key_file` stays a
+// comment: the template sets `server_key`, and the loader refuses the two
+// together. A table that the template shows only as a comment (`# [extension]`)
+// stays a comment.
+static std::string withCommentedKeysLive(const std::string& tmpl) {
+  static const std::regex header(R"(^\[{1,2}([^\]]+)\]{1,2}\s*$)");
+  static const std::regex commentedHeader(R"(^# ?\[{1,2}[^\]]+\]{1,2}\s*$)");
+  static const std::regex live(R"(^([a-z_][a-z0-9_]*)\s*=)");
+  static const std::regex commented(R"(^# ?([a-z_][a-z0-9_]*)\s*=.*)");
+  std::vector<std::string> lines;
+  { std::istringstream in(tmpl); for (std::string l; std::getline(in, l);) lines.push_back(l); }
+  std::set<std::string> taken;  // section + "." + key, live or made live
+  std::string section;
+  std::smatch m;
+  for (const auto& l : lines) {
+    if (std::regex_match(l, m, header)) section = m[1];
+    else if (std::regex_search(l, m, live)) taken.insert(section + "." + m[1].str());
+  }
+  std::ostringstream out;
+  section.clear();
+  bool exampleTable = false;  // after a commented table header
+  for (const auto& l : lines) {
+    if (std::regex_match(l, m, header)) { section = m[1]; exampleTable = false; }
+    else if (std::regex_match(l, commentedHeader)) exampleTable = true;
+    if (!exampleTable && std::regex_match(l, m, commented) &&
+        m[1] != "server_key_file" &&
+        taken.insert(section + "." + m[1].str()).second) {
+      out << l.substr(l[1] == ' ' ? 2 : 1) << "\n";
+    } else {
+      out << l << "\n";
+    }
+  }
+  return out.str();
+}
+
+// The loader reports each top-level key that it does not read, and each key of
+// [rpc_rudp], so a misspelled or retired key does not pass unseen. The template
+// that ces prints and the shipped config of the main server have no such key.
+BOOST_AUTO_TEST_CASE(EachConfigKeyIsOneThatCesReads) {
+  const std::string ces = findCesBinary();
+  fs::path dir = makeUniqueTempDir("ces_cfg_keys");
+
+  // The control: keys that ces does not read, also inside [rpc_rudp].
+  { std::ofstream f((dir / "bogus.toml").string());
+    f << "settlement_max_retries = 7\n[rpc_rudp]\nmax_channels = 4\n"; }
+  RunResult bogus = loadConfigOnly(ces, dir / "bogus.toml");
+  assertContains(bogus.out, "\"settlement_max_retries\" " + kNoEffect);
+  assertContains(bogus.out, "\"rpc_rudp.max_channels\" " + kNoEffect);
+
+  RunResult dump = runShell("\"" + ces + "\" --config");
+  BOOST_REQUIRE_EQUAL(dump.exitCode, 0);
+  { std::ofstream f((dir / "template.toml").string()); f << dump.out; }
+  RunResult t = loadConfigOnly(ces, dir / "template.toml");
+  BOOST_CHECK_EQUAL(t.exitCode, 0);
+  assertNotContains(t.out, kNoEffect);
+
+  // Each key that the template shows only in a comment is one that ces reads.
+  const std::string all = withCommentedKeysLive(dump.out);
+  BOOST_REQUIRE(all.find("\nthink_model ") != std::string::npos);
+  { std::ofstream f((dir / "all.toml").string()); f << all; }
+  RunResult a = loadConfigOnly(ces, dir / "all.toml");
+  BOOST_CHECK_EQUAL(a.exitCode, 0);
+  assertNotContains(a.out, "Config parse error");
+  assertNotContains(a.out, kNoEffect);
+
+  RunResult pub = loadConfigOnly(
+    ces, fs::path(CES_SOURCE_DIR) / "config_ces_pubcom_org.toml");
+  BOOST_CHECK_EQUAL(pub.exitCode, 0);
+  assertNotContains(pub.out, kNoEffect);
+
+  boost::system::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// The live export holds the settings that the loader reads, so a re-feed
+// keeps them: here the think settings, web_allow_public and
+// fee_discount_enabled, with a string value that needs escapes. Each key of
+// the export is one that ces reads.
+BOOST_AUTO_TEST_CASE(TheExportKeepsTheSettingsAndCesReadsEachKey) {
+  fs::path dir = makeUniqueTempDir("ces_cfg_export");
+  minx::Hash key;
+  key.fill(0x3C);
+  CesConfig cfg = makeTestConfig(dir, key, 0);
+  cfg.thinkModel = "a \"quoted\"\nmodel";
+  cfg.thinkMaxOutTokens = 1234;
+  cfg.webAllowPublic = true;
+  cfg.feeDiscountEnabled = false;
+  cfg.powDelaySecs = 7500;
+  std::string path;
+  {
+    CesServer srv(cfg);
+    srv.start(0);
+    path = srv._exportConfig();
+    srv.stop();
+  }
+  BOOST_REQUIRE(!path.empty());
+  std::ifstream f(path);
+  const std::string toml((std::istreambuf_iterator<char>(f)),
+                         std::istreambuf_iterator<char>());
+  assertContains(toml, "think_model = \"a \\\"quoted\\\"\\u000amodel\"\n");
+  assertContains(toml, "think_max_out_tokens = 1234\n");
+  assertContains(toml, "web_allow_public = true\n");
+  assertContains(toml, "fee_discount_enabled = false\n");
+  assertContains(toml, "pow_delay = 7500\n");
+
+  RunResult r = loadConfigOnly(findCesBinary(), path);
+  BOOST_CHECK_EQUAL(r.exitCode, 0);
+  assertNotContains(r.out, "Config parse error");
+  assertNotContains(r.out, kNoEffect);
+
   boost::system::error_code ec;
   fs::remove_all(dir, ec);
 }

@@ -741,7 +741,7 @@ BOOST_AUTO_TEST_CASE(DedupReplayViaWire) {
   cfg.maxAcc = 10000;
   cfg.minDiff = 1;
   cfg.spendSlotSize = 10;
-  cfg.minProveWorkTimestamp = 0;
+  cfg.powDelaySecs = 0;
   cfg.taskThreads = 2;
   cfg.flushValue = std::numeric_limits<uint64_t>::max();
   cfg.feeAccount = 0;

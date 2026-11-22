@@ -110,7 +110,7 @@ inline CesConfig makeTestConfig(const fs::path& dir, const minx::Hash& key,
   cfg.maxAcc = 100000;
   cfg.minDiff = 1;
   cfg.spendSlotSize = 10;
-  cfg.minProveWorkTimestamp = 0;
+  cfg.powDelaySecs = 0;
   cfg.taskThreads = 2;
   cfg.minAsset = 100;
   cfg.maxAsset = 100000;

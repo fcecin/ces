@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <set>
 #include <thread>
 #include <unistd.h>
 
@@ -90,6 +91,9 @@ min_difficulty = )" << static_cast<int>(DEFAULT_MIN_DIFF) << R"(
 
 # Delay in seconds before accepting PoW after startup (0 = immediate). A
 # delay lets the RandomX dataset finish initializing before solutions count.
+# On a server that mints, set it to at least 2 * spend_slot_size + )"
+            << minx::Minx::PROVE_WORK_FUTURE_DRIFT_SECS << R"( (the PoW future
+# drift), or a solution that the server paid before a restart is good again.
 pow_delay = )" << DEFAULT_POW_DELAY << R"(
 
 # On a ledger with an earlier run (also one seeded with `ces credit`), refuse
@@ -146,12 +150,19 @@ fee_tx      = -1   # built-in: )" << ces::BASE_FEE_TRANSACTION << R"(
 fee_query   = -1   # built-in: )" << ces::BASE_FEE_QUERY << R"(
 fee_vm_mult = -1   # built-in: )" << ces::BASE_FEE_VM_MULT << R"(
 
+# Let the fee multipliers follow the load gauges (the fee discount). false
+# keeps every fee at its full price.
+fee_discount_enabled = )" << (DEFAULT_FEE_DISCOUNT_ENABLED ? "true" : "false") << R"(
+
 # Server's public address (optional, for peer discovery)
 # If set, included in PoW submissions to peer servers.
 # server_name = "myserver.example.com:53830"
 
 # Peering: target credit balance to maintain on each peer server
 peer_target = )" << DEFAULT_PEER_TARGET << R"(
+
+# Seconds between two cycles of the peer miner.
+peer_miner_interval = )" << DEFAULT_PEER_MINER_INTERVAL_SECS << R"(
 
 # Inbound PoW reciprocation (basis points): outbound PoW we mine per unit of
 # inbound PoW a peer mines on us. 0 = off (never mine on inbound-only peers).
@@ -181,6 +192,7 @@ gossip_fanout_degree = )" << DEFAULT_GOSSIP_FANOUT_DEGREE << R"(
 # tail, and the server-info "hello" banner. 0 = disabled (default).
 # web_port = 0
 # web_bind = ")" << DEFAULT_WEB_BIND << R"("
+# web_allow_public = false   # allow a web_bind that is not loopback
 
 # Dedicated MINX/RUDP UDP port for CesPlex -- the gateway for the ENTIRE
 # L2 stack (file / lua / compute / peer mesh) plus the SYS_RPC syscall.
@@ -296,10 +308,11 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 #
 # A channel that ATTACHes to a compute instance costs its caller the network
 # price times compute_payout_factor (1 to 10000). The server keeps the network price, and
-# the part above it goes to the account of the program. At the default of 2,
+# the part above it goes to the account of the program. At the default of )"
+            << DEFAULT_COMPUTE_PAYOUT_FACTOR_BP / 10000.0 << R"(,
 # the program gets what the network gets. Programs in /s/ get no payout, and
 # their callers pay the network price only.
-# compute_payout_factor    = 2
+# compute_payout_factor    = )" << DEFAULT_COMPUTE_PAYOUT_FACTOR_BP / 10000.0 << R"(
 #
 # ChannelMeter (CesPlex net metering) rates. Throughput is metered per KiB so
 # the rate can sit below 1 raw/byte. 0 is a sentinel, not "free": the server
@@ -328,12 +341,12 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # dropped. Credentials ride AUTH LOGIN; STARTTLS is used when the relay
 # advertises it. Secure this file if you set a password.
 # mail_relay_host = ""      # e.g. "localhost"
-# mail_relay_port = 587
+# mail_relay_port = )" << DEFAULT_MAIL_RELAY_PORT << R"(
 # mail_from       = ""      # e.g. "no-reply@your-domain.example"
 # mail_user       = ""      # SMTP AUTH user (empty = no AUTH)
 # mail_pass       = ""      # SMTP AUTH password (empty = no AUTH)
 # mail_fee_per_mb        = 0          # credits burned per MB of outgoing mail
-# mail_max_encoded_bytes = 20971520   # 20 MiB cap on one message
+# mail_max_encoded_bytes = )" << DEFAULT_MAIL_MAX_ENCODED_BYTES << R"(   # 20 MiB cap on one message
 )"
 #endif
        << R"(#
@@ -342,18 +355,18 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # think_api_key_file, so it is never in this file. THINK is served only when
 # the key file is readable (in a --think build) and both fees are not zero.
 # Fees are raw credit units (1 credit = 100000000) per one million tokens.
-# think_base_url        = "https://api.deepseek.com"
-# think_model           = "deepseek-flash"
+# think_base_url        = ")" << DEFAULT_THINK_BASE_URL << R"("
+# think_model           = ")" << DEFAULT_THINK_MODEL << R"("
 # think_api_key_file    = ""        # e.g. "/opt/ces/think.key" (mode 600)
 # think_reasoning       = false     # model reasoning: slower, more tokens
 # think_fee_in          = 0         # per 1M input tokens not in the cache
 # think_fee_cached_in   = 0         # per 1M input tokens from the cache
 # think_fee_out         = 0         # per 1M output tokens
-# think_max_out_tokens  = 8192      # max_tokens of every call
-# think_max_input_bytes = 1048576   # largest prompt text
+# think_max_out_tokens  = )" << DEFAULT_THINK_MAX_OUT_TOKENS << R"(      # max_tokens of every call
+# think_max_input_bytes = )" << DEFAULT_THINK_MAX_INPUT_BYTES << R"(   # largest prompt text
 # think_context_tokens  = 0         # ceiling on the model's window (0 = the API's)
-# think_timeout_secs    = 300       # one call, end to end
-# think_max_concurrent  = 8         # calls in flight
+# think_timeout_secs    = )" << DEFAULT_THINK_TIMEOUT_SECS << R"(       # one call, end to end
+# think_max_concurrent  = )" << DEFAULT_THINK_MAX_CONCURRENT << R"(         # calls in flight
 # Global subsidy: the price multiplier (basis points of the full price, as in
 # the fee multipliers) cools to think_subsidy_floor_bp while nobody thinks and
 # heats back to 10000 with use. The most it gives over a window T is
@@ -361,7 +374,7 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # 0 or the floor is 10000.
 # think_subsidy_budget   = 0        # e.g. 200000000000 (2000 credits)
 # think_subsidy_tau_secs = 0        # e.g. 172800 (2 days)
-# think_subsidy_floor_bp = 10000    # e.g. 1 (99.99% off at rest)
+# think_subsidy_floor_bp = )" << DEFAULT_THINK_SUBSIDY_FLOOR_BP << R"(    # e.g. 1 (99.99% off at rest)
 )"
        << R"(
 # === CesPlex mounts: the crucial L2 wiring (rpc_port only). ===
@@ -383,7 +396,7 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # is the most channels that one peer (one IP and port) keeps open at one time.
 # cesh and cesqt often keep a stream open while they send other operations,
 # so a peer needs more than one channel. The two reorder caps bound per-channel
-# reassembly; -1 = leave the library default (currently 1 MB / 1024 messages).
+# reassembly; -1 = leave the library default (minx::RudpConfig).
 # channel_idle_secs: a channel idle this long is GC'd; raise it for long-lived
 # interactive dial terminals where a human pauses between commands.
 [rpc_rudp]
@@ -448,7 +461,7 @@ int main(int argc, char* argv[]) {
   int64_t optFeeVmMult = -1;
   bool optGenerateKeyPair = false;
   bool optNoPowEngine = false;
-  bool optNoFeeDiscount = false;
+  bool optNoFeeDiscount = !DEFAULT_FEE_DISCOUNT_ENABLED;
   bool optCacheOnlyPoWEngine = false;
   int defaultOptTaskThreads =
     static_cast<int>(std::thread::hardware_concurrency()) / 2 - 2;
@@ -498,7 +511,7 @@ int main(int argc, char* argv[]) {
   int64_t optFeeComputeNetByte    = -1;
   int64_t optFeeComputeSlotSec    = -1;
   int64_t optFeeBucketByteSec     = -1;
-  double  optComputePayoutFactor  = 2.0;
+  double  optComputePayoutFactor  = DEFAULT_COMPUTE_PAYOUT_FACTOR_BP / 10000.0;
   // net meter (ChannelMeter). 0 is a sentinel: the CesServer ctor derives a
   // non-zero rate from the ledger anchors (floored to >= 1), so metering stays
   // on. Pass an explicit non-zero to override.
@@ -520,24 +533,24 @@ int main(int argc, char* argv[]) {
 #ifdef CES_MAIL
   // Mail relay (SMTP submission for ces.mail.send / builtin:mail).
   std::string optMailRelayHost;
-  uint16_t    optMailRelayPort = 587;
+  uint16_t    optMailRelayPort = DEFAULT_MAIL_RELAY_PORT;
   std::string optMailFrom, optMailUser, optMailPass;
   uint64_t    optMailFeePerMB = 0;
-  uint64_t    optMailMaxEncodedBytes = 20ull * 1024 * 1024;
+  uint64_t    optMailMaxEncodedBytes = DEFAULT_MAIL_MAX_ENCODED_BYTES;
 #endif  // CES_MAIL
   // builtin:think.
-  std::string optThinkBaseUrl = "https://api.deepseek.com";
-  std::string optThinkModel = "deepseek-flash";
+  std::string optThinkBaseUrl = DEFAULT_THINK_BASE_URL;
+  std::string optThinkModel = DEFAULT_THINK_MODEL;
   std::string optThinkApiKeyFile;
   bool        optThinkReasoning = false;
   uint64_t    optThinkFeeIn = 0, optThinkFeeCachedIn = 0, optThinkFeeOut = 0;
-  uint32_t    optThinkMaxOutTokens = 8192;
-  uint32_t    optThinkMaxInputBytes = 1024 * 1024;
+  uint32_t    optThinkMaxOutTokens = DEFAULT_THINK_MAX_OUT_TOKENS;
+  uint32_t    optThinkMaxInputBytes = DEFAULT_THINK_MAX_INPUT_BYTES;
   uint32_t    optThinkContextTokens = 0;
-  uint32_t    optThinkTimeoutSecs = 300;
-  uint32_t    optThinkMaxConcurrent = 8;
+  uint32_t    optThinkTimeoutSecs = DEFAULT_THINK_TIMEOUT_SECS;
+  uint32_t    optThinkMaxConcurrent = DEFAULT_THINK_MAX_CONCURRENT;
   uint64_t    optThinkSubsidyBudget = 0, optThinkSubsidyTauSecs = 0;
-  uint16_t    optThinkSubsidyFloorBp = 10000;
+  uint16_t    optThinkSubsidyFloorBp = DEFAULT_THINK_SUBSIDY_FLOOR_BP;
   // CesPlex mounts — `proto=target` pairs. Target is
   // "builtin:<name>" (statically linked handler).
   std::vector<std::string> optCesplexMounts;
@@ -592,7 +605,9 @@ int main(int argc, char* argv[]) {
       "Minimum proof-of-work difficulty")
       ->default_val(std::to_string(DEFAULT_MIN_DIFF));
     app.add_option("--powdelay", optPoWDelay,
-      "Delay in seconds before accepting PoW")
+      "Delay in seconds before accepting PoW. On a server that mints, set it "
+      "to at least 2 * spend_slot_size + the PoW future drift, or a solution "
+      "spent before a restart is good again after it")
       ->default_val(std::to_string(DEFAULT_POW_DELAY));
     app.add_option("--noncelessdelay", optNoncelessDelay,
       "After a restart, refuse nonceless requests stamped before boot + this "
@@ -635,7 +650,7 @@ int main(int argc, char* argv[]) {
       "Inbound PoW reciprocation, basis points (0=off, 10000=1:1)")
       ->default_val(std::to_string(DEFAULT_PEER_POW_INBOUND_RECIPROCATION_BPS));
     app.add_option("--peerminerinterval", optPeerMinerInterval,
-      "Seconds between peer miner cycles (default 60; lower for local/dev)")
+      "Seconds between peer miner cycles (lower for local/dev)")
       ->default_val(std::to_string(DEFAULT_PEER_MINER_INTERVAL_SECS));
     app.add_option("--maxpeers", optMaxPeers,
       "Peer-table size (persisted/exposed; RAM holds 3x). Small bounds the view")
@@ -684,8 +699,8 @@ int main(int argc, char* argv[]) {
       ->default_val(std::to_string(DEFAULT_RPC_RUDP_BURST_BYTES));
     app.add_option("--rpcrudpmaxchannels",
       optRpcRudpMaxChannelsPerPeer,
-      "rpc_port RUDP: max RUDP channels per peer "
-      "(CES default 2 — long-lived dial + side ops)")
+      "rpc_port RUDP: max RUDP channels per peer (a long-lived dial needs "
+      "more than one, for the operations beside it)")
       ->default_val(std::to_string(DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER));
     app.add_option("--rpcrudpmaxreorderbytes",
       optRpcRudpMaxReorderBytesPerChannel,
@@ -698,7 +713,7 @@ int main(int argc, char* argv[]) {
       "(-1 = library default)")
       ->default_val(std::to_string(DEFAULT_RPC_RUDP_MAX_REORDER_MSGS));
     app.add_option("--rpcrudpidlesecs", optRpcRudpChannelIdleSecs,
-      "rpc_port RUDP channel idle-GC timeout in seconds (default 60). A channel "
+      "rpc_port RUDP channel idle-GC timeout in seconds. A channel "
       "with no traffic for this long is dropped; raise it for long-lived "
       "interactive dial terminals where a human pauses between commands.")
       ->default_val(std::to_string(DEFAULT_RPC_RUDP_CHANNEL_IDLE_SECS));
@@ -711,7 +726,8 @@ int main(int argc, char* argv[]) {
       "SMTP submission relay host for outbound mail (empty = log + drop)")
       ->default_val("");
     app.add_option("--mailrelayport", optMailRelayPort,
-      "SMTP submission relay port")->default_val("587");
+      "SMTP submission relay port")
+      ->default_val(std::to_string(DEFAULT_MAIL_RELAY_PORT));
     app.add_option("--mailfrom", optMailFrom,
       "From address for outbound mail")->default_val("");
     app.add_option("--mailuser", optMailUser,
@@ -722,15 +738,15 @@ int main(int argc, char* argv[]) {
       "Credits burned per MB of outgoing mail (0 = free)")->default_val("0");
     app.add_option("--mailmaxencodedbytes", optMailMaxEncodedBytes,
       "Max encoded size of one email, bytes")
-      ->default_val(std::to_string(20ull * 1024 * 1024));
+      ->default_val(std::to_string(DEFAULT_MAIL_MAX_ENCODED_BYTES));
 #endif  // CES_MAIL
 
     // --- builtin:think ---
     app.add_option("--thinkbaseurl", optThinkBaseUrl,
       "OpenAI-format API base URL for builtin:think")
-      ->default_val("https://api.deepseek.com");
+      ->default_val(DEFAULT_THINK_BASE_URL);
     app.add_option("--thinkmodel", optThinkModel,
-      "Model name for builtin:think")->default_val("deepseek-flash");
+      "Model name for builtin:think")->default_val(DEFAULT_THINK_MODEL);
     app.add_option("--thinkapikeyfile", optThinkApiKeyFile,
       "File that holds the builtin:think API key (empty = THINK off)")
       ->default_val("");
@@ -744,16 +760,20 @@ int main(int argc, char* argv[]) {
     app.add_option("--thinkfeeout", optThinkFeeOut,
       "Raw credits per 1M output tokens (0 = THINK off)")->default_val("0");
     app.add_option("--thinkmaxouttokens", optThinkMaxOutTokens,
-      "max_tokens of every builtin:think call")->default_val("8192");
+      "max_tokens of every builtin:think call")
+      ->default_val(std::to_string(DEFAULT_THINK_MAX_OUT_TOKENS));
     app.add_option("--thinkmaxinputbytes", optThinkMaxInputBytes,
-      "Largest builtin:think prompt, bytes")->default_val("1048576");
+      "Largest builtin:think prompt, bytes")
+      ->default_val(std::to_string(DEFAULT_THINK_MAX_INPUT_BYTES));
     app.add_option("--thinkcontexttokens", optThinkContextTokens,
       "Ceiling on the model's context window told to callers, in tokens "
       "(0 = the window that the model API states)")->default_val("0");
     app.add_option("--thinktimeoutsecs", optThinkTimeoutSecs,
-      "Timeout of one builtin:think call, seconds")->default_val("300");
+      "Timeout of one builtin:think call, seconds")
+      ->default_val(std::to_string(DEFAULT_THINK_TIMEOUT_SECS));
     app.add_option("--thinkmaxconcurrent", optThinkMaxConcurrent,
-      "builtin:think calls in flight")->default_val("8");
+      "builtin:think calls in flight")
+      ->default_val(std::to_string(DEFAULT_THINK_MAX_CONCURRENT));
     app.add_option("--thinksubsidybudget", optThinkSubsidyBudget,
       "builtin:think subsidy heat budget, raw credits (0 = off)")
       ->default_val("0");
@@ -762,7 +782,8 @@ int main(int argc, char* argv[]) {
       ->default_val("0");
     app.add_option("--thinksubsidyfloorbp", optThinkSubsidyFloorBp,
       "builtin:think subsidy price multiplier at rest, bp of full price "
-      "(1 = 99.99% off; 10000 = off)")->default_val("10000");
+      "(1 = 99.99% off; 10000 = off)")
+      ->default_val(std::to_string(DEFAULT_THINK_SUBSIDY_FLOOR_BP));
 
     // --- File-storage feature (CesPlex builtin:file) ---
     app.add_option("--filestoremaxbytes", optFileStoreMaxBytes,
@@ -822,8 +843,9 @@ int main(int argc, char* argv[]) {
       "(credits, -1 = derive from feeComputeRssByteDay)");
     app.add_option("--computepayoutfactor", optComputePayoutFactor,
       "A channel that ATTACHes to a compute instance costs its caller the network "
-      "price times this factor (1 to 10000, default 2). The part above the price "
-      "goes to the program's account");
+      "price times this factor (1 to 10000). The part above the price "
+      "goes to the program's account")
+      ->default_val(DEFAULT_COMPUTE_PAYOUT_FACTOR_BP / 10000.0);
     app.add_option("--feenetkibsent", optFeeNetKiBSent,
       "Net meter: credits per KiB sent server->client (0 = derive default)");
     app.add_option("--feenetkibreceived", optFeeNetKiBReceived,
@@ -887,11 +909,16 @@ int main(int argc, char* argv[]) {
     try {
       auto tbl = toml::parse_file(optConfigFile);
 
+      // The top-level keys that this loader reads. A key of the file that is
+      // not in it has no effect, and the loader says so at the end.
+      std::set<std::string> readKeys;
+
       // Helper: apply a TOML value into `var` only if the matching CLI
       // flag wasn't explicitly set on the command line. Precedence is
       // CLI > TOML > compiled default.
       auto applyIfDefault = [&](const char* tomlKey, auto& var,
                                  const char* cliFlag) {
+        readKeys.insert(tomlKey);
         if (app[cliFlag]->count() != 0)
           return;  // CLI wins
         auto v = tbl[tomlKey];
@@ -963,23 +990,38 @@ int main(int argc, char* argv[]) {
 
       // [rpc_rudp] table — transport caps on the rpc_port. Mirror the
       // CLI > TOML precedence the rest of the loader uses.
+      readKeys.insert("rpc_rudp");
       if (auto t = tbl["rpc_rudp"].as_table()) {
+        // The keys of [rpc_rudp] that this loader reads, as for the top level.
+        std::set<std::string> rpcKeys;
+        auto rpcKey = [&](const char* name) {
+          rpcKeys.insert(name);
+          return (*t)[name];
+        };
+        auto maxChannels = rpcKey("max_channels_per_peer");
+        auto reorderBytes = rpcKey("max_reorder_bytes_per_channel");
+        auto reorderMsgs = rpcKey("max_reorder_msgs_per_channel");
+        auto idleSecs = rpcKey("channel_idle_secs");
         if (app["--rpcrudpmaxchannels"]->count() == 0) {
-          if (auto v = (*t)["max_channels_per_peer"].value<int64_t>();
-              v && *v >= 0)
+          if (auto v = maxChannels.value<int64_t>(); v && *v >= 0)
             optRpcRudpMaxChannelsPerPeer = static_cast<uint64_t>(*v);
         }
         if (app["--rpcrudpmaxreorderbytes"]->count() == 0) {
-          if (auto v = (*t)["max_reorder_bytes_per_channel"].value<int64_t>())
+          if (auto v = reorderBytes.value<int64_t>())
             optRpcRudpMaxReorderBytesPerChannel = *v;
         }
         if (app["--rpcrudpmaxreordermsgs"]->count() == 0) {
-          if (auto v = (*t)["max_reorder_msgs_per_channel"].value<int64_t>())
+          if (auto v = reorderMsgs.value<int64_t>())
             optRpcRudpMaxReorderMsgsPerChannel = *v;
         }
         if (app["--rpcrudpidlesecs"]->count() == 0) {
-          if (auto v = (*t)["channel_idle_secs"].value<int64_t>(); v && *v > 0)
+          if (auto v = idleSecs.value<int64_t>(); v && *v > 0)
             optRpcRudpChannelIdleSecs = static_cast<uint32_t>(*v);
+        }
+        for (const auto& [k, v] : *t) {
+          if (!rpcKeys.count(std::string(k.str())))
+            std::cerr << "Warning: the config key \"rpc_rudp." << k.str()
+                      << "\" has no effect in this build of ces.\n";
         }
       }
 
@@ -989,6 +1031,12 @@ int main(int argc, char* argv[]) {
       applyIfDefault("fee_tx",      optFeeTx,      "--feetx");
       applyIfDefault("fee_query",   optFeeQuery,   "--feequery");
       applyIfDefault("fee_vm_mult", optFeeVmMult,  "--feevmmult");
+      // fee_discount_enabled = false is the TOML form of --nofeediscount.
+      readKeys.insert("fee_discount_enabled");
+      if (app["--nofeediscount"]->count() == 0) {
+        if (auto v = tbl["fee_discount_enabled"].value<bool>())
+          optNoFeeDiscount = !*v;
+      }
 
       // File-storage feature knobs.
       applyIfDefault("file_store_max_bytes", optFileStoreMaxBytes,
@@ -1086,6 +1134,7 @@ int main(int argc, char* argv[]) {
       //   [extension]
       //   dice = 1
       //   chat = 1
+      readKeys.insert("extension");
       if (optExtensions.empty()) {
         if (auto t = tbl["extension"].as_table()) {
           for (auto& [k, v] : *t) {
@@ -1101,6 +1150,7 @@ int main(int argc, char* argv[]) {
       // TOML shape:
       //   [cesplex_mounts]
       //   "/ces/file/1" = "builtin:file"
+      readKeys.insert("cesplex_mounts");
       if (optCesplexMounts.empty()) {
         if (auto t = tbl["cesplex_mounts"].as_table()) {
           for (auto& [k, v] : *t) {
@@ -1113,6 +1163,7 @@ int main(int argc, char* argv[]) {
       }
 
       // Peers from config (only if no CLI peers specified)
+      readKeys.insert("peers");
       if (optPeers.empty()) {
         if (auto peers = tbl["peers"].as_array()) {
           for (auto& p : *peers) {
@@ -1124,6 +1175,14 @@ int main(int argc, char* argv[]) {
             }
           }
         }
+      }
+
+      // A key that no line above reads has no effect. Say so, so that a
+      // misspelled or retired key does not pass unseen.
+      for (const auto& [k, v] : tbl) {
+        if (!readKeys.count(std::string(k.str())))
+          std::cerr << "Warning: the config key \"" << k.str()
+                    << "\" has no effect in this build of ces.\n";
       }
 
     } catch (const toml::parse_error& err) {
@@ -1211,13 +1270,9 @@ int main(int argc, char* argv[]) {
   if (optFeeTx >= 0)      config.feeTx      = static_cast<uint64_t>(optFeeTx);
   if (optFeeQuery >= 0)   config.feeQuery   = static_cast<uint64_t>(optFeeQuery);
   if (optFeeVmMult >= 0)  config.feeVmMult  = static_cast<uint64_t>(optFeeVmMult);
-  if (optNoFeeDiscount)   config.feeDiscountEnabled = false;
+  config.feeDiscountEnabled = !optNoFeeDiscount;
 
-  uint64_t now = minx::getSecsSinceEpoch();
-  if (optPoWDelay > 0)
-    config.minProveWorkTimestamp = now + optPoWDelay;
-  else
-    config.minProveWorkTimestamp = 0;
+  config.powDelaySecs = optPoWDelay;
   config.noncelessDelaySecs = optNoncelessDelay;
 
   // Trim and normalize server name (empty/whitespace = unset)
@@ -1358,7 +1413,7 @@ int main(int argc, char* argv[]) {
   LOGINFO << "ces config"
           << VAR(optServerPort) << VAR(config.dataDir)
           << VAR(config.minAcc) << VAR(config.maxAcc)
-          << VAR(config.minDiff) << VAR(config.minProveWorkTimestamp)
+          << VAR(config.minDiff) << VAR(config.powDelaySecs)
           << VAR(config.spendSlotSize) << VAR(config.taskThreads)
           << VAR(config.feeAccount) << VAR(config.feeAsset)
           << VAR(config.feeTx) << VAR(config.feeQuery) << VAR(config.feeVmMult)

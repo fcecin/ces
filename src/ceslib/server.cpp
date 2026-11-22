@@ -21,6 +21,7 @@
 #include <ces/util/wallet.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -1082,6 +1083,10 @@ CesServer::CesServer(const CesConfig& config)
       keyNames_((config.dataDir / KEYNAMES_DATA_SUBDIRECTORY).string(),
                 config.minKeyName, config.flushValue),
       presence_(config.presenceCacheSize) {
+  // pow_delay: refuse PoW until the boot plus that many seconds.
+  minProveWorkTimestamp_ =
+    cfg_.powDelaySecs ? minx::getSecsSinceEpoch() + cfg_.powDelaySecs : 0;
+
   // The record of the CES_NONCELESS signatures that the server saw is in
   // memory, so a restart loses it. An earlier run of this ledger took
   // timestamps up to one future drift after the moment that it stopped. So a
@@ -1123,7 +1128,7 @@ CesServer::CesServer(const CesConfig& config)
   minx_ = std::make_unique<minx::Minx>(
     this, minx::MinxConfig{
       .instanceName = "sv",
-      .minProveWorkTimestamp = cfg_.minProveWorkTimestamp,
+      .minProveWorkTimestamp = minProveWorkTimestamp_,
       .spendSlotSize = cfg_.spendSlotSize,
       .randomXVMsToKeep = RANDOMX_VMS_TO_KEEP,
       .randomXInitThreads = 0,
@@ -1338,6 +1343,10 @@ uint16_t CesServer::start(uint16_t serverPort) {
   verifyPoWThread_ = std::thread([this]() {
     while (running_) {
       try {
+        // Move the PoW spend window to the present before each check, as MINX
+        // asks. Without this, the window stays where the boot put it, and a
+        // solution that the server paid before a restart is good again.
+        minx_->updatePoWSpendCache();
         minx_->verifyPoWs();
       } catch (const std::exception& e) {
         LOGERROR << "verifyPoW handler escaped an exception; continuing"
@@ -1403,7 +1412,7 @@ uint16_t CesServer::start(uint16_t serverPort) {
     rpcMinx_ = std::make_unique<minx::Minx>(
       &rpcListener_, minx::MinxConfig{
         .instanceName = "rpc",
-        .minProveWorkTimestamp = cfg_.minProveWorkTimestamp,
+        .minProveWorkTimestamp = minProveWorkTimestamp_,
         .spendSlotSize = cfg_.spendSlotSize,
         .randomXVMsToKeep = 0,           // no PoW engine on the RPC port
         .randomXInitThreads = 0,
@@ -4964,10 +4973,10 @@ void CesServer::incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
   LOGTRACE << "got MinxGetInfo" << VAR(addr);
   uint64_t now = minx::getSecsSinceEpoch();
   uint64_t minUntilAcceptPoW;
-  if (now > cfg_.minProveWorkTimestamp) {
+  if (now > minProveWorkTimestamp_) {
     minUntilAcceptPoW = 0;
   } else {
-    minUntilAcceptPoW = (cfg_.minProveWorkTimestamp - now) / 60;
+    minUntilAcceptPoW = (minProveWorkTimestamp_ - now) / 60;
     if (minUntilAcceptPoW == 0)
       minUntilAcceptPoW = 1;
     else if (minUntilAcceptPoW > 255)
@@ -7428,25 +7437,46 @@ bool CesServer::_setConfigKnob(const std::string& key, uint64_t value) {
 std::string CesServer::_exportConfig(std::string* errReason) {
   auto path = (cfg_.dataDir / "ces.toml").string();
   try {
+    // A TOML basic string: quote it, and escape its quotes, backslashes and
+    // control characters.
+    auto q = [](const std::string& v) {
+      std::string r = "\"";
+      for (unsigned char c : v) {
+        if (c == '"' || c == '\\') {
+          r += '\\';
+          r += static_cast<char>(c);
+        } else if (c < 0x20 || c == 0x7f) {
+          char buf[8];
+          std::snprintf(buf, sizeof buf, "\\u%04x", c);
+          r += buf;
+        } else {
+          r += static_cast<char>(c);
+        }
+      }
+      return r + "\"";
+    };
     std::ostringstream o;
     o << "# CES server config — exported live from the running server.\n"
       << "# Feed it back on the next boot with:  ces --config " << path << "\n"
       << "# Peers persist in peerdata.toml and the hello banner in hello.txt;\n"
       << "# both load automatically and are intentionally NOT duplicated here.\n\n";
 
-    // The WHOLE live effective config, so a re-feed reproduces the running
-    // server and set-vs-default is never ambiguous. Every key is exactly the
-    // TOML/CLI name (the switch IS the config name — no drift). Top-level
-    // scalars first; [table]s last (TOML scoping). Add new CesConfig fields
-    // here when you add them, or the export silently rots.
-    o << "data_dir = \"" << cfg_.dataDir.string() << "\"\n";
+    // The live effective config, so a re-feed reproduces the running server
+    // and set-vs-default is never ambiguous. It leaves out the boot flags
+    // (no_pow_engine, cache_only_pow, log_level), server_key_file (it writes
+    // the key itself) and the [extension] set; see the notes in the file.
+    // Every key is exactly the TOML/CLI name (the switch IS the config name —
+    // no drift). Top-level scalars first; [table]s last (TOML scoping). Add new
+    // CesConfig fields here when you add them, or the export silently rots.
+    o << "data_dir = " << q(cfg_.dataDir.string()) << "\n";
     o << "port = " << boundPort_ << "\n";
     o << "# server_key is the 32-byte private key (same identity on re-feed).\n";
     o << "server_key = \"" << minx::hashToString(cfg_.serverPrivKey) << "\"\n";
     if (!cfg_.serverName.empty())
-      o << "server_name = \"" << cfg_.serverName << "\"\n";
+      o << "server_name = " << q(cfg_.serverName) << "\n";
     o << "min_difficulty = " << static_cast<int>(cfg_.minDiff) << "\n";
     o << "spend_slot_size = " << cfg_.spendSlotSize << "\n";
+    o << "pow_delay = " << cfg_.powDelaySecs << "\n";
     o << "nonceless_delay = " << cfg_.noncelessDelaySecs << "\n";
     o << "threads = " << cfg_.taskThreads << "\n";
     o << "min_accounts = " << cfg_.minAcc << "\n";
@@ -7459,8 +7489,8 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "max_log_size_gb = "
       << (cfg_.maxLogBytes / (1024ULL * 1024 * 1024)) << "\n\n";
 
-    o << "# Boot/engine flags (no_pow_engine, cache_only_pow, pow_delay,\n"
-         "# log_level) are launch-time choices not held in the live config;\n"
+    o << "# Boot/engine flags (no_pow_engine, cache_only_pow, log_level) are\n"
+         "# launch-time choices not held in the live config;\n"
          "# carry them over from your launch flags / base config if you used them.\n\n";
 
     o << "# Base fees\n";
@@ -7503,9 +7533,10 @@ std::string CesServer::_exportConfig(std::string* errReason) {
 
     o << "# Interfaces\n";
     if (!cfg_.adminSocket.empty())
-      o << "admin_socket = \"" << cfg_.adminSocket << "\"\n";
+      o << "admin_socket = " << q(cfg_.adminSocket) << "\n";
     o << "web_port = " << cfg_.webPort << "\n";
-    o << "web_bind = \"" << cfg_.webBind << "\"\n";
+    o << "web_bind = " << q(cfg_.webBind) << "\n";
+    o << "web_allow_public = " << (cfg_.webAllowPublic ? "true" : "false") << "\n";
     o << "rpc_port = " << cfg_.rpcPort << "\n";
     o << "rpc_max_pending = "        << cfg_.rpcMaxPending        << "\n";
     o << "rpc_max_request_bytes = "  << cfg_.rpcMaxRequestBytes   << "\n";
@@ -7517,28 +7548,56 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "# File store / compute\n";
     o << "file_store_max_bytes = " << cfg_.cesFileStoreMaxBytes << "\n";
     if (!cfg_.cesFileStoreDir.empty())
-      o << "file_store_dir = \"" << cfg_.cesFileStoreDir << "\"\n";
+      o << "file_store_dir = " << q(cfg_.cesFileStoreDir) << "\n";
     o << "compute_max_instances = " << cfg_.computeMaxInstances << "\n";
     o << "compute_port_base = " << cfg_.computePortBase << "\n";
     o << "compute_port_count = " << cfg_.computePortCount << "\n";
     o << "compute_process_mem_max = " << cfg_.computeProcessMemMax << "\n";
     o << "compute_client_pool_size = " << cfg_.computeClientPoolSize << "\n";
     if (!cfg_.cesComputeUser.empty())
-      o << "compute_user = \"" << cfg_.cesComputeUser << "\"\n";
+      o << "compute_user = " << q(cfg_.cesComputeUser) << "\n";
     if (!cfg_.cesComputeWorkDir.empty())
-      o << "compute_work_dir = \"" << cfg_.cesComputeWorkDir << "\"\n";
+      o << "compute_work_dir = " << q(cfg_.cesComputeWorkDir) << "\n";
     if (!cfg_.cesComputeChildBinary.empty())
-      o << "compute_child_binary = \"" << cfg_.cesComputeChildBinary << "\"\n";
+      o << "compute_child_binary = " << q(cfg_.cesComputeChildBinary) << "\n";
     if (!cfg_.cesExtensionsDir.empty())
-      o << "extensions_dir = \"" << cfg_.cesExtensionsDir << "\"\n";
+      o << "extensions_dir = " << q(cfg_.cesExtensionsDir) << "\n";
     o << "ext_funding_per_day = " << extFundingPerDay() << "\n";
     o << "ext_local_budget = " << extLocalBudget() << "\n\n";
+
+    o << "# builtin:think (the API key stays in its own file)\n";
+    o << "think_base_url = " << q(cfg_.thinkBaseUrl) << "\n";
+    o << "think_model = " << q(cfg_.thinkModel) << "\n";
+    if (!cfg_.thinkApiKeyFile.empty())
+      o << "think_api_key_file = " << q(cfg_.thinkApiKeyFile) << "\n";
+    o << "think_reasoning = " << (cfg_.thinkReasoning ? "true" : "false") << "\n";
+    o << "think_fee_in = " << cfg_.thinkFeeIn << "\n";
+    o << "think_fee_cached_in = " << cfg_.thinkFeeCachedIn << "\n";
+    o << "think_fee_out = " << cfg_.thinkFeeOut << "\n";
+    o << "think_max_out_tokens = " << cfg_.thinkMaxOutTokens << "\n";
+    o << "think_max_input_bytes = " << cfg_.thinkMaxInputBytes << "\n";
+    o << "think_context_tokens = " << cfg_.thinkContextTokens << "\n";
+    o << "think_timeout_secs = " << cfg_.thinkTimeoutSecs << "\n";
+    o << "think_max_concurrent = " << cfg_.thinkMaxConcurrent << "\n";
+    o << "think_subsidy_budget = " << cfg_.thinkSubsidyBudget << "\n";
+    o << "think_subsidy_tau_secs = " << cfg_.thinkSubsidyTauSecs << "\n";
+    o << "think_subsidy_floor_bp = " << cfg_.thinkSubsidyFloorBp << "\n\n";
+#ifdef CES_MAIL
+    o << "# builtin:mail\n";
+    o << "mail_relay_host = " << q(cfg_.mailRelayHost) << "\n";
+    o << "mail_relay_port = " << cfg_.mailRelayPort << "\n";
+    o << "mail_from = " << q(cfg_.mailFrom) << "\n";
+    o << "mail_user = " << q(cfg_.mailUser) << "\n";
+    o << "mail_pass = " << q(cfg_.mailPass) << "\n";
+    o << "mail_fee_per_mb = " << cfg_.mailFeePerMB << "\n";
+    o << "mail_max_encoded_bytes = " << cfg_.mailMaxEncodedBytes << "\n\n";
+#endif
 
     // Tables last (everything after a [table] header belongs to that table).
     if (!cfg_.cesplexMounts.empty()) {
       o << "[cesplex_mounts]\n";
       for (const auto& [proto, handler] : cfg_.cesplexMounts)
-        o << "\"" << proto << "\" = \"" << handler << "\"\n";
+        o << q(proto) << " = " << q(handler) << "\n";
       o << "\n";
     }
 

@@ -111,6 +111,21 @@ constexpr uint64_t DEFAULT_POW_DELAY       = 0;
 // earlier run took times up to one drift after it stopped. 0 turns it off.
 constexpr uint64_t DEFAULT_NONCELESS_DELAY =
   2 * CES_NONCELESS_FUTURE_DRIFT_US / 1000000;
+// fee_discount_enabled: the fee multipliers follow the load gauges.
+constexpr bool DEFAULT_FEE_DISCOUNT_ENABLED = true;
+// compute_payout_factor, in basis points: 2x, the program gets what the
+// network gets.
+constexpr uint32_t DEFAULT_COMPUTE_PAYOUT_FACTOR_BP = 20000;
+// builtin:mail and builtin:think.
+constexpr uint16_t    DEFAULT_MAIL_RELAY_PORT        = 587;
+constexpr uint64_t    DEFAULT_MAIL_MAX_ENCODED_BYTES = 20ull * 1024 * 1024;
+constexpr const char* DEFAULT_THINK_BASE_URL         = "https://api.deepseek.com";
+constexpr const char* DEFAULT_THINK_MODEL            = "deepseek-flash";
+constexpr uint32_t    DEFAULT_THINK_MAX_OUT_TOKENS   = 8192;
+constexpr uint32_t    DEFAULT_THINK_MAX_INPUT_BYTES  = 1024 * 1024;
+constexpr uint32_t    DEFAULT_THINK_TIMEOUT_SECS     = 300;
+constexpr uint32_t    DEFAULT_THINK_MAX_CONCURRENT   = 8;
+constexpr uint16_t    DEFAULT_THINK_SUBSIDY_FLOOR_BP = 10000;
 constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
 constexpr uint64_t DEFAULT_FLUSH_VALUE     = 0;          // 0 = flush every change
 constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB = 100;
@@ -174,7 +189,9 @@ struct CesConfig {
   uint64_t maxAcc = DEFAULT_MAX_ACC;
   uint8_t minDiff = DEFAULT_MIN_DIFF;
   uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE;
-  uint64_t minProveWorkTimestamp = 0;
+  // pow_delay: the server refuses PoW until the boot plus this many seconds
+  // (CesServer::minProveWorkTimestamp_).
+  uint64_t powDelaySecs = DEFAULT_POW_DELAY;
   // See DEFAULT_NONCELESS_DELAY. 0 turns the restart cutoff off.
   uint64_t noncelessDelaySecs = DEFAULT_NONCELESS_DELAY;
 
@@ -206,7 +223,7 @@ struct CesConfig {
   // server → fees subsidized → full free; saturated → full price. When
   // false, every multiplier is pinned to 10000 (full price always).
   // Tests set this false to keep static-fee assertions.
-  bool feeDiscountEnabled = true;
+  bool feeDiscountEnabled = DEFAULT_FEE_DISCOUNT_ENABLED;
 
   size_t recvBuffersSize = MinxConfig::DEFAULT_RECV_BUFFERS_SIZE;
 
@@ -319,10 +336,10 @@ struct CesConfig {
   uint32_t rpcRudpBurstBytes     = DEFAULT_RPC_RUDP_BURST_BYTES;
 
   // RUDP transport caps on the rpc_port. CES ships an opinion on
-  // channels (default 2 — lets cesh hold a long-lived stream while
-  // doing other ops in parallel) and stays passthrough on the two
-  // reorder buffers (-1 = keep the minx::RudpConfig library default,
-  // currently 1 MB / 1024 messages).
+  // channels (DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER — lets cesh hold a
+  // long-lived stream while doing other ops in parallel) and stays
+  // passthrough on the two reorder buffers (-1 = keep the
+  // minx::RudpConfig library default).
   size_t  rpcRudpMaxChannelsPerPeer         = DEFAULT_RPC_RUDP_MAX_CHANNELS_PER_PEER;
   int64_t rpcRudpMaxReorderBytesPerChannel  = DEFAULT_RPC_RUDP_MAX_REORDER_BYTES;
   int64_t rpcRudpMaxReorderMsgsPerChannel   = DEFAULT_RPC_RUDP_MAX_REORDER_MSGS;
@@ -513,7 +530,7 @@ struct CesConfig {
   // callers pay the network price only. The default, 20000 (2x), gives the
   // program what the network gets. 10000 charges the network price only. The
   // server clamps the value to 10000 .. kComputePayoutFactorMaxBp.
-  uint32_t computePayoutFactorBp = 20000;
+  uint32_t computePayoutFactorBp = DEFAULT_COMPUTE_PAYOUT_FACTOR_BP;
   static constexpr uint32_t kComputePayoutFactorMaxBp = 100'000'000;  // 10000x
   // Supervisor tick cadence in milliseconds. One tick does: /proc
   // sample (CPU delta + RSS) + accrued slot-fee debit + source-file
@@ -547,7 +564,7 @@ struct CesConfig {
   // Credentials ride AUTH LOGIN; keep them in an operator secrets file, never
   // committed. STARTTLS is used when the relay advertises it (see util/smtp.h).
   std::string mailRelayHost;
-  uint16_t    mailRelayPort = 587;
+  uint16_t    mailRelayPort = DEFAULT_MAIL_RELAY_PORT;
   std::string mailFrom;
   std::string mailUser;
   std::string mailPass;
@@ -556,7 +573,7 @@ struct CesConfig {
   // credits burned per megabyte of encoded (on-the-wire) message; 0 = free.
   // mailMaxEncodedBytes caps one message's encoded size (default 20 MiB).
   uint64_t mailFeePerMB = 0;
-  uint64_t mailMaxEncodedBytes = 20ull * 1024 * 1024;
+  uint64_t mailMaxEncodedBytes = DEFAULT_MAIL_MAX_ENCODED_BYTES;
 #endif  // CES_MAIL
 
   // builtin:think (text in, text out, through an OpenAI-format chat API).
@@ -566,21 +583,21 @@ struct CesConfig {
   // raw credit units per one million tokens. thinkReasoning turns the model's
   // reasoning on (slower and more output tokens). thinkMaxOutTokens is
   // max_tokens for every call and sizes the hold.
-  std::string thinkBaseUrl = "https://api.deepseek.com";
-  std::string thinkModel = "deepseek-flash";
+  std::string thinkBaseUrl = DEFAULT_THINK_BASE_URL;
+  std::string thinkModel = DEFAULT_THINK_MODEL;
   std::string thinkApiKeyFile;
   bool        thinkReasoning = false;
   uint64_t    thinkFeeIn = 0;
   uint64_t    thinkFeeCachedIn = 0;
   uint64_t    thinkFeeOut = 0;
-  uint32_t    thinkMaxOutTokens = 8192;
-  uint32_t    thinkMaxInputBytes = 1024 * 1024;
+  uint32_t    thinkMaxOutTokens = DEFAULT_THINK_MAX_OUT_TOKENS;
+  uint32_t    thinkMaxInputBytes = DEFAULT_THINK_MAX_INPUT_BYTES;
   // A ceiling on the context window told to callers, in tokens. The window
   // comes from the model API when it states one (thinkWindow); this lowers
   // it, or stands in for it when the API does not state one. 0 = no ceiling.
   uint32_t    thinkContextTokens = 0;
-  uint32_t    thinkTimeoutSecs = 300;
-  uint32_t    thinkMaxConcurrent = 8;
+  uint32_t    thinkTimeoutSecs = DEFAULT_THINK_TIMEOUT_SECS;
+  uint32_t    thinkMaxConcurrent = DEFAULT_THINK_MAX_CONCURRENT;
   // builtin:think global subsidy (util/heat_subsidy.h). The price multiplier
   // (basis points of the full price, as in feemult.h) cools to
   // thinkSubsidyFloorBp while nobody thinks, and heats back to 10000 with use.
@@ -589,7 +606,7 @@ struct CesConfig {
   // 10000. The heat is saved in <data_dir>/think_subsidy.state.
   uint64_t    thinkSubsidyBudget = 0;
   uint64_t    thinkSubsidyTauSecs = 0;
-  uint16_t    thinkSubsidyFloorBp = 10000;
+  uint16_t    thinkSubsidyFloorBp = DEFAULT_THINK_SUBSIDY_FLOOR_BP;
 
   // L2 compute program UDP port range: [computePortBase, computePortBase
   // + computePortCount - 1]. Each launched child gets two ports that the
@@ -1050,6 +1067,12 @@ public:
   // noncelessCutoffUs_).
   uint64_t _noncelessCutoffUs() const { return noncelessCutoffUs_.load(); }
   void _setNoncelessCutoffUs(uint64_t us) { noncelessCutoffUs_.store(us); }
+
+  // Test hook: the answer of the PoW spend table for a solution time, as for a
+  // CES_UNSIGNED_QUERY_SOLUTION (a minx::MINX_SOLUTION_* value).
+  int _queryPoW(uint64_t time, const minx::Hash& solution) {
+    return minx_->queryPoW(time, solution);
+  }
 
   // Test hook: fire a scheduled (cron) VM run synchronously — build a
   // ScheduledRun, post it onto logicStrand_, and block until it completes.
@@ -2465,6 +2488,10 @@ private:
   double peerMinerHashRate_ = 0.0;         // EMA H/s from completed solves
   uint64_t peerMinerHashesTried_ = 0;      // live hashes tried in current solve
   uint64_t peerMinerExpectedHashes_ = 0;   // 2^difficulty for current solve
+
+  // The boot plus cfg_.powDelaySecs, in seconds since the epoch: the server
+  // refuses PoW before it. 0 means no delay. The constructor sets it.
+  uint64_t minProveWorkTimestamp_ = 0;
 
   // The restart cutoff of CES_NONCELESS timestamps, in microseconds since the
   // epoch: resolveNonceless refuses each timestamp before it. The constructor

@@ -7,6 +7,7 @@
  */
 
 #include "test_common.h"
+#include "test_compute_wait.h"
 
 #include <chrono>
 #include <limits>
@@ -88,6 +89,72 @@ BOOST_AUTO_TEST_CASE(RpcPortZeroWhenDisabled) {
   server->stop();
   server.reset();
   std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  boost::system::error_code ec;
+  fs::remove_all(dir, ec);
+}
+
+// pow_delay reaches the INFO reply as the minutes until the server takes PoW.
+BOOST_AUTO_TEST_CASE(PowDelayReachesTheInfoReply) {
+  blog::init();
+  blog::set_level(blog::info);
+  for (const uint64_t delay : {uint64_t{0}, uint64_t{600}}) {
+    fs::path dir = makeUniqueTempDir("ces_getinfo_powdelay");
+    minx::Hash priv; priv.fill(0xD1);
+    CesConfig cfg = makeTestConfig(
+      dir, priv, std::numeric_limits<uint64_t>::max());
+    cfg.powDelaySecs = delay;
+    auto server = std::make_unique<CesServer>(cfg);
+    const uint16_t serverPort = server->start(0);
+    BOOST_REQUIRE(serverPort != 0);
+
+    KeyPair kp;
+    CesClient client(testServerEp(serverPort), false);
+    client.setKey(kp);
+    BOOST_REQUIRE(client.start(0));
+    BOOST_REQUIRE(client.connect());
+    // 600 s is 10 minutes; the server rounds down, so a slow start gives 9.
+    const unsigned minutes = client.getMinSecsPoW();
+    if (delay == 0)
+      BOOST_CHECK_EQUAL(minutes, 0u);
+    else
+      BOOST_CHECK(minutes == 9u || minutes == 10u);
+
+    client.disconnect();
+    client.stop();
+    server->stop();
+    server.reset();
+    boost::system::error_code ec;
+    fs::remove_all(dir, ec);
+  }
+}
+
+// The PoW spend window moves with the clock, also with no PoW traffic. A
+// solution time that the window covers at boot is untimely two slots later,
+// so a solution that the server paid before a restart cannot pay again once
+// pow_delay ends. (Without updatePoWSpendCache the window stayed at boot.)
+BOOST_AUTO_TEST_CASE(TheSpendWindowMovesWithTheClock) {
+  blog::init();
+  blog::set_level(blog::info);
+  fs::path dir = makeUniqueTempDir("ces_spend_window");
+  minx::Hash priv; priv.fill(0xD2);
+  CesConfig cfg = makeTestConfig(
+    dir, priv, std::numeric_limits<uint64_t>::max());
+  cfg.spendSlotSize = 2;
+  auto server = std::make_unique<CesServer>(cfg);
+  BOOST_REQUIRE(server->start(0) != 0);
+
+  minx::Hash solution; solution.fill(0x5A);
+  const uint64_t t0 = minx::getSecsSinceEpoch();
+  BOOST_CHECK_EQUAL(server->_queryPoW(t0, solution), minx::MINX_SOLUTION_UNSPENT);
+  // After two slots and one second the window base is after t0. The verify
+  // thread moves it each 100 ms, so poll for it.
+  std::this_thread::sleep_for(std::chrono::seconds(2 * cfg.spendSlotSize + 1));
+  BOOST_CHECK(waitUntil([&] {
+    return server->_queryPoW(t0, solution) == minx::MINX_SOLUTION_UNTIMELY;
+  }, std::chrono::seconds(30)));
+
+  server->stop();
+  server.reset();
   boost::system::error_code ec;
   fs::remove_all(dir, ec);
 }

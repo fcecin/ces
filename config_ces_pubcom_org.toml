@@ -19,8 +19,11 @@ server_name = "ces.pubcom.org:53830"
 # Production scarcity: ~minutes per solution on modern hardware (default 10 is dev-fast).
 min_difficulty = 15
 
-# Let the RandomX dataset finish initializing before solutions count.
-pow_delay = 120
+# Refuse proofs of work until no solution spent before the boot is in the
+# spend window: at least 2 * spend_slot_size + 300 s (the future drift).
+# A shorter delay lets a miner send its paid solutions again after a restart.
+# This also covers the time that the RandomX dataset needs to initialize.
+pow_delay = 7500
 
 spend_slot_size = 3600
 no_pow_engine = false
@@ -56,7 +59,6 @@ peer_target = 0
 peer_pow_inbound_reciprocation_bps = 10000
 
 max_peer_reserve_disturbance = 100000
-settlement_max_retries = 7
 gossip_fanout_degree = 6
 
 # Enable the CesPlex / L2 stack (file/lua/compute/peer) + SYS_RPC on this UDP
@@ -152,7 +154,7 @@ vellum = 1
 # this server in that peer.
 [[peers]]
 key = "b51a30d7fb6175a0e4be17dd06e8e67ba996cf95ffaf04068c8c9904bed3aad2"
-address = "ces.pubcom.org:54000"
+address = "ces.pubcom.org:59000"
 [[peers]]
 key = "a70b5835c697e0f74d1fd6e70aa7dddbef70e62c1ad9aee85f15666ed183bbea"
 address = "ces.pubcom.org:55000"

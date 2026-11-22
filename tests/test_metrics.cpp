@@ -171,7 +171,7 @@ ces::CesConfig makeDiscountConfig(const fs::path& dir,
   cfg.maxAcc = maxAcc;
   cfg.minDiff = 1;
   cfg.spendSlotSize = 10;
-  cfg.minProveWorkTimestamp = 0;
+  cfg.powDelaySecs = 0;
   cfg.taskThreads = 2;
   cfg.minAsset = maxAsset > 0 ? 100 : 0;
   cfg.maxAsset = maxAsset;
