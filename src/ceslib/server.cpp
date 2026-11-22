@@ -20,6 +20,7 @@
 #include <ces/util/wallet.h>
 
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -2009,6 +2010,17 @@ CesServer::NoncelessResult CesServer::resolveNonceless(
   auto acc = accounts_.get(originPrefix);
   outNonce = acc.exists() ? acc.nonce() + 1 : 1;
   return NoncelessResult::Proceed;
+}
+
+// A debug build stops here, so that a test finds the caller. A release build
+// logs it: with more than one task thread, the wait can still end.
+void CesServer::logicSyncOnTaskThread() noexcept {
+  try {
+    LOGERROR << "logicSync on a task thread: it waits for logicStrand_, which runs on the task threads";
+  } catch (...) {}
+#ifndef NDEBUG
+  std::abort();
+#endif
 }
 
 void CesServer::onLogicHandlerThrew(const char* what) noexcept {

@@ -2137,6 +2137,8 @@ private:
   // Logs a logic-handler exception (definition in server.cpp, where the log
   // macros live). noexcept: it is called from a catch and must not re-throw.
   void onLogicHandlerThrew(const char* what) noexcept;
+  // Reports a logicSync on a task thread (definition in server.cpp).
+  void logicSyncOnTaskThread() noexcept;
 
   template <class F>
   void postLogic(F&& f) {
@@ -2168,6 +2170,10 @@ private:
   // for ever. The caller must not be on logicStrand_ (that would deadlock).
   template <class F>
   auto logicSync(F&& f) {
+    // logicStrand_ runs on the task threads. A task thread that waits for it
+    // holds a thread that the strand can need: with one task thread, the wait
+    // never ends.
+    if (taskIO_.get_executor().running_in_this_thread()) logicSyncOnTaskThread();
     auto logged = [this, &f]() -> decltype(f()) {
       try {
         return f();
