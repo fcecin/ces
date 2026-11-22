@@ -497,6 +497,17 @@ struct CesConfig {
   // than a sampled measurement. Use a small positive value if
   // feeComputeRssByteDay is too tuned-down to derive a non-zero rate.
   int64_t feeBucketByteSec     = 0;
+  // compute_payout_factor, in basis points (10000 = 1x). A channel that
+  // ATTACHes to a compute instance over /ces/lua/1 costs its caller the
+  // network price times this factor. (A direct /ces/luarpc/1 dial pays the
+  // network price only; see the compute handler's TAG_NET_USAGE.) The server
+  // keeps the network price, and the part above it goes to the account of
+  // the program. A program in the server zone (/s/) gets no payout, and its
+  // callers pay the network price only. The default, 20000 (2x), gives the
+  // program what the network gets. 10000 charges the network price only. The
+  // server clamps the value to 10000 .. kComputePayoutFactorMaxBp.
+  uint32_t computePayoutFactorBp = 20000;
+  static constexpr uint32_t kComputePayoutFactorMaxBp = 100'000'000;  // 10000x
   // Supervisor tick cadence in milliseconds. One tick does: /proc
   // sample (CPU delta + RSS) + accrued slot-fee debit + source-file
   // sidecar rewrite. 60 s is the production default — rare enough
@@ -665,6 +676,17 @@ public:
 private:
   CesServer* owner_;
 };
+
+// A factor in basis points as decimal text: 10000 is "1", 15000 is "1.5".
+inline std::string basisPointsText(uint32_t bp) {
+  std::string out = std::to_string(bp / 10000);
+  if (const uint32_t frac = bp % 10000) {
+    std::string d = std::to_string(10000 + frac).substr(1);
+    d.erase(d.find_last_not_of('0') + 1);
+    out += "." + d;
+  }
+  return out;
+}
 
 class CesServer : public minx::MinxListener, public CesPlexHost {
   friend class CesRpcRudpListener;
@@ -874,6 +896,14 @@ public:
                           int64_t& outOriginBalance,
                           std::vector<ServerInfoEntry>& outEntries,
                           int64_t queryFee = -1, int64_t errFee = -1);
+
+  // The KV info of the mounted builtin `name` (the part after "builtin:" in
+  // a mount target), at the price of a query. CES_ERROR_TARGET_NOT_FOUND
+  // (at the error fee) when the server mounts no builtin of that name.
+  uint8_t queryBuiltinInfo(const minx::Hash& originKey, uint32_t providedNonce,
+                           const std::string& name, int64_t& outOriginBalance,
+                           std::vector<ServerInfoEntry>& outEntries,
+                           int64_t queryFee = -1, int64_t errFee = -1);
 
   void unsignedQueryAsset(const minx::Hash& assetId, HashPrefix& outOwner,
                           AssetData& outContent, uint16_t& outBalance,
@@ -1274,10 +1304,14 @@ public:
   // ---- L2 handler support ----
 
   // ChannelMeter per-tick debit. Looks up the account
-  // by `payerPfx`; if it exists AND has at least `amount` credits,
+  // by `payerPfx`; if it exists AND has at least the charge,
   // debits and calls cb(true). Otherwise leaves the account alone
   // and calls cb(false) — the caller (ChannelMeter) responds by
   // closing the channel.
+  //
+  // The charge is `amount`. When `payeePfx` is not zero (a channel into a
+  // compute instance), the charge is `amount` times compute_payout_factor,
+  // and the part above `amount` goes to the payee's account if it exists.
   //
   // No nonce, no dedup — billing is server-authoritative and the
   // tick's idempotency comes from "we already advanced the gauges
@@ -1285,9 +1319,16 @@ public:
   // hops to cbExecutor.
   void _l2DebitNetworkBill(
       const HashPrefix& payerPfx,
-      int64_t amount,
+      const HashPrefix& payeePfx,
+      uint64_t amount,
       std::function<void(bool ok)> cb,
       boost::asio::any_io_executor cbExecutor);
+
+  // Name the program account `payeePfx` as the payee of the bus channel
+  // (peer, channelId), for the compute payout. Called by builtin:lua when a
+  // channel ATTACHes to an instance.
+  void _l2SetChannelPayee(const minx::SockAddr& peer, uint32_t channelId,
+                          const HashPrefix& payeePfx);
 
   // Asset-ownership check — looks up the asset at `assetId` and
   // returns whether it exists AND its owner prefix matches the
@@ -1510,10 +1551,11 @@ public:
   const ces::KeyPair& cesplexSigningKey() const override {
     return serverKeyPair_;
   }
-  // The bus measures; the server prices. Charges `payer` for this tick's
-  // resource usage at the live discounted feeNet* rates and closes the
-  // channel if the payer can't cover it. Defined in server.cpp.
-  void cesplexReportUsage(const HashPrefix& payer,
+  // The bus measures; the server prices. Charges `payer` for this report's
+  // resource usage at the live discounted feeNet* rates (with the compute
+  // payout to `payee`, when not zero) and closes the channel if the payer
+  // can't cover it. Defined in server.cpp.
+  void cesplexReportUsage(const HashPrefix& payer, const HashPrefix& payee,
                           const minx::SockAddr& peer, uint32_t channelId,
                           const CesPlexUsage& usage) override;
 
@@ -1531,7 +1573,10 @@ public:
   // Debit a pre-priced net bill to `payerPfx` on logicStrand_, no close callback
   // (the per-instance endpoint owns its channel). Used by the compute handler to
   // bill a child's INBOUND luarpc usage to the caller. Pair with priceNetUsage.
-  void debitNetworkBill(const HashPrefix& payerPfx, uint64_t amount);
+  // `payeePfx` is the instance's program account, or zero for no payout (see
+  // _l2DebitNetworkBill).
+  void debitNetworkBill(const HashPrefix& payerPfx, const HashPrefix& payeePfx,
+                        uint64_t amount);
 
   // The rpcTaskIO executor — L2 handlers that need to post work onto
   // the CesPlex / handler strand (e.g. the compute supervisor tick,
@@ -1946,6 +1991,14 @@ private:
                          const ces::Bytes& reply);
 
   std::unordered_map<uint64_t, CesPlexHandler*> l2Registry_;
+  // Each mounted builtin by name (the part after "builtin:"), with the
+  // protocols that it serves. Built with l2Registry_ in the mount loop and
+  // installed on the logic strand, which reads both.
+  struct MountedBuiltin {
+    CesPlexHandler* handler = nullptr;
+    std::vector<std::string> protos;
+  };
+  std::map<std::string, MountedBuiltin> builtins_;
   std::atomic<size_t> l2PendingCount_{0};
   uint64_t l2NextCallId_ = 1;            // logic strand only
 #ifdef CES_MAIL
@@ -2219,8 +2272,17 @@ private:
   // Apply the discount: raw fee × FeeKind's multiplier / 10000. Use
   // this at every named-fee debit site instead of billing raw.
   uint64_t discountFee(FeeKind k, uint64_t raw) const {
-    uint64_t bp = getFeeMult(k);
-    return (raw == 0) ? 0 : (raw * bp / 10000);
+    // 128-bit product: a raw fee above 2^64 / 10000 must not wrap. The bp is
+    // at most 10000, so the result fits.
+    const uint64_t bp = getFeeMult(k);
+    return (raw == 0) ? 0
+                      : static_cast<uint64_t>(static_cast<__uint128_t>(raw) * bp / 10000);
+  }
+
+  // Test hook: pin the live multiplier of one fee kind. With the fee
+  // discount off, the metrics pulse never writes it back.
+  void _testSetFeeMult(FeeKind k, uint16_t bp) {
+    feeMult_[static_cast<std::size_t>(k)].store(bp, std::memory_order_relaxed);
   }
 
   // Convenience: resolveFee + flat discount in one. Prepay-days fees

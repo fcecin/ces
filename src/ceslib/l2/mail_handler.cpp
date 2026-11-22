@@ -112,6 +112,13 @@ void dispatchSend(std::shared_ptr<CesPlexRequest> req, ces::Bytes pre,
 
 }  // namespace
 
+void MailHandler::cesplexInfo(
+    std::vector<std::pair<std::string, std::string>>& out) {
+  const CesConfig& c = server_->_config();
+  out.emplace_back("mailFeePerMB", std::to_string(c.mailFeePerMB));
+  out.emplace_back("mailMaxEncodedBytes", std::to_string(c.mailMaxEncodedBytes));
+}
+
 void MailHandler::serve(std::shared_ptr<minx::RudpStream> stream,
                         BoundChannelContext bound) {
   MailHandler* self = this;

@@ -29,6 +29,10 @@ class MailHandler : public CesPlexHandler {
 
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override;
+
+  // CES_QUERY_BUILTIN_INFO: the mail fee and size cap.
+  void cesplexInfo(
+      std::vector<std::pair<std::string, std::string>>& out) override;
   void stop() { stopped_ = true; }
 
   // estimate -> max-size gate -> burn `payer` -> read attachment -> send.

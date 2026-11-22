@@ -103,6 +103,10 @@ public:
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override;
 
+  // CES_QUERY_BUILTIN_INFO: the instance fees and compute_payout_factor.
+  void cesplexInfo(
+      std::vector<std::pair<std::string, std::string>>& out) override;
+
   // Bring the handler up: validate prereqs (computeMaxInstances > 0,
   // builtin:file up, work-dir + child binary resolvable), create the
   // work-dir, register the file-deletion interlock, and start the
@@ -204,6 +208,10 @@ public:
   bool instanceAcceptsConnections(uint64_t pid);
   // The instance's declared greeting (empty if none / request-driven).
   std::vector<uint8_t> instanceHello(uint64_t pid);
+  // The account that gets the compute payout for a channel into the
+  // instance: its program account. Zero for an instance in the server zone
+  // (/s/), which gets no payout, or for no such instance.
+  HashPrefix instancePayee(uint64_t pid);
   // Allocate a fresh server-side conn_id and send TAG_CONN_OPENED to the child
   // (with the user's pubkey). Returns the new conn_id, or 0 if the instance
   // is gone before the allocation lands.

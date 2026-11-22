@@ -99,6 +99,10 @@ protected:
       ces::CesQueryServerInfo req;
       return verifySigned(msg.data, req, req.originId);
     }
+    case ces::CES_QUERY_BUILTIN_INFO: {
+      ces::CesQueryBuiltinInfo req;
+      return verifySigned(msg.data, req, req.originId);
+    }
     case ces::CES_GOSSIP: {
       ces::CesGossip req;
       return verifySigned(msg.data, req, req.originId);

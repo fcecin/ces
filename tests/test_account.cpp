@@ -427,6 +427,15 @@ BOOST_AUTO_TEST_CASE(Test22_QueryServerInfo) {
   // rpcPort is now advertised in the paid KV too (mirrors the free GetInfo).
   // Value is "0" when CesPlex is disabled, but the key must be present.
   BOOST_CHECK(!find("rpcPort").empty());
+  // The builtins' own facts (the file fees) are in builtin-info now. The
+  // `builtin` list is present, and empty with no L2.
+  auto has = [&](const std::string& key) {
+    for (const auto& e : entries)
+      if (e.key == key) return true;
+    return false;
+  };
+  BOOST_CHECK(has("builtin"));
+  BOOST_CHECK(!has("feeFileRent"));
 }
 
 // Total credits tracker is consistent through operations (exact accounting)

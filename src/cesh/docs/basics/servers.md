@@ -32,7 +32,13 @@ cesh --server ces.pubcom.org:53830 think hello
 
 - `cesh ping`: free. The handshake, the server key and the rpc port.
 - `cesh server-info`: paid. The fees, the counts of accounts and assets,
-  and the version.
+  the version, and `builtin`, the list of the builtins that the server
+  mounts (empty when it has no L2).
+- `cesh builtin-info <name>`: paid. The info of one builtin from that list.
+  It shows the protocols that the builtin serves and its prices. A metered
+  builtin also shows the network rates. For example, `cesh builtin-info file`
+  shows the file fees, and `cesh builtin-info compute` shows the instance
+  fees and `computePayoutFactor`.
 - `cesh peer-info <id> <server>`: free. One slot of the server's peer table.
 
 ## When a server does not answer

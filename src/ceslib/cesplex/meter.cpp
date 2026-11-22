@@ -90,11 +90,21 @@ ChannelMeter::~ChannelMeter() {
   // construction log instead.
 }
 
+template <class F> void ChannelMeter::runOnIo(F&& f) {
+  if (io_.get_executor().running_in_this_thread())
+    f();
+  else
+    boost::asio::post(io_, std::forward<F>(f));
+}
+
 void ChannelMeter::track(const minx::SockAddr& peer, uint32_t channelId,
                            std::string tag, HashPrefix payerPfx) {
-  boost::asio::post(io_,
+  runOnIo(
     [this, peer, channelId, tag = std::move(tag), payerPfx]
     () mutable {
+      // A channel that closed before this ran is gone: its close found no
+      // row, and a row now would bill a later channel of the same id.
+      if (!rudp_.metricsFor(peer, channelId)) return;
       auto key = std::make_pair(peer, channelId);
       auto& mc = channels_[key];
       mc.tag = std::move(tag);
@@ -108,6 +118,15 @@ void ChannelMeter::track(const minx::SockAddr& peer, uint32_t channelId,
                << SVAR(mc.tag)
                << SVAR(hexPrefix(mc.payerPfx));
     });
+}
+
+void ChannelMeter::setPayee(const minx::SockAddr& peer, uint32_t channelId,
+                            HashPrefix payeePfx) {
+  runOnIo([this, peer, channelId, payeePfx]() {
+    auto it = channels_.find(std::make_pair(peer, channelId));
+    if (it == channels_.end()) return;
+    it->second.payeePfx = payeePfx;
+  });
 }
 
 std::vector<ChannelMeter::ChannelSnapshot>
@@ -126,6 +145,7 @@ ChannelMeter::snapshot() const {
       s.channelId = key.second;
       s.tag = mc.tag;
       s.payerPfx = mc.payerPfx;
+      s.payeePfx = mc.payeePfx;
       auto m = self->rudp_.metricsFor(key.first, key.second);
       if (m) s.metrics = *m;
       s.deltaBytesSent = mc.deltaBytesSent;
@@ -184,7 +204,7 @@ void ChannelMeter::doTick() {
       it = channels_.erase(it);
       continue;
     }
-    report(it->first, it->second, *m, now);
+    report(it->first, it->second, *m, now, false);
     ++it;
   }
 }
@@ -193,12 +213,13 @@ void ChannelMeter::closed(const minx::SockAddr& peer, uint32_t channelId,
                           const minx::Rudp::ChannelMetrics& final) {
   auto it = channels_.find(std::make_pair(peer, channelId));
   if (it == channels_.end()) return;
-  report(it->first, it->second, final, nowMicros());
+  report(it->first, it->second, final, nowMicros(), true);
   channels_.erase(it);
 }
 
 void ChannelMeter::report(const ChannelKey& key, MeteredChannel& mc,
-                          const minx::Rudp::ChannelMetrics& m, uint64_t now) {
+                          const minx::Rudp::ChannelMetrics& m, uint64_t now,
+                          bool final) {
   mc.deltaBytesSent      = guardedDelta(m.bytesSent, mc.lastBytesSent);
   mc.deltaBytesReceived  = guardedDelta(m.bytesReceived, mc.lastBytesReceived);
   mc.deltaMemByteSeconds = guardedDelta(m.memoryByteSeconds, mc.lastMemByteSeconds);
@@ -215,11 +236,12 @@ void ChannelMeter::report(const ChannelKey& key, MeteredChannel& mc,
   // mode) or no bound payer.
   if (host_ && !isZeroPrefix(mc.payerPfx)) {
     host_->cesplexReportUsage(
-      mc.payerPfx, key.first, key.second,
+      mc.payerPfx, mc.payeePfx, key.first, key.second,
       CesPlexUsage{.bytesSent = mc.deltaBytesSent,
                    .bytesReceived = mc.deltaBytesReceived,
                    .memByteSeconds = mc.deltaMemByteSeconds,
-                   .ageSeconds = mc.deltaAgeSec});
+                   .ageSeconds = mc.deltaAgeSec,
+                   .final = final});
   }
 
   LOGDEBUG << "usage"

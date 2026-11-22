@@ -50,7 +50,8 @@ enum op_code_t : uint8_t {
   CES_REGISTER_KEYNAME = 0x1c,         // signed: bind the signer's key to a name (key IS the owner)
   CES_CLEAR_KEYNAME = 0x1d,            // signed: erase the signer's key_name
   CES_QUERY_KEYNAME = 0x1e,            // unsigned: pubkey -> name
-  CES_QUERY_KEYNAME_BY_NAME = 0x1f     // unsigned: name -> pubkey
+  CES_QUERY_KEYNAME_BY_NAME = 0x1f,    // unsigned: name -> pubkey
+  CES_QUERY_BUILTIN_INFO = 0x20        // signed: KV info of one mounted builtin
 };
 
 /**
@@ -104,6 +105,7 @@ enum result_code_t : uint8_t {
   CES_CLEAR_KEYNAME_RESULT = 0x1d,
   CES_QUERY_KEYNAME_RESULT = 0x1e,
   CES_QUERY_KEYNAME_BY_NAME_RESULT = 0x1f,
+  CES_QUERY_BUILTIN_INFO_RESULT = 0x20,
   // Request is MINX_PROVE_WORK (no CES opcode for the request side)
   CES_PROVE_WORK_RESULT = 0x80
 };

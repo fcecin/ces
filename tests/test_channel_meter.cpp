@@ -505,6 +505,79 @@ BOOST_FIXTURE_TEST_CASE(BillsTheLastStretchAtClose, NetBillFixture) {
   BOOST_CHECK_EQUAL(server->_balanceOf(payerKey), after);
 }
 
+// 4c. A close after a tick bills only the use since that tick, not the
+//     channel's whole life. The tick bills the round trip; the close bills
+//     the close's own few bytes.
+BOOST_FIXTURE_TEST_CASE(TheCloseBillsOnlyTheUseSinceTheTick, NetBillFixture) {
+  ces::KeyPair payer;
+  const auto payerKey = payer.getPublicKeyAsHash();
+  server->_brr(payerKey, 10'000'000);
+
+  NbTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  auto stream = peer.selectAndOpen(rpcPort, "/ces/test/echo/1", payer);
+  BOOST_REQUIRE(stream != nullptr);
+  BOOST_REQUIRE_EQUAL(peer.echo(stream, std::string(4096, 'x')),
+                      std::string(4096, 'x'));
+  server->_drainLogic();
+  const int64_t b0 = server->_balanceOf(payerKey);
+  server->_channelMeter()->_runTick();
+  server->_drainLogic();
+  const int64_t b1 = server->_balanceOf(payerKey);
+  const int64_t tickDebit = b0 - b1;
+  BOOST_REQUIRE_GT(tickDebit, 0);
+
+  peer.closeStream();
+  stream.reset();
+  BOOST_REQUIRE(ces::waitUntil(
+    [&] { return server->_channelMeter()->snapshot().empty(); }));
+  server->_drainLogic();
+  const int64_t closeDebit = b1 - server->_balanceOf(payerKey);
+  BOOST_CHECK_GE(closeDebit, 0);
+  BOOST_CHECK_LT(closeDebit, tickDebit);
+}
+
+// 4d. A final report (the channel ended) closes nothing when its payer cannot
+//     pay: the id can already name a new channel. A tick report, the
+//     control, closes the channel.
+BOOST_FIXTURE_TEST_CASE(AFinalReportClosesNothing, NetBillFixture) {
+  NbTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  auto stream = peer.selectAndOpen(rpcPort, "/ces/test/echo/1", testKey);
+  BOOST_REQUIRE(stream != nullptr);
+  auto rows = server->_channelMeter()->snapshot();
+  BOOST_REQUIRE_EQUAL(rows.size(), 1u);
+
+  ces::KeyPair broke;  // no account: every debit fails
+  const auto brokePfx = ces::Account::getMapKey(broke.getPublicKeyAsHash());
+  auto report = [&](bool final) {
+    const ces::CesPlexUsage usage{.bytesSent = 1 << 20, .bytesReceived = 0,
+                                  .memByteSeconds = 0, .ageSeconds = 1,
+                                  .final = final};
+    ces::runSync(server->_rpcTaskIOExecutor(), [&] {
+      server->cesplexReportUsage(brokePfx, ces::HashPrefix{}, rows[0].peer,
+                                 rows[0].channelId, usage);
+    });
+    server->_drainLogic();                                  // the debit fails
+    ces::runSync(server->_rpcTaskIOExecutor(), [] {});      // its callback runs
+  };
+
+  report(true);
+  BOOST_CHECK_EQUAL(server->_channelMeter()->snapshot().size(), 1u);
+  report(false);
+  BOOST_CHECK(ces::waitUntil(
+    [&] { return server->_channelMeter()->snapshot().empty(); }));
+  peer.closeStream();
+}
+
+// 4e. track() of a channel that the Rudp no longer has adds no row: a row
+//     would bill a later channel of the same id.
+BOOST_FIXTURE_TEST_CASE(TrackIgnoresAGoneChannel, NetBillFixture) {
+  const minx::SockAddr gone(boost::asio::ip::make_address("::1"), 9);
+  server->_channelMeter()->track(gone, 77, "plex:/gone", ces::HashPrefix{1});
+  BOOST_CHECK(server->_channelMeter()->snapshot().empty());
+}
+
 // 5. Rate-driven debit + insufficient-funds eviction. Open a channel
 //    bound to a key whose account has been drained to ~zero, run
 //    a tick that incurs a small debit, observe the channel get

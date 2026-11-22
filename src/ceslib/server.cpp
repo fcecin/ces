@@ -1247,6 +1247,15 @@ CesServer::CesServer(const CesConfig& config)
     if (v == 0) v = 1;
     cfg_.feeBucketByteSec = v;
   }
+  // compute_payout_factor is 1x .. 10000x. Below 1x the payer would pay less
+  // than the price.
+  if (cfg_.computePayoutFactorBp < 10000 ||
+      cfg_.computePayoutFactorBp > CesConfig::kComputePayoutFactorMaxBp) {
+    LOGWARNING << "compute_payout_factor out of range, clamped"
+               << VAR(cfg_.computePayoutFactorBp);
+    cfg_.computePayoutFactorBp = std::clamp<uint32_t>(
+      cfg_.computePayoutFactorBp, 10000, CesConfig::kComputePayoutFactorMaxBp);
+  }
   // Default file store dir under dataDir. Used only when the
   // feature is active (cesFileStoreMaxBytes > 0); harmless to set
   // regardless.
@@ -1467,6 +1476,11 @@ uint16_t CesServer::start(uint16_t serverPort) {
     // params); a disabled or unauthorized bind is refused IN THE HANDLER.
     // Construction happens before the socket is opened so the listener sees a
     // coherent CesPlex pointer before any packet can arrive.
+    // The logic strand reads l2Registry_ and builtins_, and it already runs
+    // (the main port is open). So build them here, and install them there
+    // when the rpc socket is up.
+    std::unordered_map<uint64_t, CesPlexHandler*> l2Registry;
+    std::map<std::string, MountedBuiltin> builtins;
     {
       // CesPlex is impl-agnostic: each [cesplex_mounts] entry wires a protocol
       // name to a builtin handler impl. The map is the ONLY thing that decides
@@ -1525,7 +1539,11 @@ uint16_t CesServer::start(uint16_t serverPort) {
           // VM program addresses the built-in by that same hash.
           minx::Hash dh = ces::sha256(
               reinterpret_cast<const uint8_t*>(target.data()), target.size());
-          l2Registry_[ces::Buffer::peek<uint64_t>(dh.data())] = h;
+          l2Registry[ces::Buffer::peek<uint64_t>(dh.data())] = h;
+          // resolveBuiltin knows only "builtin:<name>" targets.
+          auto& b = builtins[target.substr(std::string_view("builtin:").size())];
+          b.handler = h;
+          b.protos.push_back(proto);
         } else {
           LOGWARNING << "cesplex: mount skipped, unknown builtin"
                      << SVAR(proto) << SVAR(target);
@@ -1592,6 +1610,10 @@ uint16_t CesServer::start(uint16_t serverPort) {
       rpcRudp_.reset();
     } else {
       LOGINFO << "rpc: MINX/RUDP port listening" << VAR(rpcBoundPort_);
+      logicSync([&]() {
+        for (const auto& [key, h] : l2Registry) l2Registry_[key] = h;
+        builtins_ = std::move(builtins);
+      });
       rpcNetIOThread_ = std::thread(
         [this]() { runGuardedThread([this]{ rpcNetIO_.run(); }, "rpcNetIO"); });
       rpcTaskIOThread_ = std::thread(
@@ -2415,10 +2437,6 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
   kv("feeQuery", std::to_string(cfg_.feeQuery));
   kv("feeError", std::to_string(cfg_.getFeeError()));
   kv("feeVmMult", std::to_string(cfg_.feeVmMult));
-  kv("feeFileRent", std::to_string(cfg_.feeFileRent));
-  kv("feeFileWrite", std::to_string(cfg_.feeFileWrite));
-  kv("feeFileRead", std::to_string(cfg_.feeFileRead));
-  kv("cesFileStoreMaxBytes", std::to_string(cfg_.cesFileStoreMaxBytes));
   kv("minAccounts", std::to_string(cfg_.minAcc));
   kv("maxAccounts", std::to_string(cfg_.maxAcc));
   kv("minAssets", std::to_string(cfg_.minAsset));
@@ -2444,7 +2462,77 @@ uint8_t CesServer::queryServerInfo(const minx::Hash& originKey,
   // Always emit hello, even when empty — an inspector wants to see that the
   // field exists and the server simply has no banner set, not have it vanish.
   kv("hello", _getHello());
+  // The mounted builtins, comma-separated (empty with no L2). Each one tells
+  // its own facts in CES_QUERY_BUILTIN_INFO.
+  std::string names;
+  for (const auto& [name, b] : builtins_)
+    names += (names.empty() ? "" : ",") + name;
+  kv("builtin", names);
 
+  return CES_OK;
+}
+
+uint8_t CesServer::queryBuiltinInfo(const minx::Hash& originKey,
+                                    uint32_t providedNonce,
+                                    const std::string& name,
+                                    int64_t& outOriginBalance,
+                                    std::vector<ServerInfoEntry>& outEntries,
+                                    int64_t queryFee, int64_t errFee) {
+  queryFee = discountedFlatFee(queryFee, cfg_.feeQuery, FeeKind::Query);
+  errFee = discountedFlatFee(errFee, cfg_.getFeeError(), FeeKind::Query);
+
+  ActiveAccount origin = accounts_.get(Account::getMapKey(originKey));
+  uint8_t rc = origin.validateSpend(0, queryFee, providedNonce, errFee);
+  if (rc != CES_OK) {
+    if (origin.exists())
+      outOriginBalance = origin.balance();
+    return rc;
+  }
+
+  auto it = builtins_.find(name);
+  if (it == builtins_.end()) {
+    origin.chargeError(errFee);
+    outOriginBalance = origin.balance();
+    return CES_ERROR_TARGET_NOT_FOUND;
+  }
+
+  const MountedBuiltin& b = it->second;
+  std::vector<ServerInfoEntry> entries;
+  auto kv = [&](const char* k, const std::string& v) { entries.push_back({k, v}); };
+  std::string protos;
+  bool metered = false;
+  for (const auto& p : b.protos) {
+    protos += (protos.empty() ? "" : ",") + p;
+    metered = metered || cesplexChannelMetered(p);
+  }
+  kv("mounts", protos);
+  // Every metered channel of the bus pays these network rates now (as
+  // priceNetUsage prices them).
+  if (metered) {
+    kv("feeNetKiBSent", std::to_string(discountFee(FeeKind::Net, cfg_.feeNetKiBSent)));
+    kv("feeNetKiBReceived", std::to_string(discountFee(FeeKind::Net, cfg_.feeNetKiBReceived)));
+    kv("feeNetChannelSec", std::to_string(discountFee(FeeKind::Net, cfg_.feeNetChannelSec)));
+    kv("feeNetMemByteDay", std::to_string(discountFee(FeeKind::Net, cfg_.feeNetMemByteDay)));
+  }
+  std::vector<std::pair<std::string, std::string>> own;
+  b.handler->cesplexInfo(own);
+  for (auto& [k, v] : own) entries.push_back({std::move(k), std::move(v)});
+
+  // The reply is one datagram. Refuse one that does not fit before the fee,
+  // with no charge (the mounts, not the caller, make it too long).
+  CesQueryBuiltinInfoResult probe;
+  probe.rcode = CES_OK;
+  probe.entries = entries;
+  if (1 + probe.getPayloadSize() + sizeof(Signature) > kMaxInfoReplyBytes) {
+    LOGWARNING << "builtin-info reply does not fit one datagram" << SVAR(name);
+    outOriginBalance = origin.balance();
+    return CES_ERROR_INTERNAL;
+  }
+
+  origin.debit(queryFee);
+  outOriginBalance = origin.balance();
+  accounts_.checkFlush(queryFee);
+  outEntries = std::move(entries);
   return CES_OK;
 }
 
@@ -4000,6 +4088,29 @@ void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
             queryServerInfo(req.originId, req.reqNonce, newBal, entries);
 
           CesQueryServerInfoResult res;
+          res.originId = originPrefix;
+          res.reqNonce = req.reqNonce;
+          res.rcode = rc;
+          if (rc == CES_OK)
+            res.entries = std::move(entries);
+          sendSignedReply(addr, msg, std::move(res));
+        });
+      break;
+    }
+
+    case CES_QUERY_BUILTIN_INFO: {
+      CesQueryBuiltinInfo req;
+      req.fromBytes(msg.data);
+      Hash key = req.originId;
+      dispatchSigned(addr, msg, std::move(req), key,
+        [this](const CesQueryBuiltinInfo& req, const HashPrefix& originPrefix,
+               const SockAddr& addr, const MinxMessage& msg) {
+          int64_t newBal = 0;
+          std::vector<ServerInfoEntry> entries;
+          uint8_t rc = queryBuiltinInfo(req.originId, req.reqNonce, req.name,
+                                        newBal, entries);
+
+          CesQueryBuiltinInfoResult res;
           res.originId = originPrefix;
           res.reqNonce = req.reqNonce;
           res.rcode = rc;
@@ -5782,7 +5893,7 @@ void CesServer::_burnInner(const minx::Hash& accountKey, int64_t amount) {
     int64_t bal = acc.balance();
     int64_t toDebit = std::min(amount, bal);
     if (toDebit > 0)
-      acc.debit(static_cast<uint64_t>(toDebit));
+      acc.debitBill(static_cast<uint64_t>(toDebit));
   }
 }
 
@@ -5808,7 +5919,7 @@ struct ServerLedgerTxn : ces::LedgerTxn {
     auto acc = s->accounts_.get(Account::getMapKey(pubkey));
     if (!acc.exists() || !balanceCovers(acc.balance(), amount))
       return false;
-    acc.debit(amount);
+    acc.debitBill(amount);
     return true;
   }
   void credit(const minx::Hash& pubkey, int64_t amount) override {
@@ -5856,7 +5967,7 @@ void CesServer::_l2DebitProgramAccount(
             [cb, bal]() { cb(false, bal); });
         return;
       }
-      acc.debit(static_cast<uint64_t>(amount));
+      acc.debitBill(static_cast<uint64_t>(amount));
       int64_t newBal = bal - amount;
       if (cb)
         boost::asio::post(cbExecutor,
@@ -5874,7 +5985,7 @@ CesServer::_l2DebitProgramAccountSync(
       if (!acc.exists()) return {false, 0};
       int64_t bal = acc.balance();
       if (amount < 0 || bal < amount) return {false, bal};
-      acc.debit(static_cast<uint64_t>(amount));
+      acc.debitBill(static_cast<uint64_t>(amount));
       return {true, bal - amount};
     });
 }
@@ -6121,49 +6232,92 @@ uint64_t CesServer::priceNetUsage(const CesPlexUsage& usage) const {
 }
 
 void CesServer::cesplexReportUsage(const HashPrefix& payer,
+                                   const HashPrefix& payee,
                                    const minx::SockAddr& peer,
                                    uint32_t channelId,
                                    const CesPlexUsage& usage) {
   const uint64_t amount = priceNetUsage(usage);
   if (amount == 0) return;  // free at current rates — nothing to charge
 
+  // A final report runs inside the Rudp's close: the channel is gone, and its
+  // id can name a new channel by the time the debit is done. Close nothing.
+  if (usage.final) {
+    _l2DebitNetworkBill(payer, payee, amount, nullptr, rpcTaskIO_.get_executor());
+    return;
+  }
   // Debit the payer on logicStrand; if it can't cover the tick, the host
-  // closes the channel (on the rpc strand). The bus never sees the cost
-  // and never evicts for non-payment.
+  // closes the channel (on the rpc strand), if the id still names the
+  // channel that was billed. The bus never sees the cost and never evicts
+  // for non-payment.
+  const uint64_t token = rpcRudp_ ? rpcRudp_->sessionToken(peer, channelId) : 0;
   _l2DebitNetworkBill(
-    payer, static_cast<int64_t>(amount),
-    [this, peer, channelId, amount](bool ok) {
-      if (ok) return;
+    payer, payee, amount,
+    [this, peer, channelId, amount, token](bool ok) {
+      if (ok || !rpcRudp_ || rpcRudp_->sessionToken(peer, channelId) != token) return;
       LOGDEBUG << "netbill: insufficient funds → close"
                << SVAR(peer) << VAR(channelId) << VAR(amount);
-      if (rpcRudp_) rpcRudp_->closeChannel(peer, channelId);
+      rpcRudp_->closeChannel(peer, channelId);
     },
     rpcTaskIO_.get_executor());
 }
 
-void CesServer::debitNetworkBill(const HashPrefix& payerPfx, uint64_t amount) {
+void CesServer::debitNetworkBill(const HashPrefix& payerPfx,
+                                 const HashPrefix& payeePfx, uint64_t amount) {
   // Per-instance endpoint billing: charge a child's INBOUND luarpc caller. No
   // close callback - the child owns the channel (no rpc-side channel to evict).
   if (amount == 0) return;
-  _l2DebitNetworkBill(payerPfx, static_cast<int64_t>(amount), nullptr,
+  _l2DebitNetworkBill(payerPfx, payeePfx, amount, nullptr,
                       rpcTaskIO_.get_executor());
+}
+
+void CesServer::_l2SetChannelPayee(const minx::SockAddr& peer,
+                                   uint32_t channelId,
+                                   const HashPrefix& payeePfx) {
+  if (channelMeter_) channelMeter_->setPayee(peer, channelId, payeePfx);
 }
 
 void CesServer::_l2DebitNetworkBill(
     const HashPrefix& payerPfx,
-    int64_t amount,
+    const HashPrefix& payeePfx,
+    uint64_t amount,
     std::function<void(bool ok)> cb,
     boost::asio::any_io_executor cbExecutor) {
   auto self = this;
   postLogic(
-    [self, payerPfx, amount, cb, cbExecutor]() {
+    [self, payerPfx, payeePfx, amount, cb, cbExecutor]() {
+      // The compute payout: the payer pays `amount` and the payout, and the
+      // server keeps `amount`. The payout is `amount` times (factor - 1), and
+      // never more than the payee can hold. A payee that is the payer, that
+      // has no account, or that is a payment record (a negative balance)
+      // gets none, and the payer pays `amount` only.
+      uint64_t payout = 0;
+      if (payeePfx != HashPrefix{} && payeePfx != payerPfx) {
+        ActiveAccount payee = self->accounts_.get(payeePfx);
+        if (payee.exists() && payee.balance() >= 0) {
+          const __uint128_t surcharge =
+            static_cast<__uint128_t>(amount) *
+            (self->cfg_.computePayoutFactorBp - 10000) / 10000;
+          const uint64_t room = static_cast<uint64_t>(BALANCE_MAX - payee.balance());
+          payout = surcharge > room ? room : static_cast<uint64_t>(surcharge);
+        }
+      }
+      // A payer short of the charge pays what it has, the server's part
+      // first, and the bill is not ok (a tick report then closes the
+      // channel). A charge that no account can hold is a bug, not a price,
+      // and moves nothing.
+      const __uint128_t charge = static_cast<__uint128_t>(amount) + payout;
       bool ok = false;
       ActiveAccount acc = self->accounts_.get(payerPfx);
-      if (amount >= 0 && acc.exists() && acc.balance() >= amount) {
-        acc.debit(static_cast<uint64_t>(amount));
-        ok = true;
+      if (charge <= static_cast<uint64_t>(BALANCE_MAX) && acc.exists() &&
+          acc.balance() > 0) {
+        const uint64_t has = static_cast<uint64_t>(acc.balance());
+        ok = has >= charge;
+        const uint64_t paid = ok ? static_cast<uint64_t>(charge) : has;
+        const uint64_t toPayee = paid > amount ? paid - amount : 0;
+        acc.debitBill(paid);
+        if (toPayee > 0) self->accounts_.get(payeePfx).credit(toPayee);
       }
-      // Account already-not-exists OR balance < amount → leave alone,
+      // Account already-not-exists OR balance < charge → leave alone,
       // signal failure. ChannelMeter will closeChannel on the
       // callback hop.
       if (cb) boost::asio::post(cbExecutor, [cb, ok]() { cb(ok); });
@@ -7337,7 +7491,8 @@ std::string CesServer::_exportConfig(std::string* errReason) {
     o << "fee_compute_cpu_sec = "      << cfg_.feeComputeCpuSec     << "\n";
     o << "fee_compute_rss_byte_day = " << cfg_.feeComputeRssByteDay << "\n";
     o << "fee_compute_net_byte = "     << cfg_.feeComputeNetByte    << "\n";
-    o << "fee_bucket_byte_sec = "      << cfg_.feeBucketByteSec     << "\n\n";
+    o << "fee_bucket_byte_sec = "      << cfg_.feeBucketByteSec     << "\n";
+    o << "compute_payout_factor = "    << basisPointsText(cfg_.computePayoutFactorBp) << "\n\n";
 
     o << "# ChannelMeter net-metering rates (0 = derive a non-zero default, NOT free)\n";
     o << "fee_net_kib_sent = "      << cfg_.feeNetKiBSent      << "\n";

@@ -176,6 +176,8 @@ struct BoundChannelContext {
   // Channel anchor (from RUDP). Always non-zero for a successful bind;
   // a 0 sessionToken indicates the context wasn't populated.
   uint64_t   sessionToken = 0;     // per-channel-incarnation salt for sigs
+  minx::SockAddr peer{};           // the channel's RUDP address
+  uint32_t   channelId = 0;
 
   // Server's wall-clock at bind (informational; useful for handler
   // logging and freshness checks).

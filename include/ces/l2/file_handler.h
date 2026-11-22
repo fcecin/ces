@@ -136,6 +136,10 @@ public:
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override;
 
+  // CES_QUERY_BUILTIN_INFO: the file fees and the store's size cap.
+  void cesplexInfo(
+      std::vector<std::pair<std::string, std::string>>& out) override;
+
   // Release kv handles and stop accepting verbs. Call on shutdown before
   // CesPlex / rpcRudp_ go away.
   void stop();

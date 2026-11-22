@@ -267,6 +267,10 @@ public:
    * @return CES_OK, protocol error, or CES_ERROR_TIMEOUT/INTERNAL
    */
   uint8_t queryServerInfo(std::vector<ServerInfoEntry>& outEntries);
+  // Paid KV info of one builtin that the server mounts, by its name (the
+  // part after "builtin:" in a mount target, such as "file").
+  uint8_t queryBuiltinInfo(const std::string& name,
+                           std::vector<ServerInfoEntry>& outEntries);
 
   // Info obtained from the MINX handshake (available after connect)
   uint8_t getMinDifficulty() const { return serverMinDiff_; }
@@ -541,6 +545,12 @@ private:
   uint8_t serverInfoExtResultCode_ = 0;
   std::vector<ServerInfoEntry> serverInfoExtEntries_;
   std::atomic<uint64_t> serverInfoExtGen_ = 0;
+
+  HashPrefix builtinInfoOriginId_;
+  uint32_t builtinInfoReqNonce_ = 0;
+  uint8_t builtinInfoResultCode_ = 0;
+  std::vector<ServerInfoEntry> builtinInfoEntries_;
+  std::atomic<uint64_t> builtinInfoGen_ = 0;
 };
 
 } // namespace ces

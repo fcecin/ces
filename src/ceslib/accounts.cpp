@@ -173,6 +173,27 @@ void Accounts::ActiveAccount::debitTransfer(uint64_t totalAmount,
   }
 }
 
+void Accounts::ActiveAccount::debitBill(uint64_t amount) {
+  if (!exists())
+    return;
+  int64_t oldBal = balance();
+  int64_t newBal = balanceCovers(oldBal, amount)
+                     ? oldBal - static_cast<int64_t>(amount)
+                     : 0;
+  if (newBal <= 0) {
+    parent.totalCredits_ -= std::max<int64_t>(0, oldBal);
+    parent.store_.erase(it);
+    it = parent.store_.end();
+    LOGTRACE << "debitBill: account deleted" << VAR(id) << VAR(oldBal)
+             << VAR(amount);
+  } else {
+    parent.totalCredits_ -= static_cast<int64_t>(amount);
+    data().setBalance(newBal);
+    parent.store_.persist(it);
+    LOGTRACE << "debitBill" << VAR(id) << VAR(newBal);
+  }
+}
+
 void Accounts::ActiveAccount::credit(uint64_t amount) {
   if (!exists())
     return;

@@ -169,7 +169,8 @@ public:
   bool bind(uint16_t targetPort, const KeyPair& signer,
             uint64_t& sessionToken,
             std::chrono::milliseconds timeout =
-              std::chrono::seconds(3)) {
+              std::chrono::seconds(3),
+            const std::string& name = "/ces/lua/1") {
     currentPeer_ = minx::SockAddr(
       boost::asio::ip::address_v6::loopback(), targetPort);
     currentChannel_ = 1;
@@ -180,7 +181,7 @@ public:
     auto mu = std::make_shared<std::mutex>();
     auto cv = std::make_shared<std::condition_variable>();
 
-    boost::asio::post(taskIO_, [this, &signer, done, ok, tok, mu, cv]() {
+    boost::asio::post(taskIO_, [this, &signer, name, done, ok, tok, mu, cv]() {
       rudp_->tick(nowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
         taskIO_.get_executor());
@@ -191,7 +192,6 @@ public:
       }
 
       const uint64_t bindNowUs = nowMicros();
-      const std::string name = "/ces/lua/1";
       auto bindReq = std::make_shared<minx::Bytes>(
         ces::buildBindRequest(name, bindNowUs, signer));
       boost::asio::async_write(

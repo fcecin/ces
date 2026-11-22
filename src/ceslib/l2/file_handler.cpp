@@ -3224,6 +3224,18 @@ void FileHandler::stop() {
   kv_->stores.clear();
 }
 
+void FileHandler::cesplexInfo(
+    std::vector<std::pair<std::string, std::string>>& out) {
+  // Rent is the base price; the store's use scales it now by fileRentBp.
+  // Writes and reads are not scaled.
+  const CesConfig& c = server_->_config();
+  out.emplace_back("feeFileRent", std::to_string(c.feeFileRent));
+  out.emplace_back("fileRentBp", std::to_string(rentBp()));
+  out.emplace_back("feeFileWrite", std::to_string(c.feeFileWrite));
+  out.emplace_back("feeFileRead", std::to_string(c.feeFileRead));
+  out.emplace_back("cesFileStoreMaxBytes", std::to_string(c.cesFileStoreMaxBytes));
+}
+
 void FileHandler::serve(std::shared_ptr<minx::RudpStream> stream,
                         BoundChannelContext bound) {
   CesServer* server = server_;

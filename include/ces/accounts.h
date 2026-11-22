@@ -28,6 +28,11 @@ public:
     uint8_t validateSpend(uint64_t amount, uint64_t fee, uint32_t reqNonce,
                           int64_t errFee);
     void debit(uint64_t totalAmount);
+    // A bill that the server makes on its own (a network bill, a program's
+    // compute fees, a burn): like debit, but the nonce stays, because only
+    // a signed op moves it. A signed op that runs at the same time keeps its
+    // nonce.
+    void debitBill(uint64_t amount);
     void debitTransfer(uint64_t totalAmount, const HashPrefix& destId,
                        uint64_t xferAmount);
     void credit(uint64_t amount);

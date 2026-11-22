@@ -1237,6 +1237,37 @@ uint8_t CesClient::queryServerInfo(std::vector<ServerInfoEntry>& outEntries) {
   return rc;
 }
 
+uint8_t CesClient::queryBuiltinInfo(const std::string& name,
+                                    std::vector<ServerInfoEntry>& outEntries) {
+  LOGTRACE << "queryBuiltinInfo" << VAR(name);
+  if (name.size() > 255)
+    return CES_ERROR_BAD_INPUT;
+  uint32_t reqNonce;
+  if (!ensureServerTicket() || getMyNonce(reqNonce) != CES_OK)
+    return CES_ERROR_INTERNAL;
+
+  Hash myFullKey = keyPair_.getPublicKeyAsHash();
+  HashPrefix myId = Account::getMapKey(myFullKey);
+
+  CesQueryBuiltinInfo req;
+  req.originId = myFullKey;
+  req.serverId = getServerId();
+  req.reqNonce = reqNonce;
+  req.name = name;
+
+  uint8_t rc = sendSigned(req, builtinInfoGen_, builtinInfoResultCode_, [&] {
+    return builtinInfoReqNonce_ == reqNonce && builtinInfoOriginId_ == myId;
+  });
+
+  if (rc != CES_ERROR_INTERNAL && rc != CES_ERROR_TIMEOUT) {
+    if (builtinInfoResultCode_ == CES_OK)
+      outEntries = builtinInfoEntries_;
+    else
+      outEntries.clear();
+  }
+  return rc;
+}
+
 // =============================================================================
 // MESSAGE DISPATCH
 // =============================================================================
@@ -1618,6 +1649,16 @@ void CesClient::incomingMessage(const minx::SockAddr& addr,
         serverInfoExtReqNonce_ = r.reqNonce;
         serverInfoExtResultCode_ = r.rcode;
         serverInfoExtEntries_ = std::move(r.entries);
+      });
+      break;
+
+    case CES_QUERY_BUILTIN_INFO_RESULT:
+      handleSigned(CesQueryBuiltinInfoResult{}, "builtin info",
+                   builtinInfoGen_, [&](auto& r) {
+        builtinInfoOriginId_ = r.originId;
+        builtinInfoReqNonce_ = r.reqNonce;
+        builtinInfoResultCode_ = r.rcode;
+        builtinInfoEntries_ = std::move(r.entries);
       });
       break;
 

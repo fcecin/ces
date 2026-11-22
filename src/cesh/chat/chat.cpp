@@ -36,7 +36,8 @@ const std::set<std::string> kGroups = {
   "autoexec"};
 
 const std::set<std::string> kReads = {
-  "man", "query", "squery", "ping", "peer-info", "server-info", "keys list",
+  "man", "query", "squery", "ping", "peer-info", "server-info", "builtin-info",
+  "keys list",
   "keyname query", "keyname resolve", "alias read",
   "file stat", "file get", "compute ps", "compute stat", "compute instances",
   "asset query", "asset squery"};

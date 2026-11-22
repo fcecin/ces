@@ -178,6 +178,8 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     bound.boundPubkey = clientPubkey;
     bound.payerPfx = getHashPrefix(clientPubkey.getHash());
     bound.sessionToken = parent.rudp_.sessionToken(peer, channelId);
+    bound.peer = peer;
+    bound.channelId = channelId;
 
     BindReplyFields reply;
     reply.status = CES_PLEX_OK;

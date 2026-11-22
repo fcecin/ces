@@ -382,7 +382,10 @@ class LuaHostPlexHost : public ces::CesPlexHost {
 public:
   explicit LuaHostPlexHost(const ces::KeyPair& key) : key_(key) {}
   const ces::KeyPair& cesplexSigningKey() const override { return key_; }
+  // `payee`: the endpoint never names one. The parent knows which instance
+  // an inbound dial feeds, and pays it there.
   void cesplexReportUsage(const ces::HashPrefix& payer,
+                          const ces::HashPrefix& /*payee*/,
                           const minx::SockAddr& /*peer*/,
                           uint32_t /*channelId*/,
                           const ces::CesPlexUsage& usage) override {

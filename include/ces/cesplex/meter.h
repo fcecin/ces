@@ -61,8 +61,8 @@ public:
 
   // Begin tracking (peer, channelId). The framework calls track()
   // exactly once per channel after a successful bind, with the
-  // payerPfx from the bound principal. Posts onto the construction
-  // io_context; safe to call from any thread.
+  // payerPfx from the bound principal. Runs at once on the construction
+  // io_context's thread, and posts there from any other thread.
   //
   // payerPfx default = HashPrefix{} is for tests / observability paths
   // where there's no bound payer (no host, or the operator wants delta
@@ -73,6 +73,14 @@ public:
   void track(const minx::SockAddr& peer, uint32_t channelId,
              std::string tag, HashPrefix payerPfx = {});
 
+  // Name the account of the program that a tracked channel feeds. Each
+  // report of the channel from now on carries it, so the host can pay the
+  // program its share. Like track(), it runs at once on the construction
+  // io_context's thread, and posts there from any other thread. A channel
+  // that is not tracked is ignored.
+  void setPayee(const minx::SockAddr& peer, uint32_t channelId,
+                HashPrefix payeePfx);
+
   // Per-channel snapshot, by value. Posts onto the construction
   // io_context and waits for the post to run, so this BLOCKS the
   // caller. Used by cesco `netbill` and tests; not for hot paths.
@@ -81,6 +89,7 @@ public:
     uint32_t channelId = 0;
     std::string tag;
     HashPrefix payerPfx{};
+    HashPrefix payeePfx{};
     minx::Rudp::ChannelMetrics metrics{};
     // Last per-tick resource delta (zero before the first tick has run).
     // Credits are not here — the meter measures resources; the host prices
@@ -110,6 +119,7 @@ private:
   struct MeteredChannel {
     std::string tag;
     HashPrefix payerPfx{};
+    HashPrefix payeePfx{};  // zero: the channel feeds no program
     // Last-seen counter values (for delta computation).
     uint64_t lastBytesSent = 0;
     uint64_t lastBytesReceived = 0;
@@ -127,9 +137,13 @@ private:
   void scheduleTick();
   void doTick();
   // Report a channel's use since its last report, from its metrics `m`, and
-  // move its baselines to `m` and `now`.
+  // move its baselines to `m` and `now`. `final`: the channel ended.
   void report(const ChannelKey& key, MeteredChannel& mc,
-              const minx::Rudp::ChannelMetrics& m, uint64_t now);
+              const minx::Rudp::ChannelMetrics& m, uint64_t now, bool final);
+  // Run `f` now on io_'s thread, or post it there from another thread. A
+  // bind or an ATTACH runs on io_'s thread, so its track() or setPayee()
+  // lands before a close that is already queued behind it.
+  template <class F> void runOnIo(F&& f);
   // The Rudp's closed observer: report the last stretch of a tracked
   // channel, then forget the channel.
   void closed(const minx::SockAddr& peer, uint32_t channelId,

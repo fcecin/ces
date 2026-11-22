@@ -370,6 +370,18 @@ ThinkHandler::ThinkHandler(CesServer* server) : server_(server) {
 
 ThinkHandler::~ThinkHandler() { stop(); }
 
+void ThinkHandler::cesplexInfo(
+    std::vector<std::pair<std::string, std::string>>& out) {
+  // The full prices, per million tokens. A call gets thinkPriceBp of them
+  // now while the subsidy lasts.
+  const CesConfig& c = server_->_config();
+  out.emplace_back("thinkModel", c.thinkModel);
+  out.emplace_back("thinkPriceBp", std::to_string(subsidy_->multBp()));
+  out.emplace_back("thinkFeeIn", std::to_string(c.thinkFeeIn));
+  out.emplace_back("thinkFeeCachedIn", std::to_string(c.thinkFeeCachedIn));
+  out.emplace_back("thinkFeeOut", std::to_string(c.thinkFeeOut));
+}
+
 void ThinkHandler::serve(std::shared_ptr<minx::RudpStream> stream,
                          BoundChannelContext bound) {
   ThinkHandler* self = this;

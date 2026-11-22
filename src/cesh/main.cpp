@@ -134,6 +134,24 @@ std::string jesc(const std::string& s) {
   return o;
 }
 
+// Print the entries of a KV info reply: a JSON object with --quiet, else a
+// header and one field for each entry.
+void print_kv_info(const std::string& title,
+                   const std::vector<ServerInfoEntry>& entries) {
+  if (g_quiet) {
+    std::cout << "{";
+    for (size_t i = 0; i < entries.size(); ++i)
+      std::cout << (i ? "," : "") << "\"" << jesc(entries[i].key)
+                << "\":\"" << jesc(entries[i].value) << "\"";
+    std::cout << "}\n";
+  } else {
+    print_header(title);
+    for (const auto& e : entries)
+      print_field(e.key, e.value);
+    std::cout << std::endl;
+  }
+}
+
 // One compute instance as a JSON object (shared by compute ps/stat/instances
 // in --quiet mode).
 std::string instanceJson(const ces::CesComputeClient::InstanceInfo& e) {
@@ -387,6 +405,13 @@ int ceshRun(int argc, char* argv[]) {
 
   auto* cmd_sinfo =
     app.add_subcommand("server-info", "Query extended server info (paid)");
+
+  // ---- Subcommand: builtin-info (signed/paid) ----
+  std::string binfo_name;
+  auto* cmd_binfo = app.add_subcommand(
+    "builtin-info", "Query the info of one builtin, such as its prices (paid)");
+  cmd_binfo->add_option("name", binfo_name,
+    "A name from the `builtin` list of server-info, such as file")->required();
 
   // ---- Subcommand: peer-info (unsigned, no actor needed) ----
 
@@ -1507,7 +1532,8 @@ int ceshRun(int argc, char* argv[]) {
 
   bool needs_actor =
     (cmd_squery->parsed() || cmd_transfer->parsed() || cmd_payment->parsed() ||
-     cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_mine->parsed() ||
+     cmd_cross->parsed() || cmd_sinfo->parsed() || cmd_binfo->parsed() ||
+     cmd_mine->parsed() ||
      cmd_asset->parsed() || cmd_file->parsed() || cmd_autoexec->parsed() ||
      cmd_dfile->parsed() || cmd_compute->parsed() || cmd_dial->parsed() ||
      cmd_mail->parsed() || cmd_think->parsed() || cmd_gossip->parsed() ||
@@ -2391,15 +2417,15 @@ int ceshRun(int argc, char* argv[]) {
 
       // feeFileRent/feeFileWrite are only needed to size the DEFAULT upfront
       // deposit for `put` when the caller didn't pass --deposit. Fetch them
-      // via the paid server-info ONLY in that case — get/stat, and any put
-      // with an explicit --deposit, never trigger a paid query.
+      // via the paid builtin-info of "file" ONLY in that case — get/stat, and
+      // any put with an explicit --deposit, never trigger a paid query.
       uint64_t feeFileRent = 0;
       uint64_t feeFileWrite = 0;
       if (cmd_dfp->parsed() && df_deposit_arg == 0) {
         std::vector<ServerInfoEntry> entries;
-        uint8_t sirc = cc.queryServerInfo(entries);
+        uint8_t sirc = cc.queryBuiltinInfo("file", entries);
         if (sirc != CES_OK) {
-          std::cerr << "Error: queryServerInfo failed: "
+          std::cerr << "Error: builtin-info file failed: "
                     << errorString(sirc) << "\n";
           return 1;
         }
@@ -3265,20 +3291,22 @@ int ceshRun(int argc, char* argv[]) {
       std::vector<ServerInfoEntry> entries;
       uint8_t rc = cc.queryServerInfo(entries);
       if (rc == CES_OK) {
-        if (g_quiet) {
-          std::cout << "{";
-          for (size_t i = 0; i < entries.size(); ++i)
-            std::cout << (i ? "," : "") << "\"" << jesc(entries[i].key)
-                      << "\":\"" << jesc(entries[i].value) << "\"";
-          std::cout << "}\n";
-        } else {
-          print_header("Server Info");
-          for (const auto& e : entries)
-            print_field(e.key, e.value);
-          std::cout << std::endl;
-        }
+        print_kv_info("Server Info", entries);
       } else {
         std::cerr << "Server Info Failed: " << errorString(rc) << "\n";
+        return 1;
+      }
+    }
+
+    // ---- builtin-info ----
+
+    else if (cmd_binfo->parsed()) {
+      std::vector<ServerInfoEntry> entries;
+      uint8_t rc = cc.queryBuiltinInfo(binfo_name, entries);
+      if (rc == CES_OK) {
+        print_kv_info("Builtin Info: " + binfo_name, entries);
+      } else {
+        std::cerr << "Builtin Info Failed: " << errorString(rc) << "\n";
         return 1;
       }
     }

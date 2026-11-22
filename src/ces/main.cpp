@@ -7,6 +7,7 @@
  */
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <thread>
 #include <unistd.h>
@@ -285,6 +286,13 @@ fee_file_read  = -1   # when -1: fee_file_rent / 8       (read, per KB)
 # fee_compute_slot_sec     = -1   # when -1: fee_asset / 86400
 # fee_bucket_byte_sec      = -1   # when -1: fee_compute_rss_byte_day / 86400
 #
+# A channel that ATTACHes to a compute instance costs its caller the network
+# price times compute_payout_factor (1 to 10000). The server keeps the network price, and
+# the part above it goes to the account of the program. At the default of 2,
+# the program gets what the network gets. Programs in /s/ get no payout, and
+# their callers pay the network price only.
+# compute_payout_factor    = 2
+#
 # ChannelMeter (CesPlex net metering) rates. Throughput is metered per KiB so
 # the rate can sit below 1 raw/byte. 0 is a sentinel, not "free": the server
 # derives a non-zero default from the ledger anchors at startup, so metering
@@ -481,6 +489,7 @@ int main(int argc, char* argv[]) {
   int64_t optFeeComputeNetByte    = -1;
   int64_t optFeeComputeSlotSec    = -1;
   int64_t optFeeBucketByteSec     = -1;
+  double  optComputePayoutFactor  = 2.0;
   // net meter (ChannelMeter). 0 is a sentinel: the CesServer ctor derives a
   // non-zero rate from the ledger anchors (floored to >= 1), so metering stays
   // on. Pass an explicit non-zero to override.
@@ -798,6 +807,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--feebucketbytesec", optFeeBucketByteSec,
       "Bucket cache fee per byte per second of declared capacity "
       "(credits, -1 = derive from feeComputeRssByteDay)");
+    app.add_option("--computepayoutfactor", optComputePayoutFactor,
+      "A channel that ATTACHes to a compute instance costs its caller the network "
+      "price times this factor (1 to 10000, default 2). The part above the price "
+      "goes to the program's account");
     app.add_option("--feenetkibsent", optFeeNetKiBSent,
       "Net meter: credits per KiB sent server->client (0 = derive default)");
     app.add_option("--feenetkibreceived", optFeeNetKiBReceived,
@@ -881,6 +894,8 @@ int main(int argc, char* argv[]) {
           var = static_cast<uint16_t>(v.value_or(static_cast<int64_t>(var)));
         else if constexpr (std::is_same_v<T, int>)
           var = static_cast<int>(v.value_or(static_cast<int64_t>(var)));
+        else if constexpr (std::is_same_v<T, double>)
+          var = v.value_or(var);  // a TOML integer or float
         else
           var = static_cast<T>(v.value_or(static_cast<int64_t>(var)));
       };
@@ -1034,6 +1049,8 @@ int main(int argc, char* argv[]) {
                      "--feecomputeslotsec");
       applyIfDefault("fee_bucket_byte_sec",      optFeeBucketByteSec,
                      "--feebucketbytesec");
+      applyIfDefault("compute_payout_factor",    optComputePayoutFactor,
+                     "--computepayoutfactor");
       applyIfDefault("fee_net_kib_sent",         optFeeNetKiBSent,
                      "--feenetkibsent");
       applyIfDefault("fee_net_kib_received",     optFeeNetKiBReceived,
@@ -1269,6 +1286,12 @@ int main(int argc, char* argv[]) {
     config.feeComputeSlotSec    = optFeeComputeSlotSec;
   if (optFeeBucketByteSec     >= 0)
     config.feeBucketByteSec     = optFeeBucketByteSec;
+  if (!(optComputePayoutFactor >= 1.0 && optComputePayoutFactor <= 10000.0)) {
+    std::cerr << "Error: compute_payout_factor must be from 1 to 10000.\n";
+    return 1;
+  }
+  config.computePayoutFactorBp =
+    static_cast<uint32_t>(std::llround(optComputePayoutFactor * 10000.0));
   config.feeNetKiBSent        = optFeeNetKiBSent;
   config.feeNetKiBReceived    = optFeeNetKiBReceived;
   config.feeNetChannelSec     = optFeeNetChannelSec;
@@ -1330,6 +1353,7 @@ int main(int argc, char* argv[]) {
           << VAR(config.peerPowInboundReciprocationBps)
           << VAR(config.rpcPort)
           << VAR(config.cesFileStoreMaxBytes)
+          << VAR(config.computePayoutFactorBp)
           << VAR(optNoPowEngine);
   for (auto& p : optPeers) {
     auto at = p.find('@');

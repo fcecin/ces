@@ -1295,12 +1295,55 @@ struct CesQueryServerInfo {
   CES_INJECT_SIGNED_METHODS(CES_QUERY_SERVER_INFO)
 };
 
+// --- CES_QUERY_BUILTIN_INFO (Signed, self-describing KV response) ---
+// `name` names one builtin, as in the mount target "builtin:<name>".
+struct CesQueryBuiltinInfo {
+  Hash originId;
+  HashPrefix serverId{};
+  uint32_t reqNonce;
+  std::string name;
+  Signature sig{};
+
+  size_t getPayloadSize() const {
+    return sizeof(originId) + sizeof(serverId) + sizeof(reqNonce) + 1 + name.size();
+  }
+
+  void writePayload(minx::Buffer& buf) {
+    if (name.size() > 255)
+      throw std::runtime_error("builtin name too long");
+    buf.put(originId);
+    buf.put(serverId);
+    buf.put(reqNonce);
+    buf.put(static_cast<uint8_t>(name.size()));
+    buf.putBytes(std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(name.data()), name.size()));
+  }
+
+  void readPayload(minx::ConstBuffer& buf) {
+    originId = buf.get<Hash>();
+    serverId = buf.get<HashPrefix>();
+    reqNonce = buf.get<uint32_t>();
+    uint8_t len = buf.get<uint8_t>();
+    name = buf.getBytes<std::string>(len);
+  }
+  CES_INJECT_SIGNED_METHODS(CES_QUERY_BUILTIN_INFO)
+};
+
 struct ServerInfoEntry {
   std::string key;
   std::string value;
 };
 
-struct CesQueryServerInfoResult {
+// The most bytes of a server-info or builtin-info reply (opcode, payload and
+// signature), so that it fits one datagram that is never fragmented: the UDP
+// payload of the minimum IPv6 MTU (1232) minus the MINX message header (type,
+// version and the two passwords, 18 bytes).
+inline constexpr size_t kMaxInfoReplyBytes = 1232 - 18;
+
+// A signed result that carries key-value entries. The server-info and the
+// builtin-info replies have this shape.
+template <uint8_t OpCode>
+struct CesKvInfoResult {
   HashPrefix originId;
   uint32_t reqNonce;
   uint8_t rcode;
@@ -1342,7 +1385,7 @@ struct CesQueryServerInfoResult {
     if (rcode == CES_OK) {
       size_t avail = buf.getRemainingBytesCount();
       if (avail < sizeof(Signature))
-        throw std::runtime_error("truncated server-info result");
+        throw std::runtime_error("truncated info result");
       auto mapData = buf.getBytes<std::vector<char>>(avail - sizeof(Signature));
       std::map<std::string, std::string> m;
       logkv::serializer<std::map<std::string, std::string>>::read(
@@ -1351,7 +1394,10 @@ struct CesQueryServerInfoResult {
         entries.push_back({k, v});
     }
   }
-  CES_INJECT_SIGNED_METHODS(CES_QUERY_SERVER_INFO_RESULT)
+  CES_INJECT_SIGNED_METHODS(OpCode)
 };
+
+using CesQueryServerInfoResult = CesKvInfoResult<CES_QUERY_SERVER_INFO_RESULT>;
+using CesQueryBuiltinInfoResult = CesKvInfoResult<CES_QUERY_BUILTIN_INFO_RESULT>;
 
 } // namespace ces

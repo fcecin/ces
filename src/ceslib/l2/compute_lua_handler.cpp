@@ -225,6 +225,13 @@ void LuaHandler::readAttachVerb(std::shared_ptr<LuaConnCtx> ctx) {
                     sendAttachReply(ctx, CES_ERROR_NOT_LISTENING, sigHash);
                     return;
                   }
+                  // The visitor pays for the channel. One with no credit on
+                  // this server could not pay a bill, so it cannot ATTACH.
+                  if (server_->_l2ProgramAccountBalanceSync(
+                        ctx->bound.boundPubkey.getHash()) <= 0) {
+                    sendAttachReply(ctx, CES_ERROR_INSUFFICIENT_BALANCE, sigHash);
+                    return;
+                  }
                   std::array<uint8_t, 32> userPk{};
                   std::memcpy(userPk.data(),
                               ctx->bound.boundPubkey.getHash().data(), 32);
@@ -238,6 +245,12 @@ void LuaHandler::readAttachVerb(std::shared_ptr<LuaConnCtx> ctx) {
                   ctx->connId = connId;
                   ctx->attached = true;
                   conns_.emplace(ConnKey{pid, connId}, ctx);
+                  // The channel feeds the program from now on, so its
+                  // reports pay the program its compute payout.
+                  HashPrefix payee = ch->instancePayee(pid);
+                  if (payee != HashPrefix{})
+                    server_->_l2SetChannelPayee(
+                      ctx->bound.peer, ctx->bound.channelId, payee);
                   LOGDEBUG << "builtin:lua attached"
                            << VAR(pid) << VAR(connId);
                   sendAttachReply(ctx, CES_OK, sigHash,

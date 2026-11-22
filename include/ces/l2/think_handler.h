@@ -175,6 +175,10 @@ class ThinkHandler : public CesPlexHandler {
   void serve(std::shared_ptr<minx::RudpStream> stream,
              BoundChannelContext bound) override;
 
+  // CES_QUERY_BUILTIN_INFO: the model and its token fees.
+  void cesplexInfo(
+      std::vector<std::pair<std::string, std::string>>& out) override;
+
   // Stop new calls, stop the calls in flight, and join their threads.
   void stop();
 

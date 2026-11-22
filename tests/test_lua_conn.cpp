@@ -8,6 +8,10 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_lua_conn_common.h"
+#include <ces/account.h>
+#include <ces/cesplex/meter.h>
+
+#include <cstring>
 
 BOOST_FIXTURE_TEST_SUITE(LuaConnTests, LuaConnFixture)
 
@@ -549,6 +553,185 @@ BOOST_AUTO_TEST_CASE(SetListenerNilFlipsGateOff) {
   BOOST_REQUIRE(peerWrite(p1, {'!', '!'}));
   ces::Bytes g3;
   BOOST_CHECK(!peerReadExact(p1, g3, 2, std::chrono::seconds(1)));
+}
+
+// The compute payout at a factor of 2, and no supervisor tick in the test, so
+// no compute fee moves the program account while the test reads it. Each
+// instance gets an rpc port, for direct /ces/luarpc/1 dials.
+struct PayoutLuaConnFixture : LuaConnFixture {
+  PayoutLuaConnFixture() : LuaConnFixture([](CesConfig& c) {
+    c.computePayoutFactorBp = 20000;
+    c.computeTickIntervalMs = 3'600'000;
+    c.computePortBase = findFreeUdpPortRange(8);
+    c.computePortCount = 8;
+  }) {}
+};
+
+static const char* const kEcho =
+  "ces.conn.set_listener({ on_data = function(conn, d) conn:write(d) end })\n"
+  "ces.conn.run()\n";
+
+// A visit is one short channel: bind, ATTACH, a request and its reply, then
+// a close, with no meter tick between. The meter bills it at the close. The
+// ATTACH names the program as the channel's payee, so the visitor pays twice
+// the price and the program gets the price once.
+BOOST_FIXTURE_TEST_CASE(AVisitPaysAtTheCloseAndPaysTheProgram, PayoutLuaConnFixture) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/visit.lua";
+  uploadScript(path, kEcho);
+  const uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
+  std::array<uint8_t, 32> pk{};
+  BOOST_REQUIRE(server->fileHandler()->readProgramPubkey(path, pk));
+  minx::Hash programKey;
+  std::copy(pk.begin(), pk.end(), programKey.begin());
+
+  KeyPair visitor;
+  const auto visitorKey = visitor.getPublicKeyAsHash();
+  const HashPrefix visitorPfx = Account::getMapKey(visitorKey);
+  server->_brr(visitorKey, 10'000'000);
+  server->_drainLogic();
+
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t token = 0;
+  BOOST_REQUIRE(peer.bind(rpcPort, visitor, token));
+  auto r = peer.attach(visitor, token, instId);
+  CES_REQUIRE_RC_EQ(r.status, CES_OK);
+  BOOST_REQUIRE(peerWrite(peer, ces::Bytes(4096, 'x')));
+  ces::Bytes got;
+  BOOST_REQUIRE(peerReadExact(peer, got, 4096, std::chrono::seconds(10)));
+
+  // The visitor's channel names the program as its payee.
+  auto visitorRows = [&] {
+    std::vector<ChannelMeter::ChannelSnapshot> out;
+    for (auto& row : server->_channelMeter()->snapshot())
+      if (row.payerPfx == visitorPfx) out.push_back(row);
+    return out;
+  };
+  auto rows = visitorRows();
+  BOOST_REQUIRE_EQUAL(rows.size(), 1u);
+  BOOST_CHECK(rows[0].payeePfx == Account::getMapKey(programKey));
+
+  server->_drainLogic();
+  const int64_t visitorBefore = server->_balanceOf(visitorKey);
+  const int64_t programBefore = server->_balanceOf(programKey);
+  peer.closeStream();
+  // Between ticks only the close makes the meter forget the channel, and it
+  // posts the debit to the logic strand before that.
+  BOOST_REQUIRE(waitUntil([&] { return visitorRows().empty(); }));
+  server->_drainLogic();
+  const int64_t paid = visitorBefore - server->_balanceOf(visitorKey);
+  const int64_t payout = server->_balanceOf(programKey) - programBefore;
+  BOOST_CHECK_GT(paid, 0);
+  BOOST_CHECK_EQUAL(payout * 2, paid);
+}
+
+// A direct /ces/luarpc/1 dial into a program bills its caller when it closes,
+// from the program's own endpoint meter (whose tick is 60 s away, past the
+// wait). It pays the program nothing: a bind does not name its server, so a
+// dialed party could replay one.
+BOOST_FIXTURE_TEST_CASE(ADirectDialPaysAtTheCloseWithNoPayout, PayoutLuaConnFixture) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/direct.lua";
+  uploadScript(path, kEcho);
+  const uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
+  const uint16_t childPort = server->computeHandler()->testInstanceRpcPort(instId);
+  BOOST_REQUIRE(childPort != 0);
+  std::array<uint8_t, 32> pk{};
+  BOOST_REQUIRE(server->fileHandler()->readProgramPubkey(path, pk));
+  minx::Hash programKey;
+  std::copy(pk.begin(), pk.end(), programKey.begin());
+
+  KeyPair caller;
+  const auto callerKey = caller.getPublicKeyAsHash();
+  server->_brr(callerKey, 10'000'000);
+  server->_drainLogic();
+  const int64_t callerBefore = server->_balanceOf(callerKey);
+  const int64_t programBefore = server->_balanceOf(programKey);
+
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t token = 0;
+  BOOST_REQUIRE(peer.bind(childPort, caller, token, std::chrono::seconds(3), "/ces/luarpc/1"));
+  BOOST_REQUIRE(peerWrite(peer, ces::Bytes(4096, 'x')));
+  ces::Bytes got;
+  BOOST_REQUIRE(peerReadExact(peer, got, 4096, std::chrono::seconds(10)));
+  peer.closeStream();
+  // The bill and any payout land in one logic task, so once the caller paid,
+  // the program's balance is final.
+  BOOST_REQUIRE(waitUntil([&] {
+    server->_drainLogic();
+    return server->_balanceOf(callerKey) < callerBefore;
+  }, std::chrono::seconds(30)));
+  server->_drainLogic();
+  BOOST_CHECK_EQUAL(server->_balanceOf(programKey), programBefore);
+}
+
+// A visitor with no credit on the server cannot ATTACH: it could not pay for
+// the channel.
+BOOST_FIXTURE_TEST_CASE(AVisitorWithNoCreditCannotAttach, LuaConnFixture) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/free.lua";
+  uploadScript(path, kEcho);
+  const uint64_t instId = launchScript(path);
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
+
+  KeyPair nobody;
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t token = 0;
+  BOOST_REQUIRE(peer.bind(rpcPort, nobody, token));
+  auto r = peer.attach(nobody, token, instId);
+  CES_CHECK_RC_EQ(r.status, CES_ERROR_INSUFFICIENT_BALANCE);
+}
+
+// A program in the server zone (/s/) gets no payout: a visitor's channel into
+// it names no payee.
+BOOST_FIXTURE_TEST_CASE(AServerZoneProgramGetsNoPayee, PayoutLuaConnFixture) {
+  const KeyPair& serverKey = server->_serverKeyPair();
+  const std::string path = "/s/visit.lua";
+  {
+    CesFileClient fc;
+    fc.setServerPubkey(serverKey.getPublicKeyAsHash());
+    CES_REQUIRE_OK(fc.connect("localhost", rpcPort, serverKey));
+    uint64_t bal = 0, cost = 0;
+    CES_REQUIRE_OK(fc.create(path, std::strlen(kEcho), 0, 0, bal, cost));
+    ces::Bytes content(kEcho, kEcho + std::strlen(kEcho));
+    CES_REQUIRE_OK(fc.write(path, 0, content, bal));
+    fc.disconnect();
+  }
+  uint64_t instId = 0;
+  {
+    CesComputeClient cc;
+    cc.setServerPubkey(serverKey.getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", rpcPort, serverKey));
+    uint64_t started = 0;
+    CES_REQUIRE_OK(cc.launch(path, instId, started));
+    cc.disconnect();
+  }
+  BOOST_REQUIRE(waitInstanceListening(*server, instId));
+
+  KeyPair visitor;
+  const HashPrefix visitorPfx = Account::getMapKey(visitor.getPublicKeyAsHash());
+  server->_brr(visitor.getPublicKeyAsHash(), 10'000'000);
+  server->_drainLogic();
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  uint64_t token = 0;
+  BOOST_REQUIRE(peer.bind(rpcPort, visitor, token));
+  auto r = peer.attach(visitor, token, instId);
+  CES_REQUIRE_RC_EQ(r.status, CES_OK);
+  BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
+  ces::Bytes got;
+  BOOST_REQUIRE(peerReadExact(peer, got, 1, std::chrono::seconds(10)));
+
+  bool seen = false;
+  for (auto& row : server->_channelMeter()->snapshot()) {
+    if (row.payerPfx != visitorPfx) continue;
+    seen = true;
+    BOOST_CHECK(row.payeePfx == HashPrefix{});
+  }
+  BOOST_CHECK(seen);
+  peer.closeStream();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

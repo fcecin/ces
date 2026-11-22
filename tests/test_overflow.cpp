@@ -375,12 +375,12 @@ BOOST_FIXTURE_TEST_CASE(NetworkBillBeyondInt64NeverMints, OverflowFixture) {
   const int64_t before = bal(k);
   const int64_t circBefore = circ();
 
-  server->debitNetworkBill(Account::getMapKey(k), std::numeric_limits<uint64_t>::max());
+  server->debitNetworkBill(Account::getMapKey(k), HashPrefix{}, std::numeric_limits<uint64_t>::max());
   server->_drainLogic();
   BOOST_TEST(bal(k) == before);
   BOOST_TEST(circ() == circBefore);
 
-  server->debitNetworkBill(Account::getMapKey(k), (uint64_t(1) << 63) + 5);
+  server->debitNetworkBill(Account::getMapKey(k), HashPrefix{}, (uint64_t(1) << 63) + 5);
   server->_drainLogic();
   BOOST_TEST(bal(k) == before);
   BOOST_TEST(circ() == circBefore);

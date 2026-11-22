@@ -1445,10 +1445,15 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     if (amount == 0) return;
     ces::HashPrefix self{};
     std::memcpy(self.data(), inst->programPubkey.data(), self.size());
+    // Inbound: the caller pays the network price only, with no compute
+    // payout. A CesPlex bind does not name the server that it is for, and a
+    // direct /ces/luarpc/1 channel has no other proof of its caller, so a bind
+    // that a dialed party saw could be replayed to pay that party. An ATTACH
+    // over /ces/lua/1 signs its own channel, and it gets the payout there.
     if (payer == self)
       fhDebitBalance(inst->owner->server_, inst->sourceName, amount);  // outbound: instance pays
     else
-      server->debitNetworkBill(payer, amount);            // inbound: caller pays
+      server->debitNetworkBill(payer, ces::HashPrefix{}, amount);    // inbound: caller pays
     return;
   }
   if (tag == kIpcTagExtManifest) {
@@ -4018,6 +4023,31 @@ std::vector<uint8_t> ComputeHandler::instanceHello(uint64_t pid) {
   auto it = instances_.find(pid);
   if (it == instances_.end()) return {};
   return it->second->hello;
+}
+
+HashPrefix ComputeHandler::instancePayee(uint64_t pid) {
+  HashPrefix out{};
+  auto it = instances_.find(pid);
+  if (it == instances_.end() || isServerZone(it->second->sourceName)) return out;
+  std::memcpy(out.data(), it->second->programPubkey.data(), out.size());
+  return out;
+}
+
+void ComputeHandler::cesplexInfo(
+    std::vector<std::pair<std::string, std::string>>& out) {
+  // The rates that the supervisor tick charges now (see the tick's
+  // "Discounted rates for this tick").
+  const CesConfig& c = server_->_config();
+  auto rate = [](int64_t v) { return static_cast<uint64_t>(v > 0 ? v : 0); };
+  out.emplace_back("feeComputeSlotSec", std::to_string(
+    server_->discountFee(FeeKind::ComputeSlot, slotFeePerSec(c))));
+  out.emplace_back("feeComputeCpuSec", std::to_string(
+    server_->discountFee(FeeKind::ComputeCpu, rate(c.feeComputeCpuSec))));
+  out.emplace_back("feeComputeRssByteDay", std::to_string(
+    server_->discountFee(FeeKind::ComputeRss, rate(c.feeComputeRssByteDay))));
+  out.emplace_back("feeBucketByteSec", std::to_string(
+    server_->discountFee(FeeKind::BucketByteSec, rate(c.feeBucketByteSec))));
+  out.emplace_back("computePayoutFactor", basisPointsText(c.computePayoutFactorBp));
 }
 
 uint64_t ComputeHandler::openConnection(uint64_t pid,

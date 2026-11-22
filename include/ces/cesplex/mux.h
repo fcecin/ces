@@ -51,6 +51,7 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace ces {
 class ChannelMeter;
@@ -70,6 +71,7 @@ struct CesPlexUsage {
   uint64_t bytesReceived = 0;    // wire bytes received this tick
   uint64_t memByteSeconds = 0;   // RUDP buffer residency this tick (byte·s)
   uint64_t ageSeconds = 0;       // wall seconds the channel lived this tick
+  bool final = false;            // the channel ended: this is its last report
 };
 
 // -----------------------------------------------------------------------
@@ -93,11 +95,15 @@ struct CesPlexHost {
   // meter reports at each tick, and once more when the channel closes. The
   // host does ALL the accounting: it prices the usage in its own units,
   // charges `payer`, and — if the payer can't cover it — closes (peer,
-  // channelId). It runs on the Rudp's thread and must not call into the Rudp
-  // there (a close goes through a post). Fire-and-forget from CesPlex's
-  // side: CesPlex never learns the cost and never closes a channel for
-  // non-payment.
+  // channelId). A final report (usage.final) closes nothing: the channel is
+  // gone, and its id can already name a new channel. `payee` is the account
+  // of the program that the channel feeds (ChannelMeter::setPayee), or zero.
+  // It runs on the Rudp's thread, and a final report runs inside the Rudp's
+  // close, so it must not call into the Rudp (a close goes through a post).
+  // Fire-and-forget from CesPlex's side: CesPlex never learns the cost and
+  // never closes a channel for non-payment.
   virtual void cesplexReportUsage(const HashPrefix& payer,
+                                  const HashPrefix& payee,
                                   const minx::SockAddr& peer,
                                   uint32_t channelId,
                                   const CesPlexUsage& usage) = 0;
@@ -214,6 +220,14 @@ public:
   virtual uint8_t cesplexL2Call(const L2CallRequest& /*req*/,
                                 L2CallReport /*report*/)
   { return CES_ERROR_UNSUPPORTED; }
+
+  // CES_QUERY_BUILTIN_INFO: add this builtin's own public facts, such as the
+  // prices that it charges now, as (key, value) entries. The host adds the
+  // facts of the bus (the mounts and the network rates). It runs on the logic
+  // strand. The reply is one datagram, so keep it to a few short entries.
+  // The default adds none.
+  virtual void cesplexInfo(
+      std::vector<std::pair<std::string, std::string>>& /*out*/) {}
 };
 
 // -----------------------------------------------------------------------
