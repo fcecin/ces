@@ -122,6 +122,7 @@ function buildConfig(node, i) {
     `server_name = "127.0.0.1:${node.main}"`,
     `min_difficulty = 1`,
     `pow_delay = 0`,
+    `nonceless_delay = 0`,     // a test network restarts often: no restart cutoff
     `no_pow_engine = false`,   // engine ON (diff=1, cache-only) so main-port probes/tickets work;
     `cache_only_pow = true`,   // peer_target=0 + pre-funded => nothing actually mints
     `threads = 1`,

@@ -1082,6 +1082,21 @@ CesServer::CesServer(const CesConfig& config)
       keyNames_((config.dataDir / KEYNAMES_DATA_SUBDIRECTORY).string(),
                 config.minKeyName, config.flushValue),
       presence_(config.presenceCacheSize) {
+  // The record of the CES_NONCELESS signatures that the server saw is in
+  // memory, so a restart loses it. An earlier run of this ledger took
+  // timestamps up to one future drift after the moment that it stopped. So a
+  // ledger with an earlier run refuses each CES_NONCELESS timestamp before the
+  // boot plus nonceless_delay (by default two future drifts), and a copy of a
+  // request that the earlier run applied cannot apply again. This holds if the
+  // clock at boot is not more than one drift behind the clock of the earlier
+  // run. A ledger with no earlier run applied nothing, and has no cutoff.
+  if (cfg_.noncelessDelaySecs > 0 && !accounts_->getObjects().empty()) {
+    noncelessCutoffUs_.store(getMicrosSinceEpoch() +
+                             cfg_.noncelessDelaySecs * 1000000);
+    LOGINFO << "nonceless requests stamped before the restart cutoff are "
+               "refused" << VAR(cfg_.noncelessDelaySecs);
+  }
+
   // Default every fee multiplier to full price (10000 bp). The metrics
   // pulse overwrites these once a tick from the gauge each kind is
   // mapped to — but only when feeDiscountEnabled is true.
@@ -1991,7 +2006,10 @@ CesServer::NoncelessResult CesServer::resolveNonceless(
   if (reqNonce != CES_NONCELESS)
     return NoncelessResult::Proceed;
   uint64_t now = getMicrosSinceEpoch();
-  if (time > now + DEDUP_FUTURE_DRIFT_US || time + DEDUP_WINDOW_US < now)
+  // A timestamp before the restart cutoff can be the copy of a request that
+  // an earlier run applied (see noncelessCutoffUs_).
+  if (time > now + DEDUP_FUTURE_DRIFT_US || time + DEDUP_WINDOW_US < now ||
+      time < noncelessCutoffUs_.load())
     return NoncelessResult::Stale;
   uint64_t sigHash;
   std::memcpy(&sigHash, sig.data(), sizeof(sigHash));
@@ -2600,16 +2618,20 @@ uint8_t CesServer::crossTransfer(const minx::Hash& originKey,
                   destKey, amount);
 
   // 5. Dispatch remote transfer (settlementClient is non-null here). The
-  // callback fires only on a TERMINAL failure: settlement retries until the
-  // peer confirms, so a non-OK rc means we ultimately gave up (peer stayed
-  // unreachable past the dedup window). That should not happen in a healthy
-  // mesh — if it does, it is probably a peering bug — so log every detail at
-  // INFO. The local debit + vostro credit already stand.
+  // callback fires when the settlement ends; it logs only a failure: the peer
+  // refused the settlement, it did not confirm it within the dedup window, or
+  // this server stopped with the settlement pending. After a
+  // restart, a peer refuses each settlement stamped before its restart cutoff
+  // (nonceless_delay), so a give-up is expected for the settlements of the
+  // first minutes after a peer restart. If the peer applied the settlement
+  // before it restarted and the reply was lost, the settlement stands and the
+  // give-up is not true. Log every detail at INFO. The local debit + vostro
+  // credit already stand: on a give-up, the amount stays in the vostro.
   settlementClient->openTransfer(destKey, amount,
     [originKey, destKey, peerKey, destServer, amount](uint8_t rc) {
       if (rc != CES_OK) {
-        LOGINFO << "cross-transfer settlement GAVE UP "
-                   "(peer never confirmed; likely a peering bug)"
+        LOGINFO << "cross-transfer settlement GAVE UP (the peer refused it "
+                   "or did not confirm it; expected after a peer restart)"
                 << VAR(rc) << SVAR(destServer) << VAR(amount)
                 << BVAR(originKey) << BVAR(destKey) << BVAR(peerKey);
       }
@@ -4426,14 +4448,15 @@ CesServer::VmRunResult CesServer::executeVmRun(const VmRunRequest& req) {
       auto* client = getOrCreateSettlementClient(cx.server, cx.peerKey);
       if (client) {
         // Terminal-failure callback (see crossTransfer): a non-OK rc means
-        // settlement gave up after retries — should not happen; log it all
-        // at INFO so a peering bug is debuggable.
+        // the peer refused the settlement or did not confirm it. That is
+        // expected after a peer restart; log it all at INFO.
         client->openTransfer(cx.dest, cx.amount,
           [server = cx.server, peerKey = cx.peerKey,
            dest = cx.dest, amount = cx.amount](uint8_t rc) {
             if (rc != CES_OK) {
-              LOGINFO << "VM cross-transfer settlement GAVE UP "
-                         "(peer never confirmed; likely a peering bug)"
+              LOGINFO << "VM cross-transfer settlement GAVE UP (the peer "
+                         "refused it or did not confirm it; expected after a "
+                         "peer restart)"
                       << VAR(rc) << SVAR(server) << VAR(amount)
                       << BVAR(dest) << BVAR(peerKey);
             }
@@ -6366,23 +6389,19 @@ void CesServer::_save() {
   assets_->save(logkv::StoreSaveMode::syncSave);
 }
 
+// An entry stays for at least one rotation period. A request can be stamped up
+// to the future drift ahead, and it is good until one window after its stamp.
+// So the period is the window plus the future drift: a copy cannot arrive
+// after its entry is gone. A clock that steps back does not rotate, so the
+// entries stay longer.
 void CesServer::rotateDedupLocked(uint64_t epochNow) {
   if (dedupBaseTime_ == 0) dedupBaseTime_ = epochNow;
-  if (epochNow - dedupBaseTime_ >= DEDUP_WINDOW_US) {
+  if (epochNow >= dedupBaseTime_ &&
+      epochNow - dedupBaseTime_ >= DEDUP_WINDOW_US + DEDUP_FUTURE_DRIFT_US) {
     dedupOlder_ = std::move(dedupCurrent_);
     dedupCurrent_.clear();
     dedupBaseTime_ = epochNow;
   }
-}
-
-bool CesServer::checkAndInsertDedup(uint64_t sigHash, uint64_t epochNow) {
-  if (epochNow == 0) epochNow = getMicrosSinceEpoch();
-  std::lock_guard lock(dedupMutex_);
-  rotateDedupLocked(epochNow);
-  if (dedupOlder_.count(sigHash) || dedupCurrent_.count(sigHash))
-    return false; // duplicate
-  dedupCurrent_.insert(sigHash);
-  return true; // new
 }
 
 bool CesServer::isDuplicateDedup(uint64_t sigHash, uint64_t epochNow) {
@@ -7428,6 +7447,7 @@ std::string CesServer::_exportConfig(std::string* errReason) {
       o << "server_name = \"" << cfg_.serverName << "\"\n";
     o << "min_difficulty = " << static_cast<int>(cfg_.minDiff) << "\n";
     o << "spend_slot_size = " << cfg_.spendSlotSize << "\n";
+    o << "nonceless_delay = " << cfg_.noncelessDelaySecs << "\n";
     o << "threads = " << cfg_.taskThreads << "\n";
     o << "min_accounts = " << cfg_.minAcc << "\n";
     o << "max_accounts = " << cfg_.maxAcc << "\n";

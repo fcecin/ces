@@ -213,6 +213,9 @@ static constexpr uint32_t CES_NONCELESS = UINT32_MAX;
 /// to it: a retry past this window can no longer be accepted by the receiver.
 static constexpr uint64_t CES_NONCELESS_DEDUP_WINDOW_US = 3600ULL * 1000000;
 
+/// How far ahead of the receiver's clock a CES_NONCELESS timestamp may be.
+static constexpr uint64_t CES_NONCELESS_FUTURE_DRIFT_US = 300ULL * 1000000;
+
 /// A client gets a new MINX ticket (handshake) before it sends with a ticket
 /// older than this. A MINX server keeps an issued ticket for at least 60 s.
 static constexpr uint64_t CES_SERVER_TICKET_REFRESH_SECS = 15;

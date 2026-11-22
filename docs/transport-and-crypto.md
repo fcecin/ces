@@ -107,7 +107,7 @@ Accounts, transfers, assets and queries use MINX `MESSAGE` datagrams on the main
 **Signed requests.** The client signs each request with its account key. The signed bytes include:
 - `serverId`, the first 8 bytes of the server key. The server drops a request for another `serverId`, so a copy fails at each other server.
 - `reqNonce`, the next nonce of the account. A copy fails at the same server, because the nonce moved on.
-- Or `CES_NONCELESS` with a time. The server accepts a time up to 1 hour old and 5 minutes ahead. It keeps the first 8 bytes of each accepted signature, in memory, for one to two hours. A second copy gets `CES_OK`, and the server does not do it again. A restart clears them. Only some operations accept this form.
+- Or `CES_NONCELESS` with a time. The server accepts a time up to 1 hour old and 5 minutes ahead. It keeps the first 8 bytes of each accepted signature in memory, for at least 65 minutes, the longest time that a copy is good. A second copy gets `CES_OK`, and the server does not do it again. A restart clears this record. So a server whose ledger has an earlier run refuses each time before its boot plus `nonceless_delay`, 10 minutes by default: the earlier run took times up to 5 minutes after it stopped. This holds if the clock at boot is not more than 5 minutes behind the clock of the earlier run. A request stamped before the cutoff fails for good, and the sender does not sign a settlement again. The amount of that settlement stays in the vostro, the account of the receiving server at the sending server. Test networks set `nonceless_delay = 0`. Only some operations accept this form.
 
 The server looks up the account by the first 8 bytes of the key, then checks the full key, so two keys with the same prefix are not mixed. The server's own bills (network use, a program's compute fees, burns) do not move the account nonce, so a signed request that runs at the same time keeps its nonce. The server signs its replies to signed requests with its key.
 
@@ -117,7 +117,7 @@ The server looks up the account by the first 8 bytes of the key, then checks the
 
 **Application datagrams.** A client can send an unsigned datagram to a program on the main port (`CES_APP_COMPUTE_MSG`). It needs no ticket. The server tells the program a sender: the key whose presence is at that address and port. A program can send an unsigned datagram to the presence address of a key (`ces.client_send`), and the client accepts it by its source address only. So this sender is a claim about an address only, and a program must not give a right to it.
 
-**Gossip.** Servers pass `CES_GOSSIP` messages along. Each hop signs again, so a message proves its last sender only, and its author field has no signature. A message id in a bounded cache stops repeats.
+**Gossip.** Servers pass `CES_GOSSIP` messages along. Each hop signs again, so a message proves its last sender only, and its author field has no signature. A message id in a bounded cache stops repeats. Gossip uses `CES_NONCELESS`, but it checks no time, so the cutoff after a restart does not cover it (section 13).
 
 **Autoexec.** A server can keep a signed `CES_RUN_ASSET` request and run it at each boot, with no nonce and no time check. This is a deliberate exception to rule 3.
 
@@ -162,7 +162,7 @@ The bind reply covers the status, `client_sha256`, the server time, the server k
 
 **Per-op signatures.** After the bind, each file, compute, think and mail verb is `[u8 verb][u32 len][preamble][65 sig]`. The signature covers `SHA-256(verb || preamble || client_sha256)`, with the `client_sha256` of the bind of the channel. That digest covers the protocol name, the client time, the client key, the server key and the challenge. The preamble starts with an 8-byte per-op salt, so two equal operations sign differently, and then an account nonce, or `CES_NONCELESS`. The C++ clients send `CES_NONCELESS` in each verb, and a verb carries no time.
 
-A copy of a verb fails on each other channel and at each other server, because the bind digest differs. This is also true when a dishonest server gives its channel the challenge of a channel at another server: the server keys differ, so the bind digests differ. On the same channel, a copy with an account nonce fails if the operation has a fee. A copy with `CES_NONCELESS` gets `CES_OK` for one to two hours: the server does not do a change again, but it does a read again, with no fee. After that time, the copy is a new operation. `LAUNCH` and `CALL` of `/ces/compute/1` use no nonce, so a copy of them on the same channel is a new, paid operation.
+A copy of a verb fails on each other channel and at each other server, because the bind digest differs. This is also true when a dishonest server gives its channel the challenge of a channel at another server: the server keys differ, so the bind digests differ. On the same channel, a copy with an account nonce fails if the operation has a fee. A copy with `CES_NONCELESS` gets `CES_OK` for 65 to 130 minutes: the server does not do a change again, but it does a read again, with no fee. After that time, the copy is a new operation. `LAUNCH` and `CALL` of `/ces/compute/1` use no nonce, so a copy of them on the same channel is a new, paid operation.
 
 A client with no expected key signs for the server key in the hello. A server that such a client dials can send the hello of another server and relay the bind there. Then it can relay the per-op verbs too. That is the cost of rule 5, as for the bind.
 
@@ -273,7 +273,7 @@ These effects reach past one channel:
 
 | Principle | What it asks | Where CES applies it |
 | --- | --- | --- |
-| Freshness | A signature is good one time: the verifier gives a challenge, or keeps the messages that it saw | The CesPlex challenge; the account nonce; the deduplication of `CES_NONCELESS` (in memory only) |
+| Freshness | A signature is good one time: the verifier gives a challenge, or keeps the messages that it saw | The CesPlex challenge; the account nonce; the deduplication of `CES_NONCELESS` (in memory, with a cutoff after a restart); gossip has only a cache of message ids |
 | Name the receiver | A signed message names its receiver, so another receiver refuses it | `serverId` in each signed request; the server key in each bind, and so in each per-op verb, which signs the bind digest (section 6) |
 | Channel binding | An authentication belongs to one channel | The CesPlex challenge: a value that the server makes for one channel, and that the client signs. With no key agreement, a party in the middle can still pass a bind on. It can pass it to the same server for each client, and to another server when the client expects no key. |
 | Intended identity | The signer signs the identity that it meant, from a key that it already holds, not one that the other side announced | Each client with an expected key. A client with no expected key accepts this risk (rule 5). |
@@ -289,16 +289,16 @@ These effects reach past one channel:
 - A packet with a wrong token bans the address block that it claims, on the rpc port (section 11).
 - A ban ends only when later bans rotate the table, so on a quiet port it does not end (section 3).
 - Forged first contacts can fill the spam budget of an address block (section 11).
-- The deduplication of `CES_NONCELESS` is in memory. After a restart, a copy of a nonceless request less than one hour old is accepted again. A request dated up to 5 minutes ahead can also outlive the window by that much.
 - The spent proofs of work are in memory, and the default `pow_delay` is 0, so a spent solution is good again after a restart.
 - The server writes the presence of a key before it checks the nonce of the request (section 5).
 - `CesPlexChannel` logs a response that fails its signature check, and goes on (section 6).
 - MinxProxy takes an `INFO` from any source as the reply of its server, and caches its key before it checks the ticket.
 - Gossip has no `serverId` check on its path, and its author field has no signature (section 5).
+- Gossip checks no time. After a restart, or after the cache drops the message id, a copy of a signed hop debits its sender again (section 5).
 - Autoexec runs a stored signed request at each boot, with no nonce and no time check (section 5).
 - `HDATA` is not compared with the data of a `PROVE_WORK`, so a party on the path can change a peer advertisement (section 3).
 - Forged opens can fill the memory of a server: each one keeps a channel and a CesPlex session until the idle time ends (section 4).
-- A copy of a `CES_NONCELESS` read runs again with no fee, for one to two hours (section 6).
+- A copy of a `CES_NONCELESS` read runs again with no fee, for 65 to 130 minutes (section 6).
 - The table from address to key of the presence has no size limit (section 5).
 - `cesh dial` and the fc bridge do not check the signature of the `ATTACH` response (section 6).
 - A direct channel between two instances of one program bills the file balance of the program in place of its account, because the report tells the direction by `payer == self`.

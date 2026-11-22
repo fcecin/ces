@@ -113,6 +113,49 @@ BOOST_AUTO_TEST_CASE(NoncelessSucceededOpNotReapplied) {
   BOOST_CHECK_EQUAL(destBal, static_cast<int64_t>(5000 + amount));
 }
 
+// Bug 0010. The server keeps the signature of a CES_NONCELESS request for as
+// long as a copy of the request can arrive. A request can be stamped up to the
+// future drift ahead, and it is good until one window after its stamp. The test
+// records one request each minute for three windows, each stamped the future
+// drift ahead, and each minute it checks every request that is still good.
+BOOST_AUTO_TEST_CASE(NoncelessRecordLastsAsLongAsItsRequest) {
+  constexpr uint64_t W = CES_NONCELESS_DEDUP_WINDOW_US;
+  constexpr uint64_t D = CES_NONCELESS_FUTURE_DRIFT_US;
+  constexpr uint64_t MINUTE = 60'000'000;
+  const uint64_t t0 = ces::getMicrosSinceEpoch();
+  std::vector<std::pair<uint64_t, uint64_t>> recorded;  // (sigHash, stamp)
+  for (uint64_t now = t0; now <= t0 + 3 * W; now += MINUTE) {
+    for (const auto& [h, stamp] : recorded) {
+      if (now <= stamp + W) {
+        BOOST_REQUIRE_MESSAGE(server->_dedupSeen(h, now),
+          "a request recorded at minute " << (stamp - D - t0) / MINUTE
+          << " is forgotten at minute " << (now - t0) / MINUTE
+          << ", and it is good until minute " << (stamp + W - t0) / MINUTE);
+      }
+    }
+    const uint64_t h = 0x5eed0000ull + recorded.size();
+    server->_dedupRecord(h, now);
+    recorded.push_back({h, now + D});
+  }
+  // Long after a request expired, its record is gone.
+  BOOST_CHECK(!server->_dedupSeen(recorded.front().first, t0 + 6 * W));
+}
+
+// A clock that steps back does not rotate the record of the CES_NONCELESS
+// signatures, so it does not drop an entry early.
+BOOST_AUTO_TEST_CASE(NoncelessRecordSurvivesAClockStepBack) {
+  constexpr uint64_t W = CES_NONCELESS_DEDUP_WINDOW_US;
+  constexpr uint64_t D = CES_NONCELESS_FUTURE_DRIFT_US;
+  constexpr uint64_t MINUTE = 60'000'000;
+  const uint64_t t0 = ces::getMicrosSinceEpoch();
+  const uint64_t h = 0x5eedbac0ull;
+  server->_dedupRecord(h, t0);
+  // One rotation period later the entry moves to the older generation.
+  BOOST_REQUIRE(server->_dedupSeen(h, t0 + W + D));
+  // The clock steps back one minute. The entry must stay.
+  BOOST_CHECK(server->_dedupSeen(h, t0 + W + D - MINUTE));
+}
+
 BOOST_AUTO_TEST_CASE(Test01_BalanceQuery) {
   LOGINFO << "TEST: Starting BalanceQuery";
   int64_t bal = 0;

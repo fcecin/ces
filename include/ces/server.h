@@ -106,6 +106,11 @@ constexpr uint64_t DEFAULT_MIN_KEYNAME     = 131072;
 constexpr uint64_t DEFAULT_MAX_KEYNAME     = 16777216;
 constexpr uint8_t  DEFAULT_MIN_DIFF        = 10;
 constexpr uint64_t DEFAULT_POW_DELAY       = 0;
+// Seconds after the boot in which a ledger with an earlier run refuses each
+// CES_NONCELESS time (CesServer::noncelessCutoffUs_). Two future drifts: the
+// earlier run took times up to one drift after it stopped. 0 turns it off.
+constexpr uint64_t DEFAULT_NONCELESS_DELAY =
+  2 * CES_NONCELESS_FUTURE_DRIFT_US / 1000000;
 constexpr uint64_t DEFAULT_SPEND_SLOT_SIZE = 3600;
 constexpr uint64_t DEFAULT_FLUSH_VALUE     = 0;          // 0 = flush every change
 constexpr uint64_t DEFAULT_MAX_LOG_SIZE_GB = 100;
@@ -170,6 +175,8 @@ struct CesConfig {
   uint8_t minDiff = DEFAULT_MIN_DIFF;
   uint64_t spendSlotSize = DEFAULT_SPEND_SLOT_SIZE;
   uint64_t minProveWorkTimestamp = 0;
+  // See DEFAULT_NONCELESS_DELAY. 0 turns the restart cutoff off.
+  uint64_t noncelessDelaySecs = DEFAULT_NONCELESS_DELAY;
 
   uint64_t minAsset = DEFAULT_MIN_ASSET;
   uint64_t maxAsset = DEFAULT_MAX_ASSET;
@@ -1028,6 +1035,21 @@ public:
   // so every mutation posted earlier (e.g. _brr) has been applied. Deterministic
   // replacement for a timed settle. Caller MUST NOT run on logicStrand_.
   void _drainLogic();
+
+  // Test hooks: the record of the CES_NONCELESS signatures that the server
+  // saw, at a time that the test gives, so a test can walk the clock through
+  // its rotation.
+  bool _dedupSeen(uint64_t sigHash, uint64_t epochNowUs) {
+    return isDuplicateDedup(sigHash, epochNowUs);
+  }
+  void _dedupRecord(uint64_t sigHash, uint64_t epochNowUs) {
+    recordDedup(sigHash, epochNowUs);
+  }
+
+  // Test hooks: the restart cutoff of CES_NONCELESS timestamps (see
+  // noncelessCutoffUs_).
+  uint64_t _noncelessCutoffUs() const { return noncelessCutoffUs_.load(); }
+  void _setNoncelessCutoffUs(uint64_t us) { noncelessCutoffUs_.store(us); }
 
   // Test hook: fire a scheduled (cron) VM run synchronously — build a
   // ScheduledRun, post it onto logicStrand_, and block until it completes.
@@ -2399,7 +2421,7 @@ private:
 
   // -- Auto-nonce dedup constants --
   static constexpr uint64_t DEDUP_WINDOW_US = CES_NONCELESS_DEDUP_WINDOW_US;
-  static constexpr uint64_t DEDUP_FUTURE_DRIFT_US = 300ULL * 1000000;
+  static constexpr uint64_t DEDUP_FUTURE_DRIFT_US = CES_NONCELESS_FUTURE_DRIFT_US;
 
   // Peer-table caps, driven by the runtime-settable maxPeers_ (seeded from cfg_.maxPeers).
   // The persisted/exposed cap is maxPeers; the in-mem hard cap is 3x, headroom so
@@ -2444,14 +2466,18 @@ private:
   uint64_t peerMinerHashesTried_ = 0;      // live hashes tried in current solve
   uint64_t peerMinerExpectedHashes_ = 0;   // 2^difficulty for current solve
 
+  // The restart cutoff of CES_NONCELESS timestamps, in microseconds since the
+  // epoch: resolveNonceless refuses each timestamp before it. The constructor
+  // sets it to the boot plus cfg_.noncelessDelaySecs when the ledger has an
+  // earlier run, because the record of seen signatures does not survive a
+  // restart. 0 means no cutoff.
+  std::atomic<uint64_t> noncelessCutoffUs_{0};
+
   // Auto-nonce dedup table
   std::mutex dedupMutex_;
   std::unordered_set<uint64_t> dedupCurrent_;
   std::unordered_set<uint64_t> dedupOlder_;
   uint64_t dedupBaseTime_ = 0;
-  // Atomic check+insert — used where seeing the request IS the dedupable
-  // event (CesPlex per-op bind dedup).
-  bool checkAndInsertDedup(uint64_t sigHash, uint64_t epochNow = 0);
   // Split check / record — used by NONCELESS ops, which must record the
   // dedup only after the op commits a ledger event (so a failed op stays
   // retryable). See resolveNonceless / recordDedup call sites.

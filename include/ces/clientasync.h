@@ -164,8 +164,9 @@ private:
   // Settlement gives up after the receiver's nonceless dedup window: past it a
   // retry is stale-rejected anyway, and this also bounds a half-up peer that
   // answers handshakes but never replies to the op. Bound to the same window
-  // (CES_NONCELESS_DEDUP_WINDOW_US) so the two cannot drift. Give-up is
-  // conserved (vostro stands).
+  // (CES_NONCELESS_DEDUP_WINDOW_US) so the two cannot drift. A receiver also
+  // refuses each settlement stamped before its restart cutoff (nonceless_delay),
+  // and that refusal is final. Give-up is conserved (vostro stands).
   static constexpr int SETTLEMENT_DEADLINE_MS =
     static_cast<int>(CES_NONCELESS_DEDUP_WINDOW_US / 1000);
 };

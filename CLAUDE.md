@@ -153,7 +153,7 @@ Private vs public key (easy to get wrong when scripting cesh/ces):
 
 Opcodes (`op_code_t`) ride the primary UDP port: transfers, account/asset queries, asset CRUD, VM run, and the unsigned peer-table read. The application lane (`app_code_t`, 0x80+) carries client/program messages (`CES_APP_COMPUTE_MSG`) over MINX's app path instead of the signed-op path. Result/error codes are `error_code_t`. These enums move; read `types.h`, do not memorize numbers.
 
-Nonce modes: `0` skip (internal); `CES_NONCELESS` (UINT32_MAX) server assigns (settlement pipelining); `N` must equal `nonce + 1`. Auto-nonce: signed ops carry a timestamp; the server rejects stale ops and dedups by sig-hash prefix. Retried ops must reuse the same signed payload so dedup returns OK without re-executing.
+Nonce modes: `0` skip (internal); `CES_NONCELESS` (UINT32_MAX) server assigns (settlement pipelining); `N` must equal `nonce + 1`. Auto-nonce: signed ops carry a timestamp; the server rejects stale ops and dedups by sig-hash prefix. Retried ops must reuse the same signed payload so dedup returns OK without re-executing. The sig-hash record is in memory, and keeps each entry for at least the window plus the future drift. A server whose ledger has an earlier run refuses `CES_NONCELESS` times before its boot plus `nonceless_delay` (default two future drifts; `noncelessCutoffUs_`), so a restart cannot apply a copy again. Test networks (`tools/cesnet.mjs`, `tools/extnet.mjs`) set `nonceless_delay = 0`. Gossip is nonceless but checks no time, so the cutoff does not cover it.
 
 ## CesVM (`cesvm.h`, `cesvm.cpp`)
 

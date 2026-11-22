@@ -53,8 +53,10 @@ void CesClientAsync::openTransfer(const Hash& destKey, uint64_t amount, Callback
     op.cb = std::move(cb);
     // Give up after the receiver's dedup window: past it, a retry is rejected
     // stale anyway, so retrying is pointless. A bounded sender-side deadline also
-    // covers a half-up peer (answers handshakes, never replies to the op). Giving
-    // up is conserved -- the amount stays parked in the vostro, no reversal.
+    // covers a half-up peer (answers handshakes, never replies to the op). A
+    // receiver also refuses each settlement stamped before its restart cutoff
+    // (nonceless_delay), and that refusal is final too. Giving up is conserved
+    // -- the amount stays parked in the vostro, no reversal.
     op.deadline = std::chrono::steady_clock::now() +
                   std::chrono::milliseconds(SETTLEMENT_DEADLINE_MS);
 

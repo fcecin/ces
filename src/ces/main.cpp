@@ -92,6 +92,14 @@ min_difficulty = )" << static_cast<int>(DEFAULT_MIN_DIFF) << R"(
 # delay lets the RandomX dataset finish initializing before solutions count.
 pow_delay = )" << DEFAULT_POW_DELAY << R"(
 
+# On a ledger with an earlier run (also one seeded with `ces credit`), refuse
+# each nonceless request (the settlement of a cross transfer, a nonceless run)
+# stamped before the boot plus this many seconds, so a copy of a request that
+# the earlier run applied cannot apply again. The default is two future drifts
+# (a nonceless time may be up to )" << CES_NONCELESS_FUTURE_DRIFT_US / 1000000
+            << R"( s ahead). 0 turns it off, for test networks.
+nonceless_delay = )" << DEFAULT_NONCELESS_DELAY << R"(
+
 # Size of the PoW double-spend tracking slots in seconds
 spend_slot_size = )" << DEFAULT_SPEND_SLOT_SIZE << R"(
 
@@ -428,6 +436,7 @@ int main(int argc, char* argv[]) {
   uint64_t optMaxAlias;
   uint8_t optMinDiff;
   uint64_t optPoWDelay;
+  uint64_t optNoncelessDelay;
   uint64_t optSpendSlotSize;
   std::string optGeneratePubKey;
   uint64_t optFlushValue = DEFAULT_FLUSH_VALUE;
@@ -585,6 +594,10 @@ int main(int argc, char* argv[]) {
     app.add_option("--powdelay", optPoWDelay,
       "Delay in seconds before accepting PoW")
       ->default_val(std::to_string(DEFAULT_POW_DELAY));
+    app.add_option("--noncelessdelay", optNoncelessDelay,
+      "After a restart, refuse nonceless requests stamped before boot + this "
+      "many seconds (0 = off)")
+      ->default_val(std::to_string(DEFAULT_NONCELESS_DELAY));
     app.add_option("--spendslotsize", optSpendSlotSize,
       "Size of spend db slots in seconds")
       ->default_val(std::to_string(DEFAULT_SPEND_SLOT_SIZE));
@@ -911,6 +924,7 @@ int main(int argc, char* argv[]) {
       }
       applyIfDefault("min_difficulty", optMinDiff, "--mindiff");
       applyIfDefault("pow_delay", optPoWDelay, "--powdelay");
+      applyIfDefault("nonceless_delay", optNoncelessDelay, "--noncelessdelay");
       applyIfDefault("spend_slot_size", optSpendSlotSize, "--spendslotsize");
       applyIfDefault("no_pow_engine", optNoPowEngine, "--nopowengine");
       applyIfDefault("cache_only_pow", optCacheOnlyPoWEngine, "--cacheonlypowengine");
@@ -1204,6 +1218,7 @@ int main(int argc, char* argv[]) {
     config.minProveWorkTimestamp = now + optPoWDelay;
   else
     config.minProveWorkTimestamp = 0;
+  config.noncelessDelaySecs = optNoncelessDelay;
 
   // Trim and normalize server name (empty/whitespace = unset)
   {

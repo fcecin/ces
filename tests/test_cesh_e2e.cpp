@@ -1335,6 +1335,24 @@ BOOST_AUTO_TEST_CASE(MultiServerTransfers) {
   BOOST_TEST_MESSAGE(r3.out);
   BOOST_CHECK_EQUAL(r3.exitCode, 0);
   assertContains(r3.out, "TEST PASS");
+
+  // The conservation check also holds when a receiver refuses a settlement
+  // (its amount stays in the vostro). So check the logs of the 5 servers: no
+  // server gave up a settlement. (The text comes from the settlement
+  // callbacks in src/ceslib/server.cpp.)
+  int gaveUp = 0, logs = 0;
+  for (const auto& e : fs::recursive_directory_iterator(workDir)) {
+    const std::string name = e.path().filename().string();
+    if (!e.is_regular_file() || name.rfind("server", 0) != 0 ||
+        e.path().extension() != ".log")
+      continue;
+    ++logs;
+    std::ifstream in(e.path());
+    for (std::string line; std::getline(in, line);)
+      if (line.find("settlement GAVE UP") != std::string::npos) ++gaveUp;
+  }
+  BOOST_CHECK_EQUAL(logs, 5);
+  BOOST_CHECK_EQUAL(gaveUp, 0);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

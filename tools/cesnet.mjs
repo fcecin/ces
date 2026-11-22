@@ -107,6 +107,8 @@ server_key = "${server.priv}"
 server_name = "127.0.0.1:${server.port}"
 min_difficulty = 1
 pow_delay = 0
+# A test network restarts often: no restart cutoff for nonceless requests.
+nonceless_delay = 0
 spend_slot_size = 3600
 no_pow_engine = true
 cache_only_pow = false

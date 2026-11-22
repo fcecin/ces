@@ -1,4 +1,5 @@
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include <ces/alias.h>
 #include <ces/cesvm.h>
 #include <ces/util/vmprogram.h>
@@ -1644,6 +1645,156 @@ BOOST_AUTO_TEST_CASE(Test_Alias_Persists_Across_Reload) {
     srv2.stop();
   }
   fs::remove_all(pDir);
+}
+
+// A signed CES_NONCELESS open transfer of `amount` from `from` to `to`, for
+// the server with the key `serverKey`, stamped `timeUs`.
+static minx::Bytes noncelessOpenTransfer(KeyPair& from,
+                                         const KeyPair& to,
+                                         const minx::Hash& serverKey,
+                                         uint64_t amount, uint64_t timeUs) {
+  CesOpenTransfer req;
+  req.originId = from.getPublicKeyAsHash();
+  req.serverId = Account::getMapKey(serverKey);
+  req.reqNonce = CES_NONCELESS;
+  req.destKey = to.getPublicKeyAsHash();
+  req.amount = amount;
+  req.time = timeUs;
+  return req.toBytes(from);
+}
+
+static int64_t balanceOf(CesServer& srv, const KeyPair& key) {
+  int64_t bal = 0;
+  uint32_t nonce = 0, xt = 0;
+  HashPrefix xd{};
+  uint64_t xa = 0;
+  srv.unsignedQueryAccount(Account::getMapKey(key.getPublicKeyAsHash()), bal,
+                           nonce, xd, xa, xt);
+  return bal;
+}
+
+// Send `bytes` to `srv` as a MINX message, and let the server process it. The
+// signature check runs here, and the op is posted to the logic strand, so the
+// barrier waits for it.
+static void sendAndSettle(CesServer& srv, const minx::Bytes& bytes) {
+  const minx::SockAddr addr(boost::asio::ip::address_v6::loopback(), 40000);
+  srv.incomingMessage(addr, minx::MinxMessage{0, 0, 0, bytes});
+  srv._drainLogic();
+}
+
+// Bug 0010. The record of the CES_NONCELESS signatures that a server saw is in
+// memory only. After a restart (`crash` = no stop), a copy of a request that
+// the server applied before the restart must not apply again, also a copy
+// stamped almost one future drift ahead. A new request, stamped after the
+// restart cutoff, must apply.
+static void checkNoncelessCopyAfterRestart(bool crash) {
+  fs::path pDir = makeUniqueTempDir("ces_nl_restart");
+  minx::Hash sPriv;
+  sPriv.fill(0xE1);
+  KeyPair rich, dest;
+  const uint64_t amount = 1'000'000;
+  minx::Bytes copy, ahead;
+  uint64_t copyStamp = 0;
+  {
+    CesServer srv(makeTestConfig(pDir, sPriv, 0));
+    srv.start(0);
+    // A ledger with no earlier run has nothing to protect: no cutoff.
+    BOOST_CHECK_EQUAL(srv._noncelessCutoffUs(), 0u);
+    srv._brr(rich.getPublicKeyAsHash(), 10'000'000);
+    srv._brr(dest.getPublicKeyAsHash(), 5000);
+    srv._drainLogic();
+    copyStamp = ces::getMicrosSinceEpoch();
+    copy = noncelessOpenTransfer(rich, dest,
+                                 srv._serverKeyPair().getPublicKeyAsHash(),
+                                 amount, copyStamp);
+    sendAndSettle(srv, copy);
+    // A request stamped just under one future drift ahead, the latest stamp
+    // that the server takes.
+    ahead = noncelessOpenTransfer(
+      rich, dest, srv._serverKeyPair().getPublicKeyAsHash(), amount,
+      ces::getMicrosSinceEpoch() + CES_NONCELESS_FUTURE_DRIFT_US - 1'000'000);
+    sendAndSettle(srv, ahead);
+    BOOST_REQUIRE_EQUAL(balanceOf(srv, dest), 5000 + 2 * amount);
+    if (!crash) srv.stop();
+  }
+  {
+    const uint64_t before = ces::getMicrosSinceEpoch();
+    CesServer srv(makeTestConfig(pDir, sPriv, 0));
+    const uint64_t after = ces::getMicrosSinceEpoch();
+    srv.start(0);
+    BOOST_REQUIRE_EQUAL(balanceOf(srv, dest), 5000 + 2 * amount);
+    // The ledger has an earlier run: the cutoff is the boot plus the default
+    // nonceless_delay, two future drifts.
+    const uint64_t delay = DEFAULT_NONCELESS_DELAY * 1'000'000;
+    BOOST_CHECK_EQUAL(delay, 2 * CES_NONCELESS_FUTURE_DRIFT_US);
+    BOOST_CHECK_GE(srv._noncelessCutoffUs(), before + delay);
+    BOOST_CHECK_LE(srv._noncelessCutoffUs(), after + delay);
+
+    // The copies are still in their window, and the server refuses them.
+    sendAndSettle(srv, copy);
+    sendAndSettle(srv, ahead);
+    BOOST_CHECK_EQUAL(balanceOf(srv, dest), 5000 + 2 * amount);
+
+    // Put the cutoff right after the stamp of the first copy: a request
+    // stamped before the cutoff stays refused, and one after it applies.
+    srv._setNoncelessCutoffUs(copyStamp + 1);
+    sendAndSettle(srv, copy);
+    BOOST_CHECK_EQUAL(balanceOf(srv, dest), 5000 + 2 * amount);
+    sendAndSettle(srv, noncelessOpenTransfer(
+                         rich, dest, srv._serverKeyPair().getPublicKeyAsHash(),
+                         amount, ces::getMicrosSinceEpoch()));
+    BOOST_CHECK_EQUAL(balanceOf(srv, dest), 5000 + 3 * amount);
+    srv.stop();
+  }
+  boost::system::error_code ec;
+  fs::remove_all(pDir, ec);
+}
+
+BOOST_AUTO_TEST_CASE(NoncelessCopyIsNotAppliedAgainAfterACrash) {
+  checkNoncelessCopyAfterRestart(true);
+}
+
+BOOST_AUTO_TEST_CASE(NoncelessCopyIsNotAppliedAgainAfterARestart) {
+  checkNoncelessCopyAfterRestart(false);
+}
+
+// nonceless_delay sets the restart cutoff: 0 turns it off (test networks), and
+// another value is used as given.
+BOOST_AUTO_TEST_CASE(NoncelessDelaySetsTheCutoff) {
+  fs::path pDir = makeUniqueTempDir("ces_nl_delay0");
+  minx::Hash sPriv;
+  sPriv.fill(0xE2);
+  KeyPair someone;
+  {
+    CesServer srv(makeTestConfig(pDir, sPriv, 0));
+    srv.start(0);
+    srv._brr(someone.getPublicKeyAsHash(), 1000);
+    srv._drainLogic();
+    srv.stop();
+  }
+  {
+    CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
+    cfg.noncelessDelaySecs = 0;
+    CesServer srv(cfg);
+    srv.start(0);
+    BOOST_CHECK_EQUAL(balanceOf(srv, someone), 1000);
+    BOOST_CHECK_EQUAL(srv._noncelessCutoffUs(), 0u);
+    srv.stop();
+  }
+  {
+    // Another value is used as given.
+    CesConfig cfg = makeTestConfig(pDir, sPriv, 0);
+    cfg.noncelessDelaySecs = 7;
+    const uint64_t before = ces::getMicrosSinceEpoch();
+    CesServer srv(cfg);
+    const uint64_t after = ces::getMicrosSinceEpoch();
+    srv.start(0);
+    BOOST_CHECK_GE(srv._noncelessCutoffUs(), before + 7'000'000);
+    BOOST_CHECK_LE(srv._noncelessCutoffUs(), after + 7'000'000);
+    srv.stop();
+  }
+  boost::system::error_code ec;
+  fs::remove_all(pDir, ec);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

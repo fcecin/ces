@@ -443,6 +443,103 @@ BOOST_AUTO_TEST_CASE(CrossServerTransfer) {
   bfs::remove_all(dirB, ec);
 }
 
+// Bug 0010. A server that restarts on an earlier ledger refuses each
+// settlement stamped before its restart cutoff. The refusal is final: the
+// sender does not sign the settlement again, the amount stays in the vostro
+// (the receiving server's account at the sender), and the sender's reserve at
+// the receiver does not move. With the cutoff cleared, the next settlement
+// lands.
+BOOST_AUTO_TEST_CASE(SettlementIntoARestartedServerStaysInTheVostro) {
+  blog::init();
+  blog::set_level(blog::info);
+  bfs::path dirA = makeUniqueTempDir("ces_cutoff_a");
+  bfs::path dirB = makeUniqueTempDir("ces_cutoff_b");
+  minx::Hash privA; privA.fill(0xA1);
+  minx::Hash privB; privB.fill(0xB1);
+  ces::KeyPair kpA(privA);
+  ces::KeyPair kpB(privB);
+  ces::KeyPair alice;  // user on A
+  ces::KeyPair bob;    // recipient on B
+  CesConfig cfgA = makePeeringConfig(dirA, privA);
+  CesConfig cfgB = cfgA;
+  cfgB.dataDir = dirB;
+  cfgB.serverPrivKey = privB;
+
+  auto serverA = std::make_unique<CesServer>(cfgA);
+  const uint16_t portA = serverA->start(0);
+  BOOST_REQUIRE(portA > 0);
+  auto serverB = std::make_unique<CesServer>(cfgB);
+  BOOST_REQUIRE(serverB->start(0) > 0);
+  serverA->_brr(alice.getPublicKeyAsHash(), 10000);
+  serverA->_drainLogic();
+  serverB->_brr(kpA.getPublicKeyAsHash(), 50000);  // A's reserve on B
+  serverB->_drainLogic();
+
+  auto bal = [](const std::unique_ptr<CesServer>& srv, const ces::KeyPair& k) {
+    int64_t b = 0;
+    uint32_t nonce = 0, xt = 0;
+    HashPrefix xd{};
+    uint64_t xa = 0;
+    srv->unsignedQueryAccount(Account::getMapKey(k.getPublicKeyAsHash()), b,
+                              nonce, xd, xa, xt);
+    return b;
+  };
+
+  // B restarts on its ledger, so its restart cutoff is set.
+  serverB->stop();
+  serverB.reset();
+  serverB = std::make_unique<CesServer>(cfgB);
+  const uint16_t portB = serverB->start(0);
+  BOOST_REQUIRE(portB > 0);
+  BOOST_REQUIRE_EQUAL(bal(serverB, kpA), 50000);
+  BOOST_REQUIRE(serverB->_noncelessCutoffUs() > ces::getMicrosSinceEpoch());
+  const std::string addrB = "127.0.0.1:" + std::to_string(portB);
+  serverA->_markPeerReachable(kpB.getPublicKeyAsHash(), addrB);
+
+  auto cross = [&](int64_t amount, int64_t aliceAfter) {
+    auto ep = boost::asio::ip::udp::endpoint(
+      boost::asio::ip::address_v6::loopback(), portA);
+    CesClient client(ep, false);
+    client.setKey(alice);
+    client.start(0);
+    BOOST_REQUIRE(client.connect());
+    int64_t newBal = 0;
+    CES_CHECK_OK(client.crossTransfer(bob.getPublicKeyAsHash(), amount, addrB,
+                                      newBal));
+    BOOST_CHECK_EQUAL(newBal, aliceAfter);
+    client.disconnect();
+    client.stop();
+  };
+
+  // B refuses the settlement. A does not send it again.
+  cross(5000, 5000);
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+  BOOST_CHECK_EQUAL(bal(serverB, bob), 0);
+  BOOST_CHECK_EQUAL(bal(serverB, kpA), 50000);  // A's reserve on B: unchanged
+  BOOST_CHECK_EQUAL(bal(serverA, kpB), 5000);   // B's vostro on A: the amount
+
+  // The cutoff clears. A sender that sent the refused settlement again, on its
+  // retry period of about 3 s, would land it now: Bob must stay at 0.
+  serverB->_setNoncelessCutoffUs(0);
+  std::this_thread::sleep_for(std::chrono::seconds(5));
+  BOOST_CHECK_EQUAL(bal(serverB, bob), 0);
+
+  // The next settlement lands.
+  cross(2000, 3000);
+  waitForBalance(serverB, Account::getMapKey(bob.getPublicKeyAsHash()), 2000);
+  BOOST_CHECK_EQUAL(bal(serverB, bob), 2000);
+  BOOST_CHECK_EQUAL(bal(serverB, kpA), 48000);
+  BOOST_CHECK_EQUAL(bal(serverA, kpB), 7000);
+
+  serverA->stop();
+  serverB->stop();
+  serverA.reset();
+  serverB.reset();
+  boost::system::error_code ec;
+  bfs::remove_all(dirA, ec);
+  bfs::remove_all(dirB, ec);
+}
+
 BOOST_AUTO_TEST_CASE(CrossServerPaymentSettlement) {
   blog::init();
   blog::set_level(blog::info);
@@ -629,7 +726,7 @@ public:
 // that the ledger moves once, not twice — the auto-nonce sig-hash dedup
 // must catch the second packet. This covers the dispatch path end-to-end:
 // MINX envelope → signature check → CES_NONCELESS timestamp window →
-// checkAndInsertDedup → transfer execution.
+// resolveNonceless → transfer execution → recordDedup.
 BOOST_AUTO_TEST_CASE(DedupReplayViaWire) {
   blog::init();
   blog::set_level(blog::info);
