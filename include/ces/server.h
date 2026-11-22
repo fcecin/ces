@@ -1544,6 +1544,17 @@ public:
     return rpcTaskIO_.get_executor();
   }
 
+  // Test hook: the executor of the task threads, which also run the logic
+  // strand and the daily timer.
+  boost::asio::any_io_executor _taskIOExecutor() { return taskIO_.get_executor(); }
+
+  // Test hook: what the daily timer does when it fires, on the caller's thread.
+  // Unlike _runDailyMaintenance, it does not wait for the file sweeps.
+  void _fireDailyTimer() {
+    boost::system::error_code ec;
+    dailyTaskTick(ec);
+  }
+
   // Test hook: if set, fires on logicStrand_ at the end of completeRpc
   // with the status code that would be handed to the followup VM
   // program's input. Lets tests observe async failures (timeout,

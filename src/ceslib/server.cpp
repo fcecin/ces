@@ -5483,13 +5483,24 @@ void CesServer::dailyTaskTick(const boost::system::error_code& ec) {
   });
 
   // Flat-file rent is collected lazily (per-op + JIT GC on CREATE), no daily
-  // pass. kv-stores differ: each key is a self-renting cell, charged by a
-  // per-key sweep the file service runs here. This runs on taskIO_, NOT the
-  // logicStrand: the sweep takes gKvMutex then hops to logicStrand to burn the
-  // rent (the lock order kv ops use), so running it inside the postLogic block
-  // above would invert that order and deadlock.
-  if (fileHandler_) fileHandler_->sweepKvRent();
-  if (fileHandler_) fileHandler_->sweepExtensionBudget();
+  // pass. kv-stores differ: each key is a self-renting cell, which the KV
+  // sweep counts down. The /s/ budget sweep tops up program accounts.
+  //
+  // The sweeps run on rpcTaskIO_, where the file verbs run. They take the kv
+  // mutex and hop to logicStrand_ and wait, in the order of the file verbs.
+  // Not here on taskIO_: logicStrand_ runs on the task threads, so a hop from
+  // a task thread waits for the strand on its own pool. With one task thread
+  // it waited for ever, and the server stopped answering at this hour. Not on
+  // logicStrand_ either: a kv verb holds the kv mutex while it waits for the
+  // strand, so the sweep there would take the two in the other order.
+  if (fileHandler_) {
+    if (auto ex = _rpcTaskIOExecutor()) {
+      boost::asio::post(ex, [this]() {
+        fileHandler_->sweepKvRent();
+        fileHandler_->sweepExtensionBudget();
+      });
+    }
+  }
 
   dailyTaskStartTimer();
 }
@@ -5516,6 +5527,10 @@ void CesServer::dailyTaskStartTimer() {
 void CesServer::_runDailyMaintenance() {
   boost::system::error_code ec;
   dailyTaskTick(ec);
+  // The file sweeps run on rpcTaskIO_. Wait for them, so the caller sees their
+  // result. The caller must not be on rpcTaskIO_ or on a task thread.
+  if (fileHandler_)
+    if (auto ex = _rpcTaskIOExecutor()) runSync(ex, []() {});
 }
 
 void CesServer::_brr(const minx::Hash& accountKey, int64_t amount) {

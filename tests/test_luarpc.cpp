@@ -23,11 +23,13 @@
 #include <ces/l2/file_client.h>
 #include <ces/l2/file_handler.h>      // FileHandler::readProgramPubkey
 
+#include <boost/asio/post.hpp>
 #include <boost/test/unit_test.hpp>
 
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -60,8 +62,8 @@ struct LuaRpcFixture {
   KeyPair ownerKey;
 
   // memMax: the address-space cap of each program (compute_process_mem_max),
-  // 0 for the default.
-  explicit LuaRpcFixture(uint16_t portCount = 16, uint64_t memMax = 0) {
+  // 0 for the default. taskThreads: the threads of taskIO_, 0 for the default.
+  explicit LuaRpcFixture(uint16_t portCount = 16, uint64_t memMax = 0, int taskThreads = 0) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("luarpc");
@@ -84,6 +86,7 @@ struct LuaRpcFixture {
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cesluajitd");
     cfg.cesComputeWorkDir = (dir / "cescompute").string();
     if (memMax != 0) cfg.computeProcessMemMax = memMax;
+    if (taskThreads != 0) cfg.taskThreads = taskThreads;
 
     server = std::make_unique<CesServer>(cfg);
     mainPort = server->start(0);
@@ -153,6 +156,12 @@ struct LuaNoPortFixture : LuaRpcFixture {
 // reserves (threads, buffers, malloc arenas), and that must leave room for Lua.
 struct LuaSmallCapFixture : LuaRpcFixture {
   LuaSmallCapFixture() : LuaRpcFixture(16, 64ull * 1024 * 1024) {}
+};
+
+// One task thread, as `threads = 1` gives: the logic strand and the handlers
+// of the main port share it.
+struct LuaOneTaskThreadFixture : LuaRpcFixture {
+  LuaOneTaskThreadFixture() : LuaRpcFixture(16, 0, 1) {}
 };
 
 }  // namespace
@@ -613,6 +622,30 @@ BOOST_FIXTURE_TEST_CASE(MainPortVerbsFromCoroutineYield, LuaRpcFixture) {
   int64_t bal = 0;
   waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// The daily timer fires on a task thread, and the logic strand runs on the
+// same task threads. The file sweeps of the daily tick hop to the logic
+// strand and wait. With one task thread, a sweep on that thread waited for
+// ever, and the server stopped answering at 09:00 UTC each day.
+BOOST_FIXTURE_TEST_CASE(DailyTimerOnTheTaskThreadEnds, LuaOneTaskThreadFixture) {
+  BOOST_REQUIRE_EQUAL(server->_config().taskThreads, 1);
+  BOOST_REQUIRE(server->fileHandler() != nullptr);
+  std::promise<void> fired;
+  boost::asio::post(server->_taskIOExecutor(), [&] {
+    server->_fireDailyTimer();
+    fired.set_value();
+  });
+  auto f = fired.get_future();
+  BOOST_REQUIRE_MESSAGE(f.wait_for(kTestWaitLimit) == std::future_status::ready,
+                        "the daily timer did not end on the task thread");
+  // The file sweeps that the timer posted end, and the logic strand runs.
+  auto swept = std::async(std::launch::async, [&] {
+    runSync(server->_rpcTaskIOExecutor(), [] {});
+    server->_drainLogic();
+  });
+  BOOST_REQUIRE_MESSAGE(swept.wait_for(kTestWaitLimit) == std::future_status::ready,
+                        "the file sweeps or the logic strand did not end after the daily timer");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

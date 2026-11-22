@@ -3320,7 +3320,7 @@ void FileHandler::sweepKvRent() {
     });
 
   for (const auto& name : stores) {
-    // logkv update/flush throw on a disk error. This runs on taskIO_, so an
+    // logkv update/flush throw on a disk error. This runs on rpcTaskIO_, so an
     // escaped throw would terminate the server; contain it per store (one bad
     // store is skipped, the rest still sweep).
     try {
@@ -3663,8 +3663,9 @@ void reconcileServerZone(CesServer* server, const std::string& dir) {
 }
 
 // Daily per-extension local-budget sweep: top every /s/ program account up to the
-// server's extLocalBudget (deficit only). Runs off logicStrand_ (the top-up
-// sync-hops to it), called from dailyTaskTick. No-op if the file feature or the
+// server's extLocalBudget (deficit only). The top-up hops to logicStrand_ and
+// waits, so this runs on rpcTaskIO_, which dailyTaskTick posts it to: not on
+// logicStrand_ and not on a task thread. No-op if the file feature or the
 // budget is off.
 void FileHandler::sweepExtensionBudget() {
   CesServer* server = server_;
