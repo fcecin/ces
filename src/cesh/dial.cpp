@@ -1,14 +1,13 @@
 // dial.cpp — implementation of `cesh dial <pid>`.
 //
-// Single self-contained translation unit. We don't reuse
-// CesComputeClient because (a) it's hardcoded to /ces/compute/1, (b) it
-// has a verb-driven request/response loop while dial flips into raw
-// byte-pump mode after ATTACH, and (c) factoring a shared CesPlex
-// client base would balloon scope. The ~80 LOC of bind boilerplate
-// duplicated below is the price.
+// We don't reuse CesComputeClient because (a) it's hardcoded to
+// /ces/compute/1, and (b) it has a verb-driven request/response loop while
+// dial flips into raw byte-pump mode after ATTACH. The bind itself is the
+// shared client of bind_client.h.
 
 #include "dial.h"
 
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/wire.h>
 #include <ces/buffer.h>
 #include <ces/types.h>
@@ -67,6 +66,10 @@ constexpr uint8_t kVerbAttach = 0x01;
 // enough that a hung server gives the user back the prompt.
 constexpr auto kBindTimeout    = std::chrono::seconds(10);
 constexpr auto kAttachTimeout  = std::chrono::seconds(10);
+
+// A greeting rides the ATTACH reply, up to this size. The server states the
+// size, so cesh caps it before it allocates.
+constexpr uint32_t kMaxGreeting = 1 << 20;
 
 uint64_t nowMicros() {
   return static_cast<uint64_t>(
@@ -211,6 +214,18 @@ public:
 
   void stop() {
     if (!minx_) return;
+    // End the channel first, so the server frees its slot and stops metering
+    // it now, also after a timeout. A no-op if the channel already ended.
+    if (rudp_ && channel_ != 0 && !taskIO_.stopped()) {
+      auto done = std::make_shared<std::promise<void>>();
+      auto fut = done->get_future();
+      boost::asio::post(taskIO_,
+        [rudp = rudp_.get(), peer = peer_, ch = channel_, done] {
+          rudp->closeChannel(peer, ch);
+          done->set_value();
+        });
+      fut.wait_for(std::chrono::seconds(1));
+    }
     if (tickTimer_) {
       boost::system::error_code ec;
       tickTimer_->cancel();
@@ -232,112 +247,81 @@ public:
     boundPort_ = 0;
   }
 
-  // Bind handshake on /ces/lua/1. On success, fills sessionToken and
-  // serverPubkey. Returns empty string on success, error message
-  // otherwise. `expected` (if non-null) hard-checks the reply pubkey;
-  // otherwise we TOFU-accept and write the captured pubkey out.
-  std::string bind(const KeyPair& signer,
-                   const minx::Hash* expected,
-                   uint64_t& sessionToken,
-                   minx::Hash& serverPubkey) {
+  // Open the channel, send the protocol name and read the server hello.
+  // `expected` (if non-null) must be the key in the hello; otherwise we take
+  // the key that the hello gives (TOFU). Nothing is signed yet. Returns empty string on success,
+  // error message otherwise.
+  std::string connect(const minx::Hash* expected, ServerHello& hello) {
+    std::optional<minx::Hash> want;
+    if (expected) want = *expected;
     auto run = std::make_shared<std::promise<std::string>>();
     auto fut = run->get_future();
-    auto tokenOut = std::make_shared<uint64_t>(0);
-    auto pubkeyOut = std::make_shared<minx::Hash>();
-    boost::asio::post(taskIO_, [this, &signer, expected,
-                                tokenOut, pubkeyOut, run]() {
+    auto helloOut = std::make_shared<ServerHello>();
+    boost::asio::post(taskIO_, [this, want, helloOut, run]() {
       rudp_->tick(nowMicros());
-      stream_ = std::make_shared<minx::RudpStream>(
-        taskIO_.get_executor());
+      stream_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
       if (!rudp_->registerChannel(peer_, channel_, stream_)) {
         run->set_value("rudp registerChannel failed");
         return;
       }
-
-      const uint64_t bindNowUs = nowMicros();
-      const std::string name = kLuaProto;
-      auto bindReq = std::make_shared<minx::Bytes>(
-        ces::buildBindRequest(name, bindNowUs, signer));
-      const auto& pkArr = signer.getPublicKeyAsHash();
-      auto clientDigest = std::make_shared<
-        std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
-          ces::computeBindRequestDigest(
-            std::span<const uint8_t>(
-              reinterpret_cast<const uint8_t*>(name.data()),
-              name.size()),
-            bindNowUs,
-            std::span<const uint8_t>(pkArr.data(), pkArr.size())));
-
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, clientDigest, expected,
-         tokenOut, pubkeyOut, run]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { run->set_value("bind write: " + ec.message()); return; }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [reply, clientDigest, expected,
-             tokenOut, pubkeyOut, run]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) {
-                run->set_value("bind read: " + ec2.message()); return;
-              }
-              auto r = ces::parseBindReply(
-                std::span<const uint8_t,
-                          ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-                  reply->data(), reply->size()));
-              if (r.status != ces::CES_PLEX_OK) {
-                run->set_value("bind NACK from server");
-                return;
-              }
-              if (!ces::verifyBindReply(
-                    r,
-                    std::span<const uint8_t>(
-                      clientDigest->data(), clientDigest->size()))) {
-                run->set_value("bind reply digest/sig verify failed");
-                return;
-              }
-              if (expected && std::memcmp(expected->data(),
-                                          r.serverPubkey.data(),
-                                          expected->size()) != 0) {
-                run->set_value("bind reply pubkey != expected");
-                return;
-              }
-              std::memcpy(pubkeyOut->data(), r.serverPubkey.data(),
-                          pubkeyOut->size());
-              *tokenOut = r.channelSessionToken;
-              run->set_value("");
-            });
+      asyncStartBind(stream_, kLuaProto, want,
+        [helloOut, run](BindError err, ServerHello h) {
+          *helloOut = h;
+          run->set_value(err == BindError::None ? std::string()
+                                                : bindErrorText(err));
         });
     });
     if (fut.wait_for(kBindTimeout) != std::future_status::ready)
-      return "bind handshake timeout";
+      return "no hello from the server";
     std::string err = fut.get();
-    if (err.empty()) {
-      sessionToken = *tokenOut;
-      serverPubkey = *pubkeyOut;
-    }
+    if (err.empty()) hello = *helloOut;
     return err;
   }
 
-  // ATTACH verb. Fills outStatus + outConnId. Returns empty string on
-  // wire success (status itself may be a CES_ERROR_*); error message
-  // on transport failure (write/read errored, no reply, etc.).
+  // The bind on /ces/lua/1, signed here with `signer`, for the hello that
+  // connect() read. On success, bindDigest_ is the digest of this bind.
+  std::string bind(const KeyPair& signer, const ServerHello& hello) {
+    return sendBind(buildBindRequest(kLuaProto, nowMicros(), signer, hello),
+                    hello);
+  }
+
+  // External-signing bind: the same request, signed elsewhere (no private
+  // key here). `pubkey` is the 32-byte client key; `sig` is over
+  // computeBindRequestDigest(kLuaProto, timeUs, pubkey, hello).
+  std::string bindExt(std::span<const uint8_t> pubkey, uint64_t timeUs,
+                      const Signature& sig, const ServerHello& hello) {
+    return sendBind(
+      buildBindRequestSigned(kLuaProto, timeUs, pubkey, hello, sig), hello);
+  }
+
+  // ATTACH verb, signed here over the digest of the last bind that
+  // succeeded (bindDigest_). See attachSigned.
   std::string attach(const KeyPair& signer,
-                     uint64_t sessionToken,
                      uint64_t pid,
                      uint8_t& outStatus,
                      uint64_t& outConnId,
-                     std::string& outHello) {
+                     std::string& outGreeting) {
     ces::Bytes preamble;
     ces::Buffer::put<uint64_t>(preamble, pid);
-
     Signature sig = ces::signPerOp(
       signer, kVerbAttach,
       std::span<const uint8_t>(preamble.data(), preamble.size()),
-      sessionToken);
+      bindDigest_);
+    return attachSigned(sig, pid, outStatus, outConnId, outGreeting);
+  }
+
+  // The ATTACH verb with a signature over computePerOpDigest(kVerbAttach,
+  // preamble = u64 pid, bind digest), made here or elsewhere (--extsign). Fills
+  // outStatus, outConnId and the greeting of the program. Returns empty
+  // string on wire success (status itself may be a CES_ERROR_*); error
+  // message on transport failure (write/read errored, no reply, etc.).
+  std::string attachSigned(const Signature& sig,
+                           uint64_t pid,
+                           uint8_t& outStatus,
+                           uint64_t& outConnId,
+                           std::string& outGreeting) {
+    ces::Bytes preamble;
+    ces::Buffer::put<uint64_t>(preamble, pid);
 
     // Wire shape: [u8 verb][u32 BE preamble_len][preamble][65 sig].
     const size_t totalSize = ces::CES_PLEX_VERB_SIZE
@@ -359,13 +343,13 @@ public:
     // stack refs, so a late handler can't poke a freed frame on timeout.
     auto statusOut = std::make_shared<uint8_t>(0xFF);
     auto connIdOut = std::make_shared<uint64_t>(0);
-    auto helloOut = std::make_shared<std::string>();
+    auto greetingOut = std::make_shared<std::string>();
 
     boost::asio::post(taskIO_,
-      [strm, wireBuf, statusOut, connIdOut, helloOut, run]() {
+      [strm, wireBuf, statusOut, connIdOut, greetingOut, run]() {
         boost::asio::async_write(
           *strm, boost::asio::buffer(*wireBuf),
-          [strm, wireBuf, statusOut, connIdOut, helloOut, run]
+          [strm, wireBuf, statusOut, connIdOut, greetingOut, run]
           (const boost::system::error_code& ec, std::size_t) {
             if (ec) {
               run->set_value("attach write: " + ec.message()); return;
@@ -373,7 +357,7 @@ public:
             auto stBuf = std::make_shared<std::array<uint8_t, 1>>();
             boost::asio::async_read(
               *strm, boost::asio::buffer(*stBuf),
-              [strm, stBuf, statusOut, connIdOut, helloOut, run]
+              [strm, stBuf, statusOut, connIdOut, greetingOut, run]
               (const boost::system::error_code& ec2, std::size_t) {
                 if (ec2) {
                   run->set_value("attach read status: " + ec2.message());
@@ -392,29 +376,34 @@ public:
                     });
                   return;
                 }
-                // OK preamble: [connId u64][helloLen u32], then [hello][trailer].
+                // OK preamble: [connId u64][greetingLen u32], then
+                // [greeting][trailer].
                 auto head = std::make_shared<std::array<uint8_t, 12>>();
                 boost::asio::async_read(
                   *strm, boost::asio::buffer(*head),
-                  [strm, head, connIdOut, helloOut, run]
+                  [strm, head, connIdOut, greetingOut, run]
                   (const boost::system::error_code& ec3, std::size_t) {
                     if (ec3) {
                       run->set_value("attach read head: " + ec3.message());
                       return;
                     }
                     *connIdOut = ces::Buffer::peek<uint64_t>(head->data());
-                    uint32_t helloLen = ces::Buffer::peek<uint32_t>(
+                    uint32_t greetingLen = ces::Buffer::peek<uint32_t>(
                       std::span<const uint8_t>(head->data(), head->size()), 8);
+                    if (greetingLen > kMaxGreeting) {
+                      run->set_value("the greeting of the program is too big");
+                      return;
+                    }
                     auto rest = std::make_shared<ces::Bytes>(
-                      static_cast<size_t>(helloLen) +
+                      static_cast<size_t>(greetingLen) +
                       ces::CES_PLEX_RESP_TRAILER_SIZE);
                     boost::asio::async_read(
                       *strm, boost::asio::buffer(*rest),
-                      [rest, helloLen, helloOut, run](
+                      [rest, greetingLen, greetingOut, run](
                         const boost::system::error_code& ec4, std::size_t) {
-                        if (!ec4 && helloLen > 0)
-                          helloOut->assign(
-                            reinterpret_cast<const char*>(rest->data()), helloLen);
+                        if (!ec4 && greetingLen > 0)
+                          greetingOut->assign(
+                            reinterpret_cast<const char*>(rest->data()), greetingLen);
                         run->set_value(
                           ec4 ? ("attach read rest: " + ec4.message())
                               : std::string());
@@ -429,149 +418,8 @@ public:
     if (err.empty()) {
       outStatus = *statusOut;
       outConnId = *connIdOut;
-      outHello = *helloOut;
+      outGreeting = *greetingOut;
     }
-    return err;
-  }
-
-  // External-signing bind: same handshake as bind(), but the request was signed
-  // elsewhere (no private key here). `pubkey` is the 32-byte client key; `sig`
-  // is over computeBindRequestDigest(kLuaProto, timeUs, pubkey).
-  std::string bindExt(std::span<const uint8_t> pubkey, uint64_t timeUs,
-                      const Signature& sig, const minx::Hash* expected,
-                      uint64_t& sessionToken, minx::Hash& serverPubkey) {
-    const std::string name = kLuaProto;
-    auto bindReq = std::make_shared<minx::Bytes>(
-      ces::buildBindRequestSigned(name, timeUs, pubkey, sig));
-    auto clientDigest = std::make_shared<
-      std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
-        ces::computeBindRequestDigest(
-          std::span<const uint8_t>(
-            reinterpret_cast<const uint8_t*>(name.data()), name.size()),
-          timeUs, pubkey));
-    auto run = std::make_shared<std::promise<std::string>>();
-    auto fut = run->get_future();
-    auto tokenOut = std::make_shared<uint64_t>(0);
-    auto pubkeyOut = std::make_shared<minx::Hash>();
-    boost::asio::post(taskIO_, [this, bindReq, clientDigest, expected,
-                                tokenOut, pubkeyOut, run]() {
-      rudp_->tick(nowMicros());
-      stream_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
-      if (!rudp_->registerChannel(peer_, channel_, stream_)) {
-        run->set_value("rudp registerChannel failed"); return;
-      }
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, clientDigest, expected, tokenOut, pubkeyOut, run]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { run->set_value("bind write: " + ec.message()); return; }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [reply, clientDigest, expected, tokenOut, pubkeyOut, run]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) { run->set_value("bind read: " + ec2.message()); return; }
-              auto r = ces::parseBindReply(
-                std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-                  reply->data(), reply->size()));
-              if (r.status != ces::CES_PLEX_OK) {
-                run->set_value("bind NACK from server"); return;
-              }
-              if (!ces::verifyBindReply(r, std::span<const uint8_t>(
-                    clientDigest->data(), clientDigest->size()))) {
-                run->set_value("bind reply digest/sig verify failed"); return;
-              }
-              if (expected && std::memcmp(expected->data(),
-                    r.serverPubkey.data(), expected->size()) != 0) {
-                run->set_value("bind reply pubkey != expected"); return;
-              }
-              std::memcpy(pubkeyOut->data(), r.serverPubkey.data(),
-                          pubkeyOut->size());
-              *tokenOut = r.channelSessionToken;
-              run->set_value("");
-            });
-        });
-    });
-    if (fut.wait_for(kBindTimeout) != std::future_status::ready)
-      return "bind handshake timeout";
-    std::string err = fut.get();
-    if (err.empty()) { sessionToken = *tokenOut; serverPubkey = *pubkeyOut; }
-    return err;
-  }
-
-  // External-signing ATTACH: same as attach(), but `sig` was produced elsewhere
-  // over computePerOpDigest(kVerbAttach, preamble=pid, sessionToken).
-  std::string attachExt(const Signature& sig, uint64_t pid,
-                        uint8_t& outStatus, uint64_t& outConnId) {
-    ces::Bytes preamble;
-    ces::Buffer::put<uint64_t>(preamble, pid);
-    const size_t totalSize = ces::CES_PLEX_VERB_SIZE
-                             + ces::CES_PLEX_PREAMBLE_LEN_SIZE
-                             + preamble.size() + sig.size();
-    minx::Bytes wire(totalSize);
-    minx::Buffer buf(wire);
-    buf.put<uint8_t>(kVerbAttach);
-    buf.put<uint32_t>(static_cast<uint32_t>(preamble.size()));
-    buf.put(std::span<const uint8_t>(preamble.data(), preamble.size()));
-    buf.put(sig);
-
-    auto run = std::make_shared<std::promise<std::string>>();
-    auto fut = run->get_future();
-    auto wireBuf = std::make_shared<minx::Bytes>(std::move(wire));
-    auto strm = stream_;
-    auto statusOut = std::make_shared<uint8_t>(0xFF);
-    auto connIdOut = std::make_shared<uint64_t>(0);
-    boost::asio::post(taskIO_, [strm, wireBuf, statusOut, connIdOut, run]() {
-      boost::asio::async_write(
-        *strm, boost::asio::buffer(*wireBuf),
-        [strm, wireBuf, statusOut, connIdOut, run]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { run->set_value("attach write: " + ec.message()); return; }
-          auto stBuf = std::make_shared<std::array<uint8_t, 1>>();
-          boost::asio::async_read(
-            *strm, boost::asio::buffer(*stBuf),
-            [strm, stBuf, statusOut, connIdOut, run]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) { run->set_value("attach read status: " + ec2.message()); return; }
-              uint8_t status = (*stBuf)[0];
-              *statusOut = status;
-              if (status != CES_OK) {
-                auto tr = std::make_shared<ces::Bytes>(
-                  ces::CES_PLEX_RESP_TRAILER_SIZE);
-                boost::asio::async_read(
-                  *strm, boost::asio::buffer(*tr),
-                  [tr, run](const boost::system::error_code& ec3, std::size_t) {
-                    run->set_value(
-                      ec3 ? ("attach read tail: " + ec3.message()) : std::string());
-                  });
-                return;
-              }
-              auto head = std::make_shared<std::array<uint8_t, 12>>();
-              boost::asio::async_read(
-                *strm, boost::asio::buffer(*head),
-                [strm, head, connIdOut, run]
-                (const boost::system::error_code& ec3, std::size_t) {
-                  if (ec3) { run->set_value("attach read head: " + ec3.message()); return; }
-                  *connIdOut = ces::Buffer::peek<uint64_t>(head->data());
-                  uint32_t helloLen = ces::Buffer::peek<uint32_t>(
-                    std::span<const uint8_t>(head->data(), head->size()), 8);
-                  auto rest = std::make_shared<ces::Bytes>(
-                    static_cast<size_t>(helloLen) + ces::CES_PLEX_RESP_TRAILER_SIZE);
-                  boost::asio::async_read(
-                    *strm, boost::asio::buffer(*rest),
-                    [rest, run](const boost::system::error_code& ec4, std::size_t) {
-                      run->set_value(
-                        ec4 ? ("attach read rest: " + ec4.message()) : std::string());
-                    });
-                });
-            });
-        });
-    });
-    if (fut.wait_for(kAttachTimeout) != std::future_status::ready)
-      return "attach timeout";
-    std::string err = fut.get();
-    if (err.empty()) { outStatus = *statusOut; outConnId = *connIdOut; }
     return err;
   }
 
@@ -757,6 +605,28 @@ public:
   }
 
 private:
+  // Write a bind request built for `hello`, and read and check the reply.
+  std::string sendBind(minx::Bytes request, const ServerHello& hello) {
+    auto run =
+      std::make_shared<std::promise<std::pair<std::string, BindDigest>>>();
+    auto fut = run->get_future();
+    auto strm = stream_;
+    boost::asio::post(taskIO_,
+      [strm, req = std::move(request), hello, run]() mutable {
+        asyncFinishBind(strm, std::move(req), hello,
+                        [run](BindError err, BindDigest digest) {
+          run->set_value({err == BindError::None ? std::string()
+                                                 : bindErrorText(err),
+                          digest});
+        });
+      });
+    if (fut.wait_for(kBindTimeout) != std::future_status::ready)
+      return "bind handshake timeout";
+    auto [err, digest] = fut.get();
+    if (err.empty()) bindDigest_ = digest;
+    return err;
+  }
+
   void scheduleTick() {
     if (!tickTimer_ || !rudp_) return;
     tickTimer_->expires_after(std::chrono::milliseconds(10));
@@ -785,6 +655,9 @@ private:
   uint32_t channel_ = 0;
   std::shared_ptr<minx::RudpStream> stream_;
   boost::asio::streambuf lineBuf_;
+  // The digest of the last bind that succeeded: the per-op sigs of the
+  // channel (the ATTACH) sign it.
+  BindDigest bindDigest_{};
 };
 
 // Map ATTACH status → cesh exit code per spec.
@@ -863,20 +736,26 @@ int runDial(const DialArgs& args) {
     return 1;
   }
 
-  uint64_t sessionToken = 0;
-  minx::Hash serverPk{};
   const minx::Hash* expected =
     args.expectedServerPk.has_value() ? &*args.expectedServerPk : nullptr;
 
   // --extsign: the signatures come from a tunneler (cesweb) over a stdio
-  // control handshake; no private key here. Bind, hand back the session token
-  // so the far side can sign ATTACH over it, then ATTACH and fall into the same
-  // raw byte pipe. Control I/O is on fd 0/1 and strictly precedes the pump.
+  // control handshake; no private key here. Read the server hello, hand its
+  // key and challenge to the far side so it can sign the bind and the
+  // ATTACH, then bind, ATTACH and fall into the same raw byte pipe. Control
+  // I/O is on fd 0/1 and strictly precedes the pump.
   if (args.extSign) {
     minx::Hash clientPub{};
     if (!hexToBytes(args.clientPubkeyHex, clientPub.data(), clientPub.size())) {
       writeControlLine("ERR bad --pubkey"); return 1;
     }
+    ServerHello hello;
+    if (auto e = dialer.connect(expected, hello); !e.empty()) {
+      writeControlLine("ERR connect: " + e); return 4;
+    }
+    writeControlLine("HELLO " + minx::hashToString(hello.serverPubkey) + " " +
+                     std::to_string(hello.challenge));
+
     std::string bindLine = readControlLine();      // "BIND <timeUs> <sigHex>"
     uint64_t timeUs = 0; std::string bindSigHex;
     { std::istringstream is(bindLine); std::string tag;
@@ -888,10 +767,9 @@ int runDial(const DialArgs& args) {
     }
     if (auto e = dialer.bindExt(
           std::span<const uint8_t>(clientPub.data(), clientPub.size()),
-          timeUs, bindSig, expected, sessionToken, serverPk); !e.empty()) {
+          timeUs, bindSig, hello); !e.empty()) {
       writeControlLine("ERR bind: " + e); return 4;
     }
-    writeControlLine("TOKEN " + std::to_string(sessionToken));
 
     std::string attLine = readControlLine();       // "ATTACH <sigHex>"
     std::string attSigHex;
@@ -902,8 +780,9 @@ int runDial(const DialArgs& args) {
     if (!hexToBytes(attSigHex, attSig.data(), attSig.size())) {
       writeControlLine("ERR bad attach sig"); return 1;
     }
-    uint8_t st = 0xFF; uint64_t cid = 0;
-    if (auto e = dialer.attachExt(attSig, args.pid, st, cid); !e.empty()) {
+    uint8_t st = 0xFF; uint64_t cid = 0; std::string greeting;
+    if (auto e = dialer.attachSigned(attSig, args.pid, st, cid, greeting);
+        !e.empty()) {
       writeControlLine("ERR attach: " + e); return 5;
     }
     if (st != CES_OK) {
@@ -911,25 +790,37 @@ int runDial(const DialArgs& args) {
       return exitCodeForAttachStatus(st);
     }
     writeControlLine("READY");
+    // The greeting rode the accept: it is the first bytes of the raw pipe,
+    // exactly as if the program had sent it on open.
+    for (size_t off = 0; off < greeting.size();) {
+      ssize_t w = ::write(STDOUT_FILENO, greeting.data() + off,
+                          greeting.size() - off);
+      if (w < 0 && errno == EINTR) continue;
+      if (w <= 0) break;
+      off += static_cast<size_t>(w);
+    }
     return dialer.runDataPump();
   }
 
-  if (auto e = dialer.bind(args.signerKey, expected,
-                           sessionToken, serverPk);
-      !e.empty()) {
-    std::cerr << "Error: bind: " << e << "\n";
+  ServerHello hello;
+  if (auto e = dialer.connect(expected, hello); !e.empty()) {
+    std::cerr << "Error: connect: " << e << "\n";
     return 4;
   }
   if (!expected && args.verbose) {
     std::cerr << "TOFU server pubkey: "
-              << minx::hashToString(serverPk) << "\n";
+              << minx::hashToString(hello.serverPubkey) << "\n";
+  }
+  if (auto e = dialer.bind(args.signerKey, hello); !e.empty()) {
+    std::cerr << "Error: bind: " << e << "\n";
+    return 4;
   }
 
   uint8_t attachStatus = 0xFF;
   uint64_t connId = 0;
-  std::string hello;
-  if (auto e = dialer.attach(args.signerKey, sessionToken,
-                             args.pid, attachStatus, connId, hello);
+  std::string greeting;
+  if (auto e = dialer.attach(args.signerKey,
+                             args.pid, attachStatus, connId, greeting);
       !e.empty()) {
     std::cerr << "Error: attach: " << e << "\n";
     return 5;
@@ -944,8 +835,8 @@ int runDial(const DialArgs& args) {
   }
   // The greeting rode the accept: emit it as the first bytes of the stream,
   // exactly as if the program had sent it on open.
-  if (!hello.empty()) {
-    std::cout.write(hello.data(), static_cast<std::streamsize>(hello.size()));
+  if (!greeting.empty()) {
+    std::cout.write(greeting.data(), static_cast<std::streamsize>(greeting.size()));
     std::cout.flush();
   }
 
@@ -956,7 +847,6 @@ int runDial(const DialArgs& args) {
 
 struct DialLineSession::Impl {
   Dialer dialer;
-  uint64_t token = 0;
   bool opened = false;
 };
 
@@ -970,19 +860,28 @@ std::string DialLineSession::open(const DialArgs& args) {
   if (!resolvePeer(host, args.rpcPort, peer, err)) return err;
   std::string e = impl_->dialer.start(peer);
   if (!e.empty()) return e;
+  // On a failure, end the channel now: the caller can keep this object.
+  struct EndOnFailure {
+    Dialer& dialer;
+    bool armed = true;
+    ~EndOnFailure() { if (armed) dialer.stop(); }
+  } endOnFailure{impl_->dialer};
 
-  minx::Hash serverPk{};
   const minx::Hash* expected = args.expectedServerPk ? &*args.expectedServerPk : nullptr;
-  e = impl_->dialer.bind(args.signerKey, expected, impl_->token, serverPk);
+  ServerHello hello;
+  e = impl_->dialer.connect(expected, hello);
+  if (!e.empty()) return "connect: " + e;
+  e = impl_->dialer.bind(args.signerKey, hello);
   if (!e.empty()) return "bind: " + e;
 
   uint8_t status = 0;
   uint64_t connId = 0;
-  std::string hello;  // consumed from the accept; the line protocol ignores it
-  e = impl_->dialer.attach(args.signerKey, impl_->token, args.pid, status, connId, hello);
+  std::string greeting;  // consumed from the accept; the line protocol ignores it
+  e = impl_->dialer.attach(args.signerKey, args.pid, status, connId, greeting);
   if (!e.empty()) return "attach: " + e;
   if (status != CES_OK) return std::string("attach: ") + attachErrorName(status);
 
+  endOnFailure.armed = false;
   impl_->opened = true;
   return "";
 }

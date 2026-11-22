@@ -1,6 +1,6 @@
 // Shared test-only CesPlex handler: a length-prefixed byte echo.
 //
-// After the select handshake completes, reads an 8-byte length prefix
+// After the bind handshake completes, reads an 8-byte length prefix
 // (u64 BE), then that many payload bytes, then writes the same length +
 // payload back. Clean enough to assert "round-trip" on. Header-only so each
 // test TU instantiates its OWN object and mounts it via the host's object

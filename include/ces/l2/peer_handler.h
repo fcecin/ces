@@ -114,7 +114,6 @@ private:
   void establishChannel(std::shared_ptr<PeerLink> link, bool bulk);
   void channelReadLoop(std::shared_ptr<PeerLink> link, bool bulk);
   void kickWrite(std::shared_ptr<PeerLink> link, bool bulk);
-  void readDialBindReply(std::shared_ptr<PeerLink> link, bool bulk);
   void dialChannel(std::shared_ptr<PeerLink> link, bool bulk);
   void dialPeer(const minx::Hash& ckey, const minx::SockAddr& endpoint);
   void reconcileOnce();

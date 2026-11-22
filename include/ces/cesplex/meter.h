@@ -32,6 +32,7 @@
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <map>
 #include <memory>
@@ -101,6 +102,9 @@ public:
   };
   std::vector<ChannelSnapshot> snapshot() const;
 
+  // Test hook: the number of track() calls so far, from any thread.
+  uint64_t _trackCalls() const { return trackCalls_.load(); }
+
   // Test hook: run one tick synchronously, blocking until done.
   // Real tick cadence is 60 s; tests use this to fast-forward delta
   // computation + the usage report without sleeping a minute.
@@ -152,6 +156,7 @@ private:
   minx::Rudp& rudp_;
   boost::asio::io_context& io_;
   CesPlexHost* host_;
+  std::atomic<uint64_t> trackCalls_{0};   // see _trackCalls
   std::chrono::seconds tickInterval_;
   // Touched only on io_'s strand. No mutex needed if all access posts
   // through io_, which is the contract. The Rudp runs on io_'s thread, so its

@@ -22,6 +22,9 @@
 //   }
 
 import fs from 'node:fs';
+import crypto from 'node:crypto';
+import { ed25519 } from '@noble/curves/ed25519.js';
+import { bindDigest } from '../src/cessign.js';
 
 const argv = process.argv.slice(2);
 const fx = (() => {
@@ -46,9 +49,10 @@ if (argv.includes('keys')) {                 // `keys list -p` -> <priv> (<pub>)
 } else if (argv.includes('dial')) {
   // Simulate `cesh dial <pid>` into a line-REPL Lua program (dice-like): emit a
   // greeting, then echo each input line. With --extsign, first run the control
-  // handshake (BIND→TOKEN, ATTACH→READY) — sigs are not verified here; this is a
-  // stand-in. The fixture's `dial` block can tweak the greeting or force a fail.
-  const pid = [...argv].reverse().find((a) => /^\d+$/.test(a) && a !== '--pubkey') || '?';
+  // handshake (HELLO, then BIND and ATTACH → READY) — sigs are not verified
+  // here; this is a stand-in. The fixture's `dial` block can tweak the greeting
+  // or force a fail.
+  const pid = argv[argv.indexOf('dial') + 1] || '?';
   const d = fx.dial || {};
   if (d.fail) fail(d.fail === true ? 'COMPUTE_INSTANCE_NOT_FOUND' : d.fail);
   if (d.http != null) {
@@ -90,8 +94,20 @@ if (argv.includes('keys')) {                 // `keys list -p` -> <priv> (<pub>)
     const extsign = argv.includes('--extsign');
     const greet = () => process.stdout.write((d.greeting || `fakecesh dial pid=${pid} ready`) + '\n');
     let state = extsign ? 'bind' : 'repl';
+    // The server hello. Its challenge is above 2^53, so a relay that turns it
+    // into a Number breaks the signatures, and the checks below fail.
+    const SERVER_KEY = 'ab'.repeat(32), CHALLENGE = 9223372036854775809n;
+    const clientPub = argv[argv.indexOf('--pubkey') + 1] || '';
+    // Check an ed25519 signature (65 hex bytes, tag 0x00) as the server does.
+    const sigOk = (sigHex, digest) => {
+      const sig = Buffer.from(sigHex || '', 'hex');
+      return sig.length === 65 && sig[0] === 0x00 &&
+        ed25519.verify(sig.subarray(1), digest, Buffer.from(clientPub, 'hex'));
+    };
     if (!extsign) greet();
+    else process.stdout.write(`HELLO ${SERVER_KEY} ${CHALLENGE}\n`);
     let buf = '';
+    let boundDigest = null;   // of the BIND; the ATTACH signs it
     process.stdin.on('data', (c) => {
       buf += c.toString();
       let nl;
@@ -100,10 +116,20 @@ if (argv.includes('keys')) {                 // `keys list -p` -> <priv> (<pub>)
         buf = buf.slice(nl + 1);
         if (state === 'bind') {
           if (!line.startsWith('BIND ')) { process.stdout.write('ERR expected BIND\n'); process.exit(1); }
-          process.stdout.write('TOKEN 12345\n');
+          const [, time, sig] = line.split(' ');
+          boundDigest = bindDigest('/ces/lua/1', BigInt(time), clientPub, SERVER_KEY, CHALLENGE);
+          if (!sigOk(sig, boundDigest)) {
+            process.stdout.write('ERR bind: the server refused the bind\n'); process.exit(4);
+          }
           state = 'attach';
         } else if (state === 'attach') {
           if (!line.startsWith('ATTACH ')) { process.stdout.write('ERR expected ATTACH\n'); process.exit(1); }
+          const be64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
+          const attachDigest = crypto.createHash('sha256')
+            .update(Buffer.concat([Buffer.from([0x01]), be64(pid), boundDigest])).digest();
+          if (!sigOk(line.split(' ')[1], attachDigest)) {
+            process.stdout.write('ERR attach: bad signature\n'); process.exit(1);
+          }
           process.stdout.write('READY\n');
           greet();
           state = 'repl';

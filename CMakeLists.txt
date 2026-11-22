@@ -156,7 +156,7 @@ endif()
 
 # Recursive so ceslib's source tree mirrors the include tree: every
 # include/ces/<group>/<name>.h has its src/ceslib/<group>/<name>.cpp.
-file(GLOB_RECURSE CESLIB_SOURCES "src/ceslib/*.cpp")
+file(GLOB_RECURSE CESLIB_SOURCES CONFIGURE_DEPENDS "src/ceslib/*.cpp")
 
 # The portable client subset: keys/protocol/client, CesPlexClient, the L2
 # file/compute clients, and utils. The server half (ledger tables, VM, L2

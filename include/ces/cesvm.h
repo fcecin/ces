@@ -248,11 +248,11 @@ enum CesVMSyscall : uint64_t {
   // pre-allocated with extra capacity to receive the response), passes
   // its head key to SYS_RPC, and the dispatcher:
   //   - Reads header.fileSize bytes from the file chain as the request.
-  //   - Builds a signed envelope: [u32 BE body_len][body][u64 BE time_us]
-  //     [32 sender_key][32 sha256(body||time||key)][65 signature]
   //   - Opens an outbound Rudp channel on the server's dedicated rpcMinx_,
-  //     writes the envelope via asio::async_write on a RudpStream, reads
-  //     a [u32 BE body_len][body] response.
+  //     and binds it on CesPlex "/ces/rpc/1" with the server key.
+  //   - Writes [u32 BE body_len][body], with no signature of its own,
+  //     and reads a [u32 BE body_len][body] response. So the target sees
+  //     the server as the sender of each program's call.
   //   - Writes the response bytes back into the SAME file chain, updating
   //     header.fileSize to the response length (bounded by chain capacity;
   //     excess response bytes are silently truncated).
@@ -799,10 +799,10 @@ public:
                                    const uint8_t*, size_t, uint64_t /*time_us*/)
   { notImpl("scheduleAlias"); }
   // SYS_RPC — fire-and-forget MINX/RUDP stream call. The dispatcher reads
-  // the request body from the cesh file at `fileHeadKey`, signs a footer
-  // envelope (see the SYS_RPC enum comment), ships it to (host, port) on
-  // the server's dedicated rpcMinx_, reads the response, writes it back
-  // into the same file, and schedules a followup VM run with the outcome.
+  // the request body from the cesh file at `fileHeadKey`, ships it to
+  // (host, port) on the server's dedicated rpcMinx_ (see the SYS_RPC enum
+  // comment), reads the response, writes it back into the same file, and
+  // schedules a followup VM run with the outcome.
   // Returns a CES error code for the queue result (CES_OK = queued; the
   // actual call outcome arrives later via the followup).
   virtual uint8_t  rpc            (const std::string&, uint16_t,

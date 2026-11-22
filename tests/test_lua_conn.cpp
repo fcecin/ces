@@ -35,10 +35,10 @@ BOOST_AUTO_TEST_CASE(AttachRequiresListener) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
 
-  auto r = peer.attach(userKey, sessionToken, instId);
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_CHECK_RC_EQ(r.status, CES_ERROR_NOT_LISTENING);
 }
 
@@ -59,10 +59,10 @@ BOOST_AUTO_TEST_CASE(EchoRoundTrip) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
 
-  auto r = peer.attach(userKey, sessionToken, instId);
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_CHECK(r.connId > 0);
   BOOST_CHECK(r.hello.empty());   // request-driven program: no greeting
@@ -97,10 +97,10 @@ BOOST_AUTO_TEST_CASE(HelloRidesAttachReply) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
 
-  auto r = peer.attach(userKey, sessionToken, instId);
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_CHECK_EQUAL(r.hello, "CES TERMINAL v1\n");
 }
@@ -122,9 +122,9 @@ BOOST_AUTO_TEST_CASE(OnOpenFiresWithBoundPubkey) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   ces::Bytes got;
@@ -158,9 +158,9 @@ BOOST_AUTO_TEST_CASE(BurstyBidirectionalEcho) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   // One inbound byte triggers ten outbound writes.
@@ -192,9 +192,9 @@ BOOST_AUTO_TEST_CASE(ProgramCloseTearsDownUserChannel) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
@@ -235,9 +235,9 @@ BOOST_FIXTURE_TEST_CASE(ProgramCloseDeliversEveryQueuedWrite, SmallWindowLuaConn
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
@@ -298,9 +298,9 @@ BOOST_AUTO_TEST_CASE(OnCloseFiresOnUserClose) {
   {
     PlexLuaPeer peer;
     BOOST_REQUIRE(peer.start() != 0);
-    uint64_t sessionToken = 0;
-    BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-    auto r = peer.attach(userKey, sessionToken, instId);
+    ces::BindDigest bindDigest{};
+    BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+    auto r = peer.attach(userKey, bindDigest, instId);
     CES_REQUIRE_RC_EQ(r.status, CES_OK);
     // Explicit close emits HS_CLOSE so the server's dataReadLoop
     // errors out immediately (instead of waiting for RUDP idle GC),
@@ -334,9 +334,9 @@ BOOST_AUTO_TEST_CASE(InstanceDyingCascadesToUser) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   // Kill the instance via the compute client (separate channel).
@@ -376,7 +376,7 @@ BOOST_AUTO_TEST_CASE(MultipleConnsSameUser) {
   PlexLuaPeer p1, p2;
   BOOST_REQUIRE(p1.start() != 0);
   BOOST_REQUIRE(p2.start() != 0);
-  uint64_t st1 = 0, st2 = 0;
+  ces::BindDigest st1{}, st2{};
   BOOST_REQUIRE(p1.bind(rpcPort, userKey, st1));
   BOOST_REQUIRE(p2.bind(rpcPort, userKey, st2));
   auto r1 = p1.attach(userKey, st1, instId);
@@ -424,7 +424,7 @@ BOOST_AUTO_TEST_CASE(MultipleConnsMultipleUsers) {
   PlexLuaPeer p1, p2;
   BOOST_REQUIRE(p1.start() != 0);
   BOOST_REQUIRE(p2.start() != 0);
-  uint64_t st1 = 0, st2 = 0;
+  ces::BindDigest st1{}, st2{};
   BOOST_REQUIRE(p1.bind(rpcPort, userKey, st1));
   BOOST_REQUIRE(p2.bind(rpcPort, u2,      st2));
   CES_REQUIRE_RC_EQ(p1.attach(userKey, st1, instId).status, CES_OK);
@@ -453,9 +453,9 @@ BOOST_AUTO_TEST_CASE(MultipleConnsMultipleUsers) {
 BOOST_AUTO_TEST_CASE(AttachUnknownInstance) {
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, /*bogus*/ 99999ULL);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, /*bogus*/ 99999ULL);
   CES_CHECK_RC_EQ(r.status, CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND);
 }
 
@@ -466,8 +466,8 @@ BOOST_AUTO_TEST_CASE(AttachUnknownInstance) {
 BOOST_AUTO_TEST_CASE(AttachBadSigDropsChannel) {
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
 
   // Build an ATTACH wire by hand with a deliberately wrong sig (signed
   // with a DIFFERENT key — passes shape checks but won't verify
@@ -480,7 +480,7 @@ BOOST_AUTO_TEST_CASE(AttachBadSigDropsChannel) {
   ces::Signature badSig = ces::signPerOp(
     stranger, kVerbAttach,
     std::span<const uint8_t>(preamble.data(), preamble.size()),
-    sessionToken);
+    bindDigest);
 
   ces::Bytes wire;
   wire.push_back(kVerbAttach);
@@ -524,7 +524,7 @@ BOOST_AUTO_TEST_CASE(SetListenerNilFlipsGateOff) {
   // First peer attaches successfully.
   PlexLuaPeer p1;
   BOOST_REQUIRE(p1.start() != 0);
-  uint64_t st1 = 0;
+  ces::BindDigest st1{};
   BOOST_REQUIRE(p1.bind(rpcPort, userKey, st1));
   CES_REQUIRE_RC_EQ(p1.attach(userKey, st1, instId).status, CES_OK);
 
@@ -543,7 +543,7 @@ BOOST_AUTO_TEST_CASE(SetListenerNilFlipsGateOff) {
   // New ATTACH must be rejected.
   PlexLuaPeer p2;
   BOOST_REQUIRE(p2.start() != 0);
-  uint64_t st2 = 0;
+  ces::BindDigest st2{};
   BOOST_REQUIRE(p2.bind(rpcPort, userKey, st2));
   auto r2 = p2.attach(userKey, st2, instId);
   CES_CHECK_RC_EQ(r2.status, CES_ERROR_NOT_LISTENING);
@@ -593,9 +593,9 @@ BOOST_FIXTURE_TEST_CASE(AVisitPaysAtTheCloseAndPaysTheProgram, PayoutLuaConnFixt
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t token = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, visitor, token));
-  auto r = peer.attach(visitor, token, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, visitor, bindDigest));
+  auto r = peer.attach(visitor, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes(4096, 'x')));
   ces::Bytes got;
@@ -628,9 +628,9 @@ BOOST_FIXTURE_TEST_CASE(AVisitPaysAtTheCloseAndPaysTheProgram, PayoutLuaConnFixt
 
 // A direct /ces/luarpc/1 dial into a program bills its caller when it closes,
 // from the program's own endpoint meter (whose tick is 60 s away, past the
-// wait). It pays the program nothing: a bind does not name its server, so a
-// dialed party could replay one.
-BOOST_FIXTURE_TEST_CASE(ADirectDialPaysAtTheCloseWithNoPayout, PayoutLuaConnFixture) {
+// wait), and pays the program as an ATTACH does: the caller's bind signed this
+// program's key and the challenge of this channel.
+BOOST_FIXTURE_TEST_CASE(ADirectDialPaysAtTheCloseAndPaysTheProgram, PayoutLuaConnFixture) {
   const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/direct.lua";
   uploadScript(path, kEcho);
   const uint64_t instId = launchScript(path);
@@ -651,20 +651,55 @@ BOOST_FIXTURE_TEST_CASE(ADirectDialPaysAtTheCloseWithNoPayout, PayoutLuaConnFixt
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t token = 0;
-  BOOST_REQUIRE(peer.bind(childPort, caller, token, std::chrono::seconds(3), "/ces/luarpc/1"));
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(childPort, caller, bindDigest, std::chrono::seconds(3), "/ces/luarpc/1"));
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes(4096, 'x')));
   ces::Bytes got;
   BOOST_REQUIRE(peerReadExact(peer, got, 4096, std::chrono::seconds(10)));
   peer.closeStream();
-  // The bill and any payout land in one logic task, so once the caller paid,
+  // The bill and the payout land in one logic task, so once the caller paid,
   // the program's balance is final.
   BOOST_REQUIRE(waitUntil([&] {
     server->_drainLogic();
     return server->_balanceOf(callerKey) < callerBefore;
   }, std::chrono::seconds(30)));
   server->_drainLogic();
-  BOOST_CHECK_EQUAL(server->_balanceOf(programKey), programBefore);
+  const int64_t paid = callerBefore - server->_balanceOf(callerKey);
+  const int64_t payout = server->_balanceOf(programKey) - programBefore;
+  BOOST_CHECK_GT(paid, 0);
+  BOOST_CHECK_EQUAL(payout * 2, paid);
+}
+
+// The endpoint of a program takes only a bind signed for that program's key:
+// a bind for the key of another program, with the true challenge, gets a NACK.
+BOOST_FIXTURE_TEST_CASE(LuaRpcBindForAnotherProgramIsRejected, PayoutLuaConnFixture) {
+  auto launchEcho = [&](const std::string& file, minx::Hash& key) {
+    const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/" + file;
+    uploadScript(path, kEcho);
+    const uint64_t id = launchScript(path);
+    BOOST_REQUIRE(waitInstanceListening(*server, id));
+    std::array<uint8_t, 32> pk{};
+    BOOST_REQUIRE(server->fileHandler()->readProgramPubkey(path, pk));
+    std::copy(pk.begin(), pk.end(), key.begin());
+    return id;
+  };
+  minx::Hash keyA{}, keyB{};
+  launchEcho("progA.lua", keyA);
+  const uint64_t idB = launchEcho("progB.lua", keyB);
+  const uint16_t portB = server->computeHandler()->testInstanceRpcPort(idB);
+  BOOST_REQUIRE(portB != 0);
+
+  KeyPair caller;
+  {
+    PlexLuaPeer peer;
+    BOOST_REQUIRE(peer.start() != 0);
+    BOOST_CHECK(peer.bindFor(portB, caller, "/ces/luarpc/1", keyA) ==
+                ces::BindError::Rejected);
+  }
+  PlexLuaPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  BOOST_CHECK(peer.bindFor(portB, caller, "/ces/luarpc/1", keyB) ==
+              ces::BindError::None);
 }
 
 // A visitor with no credit on the server cannot ATTACH: it could not pay for
@@ -678,9 +713,9 @@ BOOST_FIXTURE_TEST_CASE(AVisitorWithNoCreditCannotAttach, LuaConnFixture) {
   KeyPair nobody;
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t token = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, nobody, token));
-  auto r = peer.attach(nobody, token, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, nobody, bindDigest));
+  auto r = peer.attach(nobody, bindDigest, instId);
   CES_CHECK_RC_EQ(r.status, CES_ERROR_INSUFFICIENT_BALANCE);
 }
 
@@ -716,9 +751,9 @@ BOOST_FIXTURE_TEST_CASE(AServerZoneProgramGetsNoPayee, PayoutLuaConnFixture) {
   server->_drainLogic();
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t token = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, visitor, token));
-  auto r = peer.attach(visitor, token, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, visitor, bindDigest));
+  auto r = peer.attach(visitor, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_REQUIRE(peerWrite(peer, ces::Bytes{'x'}));
   ces::Bytes got;

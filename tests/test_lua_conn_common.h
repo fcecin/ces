@@ -16,7 +16,7 @@
 //   Client → Server (ATTACH):
 //     [u8 verb=0x01][u32 BE preamble_len=8][preamble][65 sig]
 //     preamble = [u64 pid]
-//     sig over sha256(verb || preamble || sessionToken)
+//     sig over sha256(verb || preamble || bind digest)
 //
 //   Server → Client (ATTACH reply):
 //     [u8 status]
@@ -37,6 +37,7 @@
 #include <ces/l2/compute_client.h>
 #include <ces/buffer.h>
 #include <ces/l2/file_client.h>
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/mux.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_handler.h>
@@ -163,11 +164,11 @@ public:
     port_ = 0;
   }
 
-  // Open a channel to (loopback, targetPort), do the signed select for
-  // /ces/lua/1, return the bound sessionToken (and the underlying
-  // RudpStream via stream()).
+  // Open a channel to (loopback, targetPort), do the signed bind for
+  // `name`, and return the digest of the bind, which the per-op sigs sign
+  // (and the underlying RudpStream via stream()).
   bool bind(uint16_t targetPort, const KeyPair& signer,
-            uint64_t& sessionToken,
+            ces::BindDigest& bindDigest,
             std::chrono::milliseconds timeout =
               std::chrono::seconds(3),
             const std::string& name = "/ces/lua/1") {
@@ -177,11 +178,11 @@ public:
 
     auto done = std::make_shared<std::atomic<bool>>(false);
     auto ok = std::make_shared<std::atomic<bool>>(false);
-    auto tok = std::make_shared<std::atomic<uint64_t>>(0);
+    auto got = std::make_shared<ces::BindDigest>();
     auto mu = std::make_shared<std::mutex>();
     auto cv = std::make_shared<std::condition_variable>();
 
-    boost::asio::post(taskIO_, [this, &signer, name, done, ok, tok, mu, cv]() {
+    boost::asio::post(taskIO_, [this, signer, name, done, ok, got, mu, cv]() {
       rudp_->tick(nowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
         taskIO_.get_executor());
@@ -190,39 +191,59 @@ public:
         finishBind(done, mu, cv);
         return;
       }
-
-      const uint64_t bindNowUs = nowMicros();
-      auto bindReq = std::make_shared<minx::Bytes>(
-        ces::buildBindRequest(name, bindNowUs, signer));
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, done, ok, tok, mu, cv]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { finishBind(done, mu, cv); return; }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [reply, done, ok, tok, mu, cv]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2 || (*reply)[0] != ces::CES_PLEX_OK) {
-                finishBind(done, mu, cv);
-                return;
-              }
-              // sessionToken is at offset 1 + 8 (time) + 32 (pubkey).
-              uint64_t st = ces::Buffer::peek<uint64_t>(reply->data() + 1 + 8 + 32);
-              ok->store(true);
-              tok->store(st);
-              finishBind(done, mu, cv);
-            });
+      ces::asyncClientBind(stream_, name, signer, std::nullopt,
+        [done, ok, got, mu, cv](ces::BindError err, ces::ServerHello,
+                                ces::BindDigest digest) {
+          if (err == ces::BindError::None) {
+            std::lock_guard<std::mutex> lk(*mu);
+            *got = digest;
+            ok->store(true);
+          }
+          finishBind(done, mu, cv);
         });
     });
 
     std::unique_lock<std::mutex> lk(*mu);
     if (!cv->wait_for(lk, timeout, [&]() { return done->load(); }))
       return false;
-    sessionToken = tok->load();
+    bindDigest = *got;
     return ok->load();
+  }
+
+  // Open a channel to (loopback, targetPort) and send a bind for `name`
+  // signed for `serverKey`, with the true challenge of the channel's hello.
+  // Returns how the bind ended (None if the endpoint took it).
+  ces::BindError bindFor(uint16_t targetPort, const KeyPair& signer,
+                         const std::string& name, const minx::Hash& serverKey,
+                         std::chrono::milliseconds timeout =
+                           std::chrono::seconds(3)) {
+    currentPeer_ = minx::SockAddr(
+      boost::asio::ip::address_v6::loopback(), targetPort);
+    currentChannel_ = 1;
+    auto result = std::make_shared<std::promise<ces::BindError>>();
+    auto fut = result->get_future();
+    boost::asio::post(taskIO_, [this, signer, name, serverKey, result]() {
+      rudp_->tick(nowMicros());
+      stream_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
+      if (!rudp_->registerChannel(currentPeer_, currentChannel_, stream_)) {
+        result->set_value(ces::BindError::Unreachable);
+        return;
+      }
+      auto stream = stream_;
+      ces::asyncStartBind(stream, name, std::nullopt,
+        [stream, signer, name, serverKey, result](ces::BindError err,
+                                                  ces::ServerHello hello) {
+          if (err != ces::BindError::None) { result->set_value(err); return; }
+          ces::ServerHello signFor = hello;
+          signFor.serverPubkey = serverKey;
+          ces::asyncFinishBind(stream,
+            ces::buildBindRequest(name, nowMicros(), signer, signFor), hello,
+            [result](ces::BindError e, ces::BindDigest) { result->set_value(e); });
+        });
+    });
+    if (fut.wait_for(timeout) != std::future_status::ready)
+      return ces::BindError::Unreachable;
+    return fut.get();
   }
 
   // Send the ATTACH verb and read the (fixed-shape) reply.
@@ -234,7 +255,7 @@ public:
   };
 
   AttachResult attach(const KeyPair& signer,
-                      uint64_t sessionToken,
+                      const ces::BindDigest& bindDigest,
                       uint64_t pid,
                       std::chrono::milliseconds timeout =
                         std::chrono::seconds(3)) {
@@ -246,7 +267,7 @@ public:
     ces::Signature sig = ces::signPerOp(
       signer, kVerbAttach,
       std::span<const uint8_t>(preamble.data(), preamble.size()),
-      sessionToken);
+      bindDigest);
 
     ces::Bytes wire;
     wire.push_back(kVerbAttach);

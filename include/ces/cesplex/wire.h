@@ -1,43 +1,74 @@
 // wire.h — wire format helpers for the CesPlex bind contract
 // + per-op envelope.
 //
-//   1. The select handshake is a SIGNED bind contract. Both client and
-//      server commit cryptographic artifacts to the binding event:
+//   1. The bind is a signed contract in four messages. It binds the
+//      channel to the client key as its payer.
 //
-//      Client → Server (signed by client):
+//      Client → Server, the protocol name (not signed):
 //        [u16 BE name_len][name]
-//        [u64 BE client_time_us][32 client_pubkey]
-//        [32 sha256(everything above)]
-//        [65 sig]
 //
-//      Server → Client (signed by server):
+//      The client speaks first. RUDP sent its accept to the address that
+//      the open claimed, so a channel packet from the client, which carries
+//      the RUDP session token, proves that address. The server sends nothing
+//      on the channel before that: an open with a forged address gets only
+//      the small RUDP accept, as with MINX tickets.
+//
+//      Server → Client, the server hello (not signed):
+//        [32 server_pubkey][u64 BE challenge]
+//
+//      The challenge is a fresh random number that the server picks for
+//      this channel. The client signs it, so its bind is good on this
+//      channel only. The client signs the server key, so its bind is good
+//      at this server only. A client that expects a key refuses a hello
+//      with another key, and signs nothing.
+//
+//      Client → Server, the rest of the bind request (signed by client):
+//        [u64 BE client_time_us][32 client_pubkey]
+//        [32 client_sha256][65 sig]
+//
+//      client_sha256 = sha256(u16 name_len || name || u64 client_time_us
+//                             || client_pubkey || server_pubkey
+//                             || u64 challenge)
+//      The request does not carry server_pubkey and challenge: each side
+//      takes them from the hello. buildBindRequest gives the whole request,
+//      name first; the client sends the name, reads the hello, then sends
+//      the rest (bindRequestTail).
+//
+//      Server → Client, the bind reply (signed by server):
 //        [u8 status]                  (CES_PLEX_OK=0x01 / CES_PLEX_NACK=0x00)
 //        [u64 BE server_time_us][32 server_pubkey]
-//        [8  channel_session_token]   (from RUDP, anchors per-op sigs;
-//                                      guaranteed non-zero in practice)
+//        [u64 BE challenge]
 //        [u32 BE server_proto_version]
 //        [32 sha256(status || client_sha256 || all-of-above)]
 //        [65 sig]
+//
+//      No signature in CES depends on the RUDP session token. RUDP sends
+//      it in clear, and the side that accepts a channel can choose it.
 //
 //   2. Once bound, every per-op verb on the channel uses a minimal
 //      envelope:
 //
 //        [u8 verb][u32 BE preamble_len][preamble bytes]
-//        [65 sig over sha256(verb || preamble || sessionToken)]
+//        [65 sig over sha256(verb || preamble || client_sha256)]
 //        [optional body: bytes whose sha256 is committed inside the
 //         preamble for verbs that carry executable code (WRITE/APPEND).
 //         READ has the symmetric thing on the response side.]
 //
+//      client_sha256 is the digest of the bind of this channel. It covers
+//      the protocol name, the client key, the server key and the
+//      challenge, so a verb names its server and its channel: a verb
+//      that a key signs for one server fails at each other server, also
+//      when that server gives its channel the same challenge.
 //      No per-op pubkey on the wire — the bound pubkey is implicit.
 //      No per-op timestamp — the application's reqNonce in the
-//      preamble + the channel's sessionToken give natural uniqueness
-//      per channel-incarnation. Dedup key = first 8 bytes of sig as
-//      big-endian u64. Sig space is per-channel-incarnation so
+//      preamble + the channel's bind digest give natural uniqueness
+//      per channel. Dedup key = the 8 bytes of sig after the tag
+//      byte, as a big-endian u64. Sig space is per channel, so
 //      cross-channel collisions can't happen; within a channel the
 //      birthday horizon is ~2^32 ops, well beyond any practical
 //      channel lifetime.
 //
-//   3. The bound state (pubkey + sessionToken + bind time) lives on a
+//   3. The bound state (pubkey + bind digest + bind time) lives on a
 //      BoundChannelContext that the CesPlex Session passes to the
 //      application handler at handoff (CesPlexHandler::serve).
 //
@@ -48,9 +79,10 @@
 // ParsedBindReply, so a parse failure or zeroed buffer reads as
 // "rejected" not "approved".
 //
-// The signing is anti-MITM only. Server sigs prove the bind reply came from
-// the intended server; client sigs prove each op came from the bound
-// principal. The bus carries no prices — it measures bytes and time and
+// Server sigs prove the bind reply came from the intended server; client
+// sigs prove each op came from the bound principal. RUDP has no
+// encryption: a party on the path can read the channel, and the raw bytes
+// after the bind have no signature. The bus carries no prices — it measures bytes and time and
 // reports the counts to its host, which does all pricing and accounting.
 
 #pragma once
@@ -64,6 +96,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -85,8 +118,9 @@ constexpr uint8_t CES_PLEX_NACK = 0x00;
 // breaks (decade-scale events).
 constexpr uint32_t CES_PLEX_PROTO_VERSION_V1 = 1;
 
-// Maximum protocol name length accepted in the bind preamble. Names
-// longer than this are NACKed before the server reads them.
+// Maximum protocol name length accepted in the bind preamble. The server
+// drops a bind with a longer name, or an empty one, with no reply: the client
+// waits for a hello at that point, so a NACK would read as one.
 constexpr uint16_t CES_PLEX_MAX_NAME_LEN = 256;
 
 // Wire layout sizes. PublicKey and Hash in CES are 32 bytes on the
@@ -98,6 +132,17 @@ constexpr size_t CES_PLEX_SHA256_SIZE = 32;
 constexpr size_t CES_PLEX_PUBKEY_SIZE = 32;
 constexpr size_t CES_PLEX_SIG_SIZE    = 65;
 
+// The server hello: [32 server_pubkey][u64 BE challenge].
+constexpr size_t CES_PLEX_CHALLENGE_SIZE = sizeof(uint64_t);
+constexpr size_t CES_PLEX_HELLO_SIZE =
+    CES_PLEX_PUBKEY_SIZE + CES_PLEX_CHALLENGE_SIZE;
+static_assert(CES_PLEX_HELLO_SIZE == 40,
+              "server hello size diverged from documented layout");
+
+// The digest of a bind request (client_sha256). Each per-op signature of
+// the channel signs it.
+using BindDigest = std::array<uint8_t, CES_PLEX_SHA256_SIZE>;
+
 static_assert(sizeof(minx::Hash) == CES_PLEX_SHA256_SIZE,
               "wire/type mismatch: minx::Hash vs CES_PLEX_SHA256_SIZE");
 static_assert(sizeof(Signature) == CES_PLEX_SIG_SIZE,
@@ -107,11 +152,11 @@ static_assert(sizeof(Signature) == CES_PLEX_SIG_SIZE,
 // and the trailing sha256 + sig). Locked to its decomposition:
 //   8  server_time_us
 // + 32 server_pubkey         (= CES_PLEX_PUBKEY_SIZE)
-// + 8  channel_session_token
+// + 8  challenge             (= CES_PLEX_CHALLENGE_SIZE)
 // + 4  server_proto_version
 // = 52 bytes
 constexpr size_t CES_PLEX_BIND_REPLY_BODY_SIZE =
-    8 + CES_PLEX_PUBKEY_SIZE + 8 + 4;
+    8 + CES_PLEX_PUBKEY_SIZE + CES_PLEX_CHALLENGE_SIZE + 4;
 static_assert(CES_PLEX_BIND_REPLY_BODY_SIZE == 52,
               "bind reply body size diverged from documented layout");
 
@@ -149,11 +194,10 @@ constexpr size_t CES_PLEX_BIND_REQ_TAIL_SIZE =
 static_assert(CES_PLEX_BIND_REQ_TAIL_SIZE == 137,
               "bind request tail size diverged from documented layout");
 
-// Bind-request freshness window. The signed client_time_us is rejected if more
-// than CES_PLEX_BIND_MAX_AGE_US in the past or CES_PLEX_BIND_FUTURE_DRIFT_US in
-// the future. Without it a captured bind replays indefinitely on fresh channels,
-// each re-binding as the victim and accruing ChannelMeter against them. 5 min
-// each way absorbs clock skew while bounding replay.
+// Bind-request time window. The server refuses a client_time_us more than
+// CES_PLEX_BIND_MAX_AGE_US in the past or CES_PLEX_BIND_FUTURE_DRIFT_US in the
+// future. This checks the client's clock only. The signed challenge is what
+// stops a replay: a bind is good on one channel.
 constexpr uint64_t CES_PLEX_BIND_MAX_AGE_US      = 300ULL * 1000000;
 constexpr uint64_t CES_PLEX_BIND_FUTURE_DRIFT_US = 300ULL * 1000000;
 
@@ -173,9 +217,8 @@ struct BoundChannelContext {
   PublicKey  boundPubkey;          // for sig verify
   HashPrefix payerPfx{};           // first 8 bytes of pubkey, account map key
 
-  // Channel anchor (from RUDP). Always non-zero for a successful bind;
-  // a 0 sessionToken indicates the context wasn't populated.
-  uint64_t   sessionToken = 0;     // per-channel-incarnation salt for sigs
+  // The digest of the bind (client_sha256), which each per-op sig signs.
+  BindDigest bindDigest{};
   minx::SockAddr peer{};           // the channel's RUDP address
   uint32_t   channelId = 0;
 
@@ -188,35 +231,69 @@ struct BoundChannelContext {
 // Bind preamble — client side
 // ---------------------------------------------------------------------------
 
-// Build the signed bind request the client sends as the very first
-// bytes on a freshly-opened RUDP channel. `name` is the protocol name
-// (e.g. "/ces/file/1"). `clientKey` is the client's keypair; the
-// resulting bind binds this channel to clientKey.getPublicKeyAsHash() as
-// the principal identity on the server side.
+// What the server hello carries.
+struct ServerHello {
+  minx::Hash serverPubkey{};
+  uint64_t   challenge = 0;
+};
+
+// A fresh challenge for one channel, from the thread's secure random
+// source. Never zero.
+uint64_t newChallenge();
+
+// The server hello: CES_PLEX_HELLO_SIZE bytes.
+minx::Bytes buildServerHello(const ServerHello& hello);
+ServerHello parseServerHello(
+    std::span<const uint8_t, CES_PLEX_HELLO_SIZE> buf);
+
+// Build the signed bind request the client sends after it reads the server
+// hello. `name` is the protocol name (e.g. "/ces/file/1"). `clientKey` is
+// the client's keypair; the bind binds this channel to its public key as the
+// principal identity on the server side. `hello` is the server hello of this
+// channel.
 //
 // Output bytes are ready to async_write onto the RudpStream as a
 // single buffer.
 minx::Bytes buildBindRequest(const std::string& name,
                               uint64_t clientTimeUs,
-                              const KeyPair& clientKey);
+                              const KeyPair& clientKey,
+                              const ServerHello& hello);
 
 // Same wire as buildBindRequest, but with the signature supplied from outside
 // instead of signing with a local KeyPair. For tunnelers (cesweb) where the
 // private key never reaches this process: the caller signs the bind digest
 // elsewhere (browser / node) and passes the 65-byte sig + the 32-byte pubkey.
-// The digest is recomputed here from (name, time, pubkey) so it always matches
-// what the server verifies; the caller's sig must be over that same digest.
+// The digest is recomputed here, so it always matches what the server
+// verifies; the caller's sig must be over that same digest.
 minx::Bytes buildBindRequestSigned(const std::string& name,
                                    uint64_t clientTimeUs,
                                    std::span<const uint8_t> clientPubkey,
+                                   const ServerHello& hello,
                                    const Signature& sig);
 
 // Compute the digest the client signs over (and the server recomputes
-// to verify): sha256(name_len || name || clientTimeUs || clientPubkey).
+// to verify): sha256(u16 name_len || name || u64 clientTimeUs ||
+// clientPubkey || hello.serverPubkey || u64 hello.challenge).
 std::array<uint8_t, CES_PLEX_SHA256_SIZE>
 computeBindRequestDigest(std::span<const uint8_t> name,
                          uint64_t clientTimeUs,
-                         std::span<const uint8_t> clientPubkey);
+                         std::span<const uint8_t> clientPubkey,
+                         const ServerHello& hello);
+
+// The client_sha256 field of a request that buildBindRequest or
+// buildBindRequestSigned built. The bind reply signs over it. Empty if the
+// bytes are too short to be a request.
+std::optional<std::array<uint8_t, CES_PLEX_SHA256_SIZE>>
+bindRequestDigest(const minx::Bytes& request);
+
+// The first part of a bind request, [u16 name_len][name], which the client
+// sends before it reads the hello.
+minx::Bytes buildBindName(const std::string& name);
+
+// The rest of a request that buildBindRequest or buildBindRequestSigned
+// built: the bytes after [u16 name_len][name]. Empty if the bytes are not a
+// request (too short, or a name length that does not fit).
+std::optional<minx::Bytes> bindRequestTail(const minx::Bytes& request);
 
 // ---------------------------------------------------------------------------
 // Bind reply — server side
@@ -227,7 +304,7 @@ computeBindRequestDigest(std::span<const uint8_t> name,
 struct BindReplyFields {
   uint8_t  status = CES_PLEX_OK;
   uint64_t serverTimeUs = 0;
-  uint64_t channelSessionToken = 0;
+  uint64_t challenge = 0;
   uint32_t serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
 };
 
@@ -245,7 +322,7 @@ struct ParsedBindReply {
   uint8_t  status = CES_PLEX_NACK;
   uint64_t serverTimeUs = 0;
   std::array<uint8_t, CES_PLEX_PUBKEY_SIZE> serverPubkey{};
-  uint64_t channelSessionToken = 0;
+  uint64_t challenge = 0;
   uint32_t serverProtoVersion = 0;
   std::array<uint8_t, CES_PLEX_SHA256_SIZE> sha256{};
   std::array<uint8_t, CES_PLEX_SIG_SIZE> sig{};
@@ -253,10 +330,10 @@ struct ParsedBindReply {
 
 // Compute the digest the server signs over and the client recomputes:
 // sha256(status || clientSha256 || serverTimeUs || serverPubkey ||
-//        channelSessionToken || serverProtoVersion).
+//        challenge || serverProtoVersion).
 //
 // Reads only the input fields of `reply` (status / time / pubkey /
-// token / version). Ignores reply.sha256 and reply.sig (those are the
+// challenge / version). Ignores reply.sha256 and reply.sig (those are the
 // digest's *output*, populated by the signer). The type is shared with
 // parseBindReply for caller convenience; the digest computation itself
 // is symmetric on both sides.
@@ -287,7 +364,7 @@ bool verifyBindReply(const ParsedBindReply& reply,
 //
 // On the wire: [u8 verb][u32 BE preamble_len][preamble][65 sig]
 //
-// The sig is over sha256(verb || preamble || sessionToken). No pubkey,
+// The sig is over sha256(verb || preamble || bind digest). No pubkey,
 // no timestamp — both implicit in the bound channel. For verbs with
 // a body (WRITE/APPEND/READ-response), the preamble carries
 // body_length + body_sha256; the body bytes follow the sig and are
@@ -295,18 +372,19 @@ bool verifyBindReply(const ParsedBindReply& reply,
 // digest in the preamble.
 
 // Compute the digest the client signs over and the server recomputes
-// to verify: sha256(verb || preamble || sessionToken).
+// to verify: sha256(verb || preamble || bindDigest), with the digest of
+// the bind of the channel.
 std::array<uint8_t, CES_PLEX_SHA256_SIZE>
 computePerOpDigest(uint8_t verb,
                    std::span<const uint8_t> preamble,
-                   uint64_t sessionToken);
+                   const BindDigest& bindDigest);
 
 // Build the 65-byte sig for a per-op envelope. Caller emits
 // [u8 verb][u32 preamble_len][preamble] and appends this sig.
 Signature signPerOp(const KeyPair& signer,
                     uint8_t verb,
                     std::span<const uint8_t> preamble,
-                    uint64_t sessionToken);
+                    const BindDigest& bindDigest);
 
 // Verify a per-op sig against the bound pubkey. Returns true on
 // success; false on any mismatch (bad sig, wrong pubkey, etc.).

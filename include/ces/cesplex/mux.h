@@ -9,8 +9,8 @@
 // (file / compute / lua) are handlers that ride this bus — users of it,
 // not part of it.
 //
-// Every inbound RUDP channel speaks a SIGNED protocol-select handshake
-// (the bind contract — see cesplex/wire.h for the wire format) before any
+// Every inbound RUDP channel speaks a SIGNED bind handshake, which also
+// selects the protocol (see cesplex/wire.h for the wire format), before any
 // protocol-specific bytes flow. On bind OK, the handler registered under
 // the requested name takes over the channel for its life and the channel
 // is metered against its bound payer. On NACK, the channel closes.
@@ -131,7 +131,7 @@ inline constexpr auto kRudpStreamCloseTimeout = std::chrono::seconds(3);
 // Handler base class
 // -----------------------------------------------------------------------
 //
-// A CesPlexHandler owns an inbound RUDP channel once the select handshake
+// A CesPlexHandler owns an inbound RUDP channel once the bind handshake
 // has completed successfully with its registered name. The single
 // virtual is `serve`; the handler implements whatever protocol it
 // speaks by reading/writing on the stream and closing when done.
@@ -198,11 +198,11 @@ using L2CallReport =
 class CesPlexHandler {
 public:
   virtual ~CesPlexHandler() = default;
-  // Called once per inbound channel after the signed select handshake
+  // Called once per inbound channel after the signed bind handshake
   // succeeded with this handler's name. The stream is pre-constructed
   // and ready for async_read/async_write. The bound context carries
   // the channel's principal identity (pubkey + payerPfx) and
-  // anchoring state (sessionToken + bound rate schedule + bind time)
+  // anchoring state (bind digest + bind time)
   // — all set once at handoff, immutable for the channel's lifetime.
   // The handler stores the BoundChannelContext on its per-channel
   // state struct and uses it for every per-op verify (verifyPerOp).
@@ -256,8 +256,7 @@ public:
   // `host` supplies the bind-reply ingredients: cesplexSigningKey() to
   // sign the reply. May be null only for tests that don't exercise the
   // bind handshake.
-  CesPlex(minx::Rudp& rudp,
-          boost::asio::io_context& io,
+  CesPlex(boost::asio::io_context& io,
           CesPlexHost* host,
           ChannelMeter* meter = nullptr);
 
@@ -297,20 +296,25 @@ public:
   size_t _pendingSessionCount() const { return sessions_.size(); }
 
 private:
-  // Per-channel session state: opens, reads the select header, either
+  // Per-channel session state: reads the name, writes the hello, reads the
+  // rest of the bind, either
   // hands off to a handler (OK) or closes (NACK).
   struct Session;
   using SessionKey = std::pair<minx::SockAddr, uint32_t>;
 
-  minx::Rudp& rudp_;
   boost::asio::io_context& io_;
-  CesPlexHost* host_;           // signs bind replies + supplies bind rates
+  CesPlexHost* host_;           // sends the hello and signs bind replies
+  // False once this CesPlex is gone. A session's completion can still be
+  // queued in io_ then (a stopped io_context keeps its handlers, and a
+  // restart runs them), so each one checks this before it touches its parent
+  // or a handler.
+  std::shared_ptr<bool> alive_ = std::make_shared<bool>(true);
   ChannelMeter* channelMeter_;  // optional, may be null
 
   // Protocol-name → mounted handler object (host-owned). Filled by mount().
   std::map<std::string, CesPlexHandler*> bindings_;
 
-  // In-flight inbound select handshakes. Keyed by (peer, channelId).
+  // In-flight inbound bind handshakes. Keyed by (peer, channelId).
   // Entries are removed once a handler takes over or the channel
   // closes.
   std::map<SessionKey, std::shared_ptr<Session>> sessions_;

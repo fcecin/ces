@@ -260,6 +260,58 @@ BOOST_FIXTURE_TEST_CASE(DirectCloseDeliversEveryQueuedWrite, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 8);
 }
 
+// A program that dials another program with the wrong expected key gets no
+// conn and the "wrong peer" error, and the other program never sees that
+// channel open: the dialer refuses the server hello before it signs a bind, so
+// it pays for nothing there. A second dial with the right key, to the same
+// endpoint, opens: so the first one failed for the key only.
+BOOST_FIXTURE_TEST_CASE(ConnectWithAnotherKeyOpensNothing, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  const std::string beaconLua = luaBytes(beaconPk.data(), 32);
+
+  // The server program pays the beacon 100 on each channel that opens.
+  const std::string serverPath = "/h/" + ownerHex + "/watched.bin";
+  const std::string serverSrc =
+    "ces.conn.set_listener({\n"
+    "  on_open = function(c) ces.transfer('" + beaconLua + "', 100) end,\n"
+    "  on_data = function(c, b) c:write(b) end })\n"
+    "ces.conn.run()\n";
+  const auto serverPk = deploy(serverPath, serverSrc);
+  server->_brr(serverPk, 1'000'000'000);
+  const uint64_t serverId = launch(serverPath);
+  uint16_t serverRpc = 0;
+  waitUntil([&] { serverRpc = server->computeHandler()->testInstanceRpcPort(serverId); return serverRpc != 0; });
+  BOOST_REQUIRE_MESSAGE(serverRpc != 0, "watched server got no rpc port");
+  std::this_thread::sleep_for(std::chrono::seconds(2));  // endpoint bind
+
+  // First the beacon's key at that address (3 for the "wrong peer" error),
+  // then the server's own key (7 for a conn).
+  const std::string addr = "'127.0.0.1:" + std::to_string(serverRpc) + "'";
+  const std::string clientSrc =
+    "ces.conn.set_listener({ on_data = function(c, b) end })\n"
+    "local bad, err = ces.conn.connect(" + addr + ", '" + beaconLua + "')\n"
+    "if bad == nil and err == 'bind rejected or wrong peer' then\n"
+    "  ces.transfer('" + beaconLua + "', 3)\n"
+    "end\n"
+    "local good = ces.conn.connect(" + addr + ", '" + luaBytes(serverPk.data(), 32) + "')\n"
+    "if good then ces.transfer('" + beaconLua + "', 7) end\n"
+    "ces.conn.run()\n";
+  const std::string clientPath = "/h/" + ownerHex + "/wrongkey.bin";
+  const auto clientPk = deploy(clientPath, clientSrc);
+  server->_brr(clientPk, 1'000'000'000);
+  launch(clientPath);
+
+  // 1 + 3 (wrong key refused) + 7 (right key opens) + 100 (its open). A
+  // wrong-key channel that opened would add 100 more.
+  int64_t bal = 0;
+  waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 111; });
+  std::this_thread::sleep_for(std::chrono::seconds(2));   // a late open shows
+  BOOST_CHECK_EQUAL(balanceOf(beaconPk), 111);
+}
+
 // Regression: a program that opens a /ces/luarpc/1 endpoint and then returns (no
 // ces.conn.run()) makes the child reach static destruction on exit. That path used
 // to SEGV in ~ChannelMeter, which logs through an already-destroyed Boost.Log core
@@ -555,8 +607,8 @@ BOOST_FIXTURE_TEST_CASE(ConnectFromCoroutineYields, LuaRpcFixture) {
 // ces.conn.connect bounds the bind at the SOURCE: dialing a dead /ces/luarpc/1
 // target (the server's MAIN port speaks no luarpc) with a 300ms timeout must
 // fail in ~that time, not park ~60s for RUDP idle-GC. The coroutine ships the
-// sentinel on the nil result; the SHORT (~10s) poll budget would fail if the
-// timeout did not fire.
+// sentinel only on the timeout error, so a failure of another kind (such as
+// the end of the RUDP handshake) does not pass.
 BOOST_FIXTURE_TEST_CASE(ConnectTimeoutFailsFast, LuaRpcFixture) {
   KeyPair beacon;
   const auto beaconPk = beacon.getPublicKeyAsHash();
@@ -567,9 +619,9 @@ BOOST_FIXTURE_TEST_CASE(ConnectTimeoutFailsFast, LuaRpcFixture) {
   const std::string src =
     "local B = '" + luaBytes(beaconPk.data(), 32) + "'\n"
     "ces.spawn(function()\n"
-    "  local c = ces.conn.connect('127.0.0.1:" + std::to_string(mainPort)
+    "  local c, err = ces.conn.connect('127.0.0.1:" + std::to_string(mainPort)
       + "', string.rep('\\0', 32), 300)\n"
-    "  if c == nil then ces.transfer(B, 13) end\n"
+    "  if c == nil and err == 'connect timeout' then ces.transfer(B, 13) end\n"
     "end)\n"
     "ces.conn.run()\n";
   const auto progPk = deploy(path, src);

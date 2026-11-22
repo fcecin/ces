@@ -65,7 +65,7 @@ CesPlexEndpoint::CesPlexEndpoint(uint16_t port,
   // ChannelMeter before CesPlex, so CesPlex's Session can track() each
   // channel as it binds. Both take taskIO_ as their external strand.
   meter_ = std::make_unique<ChannelMeter>(*rudp_, taskIO_, host_, meterTick);
-  cesplex_ = std::make_unique<CesPlex>(*rudp_, taskIO_, host_, meter_.get());
+  cesplex_ = std::make_unique<CesPlex>(taskIO_, host_, meter_.get());
   // Mount handler objects before the socket opens (taskIO_ threads not started
   // yet, so no concurrent acceptInbound can race the bindings map).
   for (const auto& [proto, handler] : mounts) {

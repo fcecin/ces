@@ -43,6 +43,7 @@
 #include <chrono>
 #include <cstring>
 #include <span>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -199,7 +200,8 @@ std::string readLine(int fd, std::chrono::milliseconds timeout) {
 DialChild spawnCeshDialExt(const std::string& ceshBin,
                            const std::string& pubkeyHex,
                            uint16_t rpcPort,
-                           uint64_t instId) {
+                           uint64_t instId,
+                           const std::string& serverKeyHex = "") {
   int sin[2]{-1, -1}, sout[2]{-1, -1}, serr[2]{-1, -1};
   BOOST_REQUIRE_EQUAL(::pipe(sin),  0);
   BOOST_REQUIRE_EQUAL(::pipe(sout), 0);
@@ -223,6 +225,9 @@ DialChild spawnCeshDialExt(const std::string& ceshBin,
     argv.push_back("--server");   argv.push_back("localhost");
     argv.push_back("--rpc-port"); argv.push_back(portStr.c_str());
     argv.push_back("-l");         argv.push_back("fatal");
+    if (!serverKeyHex.empty()) {
+      argv.push_back("--server-key"); argv.push_back(serverKeyHex.c_str());
+    }
     argv.push_back("dial");
     argv.push_back("--extsign");
     argv.push_back("--pubkey");   argv.push_back(pubkeyHex.c_str());
@@ -394,6 +399,58 @@ BOOST_AUTO_TEST_CASE(EchoThenSigterm) {
   ch.pid = -1; // already reaped
 }
 
+// Parse the HELLO line of `cesh dial --extsign`: "HELLO <keyHex> <challenge>".
+bool parseExtHello(const std::string& line, ServerHello& hello) {
+  std::istringstream is(line);
+  std::string tag, keyHex, challenge;
+  if (!(is >> tag >> keyHex >> challenge) || tag != "HELLO") return false;
+  if (keyHex.size() != 64) return false;
+  minx::stringToHash(hello.serverPubkey, keyHex);
+  hello.challenge = std::stoull(challenge);
+  return true;
+}
+
+// The BIND line that a tunneler writes for `hello`, signed here. `outDigest`
+// gets the digest of this bind, which the ATTACH signs.
+std::string extBindLine(const KeyPair& key, const ServerHello& hello,
+                        BindDigest& outDigest) {
+  const std::string name = "/ces/lua/1";
+  const uint64_t t = ces::getMicrosSinceEpoch();
+  const auto& pk = key.getPublicKeyAsHash();
+  auto digest = computeBindRequestDigest(
+    std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(name.data()), name.size()),
+    t, std::span<const uint8_t>(pk.data(), pk.size()), hello);
+  outDigest = digest;
+  Signature sig = key.signData(std::span<const uint8_t>(digest.data(), digest.size()));
+  return "BIND " + std::to_string(t) + " " + toHex(sig.data(), sig.size()) + "\n";
+}
+
+// The ATTACH line for `pid`, signed over the bind digest `bindDigest`.
+std::string extAttachLine(const KeyPair& key, uint64_t pid,
+                          const BindDigest& bindDigest) {
+  ces::Bytes preamble;
+  ces::Buffer::put<uint64_t>(preamble, pid);
+  Signature sig = signPerOp(key, 0x01,
+    std::span<const uint8_t>(preamble.data(), preamble.size()), bindDigest);
+  return "ATTACH " + toHex(sig.data(), sig.size()) + "\n";
+}
+
+// An echo program for the extsign tests, with a greeting. Returns its pid.
+constexpr const char* kExtGreeting = "EXT GREETING\n";
+uint64_t launchEchoExt(DialFixture& fx, const std::string& ownerHex) {
+  const std::string scriptPath = "/h/" + ownerHex + "/echo_ext.lua";
+  const std::string src =
+    "ces.conn.set_listener({\n"
+    "  hello = 'EXT GREETING\\n',\n"
+    "  on_data = function(conn, data) conn:write(data) end,\n"
+    "})\n"
+    "ces.conn.run()\n";
+  fx.uploadScript(scriptPath, src);
+  uint64_t instId = fx.launchScript(scriptPath);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  return instId;
+}
+
 // External-signing dial: the bind + ATTACH signatures are produced HERE (no key
 // in cesh) and fed over the stdio control handshake; the server cryptographically
 // verifies them. Exercises `cesh dial --extsign` / bindExt / attachExt /
@@ -401,50 +458,33 @@ BOOST_AUTO_TEST_CASE(EchoThenSigterm) {
 // reaches the tunnel.
 BOOST_AUTO_TEST_CASE(ExtSignEchoRoundtrip) {
   const std::string ownerHex = ownerKey.getPublicKeyHexStr();
-  const std::string scriptPath = "/h/" + ownerHex + "/echo_ext.lua";
-  const std::string src =
-    "ces.conn.set_listener({\n"
-    "  on_data = function(conn, data) conn:write(data) end,\n"
-    "})\n"
-    "ces.conn.run()\n";
-  uploadScript(scriptPath, src);
-  uint64_t instId = launchScript(scriptPath);
+  uint64_t instId = launchEchoExt(*this, ownerHex);
   BOOST_REQUIRE(instId > 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
   std::string ceshBin = ces::e2e::findCeshBinary();
   DialChild ch = spawnCeshDialExt(ceshBin, ownerHex, rpcPort, instId);
 
-  // Sign the bind here (the digest format must match the server's).
-  const std::string name = "/ces/lua/1";
-  uint64_t t = static_cast<uint64_t>(
-    std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count());
-  const auto& pk = ownerKey.getPublicKeyAsHash();
-  auto bindDigest = computeBindRequestDigest(
-    std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(name.data()), name.size()),
-    t, std::span<const uint8_t>(pk.data(), pk.size()));
-  Signature bindSig = ownerKey.signData(
-    std::span<const uint8_t>(bindDigest.data(), bindDigest.size()));
-  std::string bindLine = "BIND " + std::to_string(t) + " " +
-    toHex(bindSig.data(), bindSig.size()) + "\n";
-  BOOST_REQUIRE(writeAll(ch.stdinW, bindLine.data(), bindLine.size()));
+  // cesh reads the server hello and hands it over first.
+  std::string helloLine = readLine(ch.stdoutR, std::chrono::seconds(5));
+  ServerHello hello;
+  BOOST_REQUIRE_MESSAGE(parseExtHello(helloLine, hello),
+                        "expected HELLO, got: " + helloLine);
+  BOOST_CHECK(hello.serverPubkey == server->_serverKeyPair().getPublicKeyAsHash());
 
-  // cesh binds, verifies the reply, hands back the session token.
-  std::string tokLine = readLine(ch.stdoutR, std::chrono::seconds(5));
-  BOOST_REQUIRE_MESSAGE(tokLine.rfind("TOKEN ", 0) == 0, "expected TOKEN, got: " + tokLine);
-  uint64_t token = std::stoull(tokLine.substr(6));
-
-  // Sign ATTACH over the token, send it.
-  ces::Bytes preamble;
-  ces::Buffer::put<uint64_t>(preamble, instId);
-  Signature attSig = signPerOp(ownerKey, 0x01,
-    std::span<const uint8_t>(preamble.data(), preamble.size()), token);
-  std::string attLine = "ATTACH " + toHex(attSig.data(), attSig.size()) + "\n";
-  BOOST_REQUIRE(writeAll(ch.stdinW, attLine.data(), attLine.size()));
+  // Both signatures need only the hello, so both lines go at once.
+  BindDigest d{};
+  std::string lines = extBindLine(ownerKey, hello, d);
+  lines += extAttachLine(ownerKey, instId, d);
+  BOOST_REQUIRE(writeAll(ch.stdinW, lines.data(), lines.size()));
 
   std::string readyLine = readLine(ch.stdoutR, std::chrono::seconds(5));
   BOOST_REQUIRE_EQUAL(readyLine, "READY");
+
+  // The greeting rode the ATTACH reply: it is the first bytes after READY.
+  const std::string greeting = kExtGreeting;
+  ces::Bytes first(greeting.size(), 0);
+  size_t g = readUpTo(ch.stdoutR, first.data(), first.size(), std::chrono::seconds(3));
+  BOOST_CHECK_EQUAL(std::string(first.begin(), first.begin() + g), greeting);
 
   // Raw byte pipe now — echo round-trip.
   const std::string msg = "ping\n";
@@ -458,6 +498,52 @@ BOOST_AUTO_TEST_CASE(ExtSignEchoRoundtrip) {
   BOOST_REQUIRE(waitForExit(ch.pid, status, std::chrono::seconds(5)));
   BOOST_CHECK(WIFEXITED(status));
   BOOST_CHECK_EQUAL(WEXITSTATUS(status), 143);
+  ch.pid = -1;
+}
+
+// A bind signed for another challenge fails: `ERR bind:` and exit 4.
+BOOST_AUTO_TEST_CASE(ExtSignBindForOtherChallengeFails) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  uint64_t instId = launchEchoExt(*this, ownerHex);
+  BOOST_REQUIRE(instId > 0);
+
+  DialChild ch = spawnCeshDialExt(ces::e2e::findCeshBinary(), ownerHex, rpcPort, instId);
+  std::string helloLine = readLine(ch.stdoutR, std::chrono::seconds(5));
+  ServerHello hello;
+  BOOST_REQUIRE_MESSAGE(parseExtHello(helloLine, hello),
+                        "expected HELLO, got: " + helloLine);
+  ServerHello other = hello;
+  other.challenge += 1;
+  BindDigest d{};
+  std::string lines = extBindLine(ownerKey, other, d);
+  lines += extAttachLine(ownerKey, instId, d);
+  BOOST_REQUIRE(writeAll(ch.stdinW, lines.data(), lines.size()));
+
+  std::string errLine = readLine(ch.stdoutR, std::chrono::seconds(5));
+  BOOST_CHECK_MESSAGE(errLine.rfind("ERR bind:", 0) == 0, "got: " + errLine);
+  int status = 0;
+  BOOST_REQUIRE(waitForExit(ch.pid, status, std::chrono::seconds(5)));
+  BOOST_CHECK(WIFEXITED(status));
+  BOOST_CHECK_EQUAL(WEXITSTATUS(status), 4);
+  ch.pid = -1;
+}
+
+// A --server-key of another server: `ERR connect:`, exit 4, and no HELLO line,
+// so the tunneler signs nothing.
+BOOST_AUTO_TEST_CASE(ExtSignWrongServerKeyFails) {
+  const std::string ownerHex = ownerKey.getPublicKeyHexStr();
+  uint64_t instId = launchEchoExt(*this, ownerHex);
+  BOOST_REQUIRE(instId > 0);
+
+  const std::string otherKey = KeyPair().getPublicKeyHexStr();
+  DialChild ch = spawnCeshDialExt(ces::e2e::findCeshBinary(), ownerHex, rpcPort,
+                                  instId, otherKey);
+  std::string line = readLine(ch.stdoutR, std::chrono::seconds(5));
+  BOOST_CHECK_MESSAGE(line.rfind("ERR connect:", 0) == 0, "got: " + line);
+  int status = 0;
+  BOOST_REQUIRE(waitForExit(ch.pid, status, std::chrono::seconds(5)));
+  BOOST_CHECK(WIFEXITED(status));
+  BOOST_CHECK_EQUAL(WEXITSTATUS(status), 4);
   ch.pid = -1;
 }
 

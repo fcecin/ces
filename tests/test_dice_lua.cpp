@@ -157,7 +157,7 @@ minx::Hash diceSetup(LuaConnFixture& fx, PlexLuaPeer& peer,
       [&] { return getMicrosSinceEpoch() / 1'000'000 > openSec; }));
 
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t st = 0;
+  ces::BindDigest st{};
   BOOST_REQUIRE(peer.bind(fx.rpcPort, fx.userKey, st));
   auto ar = peer.attach(fx.userKey, st, instId);
   CES_REQUIRE_RC_EQ(ar.status, CES_OK);

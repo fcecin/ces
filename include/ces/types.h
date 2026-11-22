@@ -135,7 +135,7 @@ enum error_code_t : uint8_t {
   CES_ERROR_VM_FAILED = 0x12,
   CES_ERROR_DISABLED = 0x13,
   CES_ERROR_ALLOWANCE_EXCEEDED = 0x14,
-  // CesPlex protocol-select was NACKed by the target. Raised by the
+  // The CesPlex bind was NACKed by the target. Raised by the
   // outbound SYS_RPC path when the remote doesn't mount the rpc
   // protocol (e.g. a plain CES server talking to another plain CES
   // server — rpc is an outbound-only capability on CES). Distinct

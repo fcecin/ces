@@ -8,6 +8,7 @@
 // over.
 
 #include <ces/cesplex/session.h>
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/mux.h>   // kRudpStreamCloseTimeout, CesPlexHost
 #include <ces/buffer.h>
 #include <ces/ramfilestore.h>         // ces::sha256
@@ -35,6 +36,7 @@
 #include <cstring>
 #include <future>
 #include <memory>
+#include <optional>
 #include <random>
 #include <span>
 #include <thread>
@@ -373,10 +375,13 @@ public:
   // max_channels_per_peer). So a client that opens a channel for each call,
   // from a port that the kernel gives again, runs out of slots.
   void close() {
-    if (channel_ != 0 && rudp_) {
-      auto end = [rudp = rudp_, peer = peer_, ch = channel_] {
-        rudp->closeChannel(peer, ch);
+    if (attempt_) {
+      // Close the stream of the last attempt, and only it: never another
+      // channel that has the same coordinates. A no-op if it ended.
+      auto end = [attempt = attempt_] {
+        if (*attempt) (*attempt)->close();
       };
+      attempt_.reset();
       channel_ = 0;
       if (taskIO_.get_executor().running_in_this_thread()) {
         end();
@@ -399,9 +404,8 @@ public:
   }
 
   const KeyPair& signerKey() const { return *signerKey_; }
-  uint64_t boundSessionToken() const { return boundSessionToken_; }
 
-  // Reopen the channel with a fresh channel_id + select handshake, used after
+  // Reopen the channel with a fresh channel_id + bind handshake, used after
   // the server closes the channel following an error. The old channel's
   // per-peer slot is freed in doSelect (RST) before the new bind: Rudp owns the
   // channel handler, so resetting our stream does not release it -- the old
@@ -409,7 +413,7 @@ public:
   // Closing it is deterministic; waiting on the peer's HS_CLOSE to free the
   // slot is not (its arrival is RTT-bound, unbounded under loss).
   uint8_t reselect() {
-    closeBeforeSelect_ = channel_;
+    closeBefore_ = attempt_;
     stream_.reset();
     std::mt19937 rng(std::random_device{}());
     channel_ = 0;
@@ -546,7 +550,7 @@ public:
 
   minx::Bytes buildEnvelope(uint8_t verb,
                             std::span<const uint8_t> preamble) {
-    // The signature covers the session token, so open the new channel
+    // The signature covers the bind digest of the channel, so open the new one
     // first when the old one failed. If that fails too, the verb's own
     // ensureClean returns the code.
     (void)ensureClean();
@@ -554,14 +558,14 @@ public:
     // preamble) still sign differently — otherwise the server's sig-dedup
     // treats a repeated query as a replay and skips its fee. The salt is
     // framework header (the server strips it); monotonic per client is
-    // enough, since the sig also covers the per-channel sessionToken.
+    // enough, since the sig also covers the per-channel bind digest.
     ces::Bytes signedPre;
     signedPre.reserve(sizeof(uint64_t) + preamble.size());
     ces::Buffer::put<uint64_t>(signedPre, opSalt_++);
     signedPre.insert(signedPre.end(), preamble.begin(), preamble.end());
     std::span<const uint8_t> sp(signedPre.data(), signedPre.size());
 
-    Signature sig = ces::signPerOp(*signerKey_, verb, sp, boundSessionToken_);
+    Signature sig = ces::signPerOp(*signerKey_, verb, sp, bindDigest_);
     // [u32 len][salt+preamble][65 sig]
     const size_t total = 4 + signedPre.size() + ces::CES_PLEX_SIG_SIZE;
     minx::Bytes wire(total);
@@ -716,98 +720,95 @@ private:
     return fut.get() || ioFailed(CES_ERROR_CONNECTION_LOST);
   }
 
-  // Parse + verify the signed bind reply. On OK, stash sessionToken and
-  // TOFU-capture the server pubkey if not already pinned.
-  uint8_t parseBindReply(
-      const std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>& buf,
-      const std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>& clientDigest) {
-    auto r = ces::parseBindReply(
-      std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-        buf.data(), buf.size()));
-    if (r.status != ces::CES_PLEX_OK) return CES_ERROR_PROTO_REJECTED;
-    if (!ces::verifyBindReply(
-          r,
-          std::span<const uint8_t>(clientDigest.data(), clientDigest.size()))) {
-      LOGERROR << "cesplexclient: bind reply digest/sig verify FAILED";
-      return CES_ERROR_INTERNAL;
+  // What the bind gives back to the calling thread.
+  struct SelectResult {
+    uint8_t rc = CES_ERROR_UNREACHABLE;
+    std::shared_ptr<minx::RudpStream> stream;
+    ServerHello hello;
+    BindDigest bindDigest{};
+  };
+
+  static uint8_t selectCode(BindError err) {
+    switch (err) {
+      case BindError::None:        return CES_OK;
+      case BindError::Unreachable: return CES_ERROR_UNREACHABLE;
+      case BindError::Rejected:    return CES_ERROR_PROTO_REJECTED;
+      case BindError::WrongServer:
+      case BindError::BadReply:    return CES_ERROR_INTERNAL;
     }
-    if (hasServerPk_) {
-      if (std::memcmp(serverPk_.data(), r.serverPubkey.data(),
-                      serverPk_.size()) != 0) {
-        LOGERROR << "cesplexclient: bind reply pubkey ≠ expected";
-        return CES_ERROR_INTERNAL;
-      }
-    } else {
-      std::memcpy(serverPk_.data(), r.serverPubkey.data(), serverPk_.size());
-      hasServerPk_ = true;
-    }
-    boundSessionToken_ = r.channelSessionToken;
-    return CES_OK;
+    return CES_ERROR_INTERNAL;
   }
 
+  // Open the channel and bind it. The posted work and its completions hold
+  // only copies and the promise: this object can be gone when they run,
+  // after the caller's timeout. Only the calling thread writes the members.
   uint8_t doSelect() {
-    auto run = std::make_shared<std::promise<uint8_t>>();
+    stream_.reset();   // the stream of this select, or none if it fails
+    auto run = std::make_shared<std::promise<SelectResult>>();
     auto fut = run->get_future();
-    boost::asio::post(taskIO_, [this, run]() {
-      // Seed Rudp's clock before registerChannel so the fresh channel
-      // isn't idle-GC'd on the next tick.
-      rudp_->tick(nowMicros());
-      // Free a prior (errored) channel's per-peer slot before binding the new
-      // one, ordered before registerChannel on this same IO thread. RST frees
-      // the slot now and tells the peer to drop its side (a no-op if the peer
-      // already closed). Skipped on the initial select (closeBeforeSelect_==0).
-      if (closeBeforeSelect_ != 0) {
-        rudp_->closeChannel(peer_, closeBeforeSelect_);
-        closeBeforeSelect_ = 0;
-      }
-      stream_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
-      if (!rudp_->registerChannel(peer_, channel_, stream_)) {
-        run->set_value(CES_ERROR_INTERNAL);
-        return;
-      }
-
-      const uint64_t bindNowUs = nowMicros();
-      auto bindReq = std::make_shared<minx::Bytes>(
-        ces::buildBindRequest(protocol_, bindNowUs, *signerKey_));
-      const auto& pkArr = signerKey_->getPublicKeyAsHash();
-      auto clientDigest = std::make_shared<
-        std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
-          ces::computeBindRequestDigest(
-            std::span<const uint8_t>(
-              reinterpret_cast<const uint8_t*>(protocol_.data()),
-              protocol_.size()),
-            bindNowUs,
-            std::span<const uint8_t>(pkArr.data(), pkArr.size())));
-
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, clientDigest, run]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) { run->set_value(CES_ERROR_UNREACHABLE); return; }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [this, reply, clientDigest, run]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) { run->set_value(CES_ERROR_UNREACHABLE); return; }
-              run->set_value(parseBindReply(*reply, *clientDigest));
-            });
-        });
-    });
+    std::optional<minx::Hash> expected;
+    if (hasServerPk_) expected = serverPk_;
+    // The stream of this attempt, once registered. A timeout, close() and
+    // the next reselect close it, and only it: never another channel that
+    // has the same coordinates.
+    auto attempt = std::make_shared<std::shared_ptr<minx::RudpStream>>();
+    attempt_ = attempt;
+    boost::asio::post(taskIO_,
+      [rudp = rudp_, exec = taskIO_.get_executor(), peer = peer_,
+       ch = channel_, closeBefore = std::move(closeBefore_), protocol = protocol_,
+       signer = *signerKey_, expected, run, attempt]() {
+        // Seed Rudp's clock before registerChannel so the fresh channel
+        // isn't idle-GC'd on the next tick.
+        rudp->tick(nowMicros());
+        // Free a prior (errored) channel's per-peer slot before binding the
+        // new one. RST frees the slot now and tells the peer to drop its
+        // side (a no-op if the stream already ended). Skipped on the initial
+        // select (no closeBefore).
+        if (closeBefore && *closeBefore) (*closeBefore)->close();
+        auto stream = std::make_shared<minx::RudpStream>(exec);
+        if (!rudp->registerChannel(peer, ch, stream)) {
+          run->set_value({CES_ERROR_INTERNAL, nullptr, {}});
+          return;
+        }
+        *attempt = stream;
+        asyncClientBind(stream, protocol, signer, expected,
+          [run, stream](BindError err, ServerHello hello, BindDigest digest) {
+            if (err == BindError::WrongServer || err == BindError::BadReply) {
+              LOGERROR << "cesplexclient: bind failed: " << bindErrorText(err);
+            }
+            run->set_value({selectCode(err),
+                            err == BindError::None ? stream : nullptr, hello,
+                            digest});
+          });
+      });
+    closeBefore_.reset();
     if (fut.wait_for(kConnectTimeout) != std::future_status::ready) {
       LOGWARNING << "cesplexclient: bind handshake timed out" << SVAR(peer_)
                  << SVAR(protocol_);
+      // Close the stream of this attempt: the pending read fails, and a late
+      // hello or reply finds no channel. This runs after the posted work
+      // above, so `attempt` is set if the channel was registered.
+      boost::asio::post(taskIO_, [attempt] {
+        if (*attempt) (*attempt)->close();
+      });
       return CES_ERROR_UNREACHABLE;
     }
-    uint8_t rc = fut.get();
-    if (rc == CES_ERROR_UNREACHABLE) {
+    SelectResult res = fut.get();
+    if (res.rc == CES_OK) {
+      stream_ = res.stream;
+      // TOFU: the first bind pins the key that the server sent.
+      if (!hasServerPk_) {
+        serverPk_ = res.hello.serverPubkey;
+        hasServerPk_ = true;
+      }
+      bindDigest_ = res.bindDigest;
+    } else if (res.rc == CES_ERROR_UNREACHABLE) {
       LOGWARNING << "cesplexclient: the server did not open the channel"
                  << SVAR(peer_) << SVAR(protocol_);
     }
     LOGDEBUG << "cesplexclient: bind complete"
-             << VAR(int(rc)) << VAR(channel_) << SVAR(protocol_);
-    return rc;
+             << VAR(int(res.rc)) << VAR(channel_) << SVAR(protocol_);
+    return res.rc;
   }
 
   boost::asio::io_context& taskIO_;   // borrowed: run by another thread
@@ -822,11 +823,14 @@ private:
   minx::Hash serverPk_{};
 
   std::unique_ptr<KeyPair> signerKey_;
-  uint64_t boundSessionToken_ = 0;
+  BindDigest bindDigest_{};      // of the bind; per-op sigs sign it
   uint64_t opSalt_ = 1;          // per-op envelope uniquifier (see buildEnvelope)
 
   bool streamDirty_ = false;
-  uint32_t closeBeforeSelect_ = 0;  // old channel to RST in doSelect before rebind
+  // The stream of the last attempt (see doSelect), and the one that the next
+  // doSelect closes first (set by reselect).
+  std::shared_ptr<std::shared_ptr<minx::RudpStream>> attempt_;
+  std::shared_ptr<std::shared_ptr<minx::RudpStream>> closeBefore_;
   uint8_t ioRc_ = CES_OK;           // why the last read or write failed
 };
 
@@ -849,10 +853,6 @@ void CesPlexChannel::close() { impl_->close(); }
 
 void CesPlexChannel::setServerPubkey(const minx::Hash& pk) {
   impl_->setServerPubkey(pk);
-}
-
-uint64_t CesPlexChannel::boundSessionToken() const {
-  return impl_->boundSessionToken();
 }
 
 minx::Bytes CesPlexChannel::buildEnvelope(

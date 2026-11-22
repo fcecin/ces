@@ -23,6 +23,7 @@ import { gatewayPubkey, queryBalance, dialHttp } from './cesh.js';
 import { Engine, State, fmtBytes } from './engine.js';
 import { TerminalManager } from './term.js';
 import { ProgWsManager } from './progws.js';
+import { PAGE_SIGN_JS } from './pagesign.js';
 
 const PORT = parseInt(process.env.CESWEB_PORT || '8088', 10);
 const BIND = process.env.CESWEB_BIND || '127.0.0.1';
@@ -350,9 +351,10 @@ function serveLocal(req, res, file, type, knownSize) {
 // entirely in the browser via native WebCrypto Ed25519 (non-extractable) — it
 // never leaves the page. cesweb only relays signatures. The TARGET (server +
 // pid) is entered in the page, not the URL: the session runs on the user's own
-// key, so it isn't tied to a server. The page sends {hello, pubkey, time,
-// bindSig, host, cesPort, pid}, gets the session token, returns {attachSig},
-// then it's a raw byte pipe. ed25519 keys only; no native Ed25519 → it errors.
+// key, so it isn't tied to a server. The page sends {hello, pubkey, host,
+// cesPort, pid}, gets the server hello {serverKey, challenge}, signs the bind
+// and the ATTACH over it, returns {sigs}, then it's a raw byte pipe. ed25519
+// keys only; no native Ed25519 → it errors.
 // `pre` is the optional URL prefill (may be null).
 function termPage(pre) {
   const host = esc(pre?.host || DEFAULT_HOST || '');
@@ -403,32 +405,16 @@ function add(t,cls){const s=document.createElement('span');if(cls)s.className=cl
 function status(t){if(t)add(t+'\\n','s');}
 
 // ---- native WebCrypto Ed25519 signing (the key never leaves this page) ----
-const PFX=Uint8Array.from([0x30,0x2e,0x02,0x01,0x00,0x30,0x05,0x06,0x03,0x2b,0x65,0x70,0x04,0x22,0x04,0x20]);
-function h2b(h){const a=new Uint8Array(h.length/2);for(let i=0;i<a.length;i++)a[i]=parseInt(h.substr(i*2,2),16);return a;}
-function b2h(b){let s='';for(const x of b)s+=x.toString(16).padStart(2,'0');return s;}
-function b64u2b(s){s=s.replace(/-/g,'+').replace(/_/g,'/');const r=atob(s);const a=new Uint8Array(r.length);for(let i=0;i<r.length;i++)a[i]=r.charCodeAt(i);return a;}
-function be16(n){const b=new Uint8Array(2);new DataView(b.buffer).setUint16(0,n,false);return b;}
-function be64(n){const b=new Uint8Array(8);new DataView(b.buffer).setBigUint64(0,BigInt(n),false);return b;}
-function cat(){let l=0;for(const x of arguments)l+=x.length;const o=new Uint8Array(l);let i=0;for(const x of arguments){o.set(x,i);i+=x.length;}return o;}
-async function sha256(buf){return new Uint8Array(await crypto.subtle.digest('SHA-256',buf));}
+// The helpers come from src/pagesign.js; tests/webcrypto.test.mjs runs them.
+${PAGE_SIGN_JS}
 let signKey=null,pubHex=null,pubBytes=null,target=null;
-async function importKey(dec66){
-  if(!/^00[0-9a-fA-F]{64}$/.test(dec66)) throw new Error('the web wallet needs an ed25519 key (00 + 64 hex)');
-  const seed=h2b(dec66.slice(2)), pk8=cat(PFX,seed);
-  let ext;
-  try{ext=await crypto.subtle.importKey('pkcs8',pk8,{name:'Ed25519'},true,['sign']);}
-  catch(e){throw new Error('this browser has no native Ed25519 (use a current Chrome/Firefox/Safari)');}
-  const jwk=await crypto.subtle.exportKey('jwk',ext);
-  pubBytes=b64u2b(jwk.x); pubHex=b2h(pubBytes);
-  signKey=await crypto.subtle.importKey('pkcs8',pk8,{name:'Ed25519'},false,['sign']); // non-extractable
-  seed.fill(0); pk8.fill(0);
+async function importKey(dec66){const k=await importEd25519(dec66);signKey=k.signKey;pubBytes=k.pubBytes;pubHex=k.pubHex;}
+// The bind signs the server hello (its key and its challenge, a decimal u64
+// string). The ATTACH signs the digest of that bind.
+async function signBindAttach(timeUs,serverKey,challenge){
+  const d=await bindDigest('/ces/lua/1',timeUs,pubBytes,serverKey,challenge);
+  return {bindSig:await signDigest(signKey,d),attachSig:await signDigest(signKey,await attachDigest(target.pid,d))};
 }
-async function signDigest(digest){
-  const sig=new Uint8Array(await crypto.subtle.sign({name:'Ed25519'},signKey,digest));
-  const o=new Uint8Array(65); o[0]=0x00; o.set(sig,1); return b2h(o);
-}
-async function signBind(timeUs){const n=enc.encode('/ces/lua/1');return signDigest(await sha256(cat(be16(n.length),n,be64(timeUs),pubBytes)));}
-async function signAttach(token){return signDigest(await sha256(cat(Uint8Array.of(0x01),be64(target.pid),be64(token))));}
 
 let ws, live=false, lineBuf='';
 function renderInput(){ ed.textContent=lineBuf; out.scrollTop=out.scrollHeight; }
@@ -443,11 +429,20 @@ function connectWs(){
   const proto=location.protocol==='https:'?'wss:':'ws:';
   ws=new WebSocket(proto+'//'+location.host+'/dev/dial');
   ws.binaryType='arraybuffer';
-  ws.onopen=async ()=>{ const time=Date.now()*1000; ws.send(JSON.stringify({t:'hello',pubkey:pubHex,time,bindSig:await signBind(time),host:target.host,cesPort:target.port,pid:target.pid})); };
+  let signed=false;   // one server hello, so one pair of signatures, per WebSocket
+  ws.onopen=()=>{ ws.send(JSON.stringify({t:'hello',pubkey:pubHex,host:target.host,cesPort:target.port,pid:target.pid})); };
   ws.onmessage=async (ev)=>{
     if(typeof ev.data==='string'){
       let m; try{m=JSON.parse(ev.data);}catch{return;}
-      if(m.t==='token'){ ws.send(JSON.stringify({t:'attachSig',sig:await signAttach(m.token)})); return; }
+      if(m.t==='serverHello'){
+        if(signed){status('✗ a second server hello');ws.close();return;}
+        if(!/^[0-9a-f]{64}$/.test(m.serverKey||'')||!/^\\d+$/.test(m.challenge||'')){status('✗ bad server hello');ws.close();return;}
+        signed=true;
+        const time=Date.now()*1000;
+        const s=await signBindAttach(time,m.serverKey,m.challenge);
+        ws.send(JSON.stringify({t:'sigs',time,bindSig:s.bindSig,attachSig:s.attachSig}));
+        return;
+      }
       if(m.t==='ready'){ setConnected(); return; }
       if(m._cesweb) status(m._cesweb);
       if(m._end){ setDisconnected(); }

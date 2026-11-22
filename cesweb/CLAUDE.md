@@ -89,6 +89,12 @@ disk pressure; latency under load is unbounded by design (requests wait).
 - **The browser holds the key.** For `/dev/dial`, the page imports the pasted
   ed25519 key with native WebCrypto (non-extractable) and signs the CesPlex bind
   + ATTACH itself. cesweb only relays the signatures into `cesh dial --extsign`.
+  The bind signs the server hello that cesh reads first (the server key and a
+  fresh challenge, a decimal u64 string end to end), and the ATTACH signs the
+  digest of that bind, so each signature is good on that one channel of that
+  one server only. The order: the browser sends `hello`, cesh prints
+  `HELLO`, cesweb sends `serverHello` to the browser, the browser sends `sigs`,
+  and cesh prints `READY` (see `src/term.js`).
   The private key never reaches the gateway. ed25519 only — no native Ed25519 in
   the browser ⇒ the page errors (WebCrypto has no secp256k1).
 
@@ -97,7 +103,8 @@ disk pressure; latency under load is unbounded by design (requests wait).
   *program's* money; CES has no pull/allowance. You only ever lose credits via a
   transfer **you** sign (dice's bet is an out-of-band `cesh transfer` it merely
   *verifies*). The bind key is identity + the channel meter's payer (infra,
-  `feeNet*`, ≈0 idle), never an app-spend authorization.
+  `feeNet*` times `compute_payout_factor` on a channel into a program, ≈0
+  idle), never an app-spend authorization.
 
 - **No open proxy / SSRF.** Two layers: (1) `CESWEB_ALLOW_HOSTS` allowlist; and
   (2) the engine refuses any host that resolves to a non-globally-routable

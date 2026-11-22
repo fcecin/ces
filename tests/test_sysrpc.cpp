@@ -5,7 +5,7 @@
 // These tests exercise the full outbound SYS_RPC path: a gateway VM
 // program on a CesServer issues the syscall, the dispatcher opens an
 // RUDP channel over the server's dedicated rpcMinx_, performs the
-// CesPlex select handshake negotiating protocol "/ces/rpc/1", sends
+// CesPlex bind handshake negotiating protocol "/ces/rpc/1", sends
 // a signed envelope, receives a response from a MockRpcServer
 // running inline in this file (on its own Minx + Rudp +
 // io_context + thread), writes the response back into the same
@@ -212,6 +212,9 @@ private:
     std::array<uint8_t, 2> bindLenBuf{};
     ces::Bytes bindNameBuf;
     std::array<uint8_t, 8 + 32 + 32 + 65> bindTailBuf{};
+    // The server hello of this channel.
+    ces::ServerHello hello;
+    minx::Bytes helloBuf;
     // Stash for the bind reply.
     std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> clientDigest{};
     minx::Bytes bindReplyBuf;
@@ -223,8 +226,23 @@ private:
             std::shared_ptr<minx::RudpStream> s)
       : parent(p), peer(pr), channelId(ch), stream(std::move(s)) {}
 
+    // The client speaks first, with the protocol name. Then the server
+    // hello, as a CesPlex endpoint sends it, and the rest of the request.
     void start() {
       readBindNameLen();
+    }
+
+    void writeHello() {
+      hello.serverPubkey = parent.serverKey_.getPublicKeyAsHash();
+      hello.challenge = ces::newChallenge();
+      helloBuf = ces::buildServerHello(hello);
+      auto self = shared_from_this();
+      boost::asio::async_write(
+        *stream, boost::asio::buffer(helloBuf),
+        [self](const boost::system::error_code& ec, std::size_t) {
+          if (ec) { self->finish(); return; }
+          self->readBindTail();
+        });
     }
 
     void readBindNameLen() {
@@ -250,7 +268,7 @@ private:
         *stream, boost::asio::buffer(bindNameBuf),
         [self](const boost::system::error_code& ec, std::size_t) {
           if (ec) { self->finish(); return; }
-          self->readBindTail();
+          self->writeHello();
         });
     }
 
@@ -263,18 +281,33 @@ private:
           // Tail = [u64 time_us][32 pubkey][32 sha256][65 sig].
           uint64_t clientTimeUs =
             ces::Buffer::peek<uint64_t>(self->bindTailBuf.data());
-          // We don't verify the client's bind sig in this mock —
-          // SYS_RPC tests aren't about server-side bind validation;
-          // they're about the post-bind body round-trip.
-          // We DO need to echo the client's sha256 in our reply so
-          // the client's verify passes.
+          // The reply echoes the client's sha256, so the client's verify
+          // passes.
           std::memcpy(self->clientDigest.data(),
                       self->bindTailBuf.data() + 8 + 32,
                       ces::CES_PLEX_SHA256_SIZE);
+          // Check the bind as a CesPlex endpoint does: the digest of this
+          // hello, and the client's sig over it.
+          minx::Hash clientPk;
+          std::memcpy(clientPk.data(), self->bindTailBuf.data() + 8,
+                      clientPk.size());
+          auto computed = ces::computeBindRequestDigest(
+            std::span<const uint8_t>(self->bindNameBuf.data(),
+                                     self->bindNameBuf.size()),
+            clientTimeUs,
+            std::span<const uint8_t>(clientPk.data(), clientPk.size()),
+            self->hello);
+          ces::Signature sig;
+          std::memcpy(sig.data(), self->bindTailBuf.data() + 8 + 32 + 32,
+                      sig.size());
+          const bool signedOk =
+            computed == self->clientDigest &&
+            ces::PublicKey(clientPk).verifySignature(
+              std::span<const uint8_t>(computed.data(), computed.size()), sig);
           const std::string name(
             reinterpret_cast<const char*>(self->bindNameBuf.data()),
             self->bindNameBuf.size());
-          if (name == self->parent.acceptedProtoName_) {
+          if (signedOk && name == self->parent.acceptedProtoName_) {
             self->sendBindOk();
           } else {
             self->sendBindNackAndFinish();
@@ -286,7 +319,7 @@ private:
       ces::BindReplyFields fields;
       fields.status = ces::CES_PLEX_OK;
       fields.serverTimeUs = mockNowMicros();
-      fields.channelSessionToken = 0;  // mock doesn't care
+      fields.challenge = hello.challenge;
       fields.serverProtoVersion = ces::CES_PLEX_PROTO_VERSION_V1;
       bindReplyBuf = ces::buildBindReply(
         fields,
@@ -305,6 +338,7 @@ private:
       ces::BindReplyFields fields;
       fields.status = ces::CES_PLEX_NACK;
       fields.serverTimeUs = mockNowMicros();
+      fields.challenge = hello.challenge;
       fields.serverProtoVersion = ces::CES_PLEX_PROTO_VERSION_V1;
       bindReplyBuf = ces::buildBindReply(
         fields,

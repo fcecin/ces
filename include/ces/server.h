@@ -627,7 +627,7 @@ struct CesConfig {
 
   // --- CesPlex protocol mounts ---
   // The L2 bus (CesPlex) runs on the secondary port (rpcPort). Every
-  // inbound RUDP channel does a protocol-select handshake; the table
+  // inbound RUDP channel does a bind handshake, which selects the protocol; the table
   // below says which protocol names are mounted, and which handler
   // each name resolves to.
   //

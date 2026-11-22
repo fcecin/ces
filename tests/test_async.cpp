@@ -376,9 +376,9 @@ BOOST_AUTO_TEST_CASE(OnDataIsAYieldingCoroutine) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   ces::Bytes ping{'x'};
@@ -426,9 +426,9 @@ BOOST_AUTO_TEST_CASE(TimerBodyIsCoroutineYieldsAndSkipsIfBusy) {
 
   PlexLuaPeer peer;
   BOOST_REQUIRE(peer.start() != 0);
-  uint64_t sessionToken = 0;
-  BOOST_REQUIRE(peer.bind(rpcPort, userKey, sessionToken));
-  auto r = peer.attach(userKey, sessionToken, instId);
+  ces::BindDigest bindDigest{};
+  BOOST_REQUIRE(peer.bind(rpcPort, userKey, bindDigest));
+  auto r = peer.attach(userKey, bindDigest, instId);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
 
   auto probe = [&](char c) {

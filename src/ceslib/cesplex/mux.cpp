@@ -26,23 +26,26 @@ LOG_MODULE("plex");
 namespace ces {
 
 // ---------------------------------------------------------------------------
-// Session — per-channel state for the select handshake
+// Session — per-channel state for the bind handshake
 // ---------------------------------------------------------------------------
 //
 // Lifecycle:
 //   1. Created when CesPlex::acceptInbound fires from the server's
 //      Rudp::Listener::onAccept. The Session owns a freshly-built
 //      RudpStream that RUDP wires as the channel handler.
-//   2. Read the bind preamble (variable name + fixed-size tail of 137 B):
-//        [u16 name_len] [name] [u64 client_time_us]
-//        [32 client_pubkey] [32 sha256] [65 sig]
-//   3. Verify sig over recomputed digest using client_pubkey. If
-//      verify fails or the name's not bound, send a signed NACK reply
-//      and drop. Otherwise build BoundChannelContext from the verified
-//      pubkey + the channel's sessionToken.
-//   4. Build + write the signed bind reply (status=OK + current rate
-//      disclosure). On write success, hand the stream + bound context
-//      to handler->serve(), drop our reference.
+//   2. Read the protocol name: [u16 name_len] [name]. The client speaks
+//      first: its channel packet carries the RUDP session token, so it
+//      proves the address of the open. The session sends nothing before it.
+//   3. Write the server hello: [32 host pubkey][u64 challenge], with a
+//      fresh challenge for this channel, then read the rest of the bind
+//      request, a fixed-size tail of 137 B:
+//        [u64 client_time_us] [32 client_pubkey] [32 sha256] [65 sig]
+//   4. Recompute the digest with this session's hello, and verify the sig
+//      with client_pubkey. If either fails or the name's not bound, send a
+//      signed NACK reply and drop. Otherwise build BoundChannelContext from
+//      the verified pubkey and the digest of the bind.
+//   5. Build + write the signed bind reply. On write success, hand the
+//      stream + bound context to handler->serve(), drop our reference.
 //
 // Continuations capture `self = shared_from_this()`; sessions_ holds
 // a strong ref until handoff or NACK-completion.
@@ -57,6 +60,11 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
   // ref is moved to the application handler.
   std::shared_ptr<minx::RudpStream> stream;
 
+  // The server hello of this channel. Its challenge exists only here: the
+  // digest check takes it from this session, never from the wire.
+  ServerHello hello;
+  minx::Bytes helloBuf;
+
   // Bind-preamble read buffers.
   std::array<uint8_t, 2> lenBuf{};
   ces::Bytes nameBuf;
@@ -67,12 +75,37 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
   // stable buffer address.
   minx::Bytes replyBuf;
 
+  // The parent's alive_ flag. Each completion returns if it is false: the
+  // parent, its map and its handlers are gone then.
+  std::shared_ptr<const bool> alive;
+
   Session(CesPlex& p, const minx::SockAddr& pr, uint32_t ch,
           std::shared_ptr<minx::RudpStream> s)
-    : parent(p), peer(pr), channelId(ch), stream(std::move(s)) {}
+    : parent(p), peer(pr), channelId(ch), stream(std::move(s)),
+      alive(p.alive_) {}
 
   void start() {
     readNameLen();
+  }
+
+  // After the name: the hello, then the rest of the request.
+  void writeHello() {
+    // No host (a test path): no key to send. verifyAndDispatch drops.
+    if (!parent.host_) {
+      readTail();
+      return;
+    }
+    hello.serverPubkey = parent.host_->cesplexSigningKey().getPublicKeyAsHash();
+    hello.challenge = newChallenge();
+    helloBuf = buildServerHello(hello);
+    auto self = shared_from_this();
+    boost::asio::async_write(
+      *stream, boost::asio::buffer(helloBuf),
+      [self](const boost::system::error_code& ec, std::size_t) {
+        if (!*self->alive) return;
+        if (ec) { self->drop("write hello"); return; }
+        self->readTail();
+      });
   }
 
   void readNameLen() {
@@ -80,13 +113,16 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     boost::asio::async_read(
       *stream, boost::asio::buffer(lenBuf),
       [self](const boost::system::error_code& ec, std::size_t) {
+        if (!*self->alive) return;
         if (ec) { self->drop("read name length"); return; }
         const uint16_t len = ces::Buffer::peek<uint16_t>(self->lenBuf.data());
         if (len == 0 || len > CES_PLEX_MAX_NAME_LEN) {
+          // No reply: the client waits for a hello here, so a NACK would
+          // be read as one. Only a client with a caller error gets here.
           LOGDEBUG << "CesPlex: bad bind name length"
                    << SVAR(self->peer) << VAR(self->channelId)
                    << VAR(len);
-          self->sendNackAndDrop("bad name length");
+          self->drop("bad name length");
           return;
         }
         self->nameBuf.resize(len);
@@ -99,8 +135,9 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     boost::asio::async_read(
       *stream, boost::asio::buffer(nameBuf),
       [self](const boost::system::error_code& ec, std::size_t) {
+        if (!*self->alive) return;
         if (ec) { self->drop("read name"); return; }
-        self->readTail();
+        self->writeHello();
       });
   }
 
@@ -109,12 +146,19 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     boost::asio::async_read(
       *stream, boost::asio::buffer(tailBuf),
       [self](const boost::system::error_code& ec, std::size_t) {
+        if (!*self->alive) return;
         if (ec) { self->drop("read bind tail"); return; }
         self->verifyAndDispatch();
       });
   }
 
   void verifyAndDispatch() {
+    if (!parent.host_) {
+      // No host (test path): no hello was sent, and no reply can be signed.
+      LOGWARNING << "CesPlex: no host, cannot check or sign a bind";
+      drop("no host keypair");
+      return;
+    }
     // Tail layout: [u64 time_us][32 pubkey][32 sha256][65 sig].
     std::span<const uint8_t> tailSpan(tailBuf.data(), tailBuf.size());
     minx::ConstBuffer reader(tailSpan);
@@ -123,12 +167,14 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     auto claimedSha = reader.get<std::array<uint8_t, CES_PLEX_SHA256_SIZE>>();
     auto sig = reader.get<Signature>();
 
-    // Recompute digest.
+    // Recompute the digest with this session's own hello. A bind signed
+    // for another server or another channel does not match.
     const auto& pkBytes = clientPubkey.getHash();
     auto computed = computeBindRequestDigest(
       std::span<const uint8_t>(nameBuf.data(), nameBuf.size()),
       clientTimeUs,
-      std::span<const uint8_t>(pkBytes.data(), pkBytes.size()));
+      std::span<const uint8_t>(pkBytes.data(), pkBytes.size()),
+      hello);
     if (computed != claimedSha) {
       LOGDEBUG << "CesPlex: bind digest mismatch"
                << SVAR(peer) << VAR(channelId);
@@ -145,9 +191,8 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
       return;
     }
 
-    // Freshness gate: the signed client_time_us is otherwise unconstrained, and
-    // the request binds no channelId/sessionToken (assigned after bind), so a
-    // captured bind would replay on fresh channels. Reject stale/future ones.
+    // Clock check. The challenge already makes the bind good on this
+    // channel only.
     const uint64_t nowUs = nowMicrosForCesplex();
     if (clientTimeUs > nowUs + CES_PLEX_BIND_FUTURE_DRIFT_US ||
         clientTimeUs + CES_PLEX_BIND_MAX_AGE_US < nowUs) {
@@ -173,28 +218,22 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
              << SVAR(peer) << VAR(channelId) << SVAR(name);
 
     // Build the BoundChannelContext we'll hand to the application
-    // handler. Anchored by the RUDP session token.
+    // handler. Per-op sigs sign the digest of this bind.
     BoundChannelContext bound;
     bound.boundPubkey = clientPubkey;
     bound.payerPfx = getHashPrefix(clientPubkey.getHash());
-    bound.sessionToken = parent.rudp_.sessionToken(peer, channelId);
+    bound.bindDigest = computed;
     bound.peer = peer;
     bound.channelId = channelId;
 
     BindReplyFields reply;
     reply.status = CES_PLEX_OK;
     reply.serverTimeUs = nowMicrosForCesplex();
-    reply.channelSessionToken = bound.sessionToken;
+    reply.challenge = hello.challenge;
     reply.serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
     bound.serverBoundAtUs = reply.serverTimeUs;
 
     // Sign the reply with the host's keypair.
-    if (!parent.host_) {
-      // No host (test path) — can't sign. Drop.
-      LOGWARNING << "CesPlex: no host, cannot sign bind reply";
-      drop("no host keypair");
-      return;
-    }
     replyBuf = buildBindReply(
       reply,
       std::span<const uint8_t>(claimedSha.data(), claimedSha.size()),
@@ -203,8 +242,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     // Begin metering this channel. Each tick measures its resource deltas
     // and reports them to the host, which prices them however it likes.
     // The host may opt a protocol out (server-to-server peer mesh).
-    if (parent.channelMeter_ &&
-        (!parent.host_ || parent.host_->cesplexChannelMetered(name))) {
+    if (parent.channelMeter_ && parent.host_->cesplexChannelMetered(name)) {
       parent.channelMeter_->track(
         peer, channelId, "plex:" + name, bound.payerPfx);
     }
@@ -219,6 +257,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
       *stream, boost::asio::buffer(replyBuf),
       [self, handler, bound = std::move(bound)]
       (const boost::system::error_code& ec, std::size_t) mutable {
+        if (!*self->alive) return;
         if (ec) { self->drop("write bind reply"); return; }
         // Move the stream to the handler. RUDP keeps its own
         // shared_ptr (the stream is the channel handler), so per-
@@ -246,13 +285,11 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     BindReplyFields reply;
     reply.status = CES_PLEX_NACK;
     reply.serverTimeUs = nowMicrosForCesplex();
-    reply.channelSessionToken = parent.rudp_.sessionToken(peer, channelId);
+    reply.challenge = hello.challenge;
     reply.serverProtoVersion = CES_PLEX_PROTO_VERSION_V1;
 
-    // Use the client's claimed sha256 if we got far enough to read
-    // the tail; otherwise zero. Bind reply digest covers it either
-    // way; client may not be able to verify a NACK that came before
-    // it sent its preamble.
+    // Each NACK comes after the tail, so it binds to the client's claimed
+    // sha256, and the client can check it.
     std::array<uint8_t, CES_PLEX_SHA256_SIZE> clientSha{};
     std::memcpy(clientSha.data(),
                 tailBuf.data() + sizeof(uint64_t) + CES_PLEX_PUBKEY_SIZE,
@@ -266,6 +303,7 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
     boost::asio::async_write(
       *stream, boost::asio::buffer(replyBuf),
       [self, why](const boost::system::error_code&, std::size_t) {
+        if (!*self->alive) return;
         self->drop(why);
       });
   }
@@ -296,20 +334,25 @@ struct CesPlex::Session : std::enable_shared_from_this<CesPlex::Session> {
 // CesPlex
 // ---------------------------------------------------------------------------
 
-CesPlex::CesPlex(minx::Rudp& rudp,
-                 boost::asio::io_context& io,
+CesPlex::CesPlex(boost::asio::io_context& io,
                  CesPlexHost* host,
                  ChannelMeter* meter)
-  : rudp_(rudp), io_(io), host_(host), channelMeter_(meter) {
+  : io_(io), host_(host), channelMeter_(meter) {
   // No bindings at construction: the host mounts handler objects via mount().
   LOGINFO << "CesPlex: constructed";
 }
 
 CesPlex::~CesPlex() {
-  // Sessions that are still mid-handshake just get dropped — their
-  // streams will close when the last reference goes. The callbacks
-  // on rpcRudp_ that point at us are cleared by CesServer before
-  // destruction; this is just defensive cleanup.
+  // The owner joined the thread of io_ before this, so nothing runs here.
+  // A session that waits for a read is held by its own stream (the pending
+  // read holds the session, which holds the stream), so clearing the map
+  // does not free it. Detach each stream: that ends the pending operations
+  // with eof, and their completions, when io_ runs them, see alive_ false
+  // and only drop their references. detach() leaves the RUDP channel alone.
+  *alive_ = false;
+  for (auto& [key, session] : sessions_) {
+    if (session->stream) session->stream->detach();
+  }
   sessions_.clear();
 }
 
@@ -327,7 +370,7 @@ std::shared_ptr<minx::Rudp::ChannelHandler> CesPlex::acceptInbound(
   // Build the per-channel stream first — RUDP wires it as the
   // channel handler at registration time and dispatches per-channel
   // events (bytes, close) directly to it. The Session uses the
-  // stream as a regular Asio AsyncStream to drive the select
+  // stream as a regular Asio AsyncStream to drive the bind
   // handshake.
   auto key = std::make_pair(peer, channelId);
   if (sessions_.find(key) != sessions_.end()) {

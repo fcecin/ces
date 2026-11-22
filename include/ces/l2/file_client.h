@@ -1,7 +1,7 @@
 // file_client.h - blocking client for the L2 file-store protocol.
 //
 // Wraps the full stack needed to drive `builtin:file` verbs from outside
-// the server: MINX socket, RUDP, CesPlex select handshake, and per-verb
+// the server: MINX socket, RUDP, CesPlex bind handshake, and per-verb
 // preamble-first encoding with server-signed response parsing.
 //
 // The class is blocking: each verb posts to internal threads, waits for

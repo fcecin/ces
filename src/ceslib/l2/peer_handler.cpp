@@ -18,6 +18,7 @@
 #include <ces/l2/peer_handler.h>
 #include <ces/buffer.h>
 
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/wire.h>
 #include <ces/keys.h>
 #include <ces/l2/compute_handler.h>
@@ -84,11 +85,7 @@ struct PeerChannel {
   ces::Bytes rxBuf;                        // inbound framing accumulator
   std::deque<std::shared_ptr<ces::Bytes>> writeQueue;
   bool writing = false;
-  // Dial-phase scratch.
-  minx::Bytes bindReqBuf;
-  std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE> bindReplyBuf{};
-  std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> bindReqDigest{};
-  std::shared_ptr<boost::asio::steady_timer> dialTimer;
+  std::shared_ptr<boost::asio::steady_timer> dialTimer;   // dial phase
 
   bool up() const { return established && stream != nullptr; }
 };
@@ -265,38 +262,6 @@ void PeerHandler::kickWrite(std::shared_ptr<PeerLink> link, bool bulk) {
     });
 }
 
-void PeerHandler::readDialBindReply(std::shared_ptr<PeerLink> link, bool bulk) {
-  PeerChannel& ch = bulk ? link->bulk : link->ctrl;
-  auto stream = ch.stream;
-  boost::asio::async_read(
-    *stream, boost::asio::buffer(ch.bindReplyBuf),
-    [this, link, bulk](const boost::system::error_code& ec, std::size_t) {
-      if (link->closed) return;
-      PeerChannel& ch = bulk ? link->bulk : link->ctrl;
-      if (ec) { closeChannel(link, bulk); return; }
-      auto r = ces::parseBindReply(
-        std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-          ch.bindReplyBuf.data(), ch.bindReplyBuf.size()));
-      if (r.status != ces::CES_PLEX_OK) { closeChannel(link, bulk); return; }
-      if (!ces::verifyBindReply(
-            r, std::span<const uint8_t>(ch.bindReqDigest.data(),
-                                        ch.bindReqDigest.size()))) {
-        closeChannel(link, bulk);
-        return;
-      }
-      if (std::memcmp(r.serverPubkey.data(), link->ckey.data(),
-                      link->ckey.size()) != 0) {
-        closeChannel(link, bulk);  // misroute / MITM
-        return;
-      }
-      establishChannel(link, bulk);
-      // Once control is up, open the bulk channel for QoS. Bulk failing later is
-      // harmless -- reconcile retries and the link runs degraded meanwhile.
-      if (!bulk && link->outbound && !link->bulk.up() && !link->bulk.dialing)
-        dialChannel(link, /*bulk=*/true);
-    });
-}
-
 void PeerHandler::dialChannel(std::shared_ptr<PeerLink> link, bool bulk) {
   if (link->closed) return;
   PeerChannel& ch = bulk ? link->bulk : link->ctrl;
@@ -328,25 +293,22 @@ void PeerHandler::dialChannel(std::shared_ptr<PeerLink> link, bool bulk) {
     }
   });
 
-  const uint64_t now = nowMicros();
-  ch.bindReqBuf = ces::buildBindRequest(
-    CES_PEER_PROTO, now, server_->_serverKeyPair());
-  {
-    const auto& pkArr = server_->_serverKeyPair().getPublicKeyAsHash();
-    std::span<const uint8_t> nameSpan(
-      reinterpret_cast<const uint8_t*>(CES_PEER_PROTO),
-      std::strlen(CES_PEER_PROTO));
-    ch.bindReqDigest = ces::computeBindRequestDigest(
-      nameSpan, now,
-      std::span<const uint8_t>(pkArr.data(), pkArr.size()));
-  }
+  // The bind refuses a hello with another key than the peer's: a misroute,
+  // or a party in the middle.
   auto stream = ch.stream;
-  boost::asio::async_write(
-    *stream, boost::asio::buffer(ch.bindReqBuf),
-    [this, link, bulk](const boost::system::error_code& ec, std::size_t) {
+  ces::asyncClientBind(
+    stream, CES_PEER_PROTO, server_->_serverKeyPair(), link->ckey,
+    [this, link, bulk, stream](ces::BindError err, ces::ServerHello,
+                               ces::BindDigest) {
       if (link->closed) return;
-      if (ec) { closeChannel(link, bulk); return; }
-      readDialBindReply(link, bulk);
+      PeerChannel& ch = bulk ? link->bulk : link->ctrl;
+      if (ch.stream != stream) return;   // a later dial owns the slot now
+      if (err != ces::BindError::None) { closeChannel(link, bulk); return; }
+      establishChannel(link, bulk);
+      // Once control is up, open the bulk channel for QoS. Bulk failing later is
+      // harmless -- reconcile retries and the link runs degraded meanwhile.
+      if (!bulk && link->outbound && !link->bulk.up() && !link->bulk.dialing)
+        dialChannel(link, /*bulk=*/true);
     });
 }
 
@@ -473,6 +435,11 @@ void PeerHandler::stop() {
       }
       if (ch->stream) {
         ch->stream->shutdown(kRudpStreamCloseTimeout);
+        // The io thread has stopped. A dial in flight holds its stream
+        // through its pending read, so end the pending operations: their
+        // completions then hold the last references, and they see
+        // link->closed when they run.
+        ch->stream->detach();
         ch->stream.reset();
       }
     }

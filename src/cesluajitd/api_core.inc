@@ -90,8 +90,8 @@ std::atomic<bool> g_luarpc_listening{false};
 // The program's set_listener greeting, delivered by the direct luarpc handler on
 // conn-open (symmetric with the relay's ATTACH accept). Guarded: written on the
 // Lua thread in set_listener, read on the endpoint strand in serve().
-std::mutex  g_luarpc_hello_mx;
-std::string g_luarpc_hello;
+std::mutex  g_luarpc_greeting_mx;
+std::string g_luarpc_greeting;
 
 // The endpoint's task strand, armed in main once the endpoint is up. Null
 // until then (and forever if this instance got no rpc port).
@@ -234,6 +234,13 @@ struct LuaRpcConnectResult {
   std::array<uint8_t, 32> peer{};
 };
 
+// The Lua error text for a failed connect.
+const char* luarpc_connect_error(uint8_t status) {
+  if (status == ces::CES_ERROR_PROTO_REJECTED) return "bind rejected or wrong peer";
+  if (status == ces::CES_ERROR_TIMEOUT) return "connect timeout";
+  return "connect failed (network)";
+}
+
 // A finished ces.conn.connect awaiting its coroutine's resume. The endpoint
 // thread pushes (under g_luarpc_mx) + nudges g_luarpc_wakefd; the run loop
 // drains, builds the conn on the coroutine, and resumes it. The blocking
@@ -241,11 +248,10 @@ struct LuaRpcConnectResult {
 struct ConnectDelivery { lua_State* co; LuaRpcConnectResult res; };
 std::deque<ConnectDelivery> g_connect_done;
 
-// Endpoint strand: open an OUTBOUND /ces/luarpc/1 channel to `peer`, drive the
-// client bind (signed by the program key), verify the reply AND that the
-// server pubkey matches `expectPk` (the program knows who it dialed), and on
-// success register the bound stream as a raw conn + start pumping. Reports via
-// `pr`. Mirrors CesPlexClient::doSelect, but on the endpoint's own Rudp.
+// Endpoint strand: open an OUTBOUND /ces/luarpc/1 channel to `peer`, and bind
+// it with the program key to the endpoint whose key is `expectPk` (the program
+// knows who it dials). On success, register the bound stream as a raw conn and
+// start pumping. Reports via `done`. Runs on the endpoint's own Rudp.
 void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
                        std::function<void(LuaRpcConnectResult)> done,
                        int timeoutMs) {
@@ -263,75 +269,58 @@ void luarpc_do_connect(minx::SockAddr peer, std::array<uint8_t, 32> expectPk,
     return;
   }
 
-  // Bind-handshake timeout, bounded AT THE SOURCE: if no reply within
-  // timeoutMs, close the half-open stream so the pending read fails with ec ->
-  // done(error), the clean "connect failed" path. Cancelled the instant the
-  // bind resolves (so it never closes a now-live conn). Beats waiting on RUDP
-  // idle-GC (~60s), and there is no racing coroutine-side timer to leave an
-  // orphaned conn behind: a timeout fails before the conn is ever registered.
+  // Bind-handshake timeout, bounded AT THE SOURCE. The attempt has one
+  // outcome: the first of the timer and the bind to run on this strand sets
+  // `settled` and wins. A timer that wins closes the stream, so the pending
+  // read fails; a success that was already queued then fails too. A bind that
+  // wins makes a later timer do nothing, so it never closes a live conn. The
+  // bind completion always runs, and it alone calls done(), one time.
+  auto settled = std::make_shared<bool>(false);
   auto timer = std::make_shared<boost::asio::steady_timer>(*g_luarpc_io);
   if (timeoutMs > 0) {
     timer->expires_after(std::chrono::milliseconds(timeoutMs));
-    timer->async_wait([stream](const boost::system::error_code& tec) {
-      if (tec) return;   // cancelled: the bind already resolved
+    timer->async_wait([stream, settled](const boost::system::error_code& tec) {
+      if (tec || *settled) return;   // cancelled, or the bind won
+      *settled = true;
       try { stream->close(); } catch (...) {}
     });
   }
 
-  static const std::string kProto = "/ces/luarpc/1";
-  const uint64_t bindNowUs = ces::getMicrosSinceEpoch();
-  auto bindReq = std::make_shared<minx::Bytes>(
-    ces::buildBindRequest(kProto, bindNowUs, *g_luarpc_signer));
-  const auto& pkArr = g_luarpc_signer->getPublicKeyAsHash();
-  auto clientDigest =
-    std::make_shared<std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
-      ces::computeBindRequestDigest(
-        std::span<const uint8_t>(
-          reinterpret_cast<const uint8_t*>(kProto.data()), kProto.size()),
-        bindNowUs,
-        std::span<const uint8_t>(pkArr.data(), pkArr.size())));
-
-  boost::asio::async_write(*stream, boost::asio::buffer(*bindReq),
-    [stream, bindReq, clientDigest, done, expectPk, peer, channel, timer]
-    (const boost::system::error_code& ec, std::size_t) {
-      if (ec) { timer->cancel(); done({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
-      auto reply = std::make_shared<
-        std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-      boost::asio::async_read(*stream, boost::asio::buffer(*reply),
-        [stream, reply, clientDigest, done, expectPk, peer, channel, timer]
-        (const boost::system::error_code& ec2, std::size_t) {
-          timer->cancel();   // bind resolved (ok or fail): disarm the timeout
-          if (ec2) { done({ces::CES_ERROR_INTERNAL, 0, {}}); return; }
-          ces::ParsedBindReply r = ces::parseBindReply(
-            std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-              reply->data(), reply->size()));
-          const bool ok =
-            r.status == ces::CES_PLEX_OK &&
-            ces::verifyBindReply(r, std::span<const uint8_t>(
-              clientDigest->data(), clientDigest->size())) &&
-            std::memcmp(r.serverPubkey.data(), expectPk.data(), 32) == 0;
-          if (!ok) {
-            done({ces::CES_ERROR_PROTO_REJECTED, 0, {}});
-            return;
-          }
-          uint64_t id = g_luarpc_next_id++;
-          auto c = std::make_shared<LuaRpcConn>();
-          c->stream = stream;
-          g_luarpc_conns[id] = c;
-          // Meter this OUTBOUND channel so the instance pays its own server
-          // (file_balance) for dialing out. Track it under this instance's own
-          // program prefix: the parent recognizes that as "the instance itself"
-          // and routes the bill to file_balance (vs an inbound caller's prefix).
-          if (g_luarpc_meter) {
-            ces::HashPrefix self{};
-            std::memcpy(self.data(), g_program_pubkey, self.size());
-            g_luarpc_meter->track(peer, channel, "luarpc:out", self);
-          }
-          LuaRpcConnectResult res{ces::CES_OK, id, {}};
-          std::memcpy(res.peer.data(), r.serverPubkey.data(), 32);
-          luarpc_start_read(id, c);
-          done(res);
-        });
+  // The bind refuses a server hello with another key than expectPk, and
+  // closes the channel on each failure.
+  ces::asyncClientBind(stream, "/ces/luarpc/1", *g_luarpc_signer, expectPk,
+    [stream, done, peer, channel, timer, settled, expectPk](
+        ces::BindError err, ces::ServerHello, ces::BindDigest) {
+      if (*settled) {     // the timer won and closed the stream
+        done({ces::CES_ERROR_TIMEOUT, 0, {}});
+        return;
+      }
+      *settled = true;
+      timer->cancel();
+      if (err == ces::BindError::Unreachable) {
+        done({ces::CES_ERROR_INTERNAL, 0, {}});
+        return;
+      }
+      if (err != ces::BindError::None) {
+        done({ces::CES_ERROR_PROTO_REJECTED, 0, {}});
+        return;
+      }
+      uint64_t id = g_luarpc_next_id++;
+      auto c = std::make_shared<LuaRpcConn>();
+      c->stream = stream;
+      g_luarpc_conns[id] = c;
+      // Meter this OUTBOUND channel so the instance pays its own server
+      // (file_balance) for dialing out. Track it under this instance's own
+      // program prefix: the parent recognizes that as "the instance itself"
+      // and routes the bill to file_balance (vs an inbound caller's prefix).
+      if (g_luarpc_meter) {
+        ces::HashPrefix self{};
+        std::memcpy(self.data(), g_program_pubkey, self.size());
+        g_luarpc_meter->track(peer, channel, "luarpc:out", self);
+      }
+      LuaRpcConnectResult res{ces::CES_OK, id, expectPk};
+      luarpc_start_read(id, c);
+      done(res);
     });
 }
 
@@ -357,14 +346,14 @@ public:
     // way the relay's ATTACH accept does, so a program's on_open never needs to
     // know which transport a conn arrived on.
     {
-      std::string hello;
+      std::string greeting;
       {
-        std::lock_guard<std::mutex> lk(g_luarpc_hello_mx);
-        hello = g_luarpc_hello;
+        std::lock_guard<std::mutex> lk(g_luarpc_greeting_mx);
+        greeting = g_luarpc_greeting;
       }
-      if (!hello.empty()) {
-        c->queuedBytes += hello.size();
-        c->writeQ.push_back(std::move(hello));
+      if (!greeting.empty()) {
+        c->queuedBytes += greeting.size();
+        c->writeQ.push_back(std::move(greeting));
         luarpc_drain_writes(id, c);
       }
     }

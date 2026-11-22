@@ -13,6 +13,7 @@
 #include "test_compute_wait.h"
 #include "test_echo_handler.h"
 
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/mux.h>
 #include <ces/buffer.h>
 #include <ces/cesplex/meter.h>
@@ -149,7 +150,7 @@ public:
     auto mu = std::make_shared<std::mutex>();
     auto cv = std::make_shared<std::condition_variable>();
     boost::asio::post(taskIO_,
-      [this, protoName, &signer, done, status, mu, cv]() {
+      [this, protoName, signer, done, status, mu, cv]() {
       rudp_->tick(nbNowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
         taskIO_.get_executor());
@@ -159,28 +160,13 @@ public:
         done->store(true); cv->notify_all();
         return;
       }
-      const uint64_t bindNowUs = nbNowMicros();
-      auto bindReq = std::make_shared<minx::Bytes>(
-        ces::buildBindRequest(protoName, bindNowUs, signer));
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, done, status, mu, cv]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) {
-            std::lock_guard<std::mutex> lk(*mu);
-            done->store(true); cv->notify_all();
-            return;
-          }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [reply, done, status, mu, cv]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (!ec2) *status = (*reply)[0];
-              std::lock_guard<std::mutex> lk(*mu);
-              done->store(true); cv->notify_all();
-            });
+      ces::asyncClientBind(stream_, protoName, signer, std::nullopt,
+        [done, status, mu, cv](ces::BindError err, ces::ServerHello,
+                               ces::BindDigest) {
+          std::lock_guard<std::mutex> lk(*mu);
+          if (err == ces::BindError::None) *status = 0x01;
+          else if (err == ces::BindError::Rejected) *status = 0x00;
+          done->store(true); cv->notify_all();
         });
     });
     std::unique_lock<std::mutex> lk(*mu);

@@ -193,9 +193,7 @@ static void drain_connect_done(lua_State* mainL) {
     if (d.res.status != ces::CES_OK) {
       lua_checkstack(d.co, 2);
       lua_pushnil(d.co);
-      lua_pushstring(d.co, d.res.status == ces::CES_ERROR_PROTO_REJECTED
-                             ? "bind rejected or wrong peer"
-                             : "connect failed (network)");
+      lua_pushstring(d.co, luarpc_connect_error(d.res.status));
       n = 2;
     } else {
       lua_checkstack(d.co, 2);
@@ -302,6 +300,10 @@ int lua_ces_conn_connect(lua_State* L) {
   }
 
   // Main chunk (cannot yield): block on the round-trip -- the degenerate case.
+  // It waits for the one outcome of the attempt: luarpc_do_connect always
+  // calls done(), at the latest when its timer (or, with timeoutMs = 0, the
+  // RUDP idle GC) ends the channel. A second deadline here would disagree
+  // with that one, and a conn could open after Lua got nil.
   auto pr = std::make_shared<std::promise<LuaRpcConnectResult>>();
   auto fut = pr->get_future();
   boost::asio::post(*g_luarpc_io, [peer, expectPk, pr, timeoutMs]() {
@@ -309,17 +311,10 @@ int lua_ces_conn_connect(lua_State* L) {
       [pr](LuaRpcConnectResult res) { pr->set_value(std::move(res)); },
       timeoutMs);
   });
-  if (fut.wait_for(std::chrono::seconds(15)) != std::future_status::ready) {
-    lua_pushnil(L);
-    lua_pushstring(L, "connect timeout");
-    return 2;
-  }
   LuaRpcConnectResult res = fut.get();
   if (res.status != ces::CES_OK) {
     lua_pushnil(L);
-    lua_pushstring(L, res.status == ces::CES_ERROR_INTERNAL
-                        ? "connect failed (network)"
-                        : "bind rejected or wrong peer");
+    lua_pushstring(L, luarpc_connect_error(res.status));
     return 2;
   }
   make_luarpc_conn(L, res.connId, res.peer.data());

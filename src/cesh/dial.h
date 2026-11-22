@@ -37,8 +37,9 @@ struct DialArgs {
   uint16_t    rpcPort = 0;         // CesPlex RUDP port (--rpc-port)
   uint64_t    pid = 0;
   KeyPair     signerKey;
-  // If provided, the bind reply's server pubkey must match. If absent,
-  // the first reply's pubkey is TOFU-accepted (logged once on stderr).
+  // If provided, the server hello must have this key, and the dial signs
+  // nothing for another key. If absent, the dial takes the key in the hello
+  // (TOFU; logged once on stderr with -v).
   std::optional<minx::Hash> expectedServerPk;
   bool        verbose = false;     // -v: print "ATTACH ok conn_id=N" once
   bool        raw = false;         // --raw: a terminal on stdin sends each key at once
@@ -48,11 +49,16 @@ struct DialArgs {
   // handshake, so a tunneler (cesweb) keeps the key in the browser/gateway and
   // never hands it to cesh. When set, signerKey is unused; clientPubkeyHex names
   // the 32-byte client pubkey (64 hex) that signed. Control protocol:
+  //   stdout -> "HELLO <serverKeyHex> <challenge>\n"   (or "ERR <msg>\n", exit)
   //   stdin  <- "BIND <timeUs> <bindSigHex>\n"
-  //   stdout -> "TOKEN <sessionToken>\n"     (or "ERR <msg>\n" then exit)
   //   stdin  <- "ATTACH <attachSigHex>\n"
   //   stdout -> "READY\n"                     (or "ERR <msg>\n" then exit)
-  // after which the channel is a raw byte pipe exactly like the wallet path.
+  // HELLO carries the server hello: the server key (64 hex) and the challenge
+  // (decimal u64). The bind sig is over the bind digest D =
+  // computeBindRequestDigest("/ces/lua/1", timeUs, pubkey, hello), and the
+  // ATTACH sig over computePerOpDigest(0x01, u64 pid, D), with the same timeUs.
+  // The tunneler can write BIND and ATTACH together.
+  // After READY the channel is a raw byte pipe exactly like the wallet path.
   bool        extSign = false;
   std::string clientPubkeyHex;
 };

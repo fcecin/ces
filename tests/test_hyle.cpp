@@ -161,9 +161,9 @@ struct HyleFixture {
 
     peer = std::make_unique<PlexLuaPeer>();
     BOOST_REQUIRE(peer->start() != 0);
-    uint64_t token = 0;
-    BOOST_REQUIRE(peer->bind(node.rpcPort, userKey, token));
-    auto r = peer->attach(userKey, token, pid);
+    ces::BindDigest bindDigest{};
+    BOOST_REQUIRE(peer->bind(node.rpcPort, userKey, bindDigest));
+    auto r = peer->attach(userKey, bindDigest, pid);
     CES_REQUIRE_RC_EQ(r.status, CES_OK);
     lines = std::make_unique<PlexLineReader>(*peer);
 
@@ -172,7 +172,7 @@ struct HyleFixture {
     {
       PlexLuaPeer sp;
       BOOST_REQUIRE(sp.start() != 0);
-      uint64_t st = 0;
+      ces::BindDigest st{};
       BOOST_REQUIRE(sp.bind(node.rpcPort, node.server->_serverKeyPair(), st));
       auto sr = sp.attach(node.server->_serverKeyPair(), st, pid);
       CES_REQUIRE_RC_EQ(sr.status, CES_OK);
@@ -663,12 +663,12 @@ BOOST_AUTO_TEST_CASE(TheProgramFacingSurfaceOfTheBinding) {
   waitUntil([&] {
     peer = std::make_unique<PlexLuaPeer>();
     if (peer->start() == 0) return false;
-    uint64_t token = 0;
-    if (!peer->bind(n.rpcPort, user, token)) {
+    ces::BindDigest bindDigest{};
+    if (!peer->bind(n.rpcPort, user, bindDigest)) {
       peer->stop();
       return false;
     }
-    r = peer->attach(user, token, pid);
+    r = peer->attach(user, bindDigest, pid);
     if (r.status != CES_OK) peer->stop();
     return r.status == CES_OK;
   }, kTestWaitLimit, std::chrono::milliseconds(250));

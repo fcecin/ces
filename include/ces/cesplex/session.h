@@ -265,8 +265,6 @@ public:
       const std::function<bool(ces::Bytes& preamble)>& readVariablePreamble,
       ces::Bytes& outPreamble);
 
-  uint64_t boundSessionToken() const;
-
   class Impl;
 
 private:
@@ -318,7 +316,7 @@ public:
   // Build a signed per-op envelope [u32 len][salt+preamble][65 sig] for
   // this channel. An 8-byte per-op salt is prepended so identical
   // (verb, preamble) ops still get distinct sigs (the server strips it);
-  // the sig is over verb || salt || preamble || sessionToken.
+  // the sig is over verb || salt || preamble || bind digest.
   minx::Bytes buildEnvelope(uint8_t verb,
                             std::span<const uint8_t> preamble);
 

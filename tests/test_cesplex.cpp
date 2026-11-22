@@ -2,10 +2,10 @@
 // CesPlex end-to-end tests
 // ===========================================================================
 //
-// Exercises the protocol-select handshake on a CES server's secondary
+// Exercises the bind handshake on a CES server's secondary
 // port. For each test, we stand up a CesServer with a specific
 // cesplexMounts config and a MINX/Rudp "client" in-process that opens
-// a channel to the server's rpc port and speaks the select wire
+// a channel to the server's rpc port and speaks the bind wire
 // protocol directly.
 //
 // Wire format (see include/ces/cesplex/mux.h):
@@ -24,6 +24,7 @@
 #include "test_common.h"
 #include "test_echo_handler.h"
 
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/mux.h>
 #include <ces/cesplex/session.h>
 #include <ces/l2/file_handler.h>
@@ -50,9 +51,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -67,7 +70,7 @@ ces::EchoHandler gEchoHandler;
 
 // ---------------------------------------------------------------------------
 // PlexTestPeer — in-process Minx + Rudp "client" that initiates a
-// channel to the server's rpc port and speaks the select wire
+// channel to the server's rpc port and speaks the bind wire
 // protocol. Mirrors the MockRpcServer pattern in test_sysrpc.cpp but
 // on the outbound-client side.
 // ---------------------------------------------------------------------------
@@ -82,11 +85,17 @@ static uint64_t nowMicros() {
 
 class NoopMinxListener : public minx::MinxListener {};
 
-// Outbound-only Rudp::Listener for the test peer. Forwards onSend
-// to the local Minx; default onAccept rejects inbound HS_OPENs.
+// Rudp::Listener for the test peer. Forwards onSend to the local Minx. It
+// rejects inbound HS_OPENs, unless a test gives it an acceptor.
 class PlexPeerRudpListener : public minx::Rudp::Listener {
 public:
+  using Acceptor = std::function<std::shared_ptr<minx::Rudp::ChannelHandler>()>;
   void setMinx(minx::Minx* m) { minx_ = m; }
+  void setAcceptor(Acceptor a) { acceptor_ = std::move(a); }
+  std::shared_ptr<minx::Rudp::ChannelHandler> onAccept(
+      const minx::SockAddr&, uint32_t) override {
+    return acceptor_ ? acceptor_() : nullptr;
+  }
   void onSend(const minx::SockAddr& peer,
               const minx::Bytes& bytes) override {
     if (!minx_) return;
@@ -98,12 +107,18 @@ public:
   }
 private:
   minx::Minx* minx_ = nullptr;
+  Acceptor acceptor_;
 };
 
 class PlexTestPeer {
 public:
   PlexTestPeer() = default;
   ~PlexTestPeer() { stop(); }
+
+  // Make the peer accept inbound channels, as a server. Call before start().
+  void setAcceptor(PlexPeerRudpListener::Acceptor a) {
+    rudpListener_.setAcceptor(std::move(a));
+  }
 
   // Bring the peer up and return its bound port. 0 on failure.
   uint16_t start() {
@@ -115,7 +130,11 @@ public:
         .trustLoopback = true});
 
     rudpListener_.setMinx(minx_.get());
-    rudp_ = std::make_unique<minx::Rudp>(&rudpListener_);
+    // Room for a few channels to one server: the replay tests hold a bound
+    // channel open while they open another one.
+    minx::RudpConfig rcfg;
+    rcfg.maxChannelsPerPeer = 4;
+    rudp_ = std::make_unique<minx::Rudp>(&rudpListener_, rcfg);
 
     {
       minx::MinxStdExtensions stdExt;
@@ -123,6 +142,7 @@ public:
         minx::Rudp::KEY_V0,
         [this](const minx::SockAddr& peer, uint64_t key,
                const minx::Bytes& payload) {
+          packetsIn_.fetch_add(1);
           if (rudp_) rudp_->onPacket(peer, key, payload, nowMicros());
         });
       minx_->setExtensionHandler(std::move(stdExt).build());
@@ -169,6 +189,7 @@ public:
     if (netThread_.joinable()) netThread_.join();
     if (taskThread_.joinable()) taskThread_.join();
     stream_.reset();
+    silent_.reset();
     tickTimer_.reset();
     rudp_.reset();
     minx_.reset();
@@ -188,28 +209,107 @@ public:
   struct SelectResult {
     uint8_t status = 0xFF;   // 0xFF = timeout / error / not attempted
     std::shared_ptr<minx::RudpStream> stream;
-    // Bound sessionToken from the signed bind reply. Tests that build
-    // per-op sigs need this — they hash (verb || preamble || token).
-    uint64_t sessionToken = 0;
+    // The challenge of the server hello.
+    uint64_t challenge = 0;
+    // The digest of the bind; per-op sigs sign it.
+    ces::BindDigest bindDigest{};
+    ces::ServerHello hello;   // the server hello of this channel
+    minx::Bytes request;      // the bind request that this channel sent
+  };
+
+  // How selectWith builds the bind request. A negative test changes one
+  // thing only.
+  struct BindOptions {
+    uint64_t timeUs = 0;      // the signed client time; 0 = now
+    uint32_t channel = 1;     // the RUDP channel id
+    // Sign for this changed hello, in place of the hello that came.
+    std::function<void(ces::ServerHello&)> changeHello;
+    // Send these bytes as the request, as they are (a replay).
+    std::optional<minx::Bytes> request;
+    // Build the request from the hello that came.
+    std::function<minx::Bytes(const ces::ServerHello&)> buildRequest;
   };
 
   boost::asio::io_context& taskIO() { return taskIO_; }
   minx::Rudp* rudp() { return rudp_.get(); }
 
-  // Step 3: signed bind handshake. `signer` is the principal pubkey
-  // the channel will be bound to; the bind preamble is signed by it.
-  // Returns SelectResult with status=OK (0x01), the bound stream, and
-  // the bound sessionToken on success; status=NACK (0x00) on a clean
-  // PROTO_REJECTED reply; status=0xFF on transport/verify failure
-  // or timeout.
+  // RUDP packets that this peer got.
+  size_t packetsIn() const { return packetsIn_.load(); }
+
+  // Open a channel to (loopback, targetPort) and say nothing on it.
+  // Returns false if the channel could not be registered.
+  bool openSilent(uint16_t targetPort, uint32_t channel) {
+    std::promise<bool> done;
+    auto fut = done.get_future();
+    boost::asio::post(taskIO_, [this, targetPort, channel, &done]() {
+      rudp_->tick(nowMicros());
+      silent_ = std::make_shared<minx::RudpStream>(taskIO_.get_executor());
+      done.set_value(rudp_->registerChannel(
+        minx::SockAddr(boost::asio::ip::address_v6::loopback(), targetPort),
+        channel, silent_));
+    });
+    return fut.get();
+  }
+
+  // Write `bytes` on the silent channel.
+  void writeSilent(minx::Bytes bytes) {
+    std::promise<void> done;
+    auto fut = done.get_future();
+    auto buf = std::make_shared<minx::Bytes>(std::move(bytes));
+    boost::asio::post(taskIO_, [this, buf, &done]() {
+      boost::asio::async_write(*silent_, boost::asio::buffer(*buf),
+        [buf](const boost::system::error_code&, std::size_t) {});
+      done.set_value();
+    });
+    fut.wait();
+  }
+
+  // Whether the silent channel is still open on this side.
+  bool silentOpen() {
+    std::promise<bool> done;
+    auto fut = done.get_future();
+    boost::asio::post(taskIO_, [this, &done]() {
+      done.set_value(silent_ && silent_->is_open());
+    });
+    return fut.get();
+  }
+
+  // Whether the silent channel is ESTABLISHED (the accept came), and the
+  // bytes that it got.
+  std::pair<bool, size_t> silentState(uint16_t targetPort, uint32_t channel) {
+    std::promise<std::pair<bool, size_t>> done;
+    auto fut = done.get_future();
+    boost::asio::post(taskIO_, [this, targetPort, channel, &done]() {
+      const bool est = rudp_->isEstablished(
+        minx::SockAddr(boost::asio::ip::address_v6::loopback(), targetPort),
+        channel);
+      done.set_value({est, silent_ ? silent_->available() : 0});
+    });
+    return fut.get();
+  }
+
+  // Signed bind handshake. `signer` is the principal pubkey the channel
+  // will be bound to; the bind preamble is signed by it. Returns
+  // SelectResult with status=OK (0x01), the bound stream, and the
+  // challenge on success; status=NACK (0x00) on a clean PROTO_REJECTED
+  // reply; status=0xFF on transport/verify failure or timeout.
   SelectResult select(uint16_t targetPort, const std::string& protoName,
                       const ces::KeyPair& signer,
                       std::chrono::milliseconds timeout =
                         std::chrono::milliseconds(3000),
                       uint64_t bindTimeOverrideUs = 0) {
+    BindOptions opts;
+    opts.timeUs = bindTimeOverrideUs;
+    return selectWith(targetPort, protoName, signer, opts, timeout);
+  }
+
+  SelectResult selectWith(uint16_t targetPort, const std::string& protoName,
+                          const ces::KeyPair& signer, BindOptions opts,
+                          std::chrono::milliseconds timeout =
+                            std::chrono::milliseconds(3000)) {
     currentPeer_ = minx::SockAddr(
       boost::asio::ip::address_v6::loopback(), targetPort);
-    currentChannel_ = 1;  // peer-chosen; arbitrary, unique within peer
+    currentChannel_ = opts.channel;
 
     auto done = std::make_shared<std::atomic<bool>>(false);
     auto result = std::make_shared<SelectResult>();
@@ -217,7 +317,7 @@ public:
     auto cv = std::make_shared<std::condition_variable>();
 
     boost::asio::post(taskIO_,
-      [this, protoName, &signer, done, result, mu, cv, bindTimeOverrideUs]() {
+      [this, protoName, signer, opts, done, result, mu, cv]() {
       // Seed Rudp's clock before registerChannel (avoid idle-GC).
       rudp_->tick(nowMicros());
       stream_ = std::make_shared<minx::RudpStream>(
@@ -227,48 +327,39 @@ public:
         finish(done, result, mu, cv, 0xFF, nullptr, 0);
         return;
       }
-
-      // Build signed bind preamble.
-      const uint64_t bindNowUs =
-        bindTimeOverrideUs ? bindTimeOverrideUs : nowMicros();
-      auto bindReq = std::make_shared<minx::Bytes>(
-        ces::buildBindRequest(protoName, bindNowUs, signer));
-      const auto& pkArr = signer.getPublicKeyAsHash();
-      auto clientDigest = std::make_shared<
-        std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE>>(
-          ces::computeBindRequestDigest(
-            std::span<const uint8_t>(
-              reinterpret_cast<const uint8_t*>(protoName.data()),
-              protoName.size()),
-            bindNowUs,
-            std::span<const uint8_t>(pkArr.data(), pkArr.size())));
-
-      boost::asio::async_write(
-        *stream_, boost::asio::buffer(*bindReq),
-        [this, bindReq, clientDigest, done, result, mu, cv]
-        (const boost::system::error_code& ec, std::size_t) {
-          if (ec) {
+      auto stream = stream_;
+      ces::asyncStartBind(stream, protoName, std::nullopt,
+        [this, stream, protoName, signer, opts, done, result, mu, cv]
+        (ces::BindError err, ces::ServerHello hello) {
+          if (err != ces::BindError::None) {
             finish(done, result, mu, cv, 0xFF, nullptr, 0);
             return;
           }
-          auto reply = std::make_shared<
-            std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>>();
-          boost::asio::async_read(
-            *stream_, boost::asio::buffer(*reply),
-            [this, reply, clientDigest, done, result, mu, cv]
-            (const boost::system::error_code& ec2, std::size_t) {
-              if (ec2) {
-                finish(done, result, mu, cv, 0xFF, nullptr, 0);
-                return;
+          ces::ServerHello signFor = hello;
+          if (opts.changeHello) opts.changeHello(signFor);
+          minx::Bytes req = opts.request ? *opts.request
+            : opts.buildRequest ? opts.buildRequest(hello)
+            : ces::buildBindRequest(
+                protoName, opts.timeUs ? opts.timeUs : nowMicros(), signer,
+                signFor);
+          {
+            std::lock_guard<std::mutex> lk(*mu);
+            result->hello = hello;
+            result->request = req;
+          }
+          ces::asyncFinishBind(stream, std::move(req), hello,
+            [this, stream, hello, done, result, mu, cv]
+            (ces::BindError e, ces::BindDigest digest) {
+              {
+                std::lock_guard<std::mutex> lk(*mu);
+                result->bindDigest = digest;
               }
-              const uint8_t status = (*reply)[0];
-              if (status != ces::CES_PLEX_OK) {
-                finish(done, result, mu, cv, status, nullptr, 0);
-                return;
-              }
-              uint64_t st = ces::Buffer::peek<uint64_t>(
-                reply->data() + 1 + 8 + 32);
-              finish(done, result, mu, cv, status, stream_, st);
+              const uint8_t status = e == ces::BindError::None     ? 0x01
+                                   : e == ces::BindError::Rejected ? 0x00
+                                                                   : 0xFF;
+              finish(done, result, mu, cv, status,
+                     e == ces::BindError::None ? stream : nullptr,
+                     e == ces::BindError::None ? hello.challenge : 0);
             });
         });
     });
@@ -296,17 +387,19 @@ private:
               std::shared_ptr<std::condition_variable> cv,
               uint8_t status,
               std::shared_ptr<minx::RudpStream> stream,
-              uint64_t sessionToken) {
+              uint64_t challenge) {
     {
       std::lock_guard<std::mutex> lk(*mu);
       result->status = status;
       result->stream = std::move(stream);
-      result->sessionToken = sessionToken;
+      result->challenge = challenge;
       done->store(true);
     }
     cv->notify_all();
   }
 
+  std::atomic<size_t> packetsIn_{0};
+  std::shared_ptr<minx::RudpStream> silent_;   // see openSilent
   NoopMinxListener listener_;
   PlexPeerRudpListener rudpListener_;
   std::unique_ptr<minx::Minx> minx_;
@@ -532,11 +625,9 @@ BOOST_AUTO_TEST_CASE(FileSelectAccepts) {
   BOOST_REQUIRE(r.stream != nullptr);
 }
 
-// A bind request carries a signed client_time_us but binds no
-// channelId/sessionToken; without a freshness check a captured bind replays on
-// fresh channels (re-binding as the victim, accruing ChannelMeter). A bind
-// whose timestamp is outside the freshness window must NACK. (Fresh binds still
-// succeed — see FileSelectAccepts above.)
+// A bind whose signed client time is outside the time window gets a NACK, with
+// the true key and challenge. (Fresh binds still succeed — see
+// FileSelectAccepts above.)
 BOOST_AUTO_TEST_CASE(BindRejectsStaleTime) {
   CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
   PlexTestPeer peer;
@@ -551,6 +642,652 @@ BOOST_AUTO_TEST_CASE(BindRejectsStaleTime) {
                        std::chrono::milliseconds(3000), staleUs);
   BOOST_CHECK_EQUAL(int(r.status), 0x00);   // NACK; pre-fix this was 0x01
   BOOST_CHECK(r.stream == nullptr);
+}
+
+namespace {
+
+// Counts serve() calls. It keeps no stream: a bound channel lives until the
+// RUDP idle GC.
+struct CountingHandler : ces::CesPlexHandler {
+  std::atomic<int> served{0};
+  void serve(std::shared_ptr<minx::RudpStream>,
+             ces::BoundChannelContext) override {
+    served.fetch_add(1);
+  }
+};
+
+// serve() runs on the server's thread; wait for it to show.
+bool waitServed(const CountingHandler& h, int n) {
+  for (int i = 0; i < 100 && h.served.load() < n; ++i)
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  return h.served.load() == n;
+}
+
+constexpr const char* kCountProto = "/ces/test/count/1";
+
+} // namespace
+
+// A copy of a bind request fails on each other channel, also at the same
+// server and in the time window: it signs the challenge of the channel that
+// it came from.
+BOOST_AUTO_TEST_CASE(BindReplayOnNewChannelIsRejected) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer victim;
+  PlexTestPeer attacker;
+  BOOST_REQUIRE(victim.start() != 0);
+  BOOST_REQUIRE(attacker.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  const uint64_t tracksBefore = fx.server->_channelMeter()->_trackCalls();
+  auto ok = victim.select(fx.rpcPort, kCountProto, signer);
+  BOOST_REQUIRE_EQUAL(int(ok.status), 0x01);
+  BOOST_REQUIRE(waitServed(counter, 1));
+
+  PlexTestPeer::BindOptions replay;
+  replay.request = ok.request;
+  auto fromOther = attacker.selectWith(fx.rpcPort, kCountProto, signer, replay);
+  BOOST_CHECK_EQUAL(int(fromOther.status), 0x00);
+  BOOST_CHECK(fromOther.stream == nullptr);
+
+  replay.channel = 2;
+  auto fromSame = victim.selectWith(fx.rpcPort, kCountProto, signer, replay);
+  BOOST_CHECK_EQUAL(int(fromSame.status), 0x00);
+
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_EQUAL(counter.served.load(), 1);
+
+  // The server meters (and so bills) the signer's own channel only: the
+  // replays never reach track().
+  BOOST_CHECK_EQUAL(fx.server->_channelMeter()->_trackCalls() - tracksBefore, 1u);
+}
+
+// An open that never speaks on its channel gets the RUDP accept, and nothing
+// more: the server sends no hello to an address that has not proven itself
+// with a channel packet. An open with the forged address of a victim is such
+// an open, so the server cannot be used to flood the victim.
+BOOST_AUTO_TEST_CASE(AnOpenThatNeverSpeaksGetsOnlyTheAccept) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  BOOST_REQUIRE(peer.openSilent(fx.rpcPort, 7));
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  // The accept came: the channel is ESTABLISHED. And the server sent no
+  // byte on it: a server that wrote its hello first would have put 40 bytes
+  // in this stream.
+  const auto [established, bytes] = peer.silentState(fx.rpcPort, 7);
+  BOOST_CHECK(established);
+  BOOST_CHECK_EQUAL(bytes, 0u);
+  // The accept, and at most a few small RUDP packets. A server that wrote
+  // its hello first sends it here too: 12 packets with this peer, which acks
+  // it. A forged address acks nothing, so that server would send it again
+  // in each pulse until the channel idles out.
+  BOOST_CHECK_LE(peer.packetsIn(), 4u);
+  BOOST_CHECK_EQUAL(counter.served.load(), 0);
+}
+
+// A bind for the key of another server fails, with the true challenge of this
+// channel. A party in the middle meets this when it moves a bind from one
+// server to another.
+BOOST_AUTO_TEST_CASE(BindForAnotherServerIsRejected) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  const ces::KeyPair otherServer;
+  PlexTestPeer::BindOptions o;
+  o.changeHello = [&](ces::ServerHello& h) {
+    h.serverPubkey = otherServer.getPublicKeyAsHash();
+  };
+  auto r = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  BOOST_CHECK_EQUAL(int(r.status), 0x00);
+
+  // The same bind for the true hello works.
+  o.changeHello = nullptr;
+  o.channel = 2;
+  auto ok = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  BOOST_CHECK_EQUAL(int(ok.status), 0x01);
+  BOOST_CHECK(waitServed(counter, 1));
+}
+
+// A bind with the right digest and a signature for another challenge gets a
+// NACK: the server checks the signature, not only the digest.
+BOOST_AUTO_TEST_CASE(BindWithAWrongSignatureIsRejected) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  PlexTestPeer::BindOptions o;
+  o.buildRequest = [&signer](const ces::ServerHello& hello) {
+    const std::string name = kCountProto;
+    const uint64_t t = nowMicros();
+    const auto& pk = signer.getPublicKeyAsHash();
+    const std::span<const uint8_t> nameSpan(
+      reinterpret_cast<const uint8_t*>(name.data()), name.size());
+    const std::span<const uint8_t> pkSpan(pk.data(), pk.size());
+    ces::ServerHello other = hello;
+    other.challenge += 1;
+    auto otherDigest = ces::computeBindRequestDigest(nameSpan, t, pkSpan, other);
+    const ces::Signature sig = signer.signData(
+      std::span<const uint8_t>(otherDigest.data(), otherDigest.size()));
+    // The digest field is for the true hello; the signature is not.
+    return ces::buildBindRequestSigned(name, t, pkSpan, hello, sig);
+  };
+  auto r = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  BOOST_CHECK_EQUAL(int(r.status), 0x00);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_EQUAL(counter.served.load(), 0);
+}
+
+// A name length of 0, or above CES_PLEX_MAX_NAME_LEN, ends the channel with
+// no reply: the client waits for a hello there, so a NACK would read as one.
+BOOST_AUTO_TEST_CASE(ABadNameLengthEndsTheChannelWithNoReply) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  for (uint16_t len : {uint16_t{0}, uint16_t{ces::CES_PLEX_MAX_NAME_LEN + 1}}) {
+    PlexTestPeer peer;
+    BOOST_REQUIRE(peer.start() != 0);
+    BOOST_REQUIRE(peer.openSilent(fx.rpcPort, 9));
+    minx::Bytes prefix(2);
+    ces::Buffer::poke<uint16_t>(reinterpret_cast<uint8_t*>(prefix.data()), len);
+    peer.writeSilent(prefix);
+    for (int i = 0; i < 400 && peer.silentOpen(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    BOOST_CHECK(!peer.silentOpen());
+    BOOST_CHECK_EQUAL(peer.silentState(fx.rpcPort, 9).second, 0u);
+  }
+  BOOST_CHECK_EQUAL(counter.served.load(), 0);
+}
+
+// A bind for another challenge fails, with the true server key.
+BOOST_AUTO_TEST_CASE(BindWithWrongChallengeIsRejected) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  PlexTestPeer::BindOptions o;
+  o.changeHello = [](ces::ServerHello& h) { h.challenge += 1; };
+  auto r = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  BOOST_CHECK_EQUAL(int(r.status), 0x00);
+  std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  BOOST_CHECK_EQUAL(counter.served.load(), 0);
+}
+
+// The hello has the server's key, and each channel gets its own challenge.
+BOOST_AUTO_TEST_CASE(EachChannelGetsItsOwnChallenge) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  PlexTestPeer::BindOptions o;
+  auto a = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  o.channel = 2;
+  auto b = peer.selectWith(fx.rpcPort, kCountProto, signer, o);
+  BOOST_REQUIRE_EQUAL(int(a.status), 0x01);
+  BOOST_REQUIRE_EQUAL(int(b.status), 0x01);
+  BOOST_CHECK(a.hello.serverPubkey ==
+              fx.server->_serverKeyPair().getPublicKeyAsHash());
+  BOOST_CHECK(b.hello.serverPubkey == a.hello.serverPubkey);
+  BOOST_CHECK_NE(a.challenge, 0u);
+  BOOST_CHECK_NE(b.challenge, 0u);
+  BOOST_CHECK_NE(a.challenge, b.challenge);
+}
+
+// A client that expects another server key refuses the hello, and signs
+// nothing: no bind reaches the server, and the channel closes.
+BOOST_AUTO_TEST_CASE(PinnedClientRefusesWrongHello) {
+  CountingHandler counter;
+  CesPlexFixture fx({}, { {kCountProto, &counter} });
+  PlexTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), fx.rpcPort);
+
+  {
+    ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+    ch.setServerPubkey(ces::KeyPair().getPublicKeyAsHash());
+    CES_CHECK_RC_EQ(ch.select(to, kCountProto, signer), CES_ERROR_INTERNAL);
+  }
+  BOOST_CHECK(serverRudpEmpties(*fx.server));
+  BOOST_CHECK_EQUAL(counter.served.load(), 0);
+
+  ces::CesPlexChannel ch(peer.taskIO(), peer.rudp());
+  ch.setServerPubkey(fx.server->_serverKeyPair().getPublicKeyAsHash());
+  CES_CHECK_OK(ch.select(to, kCountProto, signer));
+  BOOST_CHECK(waitServed(counter, 1));
+}
+
+namespace {
+
+// An endpoint that runs the server side of the bind by hand, and can lie in
+// its reply: the reply has a valid signature, but names another challenge, or
+// another key, than the hello.
+struct LyingEndpoint {
+  // None: an honest bind. Challenge, Key: a reply with that field changed.
+  // UnknownStatus: a signed reply with a status that is neither OK nor NACK.
+  // Nack: a signed NACK. BadNack: a NACK signed over another digest.
+  // NoHello: no hello after the name. NoReply: a hello, and no reply.
+  enum class Lie { None, Challenge, Key, UnknownStatus, Nack, BadNack,
+                   NoHello, NoReply };
+  ces::KeyPair key;        // the key in the hello
+  ces::KeyPair otherKey;   // signs the reply for Lie::Key
+  Lie lie = Lie::None;
+  // Send this challenge in the hello, in place of a fresh one: the challenge
+  // of a channel at another server.
+  std::optional<uint64_t> forceChallenge;
+  std::atomic<bool> gotBytes{false};    // a byte of a request came
+  std::atomic<bool> gotSigned{false};   // the signed part of a request came
+  std::atomic<bool> sawEnd{false};      // the client ended the channel
+
+  struct Session : std::enable_shared_from_this<Session> {
+    LyingEndpoint* ep = nullptr;
+    std::shared_ptr<minx::RudpStream> stream;
+    ces::ServerHello hello;
+    minx::Bytes helloBuf;
+    std::array<uint8_t, 2> lenBuf{};
+    ces::Bytes name;
+    std::array<uint8_t, ces::CES_PLEX_BIND_REQ_TAIL_SIZE> tail{};
+    minx::Bytes reply;
+
+    // Wait for the end of the channel, and record it.
+    void watchEnd() {
+      auto self = shared_from_this();
+      auto one = std::make_shared<std::array<uint8_t, 1>>();
+      boost::asio::async_read(*stream, boost::asio::buffer(*one),
+        [self, one](const boost::system::error_code& ec, std::size_t) {
+          if (ec) self->ep->sawEnd = true;
+        });
+    }
+    // The client speaks first: the protocol name.
+    void start() {
+      auto self = shared_from_this();
+      boost::asio::async_read(*stream, boost::asio::buffer(lenBuf),
+        [self](const boost::system::error_code& ec, std::size_t) {
+          if (ec) { self->ep->sawEnd = true; return; }
+          self->ep->gotBytes = true;
+          self->name.resize(ces::Buffer::peek<uint16_t>(self->lenBuf.data()));
+          boost::asio::async_read(*self->stream, boost::asio::buffer(self->name),
+            [self](const boost::system::error_code& ec2, std::size_t) {
+              if (ec2) { self->ep->sawEnd = true; return; }
+              if (self->ep->lie == Lie::NoHello) { self->watchEnd(); return; }
+              self->sendHello();
+            });
+        });
+    }
+    void sendHello() {
+      hello.serverPubkey = ep->key.getPublicKeyAsHash();
+      hello.challenge = ep->forceChallenge ? *ep->forceChallenge
+                                           : ces::newChallenge();
+      helloBuf = ces::buildServerHello(hello);
+      auto self = shared_from_this();
+      boost::asio::async_write(*stream, boost::asio::buffer(helloBuf),
+        [self](const boost::system::error_code& ec, std::size_t) {
+          if (ec) return;
+          boost::asio::async_read(*self->stream, boost::asio::buffer(self->tail),
+            [self](const boost::system::error_code& ec2, std::size_t) {
+              if (ec2) { self->ep->sawEnd = true; return; }
+              self->ep->gotSigned = true;
+              self->answer();
+            });
+        });
+    }
+    void answer() {
+      if (ep->lie == Lie::NoReply) { watchEnd(); return; }
+      std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> claimed{};
+      std::memcpy(claimed.data(),
+                  tail.data() + sizeof(uint64_t) + ces::CES_PLEX_PUBKEY_SIZE,
+                  claimed.size());
+      ces::BindReplyFields f;
+      f.status = ep->lie == Lie::UnknownStatus ? uint8_t{0x07}
+               : (ep->lie == Lie::Nack || ep->lie == Lie::BadNack)
+                   ? ces::CES_PLEX_NACK
+                   : ces::CES_PLEX_OK;
+      f.serverTimeUs = nowMicros();
+      f.challenge = hello.challenge + (ep->lie == Lie::Challenge ? 1 : 0);
+      const ces::KeyPair& signer = ep->lie == Lie::Key ? ep->otherKey : ep->key;
+      if (ep->lie == Lie::BadNack) claimed.fill(0);
+      reply = ces::buildBindReply(
+        f, std::span<const uint8_t>(claimed.data(), claimed.size()), signer);
+      auto self = shared_from_this();
+      boost::asio::async_write(*stream, boost::asio::buffer(reply),
+        [self](const boost::system::error_code&, std::size_t) {});
+    }
+  };
+
+  // Touched only on the thread of the peer that accepts.
+  std::vector<std::shared_ptr<Session>> sessions;
+
+  std::shared_ptr<minx::Rudp::ChannelHandler> accept(boost::asio::io_context& io) {
+    auto s = std::make_shared<Session>();
+    s->ep = this;
+    s->stream = std::make_shared<minx::RudpStream>(io.get_executor());
+    sessions.push_back(s);
+    s->start();
+    return s->stream;
+  }
+};
+
+} // namespace
+
+// A client refuses a bind reply that names another challenge, or another key,
+// than its server hello, also when the reply has a valid signature, and a
+// reply with an unknown status. It takes a NACK as a refusal only when the
+// NACK verifies. The honest run shows that the lie is the only thing wrong.
+BOOST_AUTO_TEST_CASE(ClientRefusesAReplyForAnotherHello) {
+  using Lie = LyingEndpoint::Lie;
+  for (Lie lie : {Lie::None, Lie::Challenge, Lie::Key, Lie::UnknownStatus,
+                  Lie::Nack, Lie::BadNack}) {
+    LyingEndpoint ep;
+    ep.lie = lie;
+    PlexTestPeer server;
+    server.setAcceptor([&ep, &server] { return ep.accept(server.taskIO()); });
+    const uint16_t port = server.start();
+    BOOST_REQUIRE(port != 0);
+    PlexTestPeer client;
+    BOOST_REQUIRE(client.start() != 0);
+    const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), port);
+    ces::KeyPair signer;
+    ces::CesPlexChannel ch(client.taskIO(), client.rudp());
+    const uint8_t rc = ch.select(to, kCountProto, signer);
+    if (lie == Lie::None) {
+      CES_CHECK_OK(rc);
+    } else if (lie == Lie::Nack) {
+      CES_CHECK_RC_EQ(rc, CES_ERROR_PROTO_REJECTED);
+    } else {
+      CES_CHECK_RC_EQ(rc, CES_ERROR_INTERNAL);
+    }
+  }
+}
+
+// A client that expects another key signs nothing for the endpoint: it sends
+// only the protocol name, and refuses the hello. The same client with no
+// expected key sends its signed request there, so the endpoint can see one.
+BOOST_AUTO_TEST_CASE(PinnedClientSignsNothingForAnotherKey) {
+  for (bool pinned : {true, false}) {
+    LyingEndpoint ep;
+    PlexTestPeer server;
+    server.setAcceptor([&ep, &server] { return ep.accept(server.taskIO()); });
+    const uint16_t port = server.start();
+    BOOST_REQUIRE(port != 0);
+    PlexTestPeer client;
+    BOOST_REQUIRE(client.start() != 0);
+    const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), port);
+    ces::KeyPair signer;
+    ces::CesPlexChannel ch(client.taskIO(), client.rudp());
+    if (pinned) ch.setServerPubkey(ces::KeyPair().getPublicKeyAsHash());
+    const uint8_t rc = ch.select(to, kCountProto, signer);
+    if (pinned) {
+      CES_CHECK_RC_EQ(rc, CES_ERROR_INTERNAL);
+      // The refusal closes the channel, so the endpoint sees its end.
+      for (int i = 0; i < 100 && !ep.sawEnd.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      BOOST_CHECK(ep.sawEnd.load());
+      BOOST_CHECK(!ep.gotSigned.load());
+    } else {
+      CES_CHECK_OK(rc);
+      BOOST_CHECK(ep.gotSigned.load());
+    }
+  }
+}
+
+// A select whose endpoint sends no hello, or no reply, ends at the connect
+// timeout with UNREACHABLE, and closes its channel: the endpoint sees the end.
+BOOST_AUTO_TEST_CASE(SelectTimeoutClosesTheChannel) {
+  using Lie = LyingEndpoint::Lie;
+  for (Lie lie : {Lie::NoHello, Lie::NoReply}) {
+    LyingEndpoint ep;
+    ep.lie = lie;
+    PlexTestPeer server;
+    server.setAcceptor([&ep, &server] { return ep.accept(server.taskIO()); });
+    const uint16_t port = server.start();
+    BOOST_REQUIRE(port != 0);
+    PlexTestPeer client;
+    BOOST_REQUIRE(client.start() != 0);
+    const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), port);
+    ces::KeyPair signer;
+    ces::CesPlexChannel ch(client.taskIO(), client.rudp());
+    CES_CHECK_RC_EQ(ch.select(to, kCountProto, signer), CES_ERROR_UNREACHABLE);
+    for (int i = 0; i < 200 && !ep.sawEnd.load(); ++i)
+      std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    BOOST_CHECK(ep.sawEnd.load());
+    BOOST_CHECK_EQUAL(ep.gotSigned.load(), lie == Lie::NoReply);
+  }
+}
+
+// A client with a protocol name that is too long refuses it before it writes:
+// the endpoint gets no byte.
+BOOST_AUTO_TEST_CASE(AClientRefusesATooLongNameBeforeItWrites) {
+  LyingEndpoint ep;
+  PlexTestPeer server;
+  server.setAcceptor([&ep, &server] { return ep.accept(server.taskIO()); });
+  const uint16_t port = server.start();
+  BOOST_REQUIRE(port != 0);
+  PlexTestPeer client;
+  BOOST_REQUIRE(client.start() != 0);
+  const minx::SockAddr to(boost::asio::ip::address_v6::loopback(), port);
+  ces::KeyPair signer;
+  ces::CesPlexChannel ch(client.taskIO(), client.rudp());
+  const std::string name(ces::CES_PLEX_MAX_NAME_LEN + 1, 'n');
+  CES_CHECK_RC_EQ(ch.select(to, name, signer), CES_ERROR_PROTO_REJECTED);
+  std::this_thread::sleep_for(std::chrono::milliseconds(200));
+  BOOST_CHECK(!ep.gotBytes.load());
+}
+
+// Write [u8 verb][envelope] on `stream`, read an error response (the status,
+// an empty preamble and the signed trailer), and return its status. 0xFF if
+// the stream ends first.
+uint8_t sendVerbStatus(boost::asio::io_context& io,
+                       std::shared_ptr<minx::RudpStream> stream,
+                       uint8_t verb, const minx::Bytes& envelope) {
+  auto wire = std::make_shared<minx::Bytes>();
+  wire->push_back(static_cast<char>(verb));
+  wire->insert(wire->end(), envelope.begin(), envelope.end());
+  auto st = std::make_shared<std::array<uint8_t, 1 + ces::CES_PLEX_RESP_TRAILER_SIZE>>();
+  auto done = std::make_shared<std::promise<uint8_t>>();
+  auto fut = done->get_future();
+  boost::asio::post(io, [stream, wire, st, done]() {
+    boost::asio::async_write(*stream, boost::asio::buffer(*wire),
+      [stream, wire, st, done](const boost::system::error_code& ec, std::size_t) {
+        if (ec) { done->set_value(0xFF); return; }
+        boost::asio::async_read(*stream, boost::asio::buffer(*st),
+          [st, done](const boost::system::error_code& ec2, std::size_t) {
+            done->set_value(ec2 ? uint8_t{0xFF} : (*st)[0]);
+          });
+      });
+  });
+  if (fut.wait_for(std::chrono::seconds(5)) != std::future_status::ready)
+    return 0xFF;
+  return fut.get();
+}
+
+// A per-op verb that a key signs for one server fails on its channel at
+// another server. Here a dishonest endpoint M gives its own channel the
+// challenge of the key's channel at the real server S. The key signs a STAT
+// for M; that STAT must not run at S.
+BOOST_AUTO_TEST_CASE(AVerbSignedForAnotherServerIsRejected) {
+  CesPlexFixture fx({ {"/ces/file/1", "builtin:file"} });
+  ces::KeyPair signer;
+  fx.server->_brr(signer.getPublicKeyAsHash(), 10'000'000'000);
+  fx.server->_drainLogic();
+
+  // The key's channel at S.
+  PlexTestPeer peerS;
+  BOOST_REQUIRE(peerS.start() != 0);
+  auto atS = peerS.select(fx.rpcPort, "/ces/file/1", signer);
+  BOOST_REQUIRE_EQUAL(int(atS.status), 0x01);
+
+  // M copies the challenge of that channel into its own hello.
+  LyingEndpoint m;
+  m.forceChallenge = atS.challenge;
+  PlexTestPeer peerM;
+  peerM.setAcceptor([&m, &peerM] { return m.accept(peerM.taskIO()); });
+  const uint16_t mPort = peerM.start();
+  BOOST_REQUIRE(mPort != 0);
+
+  // The production client binds to M and signs a STAT for M.
+  PlexTestPeer client;
+  BOOST_REQUIRE(client.start() != 0);
+  ces::CesPlexChannel ch(client.taskIO(), client.rudp());
+  CES_REQUIRE_OK(ch.select(
+    minx::SockAddr(boost::asio::ip::address_v6::loopback(), mPort),
+    "/ces/file/1", signer));
+  constexpr uint8_t kVerbStat = 0x04;
+  const std::string name = "/f/nothing";
+  ces::Bytes pre;
+  ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
+  ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
+  pre.insert(pre.end(), name.begin(), name.end());
+  const minx::Bytes env = ch.buildEnvelope(kVerbStat, pre);
+
+  // The control: the same STAT, signed for the key's channel at S, runs
+  // there as a STAT of a missing file.
+  // [u32 len][u64 salt + preamble][65 sig], as CesPlexChannel builds it.
+  ces::Bytes signedPre;
+  ces::Buffer::put<uint64_t>(signedPre, 1);
+  signedPre.insert(signedPre.end(), pre.begin(), pre.end());
+  const ces::Signature ownSig = ces::signPerOp(
+    signer, kVerbStat,
+    std::span<const uint8_t>(signedPre.data(), signedPre.size()),
+    atS.bindDigest);
+  ces::Bytes own;
+  ces::Buffer::put<uint32_t>(own, static_cast<uint32_t>(signedPre.size()));
+  own.insert(own.end(), signedPre.begin(), signedPre.end());
+  own.insert(own.end(), ownSig.begin(), ownSig.end());
+  BOOST_REQUIRE_EQUAL(
+    int(sendVerbStatus(peerS.taskIO(), atS.stream, kVerbStat,
+                       minx::Bytes(own.begin(), own.end()))),
+    int(CES_ERROR_FILE_NOT_FOUND));
+
+  // M moves the STAT that the key signed for it onto the key's channel at S.
+  // S must refuse it: the signature names M.
+  const uint8_t status =
+    sendVerbStatus(peerS.taskIO(), atS.stream, kVerbStat, env);
+  BOOST_CHECK_EQUAL(int(status), int(CES_ERROR_BAD_INPUT));
+}
+
+// Two binds that differ only in the server key give two digests, and a
+// per-op sig for one fails on the other.
+BOOST_AUTO_TEST_CASE(APerOpSigNamesTheServerKey) {
+  const std::string name = "/ces/file/1";
+  ces::KeyPair signer;
+  const auto& pub = signer.getPublicKeyAsHash();
+  ces::ServerHello helloA, helloB;
+  helloA.serverPubkey.fill(0x22);
+  helloB.serverPubkey.fill(0x33);
+  helloA.challenge = helloB.challenge = 0x8000000000000001ull;
+  auto digestFor = [&](const ces::ServerHello& h) {
+    return ces::computeBindRequestDigest(
+      std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(name.data()), name.size()),
+      1700000000000000ull, std::span<const uint8_t>(pub.data(), pub.size()), h);
+  };
+  ces::BoundChannelContext atA;
+  atA.boundPubkey = signer.getPublicKey();
+  atA.bindDigest = digestFor(helloA);
+  const ces::Bytes pre{1, 2, 3, 4};
+  const std::span<const uint8_t> sp(pre.data(), pre.size());
+  BOOST_CHECK(ces::verifyPerOp(atA, 0x04, sp,
+                               ces::signPerOp(signer, 0x04, sp, digestFor(helloA))));
+  BOOST_CHECK(!ces::verifyPerOp(atA, 0x04, sp,
+                                ces::signPerOp(signer, 0x04, sp, digestFor(helloB))));
+}
+
+// CES signs a bind digest to the same bytes as cesweb's cessign.js: the same
+// constants are in "signatures: the known answers of the C++ suite" in
+// cesweb/tests/cessign.test.mjs. Both algorithms are deterministic.
+BOOST_AUTO_TEST_CASE(SignaturesMatchCessign) {
+  const std::string name = "/ces/lua/1";
+  ces::ServerHello hello;
+  hello.serverPubkey.fill(0x22);
+  hello.challenge = 0x8000000000000001ull;
+  struct Case { ces::KeyAlgo algo; const char* priv; const char* pub; const char* sig; };
+  const Case cases[] = {
+    {ces::KeyAlgo::ED25519, "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+     "fc947730f49eb01427a66e050733294d9e520e545c7a27125a780634e0860a27",
+     "00bcc1e29f99b9d73fa943adb28cadb5140f24815aa65adb50d2d53de1a811a0137821e069fed2a1096b56cb95c50736dcc39cbd84ab115f90601289300e811709"},
+    {ces::KeyAlgo::SECP256K1, "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+     "ab5d2e79cfd621b1b027ffb24e2453ed7fb571ba9a841ff0e2473466cabd168d",
+     "02a2b26927b785d103744d29e93e720dd35ee5661bfe3e8aa211ae05a2bfa95f204bb7d15442c45bca1dd25f6dea60afcb694c9ce964a5dc8b04a41f8443aa5538"},
+  };
+  for (const auto& c : cases) {
+    const ces::KeyPair key(std::string(c.priv), c.algo);
+    const auto& pub = key.getPublicKeyAsHash();
+    BOOST_CHECK_EQUAL(minx::hashToString(pub), c.pub);
+    auto d = ces::computeBindRequestDigest(
+      std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(name.data()), name.size()),
+      1700000000000000ull, std::span<const uint8_t>(pub.data(), pub.size()),
+      hello);
+    ces::Signature sig =
+      key.signData(std::span<const uint8_t>(d.data(), d.size()));
+    std::string hex;
+    for (uint8_t b : sig) {
+      static const char* k = "0123456789abcdef";
+      hex.push_back(k[b >> 4]);
+      hex.push_back(k[b & 15]);
+    }
+    BOOST_CHECK_EQUAL(hex, c.sig);
+  }
+}
+
+// One known digest. cesweb's tests/cessign.test.mjs and
+// tests/webcrypto.test.mjs check the same bytes; the challenge is above 2^53,
+// where a JavaScript Number loses bits.
+BOOST_AUTO_TEST_CASE(BindDigestKnownAnswer) {
+  const std::string name = "/ces/lua/1";
+  std::array<uint8_t, 32> clientPub;
+  clientPub.fill(0x11);
+  ces::ServerHello hello;
+  hello.serverPubkey.fill(0x22);
+  hello.challenge = 0x8000000000000001ull;
+  auto d = ces::computeBindRequestDigest(
+    std::span<const uint8_t>(
+      reinterpret_cast<const uint8_t*>(name.data()), name.size()),
+    1700000000000000ull,
+    std::span<const uint8_t>(clientPub.data(), clientPub.size()), hello);
+  minx::Hash h;
+  std::memcpy(h.data(), d.data(), h.size());
+  BOOST_CHECK_EQUAL(minx::hashToString(h),
+    "04bcbf72a154ef9775748c52f2ee9a94a4d9234c32f509ea27db123cb36def65");
+}
+
+// One known per-op digest: the ATTACH of pid 7 on the bind of
+// BindDigestKnownAnswer. cesweb's tests check the same bytes.
+BOOST_AUTO_TEST_CASE(PerOpDigestKnownAnswer) {
+  ces::BindDigest bind{};
+  minx::Hash b;
+  minx::stringToHash(b,
+    "04bcbf72a154ef9775748c52f2ee9a94a4d9234c32f509ea27db123cb36def65");
+  std::memcpy(bind.data(), b.data(), bind.size());
+  ces::Bytes pre;
+  ces::Buffer::put<uint64_t>(pre, 7);
+  auto d = ces::computePerOpDigest(
+    0x01, std::span<const uint8_t>(pre.data(), pre.size()), bind);
+  minx::Hash h;
+  std::memcpy(h.data(), d.data(), h.size());
+  BOOST_CHECK_EQUAL(minx::hashToString(h),
+    "fcc76fdaffc05370107ae476fa3ac2cb80a156ac8486707468cef58d0bb2922b");
 }
 
 // ---------------------------------------------------------------------------
@@ -570,12 +1307,12 @@ namespace {
 
 // Build the per-op envelope for the bind-contract wire (Step 3).
 // Wire shape after the verb byte: [u32 preamble_len][salt+preamble][65 sig].
-// Sig is over sha256(verb || salt || preamble || sessionToken).
+// Sig is over sha256(verb || salt || preamble || bind digest).
 static ces::Bytes buildSignedEnvelope(
     const ces::KeyPair& signer,
     uint8_t verb,
     const ces::Bytes& preamble,
-    uint64_t sessionToken) {
+    const ces::BindDigest& bindDigest) {
   // Match CesPlexClient: prepend an 8-byte per-op salt so repeated ops
   // sign differently (a static counter gives uniqueness across calls).
   static uint64_t opSalt = 1;
@@ -585,7 +1322,7 @@ static ces::Bytes buildSignedEnvelope(
   ces::Signature sig = ces::signPerOp(
     signer, verb,
     std::span<const uint8_t>(signedPre.data(), signedPre.size()),
-    sessionToken);
+    bindDigest);
   ces::Bytes wire;
   ces::Buffer::put<uint32_t>(wire, static_cast<uint32_t>(signedPre.size()));
   wire.insert(wire.end(), signedPre.begin(), signedPre.end());
@@ -718,7 +1455,7 @@ static RespTail driveVerb(
 static RespTail fileCreate(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            uint32_t reqNonce,
                            uint64_t size, uint64_t pricePerKb,
                            uint64_t initialDeposit,
@@ -730,7 +1467,7 @@ static RespTail fileCreate(boost::asio::io_context& ioc,
   ces::Buffer::put<uint64_t>(pre, initialDeposit);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x01, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x01, pre, bindDigest);
   return driveVerb(ioc, stream, 0x01, env, /*respPreambleLen=*/16);
 }
 
@@ -738,7 +1475,7 @@ static RespTail fileCreate(boost::asio::io_context& ioc,
 static RespTail ramfileWrite(boost::asio::io_context& ioc,
                           std::shared_ptr<minx::RudpStream> stream,
                           const ces::KeyPair& signer,
-                          uint64_t sessionToken,
+                          const ces::BindDigest& bindDigest,
                           uint32_t reqNonce,
                           uint64_t offset,
                           const ces::Bytes& content,
@@ -751,7 +1488,7 @@ static RespTail ramfileWrite(boost::asio::io_context& ioc,
   pre.insert(pre.end(), contentHash.begin(), contentHash.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x02, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x02, pre, bindDigest);
   return driveVerb(ioc, stream, 0x02, env,
                    /*respPreambleLen=*/8,
                    /*extraBodyToSend=*/content);
@@ -768,7 +1505,7 @@ struct ReadResult {
 static ReadResult ramfileRead(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            uint32_t reqNonce,
                            uint64_t offset, uint32_t length,
                            const std::string& name) {
@@ -778,7 +1515,7 @@ static ReadResult ramfileRead(boost::asio::io_context& ioc,
   ces::Buffer::put<uint32_t>(pre, length);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x03, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x03, pre, bindDigest);
 
   // Write verb + env first.
   struct Run : std::enable_shared_from_this<Run> {
@@ -851,7 +1588,7 @@ struct StatResult {
 static StatResult fileStat(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            const std::string& name) {
   // Step 3: STAT is signed like every other verb. Preamble is
   // [u32 reqNonce][u16 name_len][name].
@@ -859,7 +1596,7 @@ static StatResult fileStat(boost::asio::io_context& ioc,
   ces::Buffer::put<uint32_t>(pre, CES_NONCELESS);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x04, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x04, pre, bindDigest);
 
   struct Run : std::enable_shared_from_this<Run> {
     std::shared_ptr<minx::RudpStream> stream;
@@ -952,7 +1689,7 @@ static StatResult fileStat(boost::asio::io_context& ioc,
 static RespTail fileDeposit(boost::asio::io_context& ioc,
                             std::shared_ptr<minx::RudpStream> stream,
                             const ces::KeyPair& signer,
-                            uint64_t sessionToken,
+                            const ces::BindDigest& bindDigest,
                             uint32_t reqNonce, uint64_t amount,
                             const std::string& name) {
   ces::Bytes pre;
@@ -960,13 +1697,13 @@ static RespTail fileDeposit(boost::asio::io_context& ioc,
   ces::Buffer::put<uint64_t>(pre, amount);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x05, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x05, pre, bindDigest);
   return driveVerb(ioc, stream, 0x05, env, /*respPreambleLen=*/8);
 }
 static RespTail fileWithdraw(boost::asio::io_context& ioc,
                              std::shared_ptr<minx::RudpStream> stream,
                              const ces::KeyPair& signer,
-                             uint64_t sessionToken,
+                             const ces::BindDigest& bindDigest,
                              uint32_t reqNonce, uint64_t amount,
                              const std::string& name) {
   ces::Bytes pre;
@@ -974,13 +1711,13 @@ static RespTail fileWithdraw(boost::asio::io_context& ioc,
   ces::Buffer::put<uint64_t>(pre, amount);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x06, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x06, pre, bindDigest);
   return driveVerb(ioc, stream, 0x06, env, /*respPreambleLen=*/8);
 }
 static RespTail fileSetPrice(boost::asio::io_context& ioc,
                              std::shared_ptr<minx::RudpStream> stream,
                              const ces::KeyPair& signer,
-                             uint64_t sessionToken,
+                             const ces::BindDigest& bindDigest,
                              uint32_t reqNonce, uint64_t price,
                              const std::string& name) {
   ces::Bytes pre;
@@ -988,20 +1725,20 @@ static RespTail fileSetPrice(boost::asio::io_context& ioc,
   ces::Buffer::put<uint64_t>(pre, price);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x07, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x07, pre, bindDigest);
   return driveVerb(ioc, stream, 0x07, env, /*respPreambleLen=*/8);
 }
 static RespTail fileDelete(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            uint32_t reqNonce,
                            const std::string& name) {
   ces::Bytes pre;
   ces::Buffer::put<uint32_t>(pre, reqNonce);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x08, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x08, pre, bindDigest);
   return driveVerb(ioc, stream, 0x08, env, /*respPreambleLen=*/8);
 }
 
@@ -1010,7 +1747,7 @@ static RespTail fileDelete(boost::asio::io_context& ioc,
 static RespTail fileAppend(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            uint32_t reqNonce,
                            const ces::Bytes& content,
                            const std::string& name) {
@@ -1021,7 +1758,7 @@ static RespTail fileAppend(boost::asio::io_context& ioc,
   pre.insert(pre.end(), contentHash.begin(), contentHash.end());
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x09, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x09, pre, bindDigest);
   return driveVerb(ioc, stream, 0x09, env,
                    /*respPreambleLen=*/8 + 8,
                    /*extraBodyToSend=*/content);
@@ -1032,7 +1769,7 @@ static RespTail fileAppend(boost::asio::io_context& ioc,
 static RespTail ramfileResize(boost::asio::io_context& ioc,
                            std::shared_ptr<minx::RudpStream> stream,
                            const ces::KeyPair& signer,
-                           uint64_t sessionToken,
+                           const ces::BindDigest& bindDigest,
                            uint32_t reqNonce,
                            uint64_t newSize,
                            const std::string& name) {
@@ -1041,7 +1778,7 @@ static RespTail ramfileResize(boost::asio::io_context& ioc,
   ces::Buffer::put<uint64_t>(pre, newSize);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x0a, pre, sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x0a, pre, bindDigest);
   return driveVerb(ioc, stream, 0x0a, env,
                    /*respPreambleLen=*/8);
 }
@@ -1239,12 +1976,12 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   // fixture feeFileRent=1 → upfront = 1024 × 900 / 86400 = 10.
   const uint64_t upfrontBurn = size * 1ull * 900 / 86400;
   const uint64_t postCreateBalance = deposit - upfrontBurn;
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       size, /*pricePerKb=*/10, deposit,
                       name);
   CES_CHECK_RC_EQ(c.status, CES_OK);
 
-  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_CHECK_RC_EQ(st.status, CES_OK);
   BOOST_CHECK_EQUAL(st.fileBalance, postCreateBalance);
   BOOST_CHECK_EQUAL(st.pricePerKb, 10u);
@@ -1252,13 +1989,13 @@ BOOST_AUTO_TEST_CASE(FileCreateStatWithdraw) {
   BOOST_CHECK(std::memcmp(st.ownerPubkey.data(),
                           signer.getPublicKeyAsHash().data(), 32) == 0);
 
-  auto w = fileWithdraw(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto w = fileWithdraw(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                         postCreateBalance, name);
   CES_CHECK_RC_EQ(w.status, CES_OK);
   BOOST_REQUIRE_EQUAL(w.preamble.size(), 8u);
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(w.preamble.data()), 0u); // balance drained
 
-  auto st2 = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto st2 = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_CHECK_RC_EQ(st2.status, CES_OK);
   BOOST_CHECK_EQUAL(st2.fileBalance, 0u);
 }
@@ -1285,7 +2022,7 @@ BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
   const uint64_t size = 1024;
   const uint64_t createDeposit = 1'000'000;
   const uint64_t upfrontBurn = size * 1ull * 900 / 86400;  // fixture feeFileRent=1
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest,
                       CES_NONCELESS, size, /*pricePerKb=*/0, createDeposit,
                       name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
@@ -1299,7 +2036,7 @@ BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
   ces::Buffer::put<uint64_t>(pre, amount);
   ces::Buffer::put<uint16_t>(pre, static_cast<uint16_t>(name.size()));
   pre.insert(pre.end(), name.begin(), name.end());
-  auto env = buildSignedEnvelope(signer, 0x05, pre, sel.sessionToken);
+  auto env = buildSignedEnvelope(signer, 0x05, pre, sel.bindDigest);
 
   auto d1 = driveVerb(peer.taskIO(), sel.stream, 0x05, env, /*respPreambleLen=*/8);
   CES_REQUIRE_RC_EQ(d1.status, CES_OK);
@@ -1314,7 +2051,7 @@ BOOST_AUTO_TEST_CASE(FileDepositResendIsIdempotent) {
                     postCreate + amount);
 
   // Cross-check via STAT: a single deposit applied.
-  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_REQUIRE_RC_EQ(st.status, CES_OK);
   BOOST_CHECK_EQUAL(st.fileBalance, postCreate + amount);
 }
@@ -1335,7 +2072,7 @@ BOOST_AUTO_TEST_CASE(FileWriteRead) {
   const std::string name = "/p/notes/alpha.txt";
   // Deposit must cover write_cost = 64 * feeFileWrite. With default
   // fees ~18.3K per byte, 64 bytes = ~1.2M credits. Use 10M headroom.
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/64, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
                       name);
@@ -1345,11 +2082,11 @@ BOOST_AUTO_TEST_CASE(FileWriteRead) {
   const std::string msg = "hello from the v2 write path";
   std::memcpy(content.data(), msg.data(), msg.size());
 
-  auto w = ramfileWrite(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto w = ramfileWrite(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                      /*offset=*/0, content, name);
   CES_REQUIRE_RC_EQ(w.status, CES_OK);
 
-  auto r = ramfileRead(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto r = ramfileRead(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                     /*offset=*/0, /*length=*/64, name);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_CHECK_EQUAL(r.length, 64u);
@@ -1382,7 +2119,7 @@ BOOST_AUTO_TEST_CASE(FileCrossSignerEconomics) {
   const uint64_t pricePerKb = 100'000;
   const uint64_t size = 1024;
   const uint64_t upfrontBurn = size * 1ull * 900 / 86400;
-  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.bindDigest,
                       CES_NONCELESS, size, pricePerKb,
                       /*initialDeposit=*/500'000,
                       name);
@@ -1390,26 +2127,26 @@ BOOST_AUTO_TEST_CASE(FileCrossSignerEconomics) {
   uint64_t expectedBalance = 500'000u - upfrontBurn;
 
   // B deposits 1M — file_balance should bump.
-  auto d = fileDeposit(peerB.taskIO(), selB.stream, b, selB.sessionToken,
+  auto d = fileDeposit(peerB.taskIO(), selB.stream, b, selB.bindDigest,
                        CES_NONCELESS, 1'000'000, name);
   CES_REQUIRE_RC_EQ(d.status, CES_OK);
   expectedBalance += 1'000'000u;
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(d.preamble.data()), expectedBalance);
 
   // B reads 1024 bytes — pays pricePerKb to the file.
-  auto r = ramfileRead(peerB.taskIO(), selB.stream, b, selB.sessionToken,
+  auto r = ramfileRead(peerB.taskIO(), selB.stream, b, selB.bindDigest,
                     CES_NONCELESS, /*offset=*/0, /*length=*/1024, name);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   expectedBalance += pricePerKb;
 
   // STAT (on B's channel — anyone can stat).
-  auto s = fileStat(peerB.taskIO(), selB.stream, b, selB.sessionToken,
+  auto s = fileStat(peerB.taskIO(), selB.stream, b, selB.bindDigest,
                     name);
   CES_REQUIRE_RC_EQ(s.status, CES_OK);
   BOOST_CHECK_EQUAL(s.fileBalance, expectedBalance);
 
   // A withdraws the full file_balance → bumps A's account.
-  auto w = fileWithdraw(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+  auto w = fileWithdraw(peerA.taskIO(), selA.stream, a, selA.bindDigest,
                         CES_NONCELESS, s.fileBalance, name);
   CES_REQUIRE_RC_EQ(w.status, CES_OK);
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(w.preamble.data()), 0u);
@@ -1432,18 +2169,18 @@ BOOST_AUTO_TEST_CASE(FileWithdrawBeyondInt64NeverMints) {
   BOOST_REQUIRE_EQUAL(int(selB.status), 0x01);
 
   const std::string name = "/p/withdraw/huge";
-  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.bindDigest,
                       CES_NONCELESS, 1024, 0, /*initialDeposit=*/500'000, name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
-  auto s0 = fileStat(peerB.taskIO(), selB.stream, b, selB.sessionToken, name);
+  auto s0 = fileStat(peerB.taskIO(), selB.stream, b, selB.bindDigest, name);
   CES_REQUIRE_RC_EQ(s0.status, CES_OK);
   const int64_t circBefore = fx.server->_getTotalCredits();
 
-  auto w = fileWithdraw(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+  auto w = fileWithdraw(peerA.taskIO(), selA.stream, a, selA.bindDigest,
                         CES_NONCELESS, ~uint64_t(0) - 999'999, name);
   BOOST_CHECK(w.status != CES_OK);
 
-  auto s1 = fileStat(peerB.taskIO(), selB.stream, b, selB.sessionToken, name);
+  auto s1 = fileStat(peerB.taskIO(), selB.stream, b, selB.bindDigest, name);
   CES_REQUIRE_RC_EQ(s1.status, CES_OK);
   BOOST_CHECK_LE(s1.fileBalance, s0.fileBalance);
   BOOST_CHECK_LE(fx.server->_getTotalCredits(), circBefore);
@@ -1468,7 +2205,7 @@ BOOST_AUTO_TEST_CASE(FileNonOwnerWriteRejected) {
   BOOST_REQUIRE_EQUAL(int(selB.status), 0x01);
 
   const std::string name = "/p/mine/only.txt";
-  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.sessionToken,
+  auto c = fileCreate(peerA.taskIO(), selA.stream, a, selA.bindDigest,
                       CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
                       name);
@@ -1478,7 +2215,7 @@ BOOST_AUTO_TEST_CASE(FileNonOwnerWriteRejected) {
   // NOT_OWNER because the channel's bound pubkey doesn't match the
   // file's owner.
   ces::Bytes content(16, 'B');
-  auto w = ramfileWrite(peerB.taskIO(), selB.stream, b, selB.sessionToken,
+  auto w = ramfileWrite(peerB.taskIO(), selB.stream, b, selB.bindDigest,
                      CES_NONCELESS, /*offset=*/0, content, name);
   CES_CHECK_RC_EQ(w.status, CES_ERROR_NOT_OWNER);
 }
@@ -1499,7 +2236,7 @@ BOOST_AUTO_TEST_CASE(FileAppendExtendsSize) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/p/grow/growing.bin";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
                       name);
@@ -1507,13 +2244,13 @@ BOOST_AUTO_TEST_CASE(FileAppendExtendsSize) {
 
   // WRITE 'A's into the first 16 bytes.
   ces::Bytes first(16, 'A');
-  auto w = ramfileWrite(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto w = ramfileWrite(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                      /*offset=*/0, first, name);
   CES_REQUIRE_RC_EQ(w.status, CES_OK);
 
   // APPEND 16 'B's.
   ces::Bytes second(16, 'B');
-  auto a = fileAppend(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto a = fileAppend(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       second, name);
   CES_REQUIRE_RC_EQ(a.status, CES_OK);
   BOOST_REQUIRE_EQUAL(a.preamble.size(), 8u + 8u);
@@ -1521,7 +2258,7 @@ BOOST_AUTO_TEST_CASE(FileAppendExtendsSize) {
   BOOST_CHECK_EQUAL(respSize, 32u);
 
   // READ the full 32 bytes, verify layout.
-  auto r = ramfileRead(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto r = ramfileRead(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                     /*offset=*/0, /*length=*/32, name);
   CES_REQUIRE_RC_EQ(r.status, CES_OK);
   BOOST_CHECK_EQUAL(r.length, 32u);
@@ -1545,30 +2282,30 @@ BOOST_AUTO_TEST_CASE(FileResizeGrowAndShrink) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/p/flex/flex.bin";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/100, /*pricePerKb=*/0,
                       /*initialDeposit=*/10'000'000,
                       name);
   CES_REQUIRE_RC_EQ(c.status, CES_OK);
 
   // Grow to 200.
-  auto g = ramfileResize(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto g = ramfileResize(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       200, name);
   CES_REQUIRE_RC_EQ(g.status, CES_OK);
   BOOST_REQUIRE_EQUAL(g.preamble.size(), 8u);
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(g.preamble.data()), 200u);
 
-  auto s1 = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto s1 = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_REQUIRE_RC_EQ(s1.status, CES_OK);
   BOOST_CHECK_EQUAL(s1.size, 200u);
 
   // Shrink to 50.
-  auto h = ramfileResize(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto h = ramfileResize(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       50, name);
   CES_REQUIRE_RC_EQ(h.status, CES_OK);
   BOOST_CHECK_EQUAL(ces::Buffer::peek<uint64_t>(h.preamble.data()), 50u);
 
-  auto s2 = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto s2 = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_REQUIRE_RC_EQ(s2.status, CES_OK);
   BOOST_CHECK_EQUAL(s2.size, 50u);
 }
@@ -1598,7 +2335,7 @@ BOOST_AUTO_TEST_CASE(FileRentKillsBrokeFile) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/p/dying/breath.txt";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/1024 * 1024, /*pricePerKb=*/0,
                       /*initialDeposit=*/10924,
                       name);
@@ -1606,7 +2343,7 @@ BOOST_AUTO_TEST_CASE(FileRentKillsBrokeFile) {
 
   std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-  auto s = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto s = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_CHECK_RC_EQ(s.status, CES_ERROR_FILE_NOT_FOUND);
 }
 
@@ -1629,7 +2366,7 @@ BOOST_AUTO_TEST_CASE(FileCreateRejectsUnderfundedDeposit) {
 
   const std::string name = "/p/cheap/grief.bin";
   // 1 MB requires ~10922 upfront; deposit 1 is laughable.
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/1024 * 1024, /*pricePerKb=*/0,
                       /*initialDeposit=*/1,
                       name);
@@ -1668,7 +2405,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirSelfOwnedAllowed) {
   // Signer writes under their own /h/<hex-of-their-pubkey>/... path.
   const std::string name =
     "/h/" + pubkeyHex64(signer.getPublicKeyAsHash()) + "/mydoc.txt";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
                       name);
@@ -1695,7 +2432,7 @@ BOOST_AUTO_TEST_CASE(FileHomeDirWrongSignerRejected) {
 
   const std::string name =
     "/h/" + pubkeyHex64(alice.getPublicKeyAsHash()) + "/trespass.txt";
-  auto c = fileCreate(peer.taskIO(), sel.stream, bob, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, bob, sel.bindDigest, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
                       name);
@@ -1719,7 +2456,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceUnownedRejected) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/f/unregistered/file.txt";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
                       name);
@@ -1750,7 +2487,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceKeyNameGated) {
     PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
     auto sel = peer.select(fx.rpcPort, "/ces/file/1", owner);
     BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
-    auto c = fileCreate(peer.taskIO(), sel.stream, owner, sel.sessionToken,
+    auto c = fileCreate(peer.taskIO(), sel.stream, owner, sel.bindDigest,
                         CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                         /*initialDeposit=*/1'000'000, "/f/myzone/hello.txt");
     CES_CHECK_RC_EQ(c.status, CES_OK);
@@ -1760,7 +2497,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceKeyNameGated) {
     PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
     auto sel = peer.select(fx.rpcPort, "/ces/file/1", other);
     BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
-    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.sessionToken,
+    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.bindDigest,
                         CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                         /*initialDeposit=*/1'000'000, "/f/myzone/evil.txt");
     CES_CHECK_RC_EQ(c.status, CES_ERROR_NOT_OWNER);
@@ -1770,7 +2507,7 @@ BOOST_AUTO_TEST_CASE(FileNamespaceKeyNameGated) {
     PlexTestPeer peer; BOOST_REQUIRE(peer.start() != 0);
     auto sel = peer.select(fx.rpcPort, "/ces/file/1", other);
     BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
-    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.sessionToken,
+    auto c = fileCreate(peer.taskIO(), sel.stream, other, sel.bindDigest,
                         CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                         /*initialDeposit=*/1'000'000, "/f/My_Zone/note.txt");
     CES_CHECK_RC_EQ(c.status, CES_OK);
@@ -1792,7 +2529,7 @@ BOOST_AUTO_TEST_CASE(FileBadZoneRejected) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/docs/nope.txt";  // missing zone prefix
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken, CES_NONCELESS,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest, CES_NONCELESS,
                       /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000,
                       name);
@@ -1817,12 +2554,12 @@ BOOST_AUTO_TEST_CASE(FileSidecarSurvivesQuotesAndNewlines) {
   BOOST_REQUIRE_EQUAL(int(sel.status), 0x01);
 
   const std::string name = "/p/has\"quote/f.txt";
-  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+  auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest,
                       CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                       /*initialDeposit=*/1'000'000, name);
   CES_CHECK_RC_EQ(c.status, CES_OK);
 
-  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.sessionToken, name);
+  auto st = fileStat(peer.taskIO(), sel.stream, signer, sel.bindDigest, name);
   CES_CHECK_RC_EQ(st.status, CES_OK);
   BOOST_CHECK_EQUAL(st.size, 16u);
 }
@@ -1862,7 +2599,7 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
   };
 
   for (const auto& name : bad) {
-    auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.sessionToken,
+    auto c = fileCreate(peer.taskIO(), sel.stream, signer, sel.bindDigest,
                         CES_NONCELESS, /*size=*/16, /*pricePerKb=*/0,
                         /*initialDeposit=*/1'000'000, name);
     BOOST_CHECK_MESSAGE(c.status == CES_ERROR_BAD_NAME,
@@ -1875,9 +2612,7 @@ BOOST_AUTO_TEST_CASE(FileNameValidationRejectsBadPaths) {
 // null and NOT creating a second untracked session over the in-flight one.
 BOOST_AUTO_TEST_CASE(AcceptInboundRejectsDuplicateCoords) {
   boost::asio::io_context io;
-  PlexPeerRudpListener listener;              // onSend no-ops with no minx set
-  minx::Rudp rudp(&listener);
-  ces::CesPlex plex(rudp, io, /*host=*/nullptr, /*meter=*/nullptr);
+  ces::CesPlex plex(io, /*host=*/nullptr, /*meter=*/nullptr);
 
   minx::SockAddr peer(boost::asio::ip::make_address_v6("::1"), 40000);
   auto s1 = plex.acceptInbound(peer, 7);

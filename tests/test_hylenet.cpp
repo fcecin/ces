@@ -165,9 +165,9 @@ struct Line {
     const ces::KeyPair& srv = n.server->_serverKeyPair();
     peer = std::make_unique<PlexLuaPeer>();
     BOOST_REQUIRE(peer->start() != 0);
-    uint64_t token = 0;
-    BOOST_REQUIRE(peer->bind(n.rpcPort, srv, token));
-    auto r = peer->attach(srv, token, pid);
+    ces::BindDigest bindDigest{};
+    BOOST_REQUIRE(peer->bind(n.rpcPort, srv, bindDigest));
+    auto r = peer->attach(srv, bindDigest, pid);
     CES_REQUIRE_RC_EQ(r.status, CES_OK);
     lines = std::make_unique<PlexLineReader>(*peer);
   }

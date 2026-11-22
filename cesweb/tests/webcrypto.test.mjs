@@ -1,47 +1,59 @@
 // Pins the BROWSER signing path. The terminal page signs with native WebCrypto
-// Ed25519 (PKCS#8 import → JWK pubkey → crypto.subtle.sign). This replicates
-// those exact steps with Node's WebCrypto (same implementation surface as
-// browsers) and asserts the output matches cessign — which the dice e2e proves a
-// real CES server verifies. So: browser path == cessign == CES. The DOM glue
-// itself isn't unit-tested (that needs a headless browser), but the crypto is.
+// Ed25519 (PKCS#8 import → JWK pubkey → crypto.subtle.sign). This runs the
+// page's own helpers (src/pagesign.js, the text that server.js inlines) with
+// Node's WebCrypto (same implementation surface as browsers) and asserts the
+// output matches cessign and the C++ known answer. So: browser path == cessign
+// == CES. The DOM glue itself isn't unit-tested (that needs a headless
+// browser), but the crypto is.
 // Run with: node --test
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { pubkeyHex, signBind, signAttach } from '../src/cessign.js';
+import { PAGE_SIGN_JS } from '../src/pagesign.js';
 
-const PFX = Buffer.from('302e020100300506032b657004220420', 'hex');  // Ed25519 PKCS#8 prefix
 const ED = '00' + 'cd'.repeat(32);
-const be16 = (n) => { const b = Buffer.alloc(2); b.writeUInt16BE(n); return b; };
-const be64 = (n) => { const b = Buffer.alloc(8); b.writeBigUInt64BE(BigInt(n)); return b; };
-const sha256 = async (buf) => Buffer.from(await crypto.subtle.digest('SHA-256', buf));
 
-async function importBrowserStyle(dec66) {
-  const pk8 = Buffer.concat([PFX, Buffer.from(dec66.slice(2), 'hex')]);
-  const ext = await crypto.subtle.importKey('pkcs8', pk8, { name: 'Ed25519' }, true, ['sign']);
-  const jwk = await crypto.subtle.exportKey('jwk', ext);
-  const pub = Buffer.from(jwk.x.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('hex');
-  const key = await crypto.subtle.importKey('pkcs8', pk8, { name: 'Ed25519' }, false, ['sign']); // non-extractable
-  return { key, pub };
-}
-const wcSign = async (key, digest) =>
-  Buffer.concat([Buffer.from([0x00]), Buffer.from(await crypto.subtle.sign({ name: 'Ed25519' }, key, digest))]).toString('hex');
+// The page's own helpers: the exact text that server.js puts in the page, run
+// here with Node's WebCrypto (the same API as the browsers).
+const page = new Function(PAGE_SIGN_JS +
+  '\nreturn { h2b, b2h, bindDigest, attachDigest, importEd25519, signDigest };')();
 
-test('WebCrypto path: pubkey matches cessign', async () => {
-  const { pub } = await importBrowserStyle(ED);
-  assert.equal(pub, pubkeyHex(ED));
+// The same vector as BindDigestKnownAnswer in tests/test_cesplex.cpp.
+test('page: the bind digest has the known answer of the C++ suite', async () => {
+  const d = await page.bindDigest('/ces/lua/1', 1_700_000_000_000_000,
+    page.h2b('11'.repeat(32)), '22'.repeat(32), '9223372036854775809');
+  assert.equal(page.b2h(d),
+    '04bcbf72a154ef9775748c52f2ee9a94a4d9234c32f509ea27db123cb36def65');
 });
 
-test('WebCrypto path: bind signature matches cessign (== CES)', async () => {
-  const { key, pub } = await importBrowserStyle(ED);
+test('page: the pubkey matches cessign', async () => {
+  const { pubHex } = await page.importEd25519(ED);
+  assert.equal(pubHex, pubkeyHex(ED));
+});
+
+test('page: the bind signature matches cessign (== CES)', async () => {
+  const { signKey, pubBytes } = await page.importEd25519(ED);
   const t = 1_700_000_000_000_000;
-  const name = Buffer.from('/ces/lua/1', 'utf8');
-  const digest = await sha256(Buffer.concat([be16(name.length), name, be64(t), Buffer.from(pub, 'hex')]));
-  assert.equal(await wcSign(key, digest), signBind(ED, '/ces/lua/1', t));
+  const serverKey = '22'.repeat(32), challenge = '9223372036854775809';
+  const sig = await page.signDigest(signKey,
+    await page.bindDigest('/ces/lua/1', t, pubBytes, serverKey, challenge));
+  assert.equal(sig, signBind(ED, '/ces/lua/1', t, serverKey, challenge));
 });
 
-test('WebCrypto path: ATTACH signature matches cessign', async () => {
-  const { key } = await importBrowserStyle(ED);
-  const digest = await sha256(Buffer.concat([Buffer.from([0x01]), be64(7), be64(99)]));
-  assert.equal(await wcSign(key, digest), signAttach(ED, 7, 99));
+test('page: the ATTACH signature matches cessign', async () => {
+  const { signKey, pubBytes } = await page.importEd25519(ED);
+  const t = 1_700_000_000_000_000;
+  const bindDig = await page.bindDigest('/ces/lua/1', t, pubBytes, '22'.repeat(32),
+    '9223372036854775809');
+  const sig = await page.signDigest(signKey, await page.attachDigest('7', bindDig));
+  assert.equal(sig, signAttach(ED, 7, Buffer.from(bindDig)));
+});
+
+// The same vector as PerOpDigestKnownAnswer in tests/test_cesplex.cpp.
+test('page: the per-op digest of the C++ suite', async () => {
+  const bindDig = page.h2b('04bcbf72a154ef9775748c52f2ee9a94a4d9234c32f509ea27db123cb36def65');
+  assert.equal(page.b2h(await page.attachDigest('7', bindDig)),
+    'fcc76fdaffc05370107ae476fa3ac2cb80a156ac8486707468cef58d0bb2922b');
+  await assert.rejects(() => page.attachDigest('7', '99'));
 });

@@ -7,7 +7,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { WebSocket } from 'ws';
-import { pubkeyHex, signBind, signAttach } from '../src/cessign.js';
+import { pubkeyHex, bindDigest, signBind, signAttach } from '../src/cessign.js';
 import { tmpDir, writeFixture, SERVER, FAKECESH, waitFor } from './util.mjs';
 
 const KEY = '00' + 'cd'.repeat(32);   // ed25519 decorated private key
@@ -39,23 +39,29 @@ function startServer(extraEnv = {}) {
   return { child, port, stop: () => { try { child.kill('SIGKILL'); } catch {} } };
 }
 
-// A client that drives the browser side: signs the bind on open (sending the
-// target server + pid in the hello frame), signs ATTACH when the token comes
-// back, records program bytes (binary) + control (text).
+// A client that drives the browser side: sends the target server + pid in the
+// hello frame, signs the bind and the ATTACH when the server hello comes back,
+// records program bytes (binary) + control (text). The fake cesh checks both
+// signatures over the hello that it sent.
 function connect(port, { key = KEY, pid = PID, host = 'localhost', cesPort = 53830 } = {}) {
   const ws = new WebSocket(`ws://127.0.0.1:${port}/dev/dial`);
   const ctrl = [], prog = [];
   let resolveReady, rejectReady;
   const readyP = new Promise((res, rej) => { resolveReady = res; rejectReady = rej; });
   ws.on('open', () => {
-    const time = Date.now() * 1000;
-    ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(key), time,
-      bindSig: signBind(key, '/ces/lua/1', time), host, cesPort, pid: String(pid) }));
+    ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(key), host, cesPort, pid: String(pid) }));
   });
   ws.on('message', (data, isBinary) => {
     if (isBinary) { prog.push(data.toString('utf8')); return; }
     let m; try { m = JSON.parse(data.toString('utf8')); } catch { return; }
-    if (m.t === 'token') { ws.send(JSON.stringify({ t: 'attachSig', sig: signAttach(key, Number(pid), m.token) })); return; }
+    if (m.t === 'serverHello') {
+      const time = Date.now() * 1000;
+      const d = bindDigest('/ces/lua/1', time, pubkeyHex(key), m.serverKey, m.challenge);
+      ws.send(JSON.stringify({ t: 'sigs', time,
+        bindSig: signBind(key, '/ces/lua/1', time, m.serverKey, m.challenge),
+        attachSig: signAttach(key, Number(pid), d) }));
+      return;
+    }
     if (m.t === 'ready') { resolveReady(); return; }
     ctrl.push(m);
     if (m._end) rejectReady(new Error(m._cesweb || 'ended'));
@@ -73,7 +79,7 @@ test('browser signs → relay → greeting → echo (the dice-via-web path)', as
   const port = await srv.port;
   try {
     const c = connect(port);
-    await c.readyP;                                              // hello → token → attachSig → ready
+    await c.readyP;                                  // hello → serverHello → sigs → ready
     await waitFor(() => c.progText().includes('DICE READY'));    // program greeting
     c.sendLine('hello');
     await waitFor(() => c.progText().includes('echo: hello'));   // round-trip through cesh
@@ -120,5 +126,73 @@ test('a disallowed host (named in the hello frame) is rejected', async () => {
     const c = connect(port, { host: 'evil.com' });
     const reason = await c.readyP.then(() => null, (e) => e.message);
     assert.match(reason || '', /not allowed/);
+  } finally { srv.stop(); }
+});
+
+test('the server hello reaches the browser with its challenge as a string', async () => {
+  const srv = startServer();
+  const port = await srv.port;
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/dev/dial`);
+    const hello = await new Promise((res, rej) => {
+      ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(KEY),
+        host: 'localhost', cesPort: 53830, pid: PID })));
+      ws.on('message', (d, bin) => {
+        if (bin) return;
+        const m = JSON.parse(d.toString());
+        if (m.t === 'serverHello') res(m);
+        else if (m._end) rej(new Error(m._cesweb));
+      });
+    });
+    assert.equal(hello.serverKey, 'ab'.repeat(32));
+    assert.equal(hello.challenge, '9223372036854775809');   // above 2^53, intact
+    ws.close();
+  } finally { srv.stop(); }
+});
+
+test('signatures sent before the server hello are refused', async () => {
+  const srv = startServer();
+  const port = await srv.port;
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/dev/dial`);
+    const reason = await new Promise((res) => {
+      ws.on('open', () => {
+        ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(KEY),
+          host: 'localhost', cesPort: 53830, pid: PID }));
+        ws.send(JSON.stringify({ t: 'sigs', time: Date.now() * 1000,
+          bindSig: '00'.repeat(65), attachSig: '00'.repeat(65) }));
+      });
+      ws.on('message', (d, bin) => {
+        if (bin) return;
+        try { const m = JSON.parse(d.toString()); if (m._end) res(m._cesweb); } catch {}
+      });
+      ws.on('close', () => res('closed'));
+    });
+    assert.match(reason, /unexpected control frame/);
+  } finally { srv.stop(); }
+});
+
+test('a bind signed for another challenge fails at cesh', async () => {
+  const srv = startServer();
+  const port = await srv.port;
+  try {
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/dev/dial`);
+    const reason = await new Promise((res) => {
+      ws.on('open', () => ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(KEY),
+        host: 'localhost', cesPort: 53830, pid: PID })));
+      ws.on('message', (d, bin) => {
+        if (bin) return;
+        const m = JSON.parse(d.toString());
+        if (m.t === 'serverHello') {
+          const other = (BigInt(m.challenge) + 1n).toString();
+          const time = Date.now() * 1000;
+          const d = bindDigest('/ces/lua/1', time, pubkeyHex(KEY), m.serverKey, other);
+          ws.send(JSON.stringify({ t: 'sigs', time,
+            bindSig: signBind(KEY, '/ces/lua/1', time, m.serverKey, other),
+            attachSig: signAttach(KEY, Number(PID), d) }));
+        } else if (m._end) res(m._cesweb);
+      });
+    });
+    assert.match(reason, /ERR bind|bind:/);
   } finally { srv.stop(); }
 });

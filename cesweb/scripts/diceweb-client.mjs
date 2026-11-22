@@ -1,12 +1,11 @@
 // Browser simulator for the diceweb e2e. Signs the CesPlex bind + ATTACH itself
 // (via cessign — the exact crypto the browser's WebCrypto path produces) and
-// drives the relay protocol: hello{pubkey,time,bindSig} → token → attachSig →
-// ready → raw. The private key is NEVER sent to cesweb. Then it reads dice's
+// drives the relay protocol: hello{pubkey} → serverHello → sigs → ready → raw. The private key is NEVER sent to cesweb. Then it reads dice's
 // house from the greeting, bets via cesh, and plays — a full round whose
 // signatures a real CES server cryptographically verifies.
 // Env: WS_PORT WS_PID WS_KEY CESH WALLET CES_PORT. Global WebSocket (Node ≥ 21).
 import { spawn } from 'node:child_process';
-import { pubkeyHex, signBind, signAttach } from '../src/cessign.js';
+import { pubkeyHex, bindDigest, signBind, signAttach } from '../src/cessign.js';
 
 const { WS_PORT, WS_PID, WS_KEY, CESH, WALLET, CES_PORT } = process.env;
 const ws = new WebSocket(`ws://127.0.0.1:${WS_PORT}/dev/dial`);
@@ -28,7 +27,14 @@ const cesh = (...args) => new Promise((res, rej) => {
 ws.onmessage = async (ev) => {
   if (typeof ev.data === 'string') {
     let m; try { m = JSON.parse(ev.data); } catch { return; }
-    if (m.t === 'token') { ws.send(JSON.stringify({ t: 'attachSig', sig: signAttach(WS_KEY, Number(WS_PID), m.token) })); return; }
+    if (m.t === 'serverHello') {
+      const time = Date.now() * 1000;
+      const d = bindDigest('/ces/lua/1', time, pubkeyHex(WS_KEY), m.serverKey, m.challenge);
+      ws.send(JSON.stringify({ t: 'sigs', time,
+        bindSig: signBind(WS_KEY, '/ces/lua/1', time, m.serverKey, m.challenge),
+        attachSig: signAttach(WS_KEY, String(WS_PID), d) }));
+      return;
+    }
     if (m.t === 'ready') { runRound(); return; }
     if (m._cesweb) console.error('[ctrl]', m._cesweb);
     return;
@@ -36,9 +42,7 @@ ws.onmessage = async (ev) => {
   const t = dec.decode(ev.data); prog += t; process.stdout.write(t);
 };
 ws.onopen = () => {
-  const time = Date.now() * 1000;
-  ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(WS_KEY), time,
-    bindSig: signBind(WS_KEY, '/ces/lua/1', time),
+  ws.send(JSON.stringify({ t: 'hello', pubkey: pubkeyHex(WS_KEY),
     host: 'localhost', cesPort: Number(CES_PORT), pid: String(WS_PID) }));
 };
 async function runRound() {

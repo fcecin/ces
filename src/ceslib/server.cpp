@@ -1,3 +1,4 @@
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/mux.h>
 #include <ces/cesplex/session.h>
 #include <ces/buffer.h>
@@ -258,25 +259,15 @@ public:
   //
   // Wire sequence:
   //
-  //   1. Send CesPlex select header: [u16 BE 11]["/ces/rpc/1"]
-  //      This commits the channel to the "rpc" protocol via CesPlex's
-  //      multiplexer, so a single secondary port can carry multiple
-  //      protocols. (See include/ces/cesplex/mux.h for the mux
-  //      wire format.)
-  //
-  //   2. Read back one status byte:
-  //        0x01 = OK    -> proceed to step 3
-  //        0x00 = NACK  -> fail with CES_ERROR_PROTO_REJECTED
-  //      NACK means the target doesn't mount /ces/rpc/1. CES servers
-  //      don't mount it by default — rpc is an outbound-only capability
-  //      on CES. Content-server binaries and the test MockRpcServer do.
-  //
-  //   3. Write the signed envelope.
-  //   4. Read [u32 BE len][body] response.
-  //
-  // Costs one extra RTT (steps 1-2) for a uniform L2 bus where every
-  // protocol on the secondary port, including rpc, is gated by the same
-  // select handshake.
+  //   1. The CesPlex bind on "/ces/rpc/1", signed with the server key
+  //      (bind_client.h). A NACK means that the target doesn't mount
+  //      /ces/rpc/1: CES servers don't mount it, since rpc is an
+  //      outbound-only capability on CES. Content-server binaries and
+  //      the test MockRpcServer do. It fails with CES_ERROR_PROTO_REJECTED.
+  //   2. Write [u32 BE len][body]: the program's raw request bytes, with
+  //      no signature of their own. So the target sees the server as the
+  //      sender of each program's call.
+  //   3. Read [u32 BE len][body] response.
   void start() {
     // Seed Rudp's clock before registerChannel — registerChannel
     // stamps the channel's lastActivityUs from currentTimeUs_,
@@ -291,15 +282,26 @@ public:
       finish(CES_ERROR_INTERNAL, {});
       return;
     }
-    // ChannelMeter tracking happens AFTER the bind reply lands —
-    // we need to know the bound rate schedule the remote committed
-    // before we can bill against it. See trackOnBindOk().
+    // ChannelMeter tracking starts after the bind succeeds (see bind()),
+    // so a refused or failed bind is not metered.
     arm_timeout();
-    write_signed_bind();
+    bind();
   }
 
   const minx::SockAddr& peer() const { return peer_; }
   uint32_t channelId() const { return channelId_; }
+
+  // Make this session inert, for a server stop. Call it after the thread of
+  // rpcTaskIO_ joined, while the Rudp and the meter still exist. The session
+  // never calls back, its timer ends, and its pending reads and writes end
+  // with eof. Their completions can run after a restart, when this Rudp and
+  // this meter are gone: each one then finds finished_ and does nothing.
+  void retire() {
+    finished_ = true;
+    cb_ = nullptr;
+    timeoutTimer_.cancel();
+    if (stream_) stream_->detach();
+  }
 
 private:
   // Hard-coded CesPlex protocol name for the rpc protocol. Matches
@@ -318,73 +320,36 @@ private:
   const ces::KeyPair& serverKey_;
   Callback cb_;
   boost::asio::steady_timer timeoutTimer_;
-  // Wire buffers (signed bind contract).
-  minx::Bytes bindReqBuf_;
-  std::array<uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE> bindReplyBuf_{};
-  std::array<uint8_t, ces::CES_PLEX_SHA256_SIZE> bindReqDigest_{};
   ces::Bytes requestWireBuf_;
   std::array<uint8_t, 4> respLenBuf_{};
   ces::Bytes respBodyBuf_;
   bool finished_ = false;
 
-  // Send the signed bind preamble for /ces/rpc/1, signed by the
-  // server's keypair (we are server-as-client here).
-  void write_signed_bind() {
-    const uint64_t nowUs = getMicrosSinceEpoch();
-    bindReqBuf_ = ces::buildBindRequest(kRpcProtoName, nowUs, serverKey_);
-    // Stash the digest so we can verify the reply binds to it.
-    {
-      const auto& pkArr = serverKey_.getPublicKeyAsHash();
-      std::span<const uint8_t> nameSpan(
-        reinterpret_cast<const uint8_t*>(kRpcProtoName),
-        std::strlen(kRpcProtoName));
-      bindReqDigest_ = ces::computeBindRequestDigest(
-        nameSpan, nowUs,
-        std::span<const uint8_t>(pkArr.data(), pkArr.size()));
-    }
+  // The CesPlex bind, signed with the server key. It takes the key that the
+  // target sends in its hello: a SYS_RPC caller names no key.
+  void bind() {
     auto self = shared_from_this();
-    boost::asio::async_write(
-      *stream_, boost::asio::buffer(bindReqBuf_),
-      [self](const boost::system::error_code& ec, std::size_t) {
-        if (ec) { self->finish(CES_ERROR_INTERNAL, {}); return; }
-        self->read_signed_bind_reply();
-      });
-  }
-
-  void read_signed_bind_reply() {
-    auto self = shared_from_this();
-    boost::asio::async_read(
-      *stream_, boost::asio::buffer(bindReplyBuf_),
-      [self](const boost::system::error_code& ec, std::size_t) {
-        if (ec) { self->finish(CES_ERROR_INTERNAL, {}); return; }
-        auto r = ces::parseBindReply(
-          std::span<const uint8_t, ces::CES_PLEX_BIND_REPLY_TOTAL_SIZE>(
-            self->bindReplyBuf_.data(), self->bindReplyBuf_.size()));
-        // Reject NACK before any sig check (server may have NACKed
-        // before reading our preamble; signed-NACK contract is best-
-        // effort).
-        if (r.status != ces::CES_PLEX_OK) {
+    ces::asyncClientBind(
+      stream_, kRpcProtoName, serverKey_, std::nullopt,
+      [self](ces::BindError err, ces::ServerHello, ces::BindDigest) {
+        // The timeout can finish the session after the reply came and before
+        // this runs. Then a success must not meter or write.
+        if (self->finished_) return;
+        if (err == ces::BindError::Rejected) {
           self->finish(CES_ERROR_PROTO_REJECTED, {});
           return;
         }
-        if (!ces::verifyBindReply(
-              r,
-              std::span<const uint8_t>(self->bindReqDigest_.data(),
-                                        self->bindReqDigest_.size()))) {
+        if (err != ces::BindError::None) {
           self->finish(CES_ERROR_INTERNAL, {});
           return;
         }
-        // (No expected-pubkey check in this code path — accept the
-        // key the server presented; SYS_RPC callers don't pre-know
-        // their target server's identity.)
         // Bind reply landed; register the outbound channel with the
         // local ChannelMeter for delta tracking. Billing uses the
         // local CesConfig rates (consistent with inbound channels)
         // and the local server's own pubkey as payer — which is the
         // bottomless server-self account, so the debit is effectively
-        // observability. The remote's disclosed rates from the bind
-        // reply are not enforced locally; the remote's own ledger
-        // bills however it likes on its end.
+        // observability. The remote's own ledger bills however it
+        // likes on its end.
         if (self->channelMeter_) {
           std::ostringstream tag;
           tag << "rpc-out:" << self->peer_;
@@ -1530,7 +1495,7 @@ uint16_t CesServer::start(uint16_t serverPort) {
       };
 
       cesplex_ = std::make_unique<CesPlex>(
-        *rpcRudp_, rpcTaskIO_, this, channelMeter_.get());
+        rpcTaskIO_, this, channelMeter_.get());
       for (const auto& [proto, target] : cfg_.cesplexMounts) {
         if (CesPlexHandler* h = resolveBuiltin(target)) {
           cesplex_->mount(proto, h);
@@ -1781,6 +1746,12 @@ void CesServer::stop(bool flushEvents) {
     if (rpcTaskIOThread_.joinable())
       rpcTaskIOThread_.join();
     rpcTickTimer_.reset();
+    // Outbound SYS_RPC calls in flight: make each one inert while its Rudp
+    // and the meter still exist (see RpcSession::retire). A retired call
+    // never reaches completeRpc, so take it off the pending count here.
+    rpcPendingCount_.fetch_sub(rpcSessions_.size());
+    for (auto& [key, session] : rpcSessions_) session->retire();
+    rpcSessions_.clear();
     // CesPlex holds references into rpcRudp_ (via its per-session
     // RudpStreams) and registers callbacks on it. Tear it down
     // before rpcRudp_ so no callback fires into a half-destroyed
@@ -8386,11 +8357,13 @@ void CesServer::executeRpc(std::shared_ptr<PendingRpc> pending) {
   }
   minx::SockAddr peer(addr, pending->port);
   // Channel ID from the OS CSPRNG. rpcTaskIO_ is a single thread, so a
-  // function-local random_device is fine. A collision within a live peer
-  // session map is negligibly unlikely and not a correctness issue: the
-  // inserted session would replace the older entry, which is acceptable here.
+  // function-local random_device is fine. An id that a live session to this
+  // peer has is drawn again, so no session replaces another one in
+  // rpcSessions_ (stop() retires each session that the map holds).
   std::random_device rd;
-  const uint32_t channelId = static_cast<uint32_t>(rd());
+  uint32_t channelId = static_cast<uint32_t>(rd());
+  while (rpcSessions_.count(std::make_pair(peer, channelId)))
+    channelId = static_cast<uint32_t>(rd());
 
   auto self = this;
   auto session = std::make_shared<RpcSession>(

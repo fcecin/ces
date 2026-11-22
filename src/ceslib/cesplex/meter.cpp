@@ -99,6 +99,7 @@ template <class F> void ChannelMeter::runOnIo(F&& f) {
 
 void ChannelMeter::track(const minx::SockAddr& peer, uint32_t channelId,
                            std::string tag, HashPrefix payerPfx) {
+  trackCalls_.fetch_add(1);
   runOnIo(
     [this, peer, channelId, tag = std::move(tag), payerPfx]
     () mutable {

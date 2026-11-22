@@ -95,6 +95,7 @@ extern "C" {
 }
 
 #include <ces/account.h>
+#include <ces/cesplex/bind_client.h>
 #include <ces/cesplex/endpoint.h>
 #include <ces/cesplex/session.h>
 #include <ces/client.h>

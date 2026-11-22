@@ -1445,15 +1445,18 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     if (amount == 0) return;
     ces::HashPrefix self{};
     std::memcpy(self.data(), inst->programPubkey.data(), self.size());
-    // Inbound: the caller pays the network price only, with no compute
-    // payout. A CesPlex bind does not name the server that it is for, and a
-    // direct /ces/luarpc/1 channel has no other proof of its caller, so a bind
-    // that a dialed party saw could be replayed to pay that party. An ATTACH
-    // over /ces/lua/1 signs its own channel, and it gets the payout there.
-    if (payer == self)
+    // Inbound: the caller pays, and the program gets the compute payout, as
+    // on an ATTACH over /ces/lua/1 (see instancePayee): none in the server
+    // zone. The caller's bind signed this program's key and the challenge of
+    // this channel, so it is good here only. This uses `inst` itself, so the
+    // last report of an instance that is gone pays too.
+    if (payer == self) {
       fhDebitBalance(inst->owner->server_, inst->sourceName, amount);  // outbound: instance pays
-    else
-      server->debitNetworkBill(payer, ces::HashPrefix{}, amount);    // inbound: caller pays
+    } else {
+      const ces::HashPrefix payee =
+        isServerZone(inst->sourceName) ? ces::HashPrefix{} : self;
+      server->debitNetworkBill(payer, payee, amount);                // inbound: caller pays
+    }
     return;
   }
   if (tag == kIpcTagExtManifest) {

@@ -10,12 +10,15 @@
 //
 // WS protocol (browser ↔ cesweb). Text frames = JSON control; binary frames =
 // raw terminal bytes.
-//   browser → {t:"hello", pubkey, time, bindSig, host, cesPort, pid}
-//   cesweb  spawns cesh dial <pid> --extsign --server host:port, writes BIND <time> <bindSig>
-//   cesh    → TOKEN <sessionToken>   → cesweb → browser {t:"token", token}
-//   browser → {t:"attachSig", sig}                     (browser signed ATTACH)
-//   cesweb  writes  ATTACH <sig>;  cesh → READY  → cesweb → browser {t:"ready"}
+//   browser → {t:"hello", pubkey, host, cesPort, pid}
+//   cesweb  spawns cesh dial <pid> --extsign --server host:port
+//   cesh    → HELLO <serverKey> <challenge>  (the server hello of the channel)
+//   cesweb  → browser {t:"serverHello", serverKey, challenge}   (both strings)
+//   browser → {t:"sigs", time, bindSig, attachSig}  (both sign the server hello)
+//   cesweb  writes BIND <time> <bindSig> and ATTACH <attachSig> to cesh
+//   cesh    → READY  → cesweb → browser {t:"ready"}
 //   then raw: browser keystrokes (binary) → cesh stdin; program bytes → browser
+// The challenge is a decimal u64 string end to end: it can be above 2^53.
 // cesweb status lines ride text frames as {_cesweb, _end}.
 //
 // A dial is a persisted process + RUDP channel, so the pool is bounded: global +
@@ -26,6 +29,8 @@ import { spawn } from 'node:child_process';
 
 const HEX64 = /^[0-9a-fA-F]{64}$/;
 const HEX130 = /^[0-9a-fA-F]{130}$/;   // 65-byte signature (tag + 64)
+const U64DEC = /^\d{1,20}$/;
+const isU64 = (v) => U64DEC.test(v) && BigInt(v) < (1n << 64n);
 const HOSTRE = /^[A-Za-z0-9_.\-:]+$/;  // hostname/ip; no spaces or shell metachars
 const num = (v, d) => { const n = parseInt(v, 10); return Number.isFinite(n) ? n : d; };
 
@@ -58,7 +63,7 @@ export class TerminalManager {
 
     const s = {
       ws, meta, child: null, down: false,
-      phase: 'hello',                   // hello → token → attachsig → ready → raw
+      phase: 'hello',            // hello → spawning → serverhello → sigs → ready → raw
       ctrlBuf: Buffer.alloc(0), inQueue: [],
       started: Date.now(), lastActive: Date.now(),
       winStart: Date.now(), winBytes: 0, totalIn: 0, totalOut: 0, timer: null,
@@ -93,9 +98,6 @@ export class TerminalManager {
     if (s.phase === 'hello') {
       if (msg.t !== 'hello') return this._teardown(s, 'expected hello');
       if (!HEX64.test(msg.pubkey || '')) return this._teardown(s, 'bad pubkey');
-      if (!HEX130.test(msg.bindSig || '')) return this._teardown(s, 'bad bind signature');
-      const time = Number(msg.time);
-      if (!Number.isFinite(time) || time <= 0) return this._teardown(s, 'bad time');
       // Target (server + pid) rides the hello frame, not the URL.
       const host = String(msg.host || '').trim();
       if (!host || !HOSTRE.test(host)) return this._teardown(s, 'bad or missing server host');
@@ -106,18 +108,23 @@ export class TerminalManager {
       const pid = String(msg.pid || '');
       if (!/^\d+$/.test(pid)) return this._teardown(s, 'bad instance id (pid)');
       s.pubkey = msg.pubkey.toLowerCase();
-      s.time = Math.trunc(time);
-      s.bindSig = msg.bindSig.toLowerCase();
       s.host = host;
       s.cesPort = cesPort;
       s.pid = pid;
+      s.phase = 'spawning';             // a second hello is refused below
       this._spawn(s);
       return;
     }
-    if (s.phase === 'attachsig') {
-      if (msg.t !== 'attachSig') return this._teardown(s, 'expected attachSig');
-      if (!HEX130.test(msg.sig || '')) return this._teardown(s, 'bad attach signature');
-      try { s.child.stdin.write(`ATTACH ${msg.sig.toLowerCase()}\n`); } catch {}
+    if (s.phase === 'sigs') {
+      if (msg.t !== 'sigs') return this._teardown(s, 'expected sigs');
+      const time = Number(msg.time);
+      if (!Number.isSafeInteger(time) || time <= 0) return this._teardown(s, 'bad time');
+      if (!HEX130.test(msg.bindSig || '')) return this._teardown(s, 'bad bind signature');
+      if (!HEX130.test(msg.attachSig || '')) return this._teardown(s, 'bad attach signature');
+      try {
+        s.child.stdin.write(`BIND ${time} ${msg.bindSig.toLowerCase()}\n` +
+                            `ATTACH ${msg.attachSig.toLowerCase()}\n`);
+      } catch {}
       s.phase = 'ready';                // awaiting cesh READY
       return;
     }
@@ -152,12 +159,11 @@ export class TerminalManager {
     catch { return this._teardown(s, 'failed to start cesh'); }
     s.child = child;
     child.stdin.on('error', () => {});  // contain async EPIPE if the child exits mid-write
-    s.phase = 'token';
+    s.phase = 'serverhello';
     child.stdout.on('data', (d) => this._onCeshStdout(s, d));
     child.stderr.on('data', (d) => this._status(s, d.toString().trim()));
     child.on('close', (code) => this._teardown(s, `session ended (cesh exit ${code})`));
     child.on('error', () => this._teardown(s, 'cesh error'));
-    try { child.stdin.write(`BIND ${s.time} ${s.bindSig}\n`); } catch {}
   }
 
   _onCeshStdout(s, d) {
@@ -180,11 +186,14 @@ export class TerminalManager {
     if (!line) return;
     if (line.startsWith('ERR')) return this._teardown(s, 'cesh: ' + line.slice(3).trim());
 
-    if (s.phase === 'token' && line.startsWith('TOKEN')) {
-      const tok = line.split(/\s+/)[1];
-      if (!tok) return this._teardown(s, 'bad TOKEN from cesh');
-      s.phase = 'attachsig';
-      try { s.ws.send(JSON.stringify({ t: 'token', token: tok })); } catch {}
+    if (s.phase === 'serverhello' && line.startsWith('HELLO ')) {
+      const [, serverKey, challenge] = line.split(/\s+/);
+      if (!HEX64.test(serverKey || '') || !isU64(challenge || ''))
+        return this._teardown(s, 'bad HELLO from cesh');
+      s.phase = 'sigs';
+      try {
+        s.ws.send(JSON.stringify({ t: 'serverHello', serverKey: serverKey.toLowerCase(), challenge }));
+      } catch {}
       return;
     }
     if (s.phase === 'ready' && line.startsWith('READY')) {
