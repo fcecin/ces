@@ -126,13 +126,22 @@ private:
 
   void scheduleTick();
   void doTick();
+  // Report a channel's use since its last report, from its metrics `m`, and
+  // move its baselines to `m` and `now`.
+  void report(const ChannelKey& key, MeteredChannel& mc,
+              const minx::Rudp::ChannelMetrics& m, uint64_t now);
+  // The Rudp's closed observer: report the last stretch of a tracked
+  // channel, then forget the channel.
+  void closed(const minx::SockAddr& peer, uint32_t channelId,
+              const minx::Rudp::ChannelMetrics& final);
 
   minx::Rudp& rudp_;
   boost::asio::io_context& io_;
   CesPlexHost* host_;
   std::chrono::seconds tickInterval_;
   // Touched only on io_'s strand. No mutex needed if all access posts
-  // through io_, which is the contract.
+  // through io_, which is the contract. The Rudp runs on io_'s thread, so its
+  // closed observer runs there too.
   std::map<ChannelKey, MeteredChannel> channels_;
   std::shared_ptr<boost::asio::steady_timer> timer_;
 };

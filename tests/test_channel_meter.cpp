@@ -10,6 +10,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_echo_handler.h"
 
 #include <ces/cesplex/mux.h>
@@ -468,6 +469,40 @@ BOOST_FIXTURE_TEST_CASE(EvictsAfterChannelDies, NetBillFixture) {
   server->_channelMeter()->_runTick();
   auto rows = server->_channelMeter()->snapshot();
   BOOST_CHECK_EQUAL(rows.size(), 0u);
+}
+
+// 4b. A channel that closes between two ticks pays for its last stretch at
+//     the close. One short connection (open, one round trip, close) charges
+//     its payer with no tick, and a tick after the close charges nothing more.
+//     The meter's own tick is 60 s away, so no tick runs before the close.
+BOOST_FIXTURE_TEST_CASE(BillsTheLastStretchAtClose, NetBillFixture) {
+  ces::KeyPair payer;
+  const auto payerKey = payer.getPublicKeyAsHash();
+  server->_brr(payerKey, 10'000'000);
+
+  NbTestPeer peer;
+  BOOST_REQUIRE(peer.start() != 0);
+  auto stream = peer.selectAndOpen(rpcPort, "/ces/test/echo/1", payer);
+  BOOST_REQUIRE(stream != nullptr);
+  BOOST_REQUIRE_EQUAL(peer.echo(stream, std::string(4096, 'x')),
+                      std::string(4096, 'x'));
+  server->_drainLogic();
+  const int64_t before = server->_balanceOf(payerKey);
+
+  peer.closeStream();
+  stream.reset();
+  // Between ticks only the close makes the meter forget a channel. The
+  // close posts the debit to the logic strand before that, so a drain after
+  // it sees the debit.
+  BOOST_REQUIRE(ces::waitUntil(
+    [&] { return server->_channelMeter()->snapshot().empty(); }));
+  server->_drainLogic();
+  const int64_t after = server->_balanceOf(payerKey);
+  BOOST_CHECK_LT(after, before);
+
+  server->_channelMeter()->_runTick();
+  server->_drainLogic();
+  BOOST_CHECK_EQUAL(server->_balanceOf(payerKey), after);
 }
 
 // 5. Rate-driven debit + insufficient-funds eviction. Open a channel

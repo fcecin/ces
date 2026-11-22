@@ -89,12 +89,14 @@ struct CesPlexHost {
   virtual ~CesPlexHost() = default;
   // Signs the bind reply and every per-op response on this bus.
   virtual const KeyPair& cesplexSigningKey() const = 0;
-  // Report one channel's measured resource usage for this tick. The host
-  // does ALL the accounting: it prices the usage in its own units, charges
-  // `payer`, and — if the payer can't cover it — closes (peer, channelId).
-  // Fire-and-forget from CesPlex's side: CesPlex never learns the cost and
-  // never closes a channel for non-payment; it only stops tracking a
-  // channel once the host has closed it (its metrics vanish).
+  // Report one channel's measured resource usage since its last report. The
+  // meter reports at each tick, and once more when the channel closes. The
+  // host does ALL the accounting: it prices the usage in its own units,
+  // charges `payer`, and — if the payer can't cover it — closes (peer,
+  // channelId). It runs on the Rudp's thread and must not call into the Rudp
+  // there (a close goes through a post). Fire-and-forget from CesPlex's
+  // side: CesPlex never learns the cost and never closes a channel for
+  // non-payment.
   virtual void cesplexReportUsage(const HashPrefix& payer,
                                   const minx::SockAddr& peer,
                                   uint32_t channelId,

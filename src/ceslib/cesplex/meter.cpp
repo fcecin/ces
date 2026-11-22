@@ -60,6 +60,12 @@ ChannelMeter::ChannelMeter(minx::Rudp& rudp,
                                std::chrono::seconds tickInterval)
   : rudp_(rudp), io_(io), host_(host), tickInterval_(tickInterval),
     timer_(std::make_shared<boost::asio::steady_timer>(io)) {
+  // A channel that closes between two ticks still pays for its last
+  // stretch: the Rudp gives its final metrics when it closes.
+  rudp_.setClosedObserver([this](const minx::SockAddr& peer, uint32_t channelId,
+                                 const minx::Rudp::ChannelMetrics& final) {
+    closed(peer, channelId, final);
+  });
   // Kick the first tick from io_'s strand. The timer's lambda owns
   // its own copy of the shared_ptr<timer> so cancel() at destruction
   // suffices to break the chain even if we destruct mid-tick.
@@ -75,6 +81,9 @@ ChannelMeter::~ChannelMeter() {
   if (timer_) {
     timer_->cancel();
   }
+  // The owner stops the Rudp's threads, then destroys the meter before the
+  // Rudp, so no close can call this meter after this line.
+  rudp_.setClosedObserver(nullptr);
   // No logging here. This destructor can run during static destruction (its owner
   // is a file-scope global in cesluajitd's luarpc endpoint), after Boost.Log's core
   // is already destroyed, which would SEGV. Lifecycle is visible from the matching
@@ -161,61 +170,70 @@ void ChannelMeter::scheduleTick() {
 
 void ChannelMeter::doTick() {
   const uint64_t now = nowMicros();
-  // Walk channels_: drop those whose Rudp metrics are gone (the host
-  // closed them), and report this tick's measured resource usage for the
-  // rest. The meter measures; it does not price, account, or close — the
-  // host does all of that. A channel the host closes for non-payment
-  // simply vanishes from metricsFor() on the next tick and is dropped.
+  // Walk channels_ and report this tick's measured resource usage. The
+  // meter measures; it does not price, account, or close — the host does
+  // all of that. A channel that closes is reported and forgotten in
+  // closed(), so a channel gone from metricsFor() here ended with no close
+  // event, and is dropped.
   for (auto it = channels_.begin(); it != channels_.end(); ) {
-    const auto& key = it->first;
-    auto& mc = it->second;
-    auto m = rudp_.metricsFor(key.first, key.second);
+    auto m = rudp_.metricsFor(it->first.first, it->first.second);
     if (!m) {
       LOGDEBUG << "evict (channel gone)"
-               << SVAR(key.first) << VAR(key.second)
-               << SVAR(mc.tag);
+               << SVAR(it->first.first) << VAR(it->first.second)
+               << SVAR(it->second.tag);
       it = channels_.erase(it);
       continue;
     }
-    mc.deltaBytesSent       = guardedDelta(m->bytesSent, mc.lastBytesSent);
-    mc.deltaBytesReceived   = guardedDelta(m->bytesReceived,
-                                             mc.lastBytesReceived);
-    mc.deltaMemByteSeconds  = guardedDelta(m->memoryByteSeconds,
-                                             mc.lastMemByteSeconds);
-    // Guard a backwards system-clock jump (now < lastMeteredAtUs) the same way
-    // guardedDelta guards the byte counters, so a clock step can't bill a huge
-    // spurious age.
-    mc.deltaAgeSec          = (now > mc.lastMeteredAtUs)
-                                ? (now - mc.lastMeteredAtUs) / kMicrosPerSecond
-                                : 0;
-
-    // Report measured usage to the host. It prices the usage in its own
-    // units, charges the payer, and closes (peer, channelId) itself if the
-    // payer can't cover it. Skipped when there's no host (observability
-    // mode) or no bound payer.
-    if (host_ && !isZeroPrefix(mc.payerPfx)) {
-      host_->cesplexReportUsage(
-        mc.payerPfx, key.first, key.second,
-        CesPlexUsage{.bytesSent = mc.deltaBytesSent,
-                     .bytesReceived = mc.deltaBytesReceived,
-                     .memByteSeconds = mc.deltaMemByteSeconds,
-                     .ageSeconds = mc.deltaAgeSec});
-    }
-
-    LOGDEBUG << "tick"
-             << SVAR(mc.tag)
-             << SVAR(hexPrefix(mc.payerPfx))
-             << SVAR(key.first) << VAR(key.second)
-             << VAR(mc.deltaBytesSent)
-             << VAR(mc.deltaBytesReceived)
-             << VAR(mc.deltaMemByteSeconds)
-             << VAR(mc.deltaAgeSec);
-    mc.lastBytesSent       = m->bytesSent;
-    mc.lastBytesReceived   = m->bytesReceived;
-    mc.lastMemByteSeconds  = m->memoryByteSeconds;
-    mc.lastMeteredAtUs      = now;
+    report(it->first, it->second, *m, now);
     ++it;
   }
+}
+
+void ChannelMeter::closed(const minx::SockAddr& peer, uint32_t channelId,
+                          const minx::Rudp::ChannelMetrics& final) {
+  auto it = channels_.find(std::make_pair(peer, channelId));
+  if (it == channels_.end()) return;
+  report(it->first, it->second, final, nowMicros());
+  channels_.erase(it);
+}
+
+void ChannelMeter::report(const ChannelKey& key, MeteredChannel& mc,
+                          const minx::Rudp::ChannelMetrics& m, uint64_t now) {
+  mc.deltaBytesSent      = guardedDelta(m.bytesSent, mc.lastBytesSent);
+  mc.deltaBytesReceived  = guardedDelta(m.bytesReceived, mc.lastBytesReceived);
+  mc.deltaMemByteSeconds = guardedDelta(m.memoryByteSeconds, mc.lastMemByteSeconds);
+  // Guard a backwards system-clock jump (now < lastMeteredAtUs) the same way
+  // guardedDelta guards the byte counters, so a clock step can't bill a huge
+  // spurious age.
+  mc.deltaAgeSec = (now > mc.lastMeteredAtUs)
+                     ? (now - mc.lastMeteredAtUs) / kMicrosPerSecond
+                     : 0;
+
+  // Report measured usage to the host. It prices the usage in its own
+  // units, charges the payer, and closes (peer, channelId) itself if the
+  // payer can't cover it. Skipped when there's no host (observability
+  // mode) or no bound payer.
+  if (host_ && !isZeroPrefix(mc.payerPfx)) {
+    host_->cesplexReportUsage(
+      mc.payerPfx, key.first, key.second,
+      CesPlexUsage{.bytesSent = mc.deltaBytesSent,
+                   .bytesReceived = mc.deltaBytesReceived,
+                   .memByteSeconds = mc.deltaMemByteSeconds,
+                   .ageSeconds = mc.deltaAgeSec});
+  }
+
+  LOGDEBUG << "usage"
+           << SVAR(mc.tag)
+           << SVAR(hexPrefix(mc.payerPfx))
+           << SVAR(key.first) << VAR(key.second)
+           << VAR(mc.deltaBytesSent)
+           << VAR(mc.deltaBytesReceived)
+           << VAR(mc.deltaMemByteSeconds)
+           << VAR(mc.deltaAgeSec);
+  mc.lastBytesSent      = m.bytesSent;
+  mc.lastBytesReceived  = m.bytesReceived;
+  mc.lastMemByteSeconds = m.memoryByteSeconds;
+  mc.lastMeteredAtUs    = now;
 }
 
 } // namespace ces
