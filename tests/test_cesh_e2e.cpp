@@ -5,6 +5,7 @@
  * and checks exit codes and output.
  */
 
+#include "test_common.h"         // findFreeUdpPortRange
 #include "test_compute_wait.h"   // waitUntil
 #include "test_e2e_common.h"
 
@@ -1319,9 +1320,10 @@ BOOST_FIXTURE_TEST_SUITE(CesnetBotE2E, CesnetBotFixture)
 BOOST_AUTO_TEST_CASE(MultiServerTransfers) {
   std::string home = "--home " + workDir.string();
 
-  run(cesnetBin + " nuke");
-
-  auto r1 = run(cesnetBin + " " + home + " init 5");
+  // Free ports, so the test needs no other ces process of the machine to stop.
+  const uint16_t base = findFreeUdpPortRange(5);
+  BOOST_REQUIRE(base != 0);
+  auto r1 = run(cesnetBin + " " + home + " init 5 --base-port " + std::to_string(base));
   BOOST_REQUIRE_EQUAL(r1.exitCode, 0);
   BOOST_TEST_MESSAGE(r1.out);
 

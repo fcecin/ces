@@ -40,13 +40,17 @@ function genKeypair(cesBin) {
   return { priv, pub };
 }
 
-function findStrayProcesses() {
+// The ces processes of the machine, or with `dir`, only the ones that run a
+// config of that workspace.
+function findStrayProcesses(dir) {
   try {
     const out = execSync("pgrep -a '^ces$' 2>/dev/null || true", { encoding: "utf8" });
-    return out.trim().split("\n").filter(Boolean).map((line) => {
-      const pid = parseInt(line.split(/\s+/)[0]);
-      return { pid, line: line.trim() };
-    });
+    return out.trim().split("\n").filter(Boolean)
+      .filter((line) => !dir || line.includes(join(dir, "/")))
+      .map((line) => {
+        const pid = parseInt(line.split(/\s+/)[0]);
+        return { pid, line: line.trim() };
+      });
   } catch { return []; }
 }
 
@@ -233,11 +237,13 @@ function cmdUp(args) {
     process.exit(1);
   }
 
-  // Check for strays
+  // Check for strays of this workspace. The ces processes of other
+  // workspaces and installations can run: a server whose port another
+  // process holds does not answer, and up fails with its log.
   const knownPids = new Set((loadPids(dir) || []).filter(isAlive));
-  const strays = findStrayProcesses().filter((s) => !knownPids.has(s.pid));
+  const strays = findStrayProcesses(dir).filter((s) => !knownPids.has(s.pid));
   if (strays.length > 0) {
-    console.error("Stray ces processes detected:");
+    console.error("Stray ces processes of this workspace:");
     for (const s of strays) console.error(`  ${s.line}`);
     console.error("Kill them manually or run: cesnet nuke");
     process.exit(1);
