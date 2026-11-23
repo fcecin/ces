@@ -444,6 +444,55 @@ BOOST_FIXTURE_TEST_CASE(ScheduledRunBudgetNobodyCanPay, OverflowFixture) {
   BOOST_CHECK_EQUAL(bal(owner.getPublicKeyAsHash()), ownerBal - 1000);
 }
 
+// A program that calls SYS_DEPOSIT or SYS_WITHDRAW for `amount`, and does not look
+// at the result.
+static AssetData buildMoveProgram(bool deposit, uint64_t amount) {
+  VmProgram pgm;
+  pgm.hostv(deposit ? SYS_DEPOSIT : SYS_WITHDRAW, {Imm(amount)});
+  pgm.term();
+  return pgm.buildBootBlock();
+}
+
+// A program cannot pay an account that is gone, so it takes nothing from the
+// other one. The caller's account is gone when its budget takes all of it.
+BOOST_FIXTURE_TEST_CASE(DepositAndWithdrawNeedBothAccounts, OverflowFixture) {
+  KeyPair owner, caller, nobody;
+  const minx::Hash callerKey = caller.getPublicKeyAsHash(), ownerKey = owner.getPublicKeyAsHash();
+  fund(ownerKey, 1'000'000'000);
+  fund(callerKey, 10'000'000);
+  const HashPrefix callerPfx = Account::getMapKey(callerKey);
+  minx::Hash withdrawId; withdrawId.fill(0xBA);
+  CES_REQUIRE_OK(server->createAsset(ownerKey, Account::getMapKey(ownerKey), withdrawId,
+                                     buildMoveProgram(false, 1000), /*days=*/100, 0));
+  minx::Hash depositId; depositId.fill(0xBB);
+  CES_REQUIRE_OK(server->createAsset(ownerKey, Account::getMapKey(nobody.getPublicKeyAsHash()), depositId,
+                                     buildMoveProgram(true, 1000), /*days=*/100, 0));
+  server->_drainLogic();
+  const uint64_t noCap = std::numeric_limits<uint64_t>::max();
+
+  // The owner of the program has no account.
+  const int64_t ownerBal = bal(ownerKey);
+  int64_t before = bal(callerKey);
+  BOOST_CHECK(server->_executeScheduledRunSync(callerPfx, depositId, 1'000'000, noCap, {}));
+  const int64_t gas = before - bal(callerKey);
+  BOOST_CHECK(!server->_accountExists(nobody.getPublicKeyAsHash()));
+  // The same run to an owner with an account costs 1000 more.
+  minx::Hash paidId; paidId.fill(0xBC);
+  CES_REQUIRE_OK(server->createAsset(ownerKey, Account::getMapKey(ownerKey), paidId,
+                                     buildMoveProgram(true, 1000), /*days=*/100, 0));
+  server->_drainLogic();
+  before = bal(callerKey);
+  BOOST_CHECK(server->_executeScheduledRunSync(callerPfx, paidId, 1'000'000, noCap, {}));
+  BOOST_CHECK_EQUAL(before - bal(callerKey), gas + 1000);
+  BOOST_CHECK_EQUAL(bal(ownerKey), ownerBal + 1000);
+
+  // The caller has no account: its budget is all that it has.
+  before = bal(callerKey);
+  BOOST_CHECK(server->_executeScheduledRunSync(callerPfx, withdrawId, uint64_t(before), noCap, {}));
+  BOOST_CHECK(!server->_accountExists(callerKey));
+  BOOST_CHECK_EQUAL(bal(ownerKey), ownerBal + 1000);
+}
+
 BOOST_FIXTURE_TEST_CASE(NetworkBillBeyondInt64NeverMints, OverflowFixture) {
   KeyPair payer;
   const minx::Hash k = payer.getPublicKeyAsHash();

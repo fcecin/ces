@@ -561,9 +561,9 @@ public:
 
   uint8_t deposit(uint64_t amount) override {
     if (uint8_t rc = checkCredit(programOwnerPrefix_, amount); rc != CES_OK) return rc;
-    if (uint8_t rc = debitCaller(amount); rc != CES_OK) return rc;
     auto ownerIt = server_.accounts_->find(programOwnerPrefix_);
     if (ownerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
+    if (uint8_t rc = debitCaller(amount); rc != CES_OK) return rc;
     maybeSaveAccount(programOwnerPrefix_);
     ownerIt->second.setBalance(
       saturatingAddBalance(ownerIt->second.getBalance(), amount));
@@ -572,12 +572,12 @@ public:
 
   uint8_t withdraw(uint64_t amount) override {
     // programOwner -> caller. Not allowance-bound (the owner deployed the
-    // bytecode, so they consented). Caller is the recipient — must exist
-    // (they signed the run) so the credit always lands.
+    // bytecode, so they consented). Caller is the recipient: it has no account
+    // when the run's budget took all of its balance.
     if (uint8_t rc = checkCredit(caller_, amount); rc != CES_OK) return rc;
-    if (uint8_t rc = debitProgramOwner(amount); rc != CES_OK) return rc;
     auto callerIt = server_.accounts_->find(caller_);
     if (callerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
+    if (uint8_t rc = debitProgramOwner(amount); rc != CES_OK) return rc;
     maybeSaveAccount(caller_);
     callerIt->second.setBalance(
       saturatingAddBalance(callerIt->second.getBalance(), amount));
