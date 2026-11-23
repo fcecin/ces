@@ -23,6 +23,8 @@ server that runs the model (`/ces/think/1`); elsewhere it fails with
 - `on_piece(piece)` gets the reply in pieces as the model writes it. It
   cannot wait, so it cannot call `ces.sleep` or a file call.
 - The call waits until the reply is complete, so it runs in a task.
+- A paid call has an answer in at most 30 seconds (see [Paid calls](calls.md)).
+  For a longer model call, reply at once, and give the result in a later call.
 
 ## Ask a question
 

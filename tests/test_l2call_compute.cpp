@@ -21,6 +21,7 @@
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_client.h>
 #include <ces/l2/file_handler.h>       // FileHandler::readProgramPubkey
+#include <ces/util/sync_call.h>
 #include <ces/util/vmprogram.h>
 
 #include <boost/test/unit_test.hpp>
@@ -386,6 +387,79 @@ BOOST_AUTO_TEST_CASE(CallVerb_LargeMemoAndReply_RoundTrip) {
   BOOST_CHECK_EQUAL(rc, CES_OK);
   BOOST_REQUIRE_EQUAL(reply.size(), big.size());
   BOOST_CHECK(std::equal(reply.begin(), reply.end(), big.begin()));
+}
+
+// A paid call that gets no answer ends at once when its program ends, and at
+// its deadline when the program goes on. It does not wait for the supervisor
+// tick (60 s). A call that the program took keeps the payment and has an empty
+// reply. A call that it did not take gives the payment back.
+BOOST_AUTO_TEST_CASE(CallVerb_NoAnswer_EndsAtTheProgramsEndOrTheDeadline) {
+  using clock = std::chrono::steady_clock;
+  struct Case {
+    const char* name;
+    std::string src;
+    bool kill;          // the owner kills the program during the call
+    bool taken;         // the program took the call
+    std::chrono::milliseconds limit;   // the deadline of the call
+  };
+  // Only the end of the program can end a call with the long deadline in time.
+  const std::chrono::milliseconds longLimit(30'000), shortLimit(1'500);
+  const std::vector<Case> cases = {
+    {"error", "function on_l2call() error('no') end\nces.run()\n", false, true, longLimit},
+    {"exit", "function on_l2call() ces.exit() end\nces.run()\n", false, true, longLimit},
+    {"killed", "local taken\nfunction on_l2call(m)\n"
+               "  if m == 'taken?' then return taken and 'yes' or 'no' end\n"
+               "  taken = true ces.sleep(120000)\nend\nces.run()\n", true, true, longLimit},
+    {"silent", "function on_l2call() ces.sleep(120000) end\nces.run()\n", false, true, shortLimit},
+    {"stuck", "ces.sleep = nil\nwhile true do end\n", false, false, shortLimit},
+  };
+  const int64_t fee = (int64_t)server->_config().feeQuery;
+  const KeyPair pollKey;
+  server->_brr(pollKey.getPublicKeyAsHash(), 1'000'000'000);
+  for (const auto& c : cases) {
+    BOOST_TEST_CONTEXT(c.name) {
+      const std::string path = "/h/" + myHex() + "/" + c.name + ".lua";
+      const auto progPk = deploy(path, c.src);
+      const uint64_t pid = launch(path);
+      std::this_thread::sleep_for(std::chrono::milliseconds(800));
+      runSync(server->_rpcTaskIOExecutor(),
+              [&] { server->computeHandler()->testSetL2CallTimeout(c.limit); });
+      const int64_t sBefore = signerBalance(), pBefore = balanceOf(progPk);
+      std::thread killer([&] {
+        if (!c.kill) return;
+        CesComputeClient poll, cc;   // the polls pay from their own key
+        for (auto* k : {&poll, &cc})
+          k->setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+        if (poll.connect("localhost", rpcPort, pollKey) != CES_OK ||
+            cc.connect("localhost", rpcPort, ownerKey) != CES_OK)
+          return;
+        const std::string ask = "taken?", yes = "yes";
+        ces::Bytes got;
+        for (int i = 0; i < 100 && got != ces::Bytes(yes.begin(), yes.end()); ++i)
+          if (poll.call(pid, 0, ces::Bytes(ask.begin(), ask.end()), got) != CES_OK) got.clear();
+        cc.kill(pid);
+      });
+      const auto t0 = clock::now();
+      ces::Bytes reply;
+      const uint8_t rc = callVerb(pid, V, "x", reply);
+      const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
+      killer.join();
+      BOOST_CHECK_LT(ms, 10'000);
+      if (c.limit == shortLimit) BOOST_CHECK_GE(ms, c.limit.count());
+      BOOST_CHECK_EQUAL(rc, c.taken ? CES_OK : CES_ERROR_TIMEOUT);
+      BOOST_CHECK(reply.empty());
+      const int64_t sWant = sBefore - (c.taken ? (int64_t)V : 0);
+      bool ok = false;
+      for (int i = 0; i < 100 && !ok; ++i) {
+        // Less the fees of the caller, and the rent of the program.
+        ok = signerBalance() <= sWant && signerBalance() >= sWant - 10 * fee &&
+             (!c.taken || balanceOf(progPk) >= pBefore + (int64_t)V - 100'000);
+        if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      }
+      BOOST_CHECK_MESSAGE(ok, "signer " << signerBalance() << " want " << sWant << ", program "
+                              << balanceOf(progPk) << " before " << pBefore);
+    }
+  }
 }
 
 // Escrow money: a delivered call moves exactly `value` plus the per-op fee

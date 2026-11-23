@@ -58,9 +58,7 @@ An error in Lua (`error(...)`, or a bad index) ends the task that has it.
 - `ces.on_error(fn)` sets a handler: `fn(message)` runs in a task of its
   own, and the program goes on. `ces.on_error(nil)` removes it.
 - With no handler, an error ends the program.
-- In `on_l2call`, the caller pays in every case. With a handler, the caller
-  gets an empty reply. With no handler, the program ends, and the caller
-  gets `CES_ERROR_TIMEOUT`.
+- In `on_l2call`, the caller pays in every case, and gets an empty reply.
 - An error in the handler, a compile error, and a program that uses all its
   memory end the program.
 

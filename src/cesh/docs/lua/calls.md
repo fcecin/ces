@@ -23,10 +23,12 @@ ces.run()
 - The value that `on_l2call` returns is the reply: a string, or a number as
   text. `nil` gives an empty reply.
 - The payment goes into the program's balance after `on_l2call` returns.
-- The caller pays also when `on_l2call` fails with an error. With an error
-  handler (see [Errors](errors.md)), the caller gets an empty reply. With no
-  handler, the error ends the program, and the caller gets
-  `CES_ERROR_TIMEOUT`.
+- The caller pays also when `on_l2call` fails with an error, and gets an
+  empty reply. With no error handler (see [Errors](errors.md)), the error
+  also ends the program.
+- The caller waits at most 30 seconds. After that, when the program took the
+  call, the caller gets an empty reply and the program keeps the payment. A
+  program that is too busy to take a call gives the payment back.
 - A program with no `on_l2call` gives every payment back.
 - `on_l2call` runs as a task, so it can wait (`ces.sleep`, file calls) and
   other calls run meanwhile.

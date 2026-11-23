@@ -10,6 +10,7 @@
 
 #define BOOST_TEST_DYN_LINK
 #include "test_common.h"
+#include "test_compute_wait.h"
 #include "test_e2e_common.h"
 
 #include <ces/l2/compute_client.h>
@@ -21,11 +22,16 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <fstream>
+#include <future>
 #include <set>
 #include <sstream>
 #include <thread>
 
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 using namespace ces;
@@ -50,7 +56,7 @@ struct ComputeE2EFixture {
   // so every test can reference the same file without recomputing.
   std::string ownerPath;
 
-  ComputeE2EFixture() {
+  explicit ComputeE2EFixture(const std::string& child = ces::e2e::findBinary("cescompmockd")) {
     blog::init();
     blog::set_level(blog::fatal);
 
@@ -73,7 +79,7 @@ struct ComputeE2EFixture {
 
     cfg.computeMaxInstances = 8;
     cfg.feeComputeSlotSec = 1;            // tiny; predictable math
-    childBin = ces::e2e::findBinary("cescompmockd");
+    childBin = child;
     cfg.cesComputeChildBinary = childBin;
     cfg.cesComputeWorkDir = (tempDir / "cescompute").string();
 
@@ -129,6 +135,76 @@ struct ComputeE2EFixture {
   }
 };
 
+// The test's end of the socket between the server and a child. Frames are
+// [u32 len][u8 tag][u16 corr_id][body], with big-endian numbers.
+struct ChildSocket {
+  int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  ~ChildSocket() { ::close(fd); }
+
+  bool connect(const std::string& path) {
+    const timeval limit{10, 0};
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
+    sockaddr_un a{};
+    a.sun_family = AF_UNIX;
+    std::strncpy(a.sun_path, path.c_str(), sizeof(a.sun_path) - 1);
+    return ::connect(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) == 0;
+  }
+  bool send(uint8_t tag, uint16_t corr, const ces::Bytes& body) {
+    ces::Bytes f;
+    ces::Buffer::put<uint32_t>(f, static_cast<uint32_t>(3 + body.size()));
+    ces::Buffer::put<uint8_t>(f, tag);
+    ces::Buffer::put<uint16_t>(f, corr);
+    f.insert(f.end(), body.begin(), body.end());
+    return ::send(fd, f.data(), f.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(f.size());
+  }
+  // The body of the next frame with that tag and corr_id, empty when none comes.
+  ces::Bytes recv(uint8_t tag, uint16_t corr) {
+    for (;;) {
+      ces::Bytes len(4);
+      if (::recv(fd, len.data(), len.size(), MSG_WAITALL) != 4) return {};
+      ces::Bytes in(ces::Buffer::peek<uint32_t>(len.data()));
+      if (::recv(fd, in.data(), in.size(), MSG_WAITALL) != static_cast<ssize_t>(in.size())) return {};
+      if (in.size() >= 3 && in[0] == tag && ces::Buffer::peek<uint16_t>(in.data() + 1) == corr)
+        return ces::Bytes(in.begin() + 3, in.end());
+    }
+  }
+  // Make an API call, and return the body of its reply, empty when none comes.
+  ces::Bytes call(uint16_t corr, uint16_t method, const ces::Bytes& args) {
+    constexpr uint8_t kApiCall = 0x02, kApiReply = 0x03;
+    ces::Bytes body;
+    ces::Buffer::put<uint16_t>(body, method);
+    body.insert(body.end(), args.begin(), args.end());
+    return send(kApiCall, corr, body) ? recv(kApiReply, corr) : ces::Bytes{};
+  }
+};
+
+// Each child ends at once, and the test connects to the server in its place.
+struct TestIsTheChildFixture : ComputeE2EFixture {
+  CesComputeClient cc;
+
+  TestIsTheChildFixture() : ComputeE2EFixture("true") {
+    CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));
+    cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  }
+  ~TestIsTheChildFixture() { cc.disconnect(); }
+
+  // Launch the program with `child` as its end of the socket. Returns the pid.
+  uint64_t launch(ChildSocket& child) {
+    const uint64_t pid = runSync(server->_rpcTaskIOExecutor(),
+                                 [&] { return server->computeHandler()->nextPid_; });
+    const std::string path = (tempDir / "cescompute" / (std::to_string(pid) + ".sock")).string();
+    uint64_t got = 0, startedAt = 0;
+    auto launched = std::async(std::launch::async,
+                               [&] { return cc.launch(ownerPath, got, startedAt); });
+    const bool connected = waitUntil([&] { return child.connect(path); }, std::chrono::seconds(5));
+    CES_REQUIRE_OK(launched.get());
+    BOOST_REQUIRE(connected);
+    BOOST_REQUIRE_EQUAL(got, pid);
+    return pid;
+  }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -136,6 +212,39 @@ struct ComputeE2EFixture {
 // ---------------------------------------------------------------------------
 
 BOOST_FIXTURE_TEST_SUITE(ComputeTests, ComputeE2EFixture)
+
+// Only the instance that has a paid call can answer it. The answers of another
+// instance do not settle it, and the caller gets the reply of its own.
+BOOST_FIXTURE_TEST_CASE(AnswersOfAnotherInstanceAreIgnored, TestIsTheChildFixture) {
+  constexpr uint8_t kCallIn = 0x1c, kResult = 0x1d, kReply = 0x1f;
+  constexpr uint16_t kRandomBytes = 0x0202;
+  ChildSocket own, other;
+  const uint64_t pid = launch(own);
+  launch(other);
+  CesComputeClient caller;
+  caller.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(caller.connect("localhost", rpcPort, otherKey));
+  ces::Bytes reply;
+  auto called = std::async(std::launch::async,
+                           [&] { return caller.call(pid, 1000, {}, reply); });
+  ces::Bytes callId = own.recv(kCallIn, 0);
+  BOOST_REQUIRE_GT(callId.size(), 8u);
+  callId.resize(8);
+  // Status 0 is "delivered", and 1 is "no on_l2call".
+  const auto answer = [&](ChildSocket& from, uint8_t status, const std::string& text) {
+    ces::Bytes result = callId, rep = callId;
+    result.push_back(status);
+    rep.insert(rep.end(), text.begin(), text.end());
+    return from.send(kResult, 0, result) && from.send(kReply, 0, rep);
+  };
+  BOOST_CHECK(answer(other, 1, "forged"));
+  // The server reads the frames of a socket in order, so it has read them.
+  BOOST_CHECK_EQUAL(other.call(1, kRandomBytes, {0, 1}).size(), 2u);
+  BOOST_CHECK(answer(own, 0, "real"));
+  CES_CHECK_OK(called.get());
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "real");
+  caller.disconnect();
+}
 
 BOOST_AUTO_TEST_CASE(LaunchKillRoundTrip) {
   CES_REQUIRE_OK(createSource(ownerKey, ownerPath, 1'000'000));

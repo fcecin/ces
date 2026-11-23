@@ -16,7 +16,7 @@ When a task waits, the other tasks run.
 | `ces.cancel(id)` | Stop a timer of `ces.every` |
 | `ces.now()` | The time, in microseconds since 1970 |
 | `ces.start_time()` | When this program started, in microseconds |
-| `ces.exit()` | End the program now. A call that runs then gets no reply: its caller gets `CES_ERROR_TIMEOUT` |
+| `ces.exit()` | End the program now. A paid call that runs then gets an empty reply, and its payment stays |
 
 ## Example
 

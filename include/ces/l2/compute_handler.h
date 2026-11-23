@@ -27,6 +27,7 @@
 #include <minx/rudp/rudp_stream.h>
 
 #include <boost/asio/steady_timer.hpp>
+#include <chrono>
 
 #include <array>
 #include <atomic>
@@ -186,18 +187,20 @@ public:
 
   // SYS_L2_CALL delivery: route the paid call into the target live instance
   // (blob = [u64 pid BE][payload]) via TAG_L2_CALL_IN; the child settles it
-  // with a TAG_L2_CALL_RESULT (delivered / no-handler), else the timeout
-  // sweep refunds. Runs on the CesPlex strand (like every handler entry).
+  // with a TAG_L2_CALL_RESULT (delivered / no-handler) and a TAG_L2_CALL_REPLY,
+  // else the end of the instance or the deadline does (l2NoAnswer). Runs on
+  // the CesPlex strand (like every handler entry).
   uint8_t cesplexL2Call(const L2CallRequest& req, L2CallReport report) override;
   // The child's TAG_L2_CALL_RESULT: delivered marks the pending call (settle
   // waits for the reply); no-handler reports it (refund) at once.
-  void l2Result(uint64_t callId, bool delivered);
+  void l2Result(uint64_t pid, uint64_t callId, bool delivered);
   // The child's TAG_L2_CALL_REPLY: on_l2call's return bytes. Reports the call
   // as Delivered, carrying the reply to the sink (channel respond / followup).
-  void l2Reply(uint64_t callId, const uint8_t* data, size_t len);
-  // Resolve L2 calls whose deadline passed: a delivered-but-silent call keeps
-  // the payment (empty reply); one that never delivered is refunded.
-  void l2SweepTimeouts(uint64_t nowUs);
+  void l2Reply(uint64_t pid, uint64_t callId, const uint8_t* data, size_t len);
+  // Resolve the L2 calls of an instance that ended, which answers no more.
+  void l2InstanceEnded(uint64_t pid);
+  // Resolve the L2 calls whose deadline passed, and wait for the next one.
+  void l2Deadlines();
 
   // ---- /ces/lua/1 + /ces/peer/1 cross-handler primitives. Used by the lua /
   // peer handlers; all run on rpcTaskIO_'s strand. ----
@@ -238,6 +241,10 @@ public:
   // this instead of sleeping for a guessed time. Any thread.
   bool testInstanceConnected(uint64_t pid);
 
+  // The deadline of the paid calls from now on. Set it on the rpc strand while
+  // no call is in flight.
+  void testSetL2CallTimeout(std::chrono::microseconds t) { l2CallTimeout_ = t; }
+
   // Count of child instances that terminated by a signal (a crash, e.g. SIGSEGV
   // on a bad shutdown). Surfaced in the supervisor WARNING; lets a test assert
   // an instance shut down cleanly.
@@ -255,11 +262,18 @@ public:
   // CesServer::PendingL2Call (server.h) for the full analysis and the fix.
   struct PendingL2 {
     L2CallReport report;
+    uint64_t pid = 0;
     minx::Hash payee;          // instance program pubkey, minted on delivery
     bool delivered = false;    // RESULT(delivered) seen -> keep money on timeout
-    uint64_t deadlineUs = 0;
+    std::chrono::steady_clock::time_point deadline;
   };
   std::map<uint64_t, PendingL2> pendingL2_;
+  std::chrono::microseconds l2CallTimeout_ = std::chrono::seconds(30);
+  std::shared_ptr<boost::asio::steady_timer> l2Timer_;   // the next deadline
+  // Settle a call with no answer, and erase it. A delivered call keeps the
+  // payment (empty reply). One that was not delivered is refunded. Returns the
+  // next call.
+  std::map<uint64_t, PendingL2>::iterator l2NoAnswer(std::map<uint64_t, PendingL2>::iterator it);
 
   std::map<std::array<uint8_t, 8>, std::set<uint64_t>> byPrefix_;
   std::map<std::string, std::set<uint64_t>> byName_;

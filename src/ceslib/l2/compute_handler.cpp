@@ -182,8 +182,6 @@ constexpr uint8_t kIpcTagThinkPiece     = 0x20;  // server → child
 #ifdef CES_MAIL
 constexpr uint8_t kIpcTagMailOut        = 0x1e;  // child → server (ces.mail.send)
 #endif
-// Refund a call the instance never acknowledged (crashed / wedged).
-constexpr uint64_t kL2CallTimeoutUs = 30'000'000;  // 30 s
 
 // Peer-mesh messaging (must match cesluajitd TAG_PEER_*). Targeted, free,
 // service-tagged messages over /ces/peer/1 between same-named extensions.
@@ -867,6 +865,9 @@ void killByPid(ComputeHandler& H, uint64_t pid) {
   if (CesServer* sv = H.server_)
     sv->unregisterSinkTarget(inst->programPubkey);
   H.instances_.erase(it);
+  // Its paid calls get no answer. A handler that stops does not settle: the
+  // threads that settle are gone.
+  if (!H.stopped_.load()) H.l2InstanceEnded(pid);
   if (auto pit = H.byPrefix_.find(inst->progPrefix); pit != H.byPrefix_.end()) {
     pit->second.erase(pid);
     if (pit->second.empty()) H.byPrefix_.erase(pit);
@@ -1270,7 +1271,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     if (body.size() < kIpcHdr + sizeof(uint64_t) + 1) return;
     uint64_t callId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
     bool delivered = body[kIpcHdr + sizeof(uint64_t)] == 0;
-    inst->owner->l2Result(callId, delivered);
+    inst->owner->l2Result(inst->pid, callId, delivered);
     return;
   }
   if (tag == kIpcTagL2CallReply) {
@@ -1280,7 +1281,7 @@ void handleChildFrame(std::shared_ptr<Instance> inst) {
     uint64_t callId = ces::Buffer::peek<uint64_t>(body.data() + kIpcHdr);
     const uint8_t* rb = body.data() + kIpcHdr + sizeof(uint64_t);
     size_t rlen = body.size() - kIpcHdr - sizeof(uint64_t);
-    inst->owner->l2Reply(callId, rb, rlen);
+    inst->owner->l2Reply(inst->pid, callId, rb, rlen);
     return;
   }
 #ifdef CES_MAIL
@@ -3292,10 +3293,6 @@ void supervisorTick(ComputeHandler& H) {
   const auto& cfg = server->_config();
   uint64_t now = getMicrosSinceEpoch();
 
-  // Refund any SYS_L2_CALL whose target instance never acknowledged (crashed
-  // or wedged past the deadline). Cheap: usually empty.
-  H.l2SweepTimeouts(now);
-
   // Discounted rates for this tick. The metrics pulse refreshes the
   // FeeKind multipliers from l2cpu (slot/cpu) and l2mem (rss/bucket),
   // so the supervisor pays "today's price" — no lock-in across ticks.
@@ -3716,6 +3713,7 @@ uint8_t ComputeHandler::start() {
     return CES_ERROR_INTERNAL;
   }
   tickTimer_ = std::make_shared<boost::asio::steady_timer>(io);
+  l2Timer_ = std::make_shared<boost::asio::steady_timer>(io);
   tickRunning_.store(true);
   scheduleNextTick(*this);
 
@@ -3740,6 +3738,7 @@ void ComputeHandler::stop() {
   for (auto& [pid, _] : instances_) ids.push_back(pid);
   for (uint64_t pid : ids) killByPid(*this, pid);
   tickTimer_.reset();
+  l2Timer_.reset();
 }
 
 uint8_t ComputeHandler::launchInternal(const std::string& name) {
@@ -4170,15 +4169,20 @@ uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
               inst->programPubkey.size());
   PendingL2 p;
   p.report     = std::move(report);
+  p.pid        = pid;
   p.payee      = payee;
-  p.deadlineUs = getMicrosSinceEpoch() + kL2CallTimeoutUs;
+  p.deadline   = std::chrono::steady_clock::now() + l2CallTimeout_;
   pendingL2_[req.callId] = std::move(p);
-  return CES_OK;   // accepted; the reply frame or the timeout sweep settles it
+  // callIds grow, and each call has the same time, so the first one of the map
+  // has the next deadline.
+  if (pendingL2_.size() == 1) l2Deadlines();
+  return CES_OK;   // accepted; the reply, the end of the instance or the deadline settles it
 }
 
-void ComputeHandler::l2Result(uint64_t callId, bool delivered) {
+void ComputeHandler::l2Result(uint64_t pid, uint64_t callId, bool delivered) {
   auto it = pendingL2_.find(callId);
-  if (it == pendingL2_.end()) return;   // already settled (timed out) / unknown
+  // Already settled, or a call of another instance.
+  if (it == pendingL2_.end() || it->second.pid != pid) return;
   if (delivered) {
     it->second.delivered = true;        // wait for the reply frame to settle
     return;
@@ -4188,30 +4192,39 @@ void ComputeHandler::l2Result(uint64_t callId, bool delivered) {
   pendingL2_.erase(it);
 }
 
-void ComputeHandler::l2Reply(uint64_t callId, const uint8_t* data, size_t len) {
+void ComputeHandler::l2Reply(uint64_t pid, uint64_t callId, const uint8_t* data, size_t len) {
   auto it = pendingL2_.find(callId);
-  if (it == pendingL2_.end()) return;   // already settled (timed out) / unknown
+  // Already settled, or a call of another instance.
+  if (it == pendingL2_.end() || it->second.pid != pid) return;
   it->second.report(callId, L2CallOutcome::Delivered, it->second.payee,
                     ces::Bytes(data, data + len));
   pendingL2_.erase(it);
 }
 
-void ComputeHandler::l2SweepTimeouts(uint64_t nowUs) {
-  for (auto it = pendingL2_.begin(); it != pendingL2_.end();) {
-    if (nowUs >= it->second.deadlineUs) {
-      // Delivered-then-silent keeps the payment (empty reply); a call that
-      // never delivered is refunded. Either way the payee is never drawn from.
-      if (it->second.delivered)
-        it->second.report(it->first, L2CallOutcome::Delivered, it->second.payee,
-                          ces::Bytes{});
-      else
-        it->second.report(it->first, L2CallOutcome::Timeout, minx::Hash{},
-                          ces::Bytes{});
-      it = pendingL2_.erase(it);
-    } else {
-      ++it;
-    }
-  }
+std::map<uint64_t, ComputeHandler::PendingL2>::iterator
+ComputeHandler::l2NoAnswer(std::map<uint64_t, PendingL2>::iterator it) {
+  // Either way the payee is never drawn from.
+  if (it->second.delivered)
+    it->second.report(it->first, L2CallOutcome::Delivered, it->second.payee, ces::Bytes{});
+  else
+    it->second.report(it->first, L2CallOutcome::Timeout, minx::Hash{}, ces::Bytes{});
+  return pendingL2_.erase(it);
+}
+
+void ComputeHandler::l2InstanceEnded(uint64_t pid) {
+  for (auto it = pendingL2_.begin(); it != pendingL2_.end();)
+    it = it->second.pid == pid ? l2NoAnswer(it) : std::next(it);
+}
+
+void ComputeHandler::l2Deadlines() {
+  const auto now = std::chrono::steady_clock::now();
+  auto it = pendingL2_.begin();
+  while (it != pendingL2_.end() && it->second.deadline <= now) it = l2NoAnswer(it);
+  if (it == pendingL2_.end() || !l2Timer_) return;
+  l2Timer_->expires_at(it->second.deadline);
+  l2Timer_->async_wait([this](const boost::system::error_code& ec) {
+    if (!ec) l2Deadlines();
+  });
 }
 
 } // namespace ces
