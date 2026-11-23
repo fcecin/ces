@@ -1038,9 +1038,8 @@ int lua_ces_ban_peer(lua_State* L) {
 // ces.serverSign(bytes) -> sig(65) | nil,err. Sign `bytes` with the SERVER key for a
 // privileged /s/ extension. The server private key never enters the sandbox: the host
 // (CES core) applies the reserved domain tag, hashes SHA256(tag || bytes), signs, and
-// returns only the signature. Denied (nil) for a non-/s/ program. Pairs with
-// ces.serverVerify. Used by formation to make a relayed attestation attributable to
-// the member's server identity.
+// returns only the signature. Pairs with ces.serverVerify. Used by formation to make
+// a relayed attestation attributable to the member's server identity.
 int lua_ces_server_sign(lua_State* L) {
   size_t n = 0;
   const char* s = luaL_checklstring(L, 1, &n);

@@ -843,7 +843,6 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_log>);           lua_setfield(L, -2, "log");
   lua_pushcfunction(L, guarded<lua_ces_sign>);          lua_setfield(L, -2, "sign");
   lua_pushcfunction(L, guarded<lua_ces_verify>);        lua_setfield(L, -2, "verify");
-  lua_pushcfunction(L, guarded<lua_ces_server_sign>);   lua_setfield(L, -2, "serverSign");
   lua_pushcfunction(L, guarded<lua_ces_server_verify>); lua_setfield(L, -2, "serverVerify");
   lua_pushcfunction(L, guarded<lua_ces_every>);         lua_setfield(L, -2, "every");
   lua_pushcfunction(L, guarded<lua_ces_cancel>);        lua_setfield(L, -2, "cancel");
@@ -873,10 +872,11 @@ void install_ces_api(lua_State* L) {
   lua_pushcfunction(L, guarded<lua_ces_keyname>);       lua_setfield(L, -2, "keyname");
   lua_pushcfunction(L, guarded<lua_ces_peers>);         lua_setfield(L, -2, "peers");
   lua_pushcfunction(L, guarded<lua_ces_server_info>);   lua_setfield(L, -2, "server_info");
-  // Peering CONTROL is operator-only: present solely for privileged (/s/)
-  // programs. The supervisor enforces the same gate, so the boundary holds even
-  // if the sandbox were bypassed.
+  // Peering CONTROL and the server's signature are operator-only: present solely
+  // for privileged (/s/) programs. The supervisor enforces the same gate, so the
+  // boundary holds even if the sandbox were bypassed.
   if (g_privileged) {
+    lua_pushcfunction(L, guarded<lua_ces_server_sign>);     lua_setfield(L, -2, "serverSign");
     lua_pushcfunction(L, guarded<lua_ces_add_peer>);        lua_setfield(L, -2, "add_peer");
     lua_pushcfunction(L, guarded<lua_ces_remove_peer>);     lua_setfield(L, -2, "remove_peer");
     lua_pushcfunction(L, guarded<lua_ces_grief_peer>);      lua_setfield(L, -2, "grief_peer");

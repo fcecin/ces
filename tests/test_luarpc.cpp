@@ -421,10 +421,11 @@ BOOST_FIXTURE_TEST_CASE(GossipBudgetBeyondInt64NeverMints, LuaRpcFixture) {
   BOOST_CHECK(bal != 8);
 }
 
-// serverSign is /s/-gated: a NON-/s/ user program (here under /h/) must be DENIED, so a
-// malicious user program cannot forge a server-key attestation (the coalition's accountable
-// formation relies on this gate). The probe proves it both RAN and was denied: it transfers
-// 3 on the denied path and would transfer 7 if serverSign had returned a signature.
+// serverSign is only for /s/ programs: a user program (here under /h/) does not have it, so
+// a malicious user program cannot forge a server-key attestation (the coalition's accountable
+// formation relies on this gate). The probe proves that it ran without the call: it transfers
+// 3, and would transfer 7 with it. ComputeTests/OperatorCallsOfAUserProgramAreDenied is the
+// test of the server's own check.
 BOOST_FIXTURE_TEST_CASE(ServerSignDeniedForUserProgram, LuaRpcFixture) {
   KeyPair beacon;
   const auto beaconPk = beacon.getPublicKeyAsHash();
@@ -433,18 +434,17 @@ BOOST_FIXTURE_TEST_CASE(ServerSignDeniedForUserProgram, LuaRpcFixture) {
 
   const std::string path = "/h/" + ownerHex + "/probe.bin";
   const std::string src =
-    "local sig = ces.serverSign('forge-me')\n"
-    "if sig then ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "if ces.serverSign then ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
     "else ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 3) end\n"
     "ces.run()\n";
   const auto probePk = deploy(path, src);
   server->_brr(probePk, 1'000'000'000);   // fund the probe's transfer
   launch(path);
 
-  // Observe: beacon reaches 1 + 3 = 4 (denied path); a bypass would have made it 1 + 7.
+  // Observe: beacon reaches 1 + 3 = 4; a program that has the call makes it 1 + 7.
   int64_t bal = 0;
   waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 4; });
-  BOOST_CHECK_EQUAL(bal, 4);   // ran AND was denied; 8 would mean the /s/ gate was bypassed
+  BOOST_CHECK_EQUAL(bal, 4);
 }
 
 // Gossip consumer: a program that defines a global on_gossip receives flooded

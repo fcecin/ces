@@ -213,6 +213,33 @@ struct TestIsTheChildFixture : ComputeE2EFixture {
 
 BOOST_FIXTURE_TEST_SUITE(ComputeTests, ComputeE2EFixture)
 
+// cesluajitd gives the operator calls only to /s/ programs. The server checks
+// the zone of the instance again, so a program with no sandbox gets nothing
+// from them. Here the test is such a program: it sends each one that has a
+// reply.
+BOOST_FIXTURE_TEST_CASE(OperatorCallsOfAUserProgramAreDenied, TestIsTheChildFixture) {
+  ChildSocket child;
+  launch(child);
+  const ces::Bytes key(32, 0x5a);
+  ces::Bytes add = key, funds, amount;
+  const std::string address = "127.0.0.1:9";
+  add.insert(add.end(), address.begin(), address.end());
+  ces::Buffer::put<uint64_t>(amount, 1000);
+  funds = amount;
+  ces::Buffer::put<uint8_t>(funds, static_cast<uint8_t>(address.size()));
+  funds.insert(funds.end(), address.begin(), address.end());
+  const struct { const char* name; uint16_t method; ces::Bytes args; } calls[] = {
+    {"add_peer", 0x0231, add},          {"remove_peer", 0x0232, key},
+    {"set_peer_target", 0x0233, amount}, {"peer_target", 0x0234, {}},
+    {"request_funds", 0x0235, funds},   {"grief_peer", 0x0236, key},
+    {"ban_peer", 0x0237, key},          {"serverSign", 0x0238, key},
+  };
+  const ces::Bytes denied{0x03};
+  uint16_t corr = 0;
+  for (const auto& c : calls)
+    BOOST_CHECK_MESSAGE(child.call(++corr, c.method, c.args) == denied, c.name);
+}
+
 // Only the instance that has a paid call can answer it. The answers of another
 // instance do not settle it, and the caller gets the reply of its own.
 BOOST_FIXTURE_TEST_CASE(AnswersOfAnotherInstanceAreIgnored, TestIsTheChildFixture) {
