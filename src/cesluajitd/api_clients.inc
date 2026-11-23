@@ -726,52 +726,16 @@ int lua_ces_think_client(lua_State* L) {
     });
 }
 
-// ces.err — CES error names → codes, for legible error checks.
+// ces.err: the name of each CES error code, as errorString gives it with no
+// "CES_" and "ERROR_", and its code.
 void install_ces_err_table(lua_State* L) {
   lua_newtable(L);
-  const struct { const char* name; int code; } kErrs[] = {
-    {"OK", ces::CES_OK},
-    {"ORIGIN_NOT_FOUND", ces::CES_ERROR_ORIGIN_NOT_FOUND},
-    {"WRONG_NONCE", ces::CES_ERROR_WRONG_NONCE},
-    {"INSUFFICIENT_BALANCE", ces::CES_ERROR_INSUFFICIENT_BALANCE},
-    {"INSUFFICIENT_BALANCE_WITH_CREATE",
-     ces::CES_ERROR_INSUFFICIENT_BALANCE_WITH_CREATE},
-    {"INVALID_TARGET_ACCOUNT", ces::CES_ERROR_INVALID_TARGET_ACCOUNT},
-    {"WRONG_TARGET_ACCOUNT", ces::CES_ERROR_WRONG_TARGET_ACCOUNT},
-    {"WRONG_PAYMENT_AMOUNT", ces::CES_ERROR_WRONG_PAYMENT_AMOUNT},
-    {"ASSET_EXISTS", ces::CES_ERROR_ASSET_EXISTS},
-    {"ASSET_NOT_FOUND", ces::CES_ERROR_ASSET_NOT_FOUND},
-    {"NOT_OWNER", ces::CES_ERROR_NOT_OWNER},
-    {"NOT_FOR_SALE", ces::CES_ERROR_NOT_FOR_SALE},
-    {"INSUFFICIENT_PAYMENT", ces::CES_ERROR_INSUFFICIENT_PAYMENT},
-    {"TIMEOUT", ces::CES_ERROR_TIMEOUT},
-    {"INTERNAL", ces::CES_ERROR_INTERNAL},
-    {"TARGET_NOT_FOUND", ces::CES_ERROR_TARGET_NOT_FOUND},
-    {"UNKNOWN_PEER", ces::CES_ERROR_UNKNOWN_PEER},
-    {"QUEUE_FULL", ces::CES_ERROR_QUEUE_FULL},
-    {"VM_FAILED", ces::CES_ERROR_VM_FAILED},
-    {"DISABLED", ces::CES_ERROR_DISABLED},
-    {"ALLOWANCE_EXCEEDED", ces::CES_ERROR_ALLOWANCE_EXCEEDED},
-    {"PROTO_REJECTED", ces::CES_ERROR_PROTO_REJECTED},
-    {"FILE_NOT_FOUND", ces::CES_ERROR_FILE_NOT_FOUND},
-    {"FILE_EXISTS", ces::CES_ERROR_FILE_EXISTS},
-    {"BAD_NAME", ces::CES_ERROR_BAD_NAME},
-    {"PATH_CONFLICT", ces::CES_ERROR_PATH_CONFLICT},
-    {"STORE_FULL", ces::CES_ERROR_STORE_FULL},
-    {"COMPUTE_DISABLED", ces::CES_ERROR_COMPUTE_DISABLED},
-    {"COMPUTE_NO_FILE_HANDLER", ces::CES_ERROR_COMPUTE_NO_FILE_HANDLER},
-    {"COMPUTE_FUND_TOO_LOW", ces::CES_ERROR_COMPUTE_FUND_TOO_LOW},
-    {"COMPUTE_INSTANCE_NOT_FOUND", ces::CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND},
-    {"COMPUTE_MAX_INSTANCES", ces::CES_ERROR_COMPUTE_MAX_INSTANCES},
-    {"NOT_LISTENING", ces::CES_ERROR_NOT_LISTENING},
-    {"IMMUTABLE", ces::CES_ERROR_IMMUTABLE},
-    {"BAD_INPUT", ces::CES_ERROR_BAD_INPUT},
-    {"UNREACHABLE", ces::CES_ERROR_UNREACHABLE},
-    {"CONNECTION_LOST", ces::CES_ERROR_CONNECTION_LOST},
-  };
-  for (const auto& e : kErrs) {
-    lua_pushinteger(L, e.code);
-    lua_setfield(L, -2, e.name);
+  for (int code = 0; code <= ces::CES_ERROR_LAST; ++code) {
+    std::string name = ces::errorString(static_cast<uint8_t>(code));
+    for (const std::string prefix : {"CES_", "ERROR_"})
+      if (name.rfind(prefix, 0) == 0) name.erase(0, prefix.size());
+    lua_pushinteger(L, code);
+    lua_setfield(L, -2, name.c_str());
   }
   lua_setfield(L, -2, "err");   // ces.err = {...}  (ces table is at -2)
 }

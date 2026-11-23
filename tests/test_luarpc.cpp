@@ -29,6 +29,7 @@
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <future>
 #include <memory>
 #include <string>
@@ -135,6 +136,17 @@ struct LuaRpcFixture {
     CES_REQUIRE_OK(cc.launch(path, id, st));
     cc.disconnect();
     return id;
+  }
+
+  // Call `pid` with a payment of 0. The reply of its on_l2call as text.
+  std::string callText(uint64_t pid, const std::string& memo) {
+    CesComputeClient cc;
+    cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+    ces::Bytes reply;
+    CES_REQUIRE_OK(cc.call(pid, 0, ces::Bytes(memo.begin(), memo.end()), reply));
+    cc.disconnect();
+    return std::string(reply.begin(), reply.end());
   }
 
   int64_t balanceOf(const minx::Hash& pubkey) {
@@ -674,6 +686,51 @@ BOOST_FIXTURE_TEST_CASE(MainPortVerbsFromCoroutineYield, LuaRpcFixture) {
   int64_t bal = 0;
   waitUntil([&] { bal = balanceOf(beaconPk); return bal >= 8; });
   BOOST_CHECK_EQUAL(bal, 8);
+}
+
+// A main-port verb to an address where no server answers gives
+// CES_ERROR_UNREACHABLE, from the main chunk (which runs it inline) and from a
+// task (which offloads it).
+BOOST_FIXTURE_TEST_CASE(MainPortVerbsToNoServerAreUnreachable, LuaRpcFixture) {
+  // A UDP port that takes packets and never answers.
+  boost::asio::io_context io;
+  boost::asio::ip::udp::socket silent(
+    io, boost::asio::ip::udp::endpoint(boost::asio::ip::address_v4::loopback(), 0));
+  const std::string addr = "127.0.0.1:" + std::to_string(silent.local_endpoint().port());
+
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/nobody.bin";
+  deploy(path,
+    "local A, K = '" + addr + "', ces.program_pubkey()\n"
+    "local function codes()\n"
+    "  local out = {}\n"
+    "  out[1] = select(2, ces.remote_account_read(A, K, 100))\n"
+    "  out[2] = select(2, ces.remote_transfer(A, K, 1, 100))\n"
+    "  out[3] = select(2, ces.remote_cross_transfer(A, K, 1, 'localhost:1', 100))\n"
+    "  for i = 1, 3 do out[i] = out[i] == ces.err.UNREACHABLE and 'U' or tostring(out[i]) end\n"
+    "  return table.concat(out, ' ')\n"
+    "end\n"
+    "local main = codes()\n"
+    "function on_l2call() return main .. ' ' .. codes() end\n"
+    "ces.run()\n");
+  BOOST_CHECK_EQUAL(callText(launch(path), ""), "U U U U U U");
+}
+
+// ces.err has a name for each CES error code, the same name as errorString's.
+BOOST_FIXTURE_TEST_CASE(ErrNamesEachCode, LuaRpcFixture) {
+  const std::string path = "/h/" + ownerKey.getPublicKeyHexStr() + "/errs.bin";
+  deploy(path,
+    "function on_l2call()\n"
+    "  local names, out = {}, {}\n"
+    "  for k, v in pairs(ces.err) do names[v] = k end\n"
+    "  for i = 0, 255 do if names[i] then out[#out + 1] = i .. '=' .. names[i] end end\n"
+    "  return table.concat(out, ' ')\n"
+    "end\n"
+    "ces.run()\n");
+  std::string want = "0=OK";
+  for (int code = 1; code <= CES_ERROR_LAST; ++code)
+    want += " " + std::to_string(code) + "=" +
+            std::string(errorString(static_cast<uint8_t>(code))).substr(std::strlen("CES_ERROR_"));
+  BOOST_CHECK_EQUAL(callText(launch(path), ""), want);
 }
 
 // The daily timer fires on a task thread, and the logic strand runs on the

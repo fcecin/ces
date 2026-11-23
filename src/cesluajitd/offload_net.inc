@@ -127,6 +127,11 @@ ces::CesClient* poolMainClient(const boost::asio::ip::udp::endpoint& ep,
   return c.get();
 }
 
+// The delivery of (nil, code) to the task.
+OffloadDeliver deliverCode(uint8_t code) {
+  return [code](lua_State* L) { return push_file_err(L, code); };
+}
+
 // Optional timeout_ms at Lua arg `argn` → the reused client's per-try reply
 // wait (default 3000, CesClient's own default). For single-try verbs (queries)
 // this is the whole wait; transfers apply it per retry.
@@ -176,18 +181,12 @@ int lua_ces_remote_account_read(lua_State* L) {
     g_pool_main.ensure(1);
     g_pool_main.submit(co, [ep, mapKey, retryMs]() -> OffloadDeliver {
       ces::CesClient* c = poolMainClient(ep, 1, retryMs);
-      auto fail = [](lua_State* L) {
-        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
-      };
-      if (!c) return fail;
-      if (!c->connect()) return fail;
+      if (!c) return deliverCode(ces::CES_ERROR_INTERNAL);
+      if (!c->connect()) return deliverCode(ces::CES_ERROR_UNREACHABLE);
       int64_t bal = 0; uint32_t nonce = 0; ces::HashPrefix ld{};
       uint64_t la = 0; uint32_t lt = 0;
       uint8_t rc = c->queryAccount(mapKey, bal, nonce, ld, la, lt);
-      if (rc != ces::CES_OK)
-        return [rc](lua_State* L) {
-          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
-        };
+      if (rc != ces::CES_OK) return deliverCode(rc);
       return [bal, nonce, ld, la, lt](lua_State* L) -> int {
         lua_pushnumber(L, static_cast<lua_Number>(bal));
         lua_pushnumber(L, static_cast<lua_Number>(nonce));
@@ -210,25 +209,16 @@ int lua_ces_remote_account_read(lua_State* L) {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setTries(1);
     client.setRetryIntervalMs(retryMs);
-    if (!client.start(g_program_port) || !client.connect()) {
-      lua_pushnil(L);
-      lua_pushinteger(L, STATUS_INTERNAL);
-      return 2;
-    }
+    if (!client.start(g_program_port)) return push_file_err(L, ces::CES_ERROR_INTERNAL);
+    if (!client.connect()) return push_file_err(L, ces::CES_ERROR_UNREACHABLE);
     rc = client.queryAccount(mapKey, balance, nonce, lastDest, lastAmt, lastTime);
     client.disconnect();
     client.stop();
   } catch (const std::exception& e) {
     host_log(3, std::string("ces.remote_account_read: ") + e.what());
-    lua_pushnil(L);
-    lua_pushinteger(L, STATUS_INTERNAL);
-    return 2;
+    return push_file_err(L, STATUS_INTERNAL);
   }
-  if (rc != ces::CES_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, rc);
-    return 2;
-  }
+  if (rc != ces::CES_OK) return push_file_err(L, rc);
   lua_pushnumber(L, static_cast<lua_Number>(balance));
   lua_pushnumber(L, static_cast<lua_Number>(nonce));
   lua_pushlstring(L, reinterpret_cast<const char*>(lastDest.data()),
@@ -377,10 +367,7 @@ int lua_ces_peer_info(lua_State* L) {
       if (!c->connect()) return err("unreachable");
       uint16_t count = 0; bool found = false; ces::Hash pk{}; std::string paddr;
       uint8_t rc = c->queryPeerInfo(index, count, found, pk, paddr);
-      if (rc != ces::CES_OK)
-        return [rc](lua_State* L) {
-          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
-        };
+      if (rc != ces::CES_OK) return deliverCode(rc);
       return [count, found, pk, paddr](lua_State* L) -> int {
         lua_newtable(L);
         lua_pushnumber(L, static_cast<lua_Number>(count));
@@ -422,11 +409,7 @@ int lua_ces_peer_info(lua_State* L) {
     lua_pushstring(L, "peer_info failed");
     return 2;
   }
-  if (rc != ces::CES_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, rc);
-    return 2;
-  }
+  if (rc != ces::CES_OK) return push_file_err(L, rc);
   lua_newtable(L);
   lua_pushnumber(L, static_cast<lua_Number>(count));
   lua_setfield(L, -2, "count");
@@ -492,18 +475,12 @@ int lua_ces_remote_transfer(lua_State* L) {
     g_pool_main.ensure(1);
     g_pool_main.submit(co, [ep, kp, dest, amount, retryMs]() -> OffloadDeliver {
       ces::CesClient* c = poolMainClient(ep, 3, retryMs);
-      auto fail = [](lua_State* L) {
-        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
-      };
-      if (!c) return fail;
+      if (!c) return deliverCode(ces::CES_ERROR_INTERNAL);
       c->setKey(kp);
-      if (!c->connect()) return fail;
+      if (!c->connect()) return deliverCode(ces::CES_ERROR_UNREACHABLE);
       int64_t newBal = 0;
       uint8_t rc = c->openTransfer(dest, amount, newBal);
-      if (rc != ces::CES_OK)
-        return [rc](lua_State* L) {
-          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
-        };
+      if (rc != ces::CES_OK) return deliverCode(rc);
       return [newBal](lua_State* L) -> int {
         lua_pushboolean(L, 1);
         lua_pushnumber(L, static_cast<lua_Number>(newBal));
@@ -519,25 +496,16 @@ int lua_ces_remote_transfer(lua_State* L) {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setKey(kp);
     client.setRetryIntervalMs(retryMs);
-    if (!client.start(g_program_port) || !client.connect()) {
-      lua_pushnil(L);
-      lua_pushinteger(L, STATUS_INTERNAL);
-      return 2;
-    }
+    if (!client.start(g_program_port)) return push_file_err(L, ces::CES_ERROR_INTERNAL);
+    if (!client.connect()) return push_file_err(L, ces::CES_ERROR_UNREACHABLE);
     rc = client.openTransfer(dest, amount, newBal);
     client.disconnect();
     client.stop();
   } catch (const std::exception& e) {
     host_log(3, std::string("ces.remote_transfer: ") + e.what());
-    lua_pushnil(L);
-    lua_pushinteger(L, STATUS_INTERNAL);
-    return 2;
+    return push_file_err(L, STATUS_INTERNAL);
   }
-  if (rc != ces::CES_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, rc);
-    return 2;
-  }
+  if (rc != ces::CES_OK) return push_file_err(L, rc);
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
   return 2;
@@ -598,18 +566,12 @@ int lua_ces_remote_cross_transfer(lua_State* L) {
     g_pool_main.submit(co, [ep, kp, dest, amount, dsrvStr, retryMs]()
                               -> OffloadDeliver {
       ces::CesClient* c = poolMainClient(ep, 3, retryMs);
-      auto fail = [](lua_State* L) {
-        lua_pushnil(L); lua_pushinteger(L, STATUS_INTERNAL); return 2;
-      };
-      if (!c) return fail;
+      if (!c) return deliverCode(ces::CES_ERROR_INTERNAL);
       c->setKey(kp);
-      if (!c->connect()) return fail;
+      if (!c->connect()) return deliverCode(ces::CES_ERROR_UNREACHABLE);
       int64_t newBal = 0;
       uint8_t rc = c->crossTransfer(dest, amount, dsrvStr, newBal);
-      if (rc != ces::CES_OK)
-        return [rc](lua_State* L) {
-          lua_pushnil(L); lua_pushinteger(L, rc); return 2;
-        };
+      if (rc != ces::CES_OK) return deliverCode(rc);
       return [newBal](lua_State* L) -> int {
         lua_pushboolean(L, 1);
         lua_pushnumber(L, static_cast<lua_Number>(newBal));
@@ -625,25 +587,16 @@ int lua_ces_remote_cross_transfer(lua_State* L) {
     ces::CesClient client(ep, /*useDataset=*/false, luaClientConfig());
     client.setKey(kp);
     client.setRetryIntervalMs(retryMs);
-    if (!client.start(g_program_port) || !client.connect()) {
-      lua_pushnil(L);
-      lua_pushinteger(L, STATUS_INTERNAL);
-      return 2;
-    }
+    if (!client.start(g_program_port)) return push_file_err(L, ces::CES_ERROR_INTERNAL);
+    if (!client.connect()) return push_file_err(L, ces::CES_ERROR_UNREACHABLE);
     rc = client.crossTransfer(dest, amount, std::string(dsrv, dsrv_len), newBal);
     client.disconnect();
     client.stop();
   } catch (const std::exception& e) {
     host_log(3, std::string("ces.remote_cross_transfer: ") + e.what());
-    lua_pushnil(L);
-    lua_pushinteger(L, STATUS_INTERNAL);
-    return 2;
+    return push_file_err(L, STATUS_INTERNAL);
   }
-  if (rc != ces::CES_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, rc);
-    return 2;
-  }
+  if (rc != ces::CES_OK) return push_file_err(L, rc);
   lua_pushboolean(L, 1);
   lua_pushnumber(L, static_cast<lua_Number>(newBal));
   return 2;
@@ -688,11 +641,7 @@ int lua_ces_cross_transfer(lua_State* L) {
 
   return io_call(L, METHOD_CROSS_TRANSFER, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
-  if (st != STATUS_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, st);
-    return 2;
-  }
+  if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
     return push_file_err(L, STATUS_INTERNAL);
   uint64_t newBal = get_u64(reply.body.data() + 1);
@@ -734,11 +683,7 @@ int lua_ces_request_funds(lua_State* L) {
 
   return io_call(L, METHOD_REQUEST_FUNDS, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
-  if (st != STATUS_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, st);
-    return 2;
-  }
+  if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
     return push_file_err(L, STATUS_INTERNAL);
   uint64_t granted = get_u64(reply.body.data() + 1);
@@ -802,11 +747,7 @@ int lua_ces_authentic_asset_create(lua_State* L) {
   return io_call(L, METHOD_AUTHENTIC_ASSET_CREATE, args,
     [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
-  if (st != STATUS_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, st);
-    return 2;
-  }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
   });
@@ -1029,7 +970,7 @@ int lua_ces_add_peer(lua_State* L) {
   put_bytes(args, addr, addr_len);
   return io_call(L, METHOD_PEER_ADD, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
   });
@@ -1046,7 +987,7 @@ int lua_ces_remove_peer(lua_State* L) {
   put_bytes(args, pk, 32);
   return io_call(L, METHOD_PEER_REMOVE, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, reply.body.size() >= 2 && reply.body[1] != 0);
   return 1;
   });
@@ -1069,7 +1010,7 @@ int lua_ces_grief_peer(lua_State* L) {
   put_u32(args, static_cast<uint32_t>(amt));
   return io_call(L, METHOD_PEER_GRIEF, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
   });
@@ -1088,7 +1029,7 @@ int lua_ces_ban_peer(lua_State* L) {
   put_bytes(args, pk, 32);
   return io_call(L, METHOD_PEER_BAN, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
   });
@@ -1107,7 +1048,7 @@ int lua_ces_server_sign(lua_State* L) {
   put_bytes(args, s, n);
   return io_call(L, METHOD_SERVER_SIGN, args, [](lua_State* L, const Frame& reply) -> int {
     uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-    if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+    if (st != STATUS_OK) return push_file_err(L, st);
     if (reply.body.size() != 1 + ces::SIG_SIZE) {
       lua_pushnil(L); lua_pushstring(L, "internal"); return 2;
     }
@@ -1130,7 +1071,7 @@ int lua_ces_set_peer_target(lua_State* L) {
   put_u64(args, static_cast<uint64_t>(n));
   return io_call(L, METHOD_PEER_TARGET_SET, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   lua_pushboolean(L, 1);
   return 1;
   });
@@ -1142,7 +1083,7 @@ int lua_ces_peer_target(lua_State* L) {
   std::vector<uint8_t> args;  // no arguments
   return io_call(L, METHOD_PEER_TARGET_GET, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body.empty() ? STATUS_INTERNAL : reply.body[0];
-  if (st != STATUS_OK) { lua_pushnil(L); lua_pushinteger(L, st); return 2; }
+  if (st != STATUS_OK) return push_file_err(L, st);
   if (reply.body.size() < 1 + sizeof(uint64_t))
     return push_file_err(L, STATUS_INTERNAL);
   uint64_t target = get_u64(reply.body.data() + 1);

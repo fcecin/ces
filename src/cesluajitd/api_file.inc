@@ -64,11 +64,16 @@ uint16_t send_api_call(uint16_t method, const std::vector<uint8_t>& args) {
   return corr;
 }
 
+// The code that Lua gets for a status. STATUS_INTERNAL is a status of the pipe
+// to the host, with no name in ces.err, so Lua gets the CES code for it.
+int lua_code(int status) {
+  return status == STATUS_INTERNAL ? ces::CES_ERROR_INTERNAL : status;
+}
 // On API error, pushes (nil, err_code). On IPC failure, (nil,
 // "ipc_failure"). Caller returns the number this returns.
 int push_file_err(lua_State* L, int status) {
   lua_pushnil(L);
-  lua_pushinteger(L, status);
+  lua_pushinteger(L, lua_code(status));
   return 2;
 }
 int push_ipc_fail(lua_State* L) {
@@ -138,11 +143,7 @@ int lua_ces_transfer(lua_State* L) {
 
   return io_call(L, METHOD_TRANSFER, args, [](lua_State* L, const Frame& reply) -> int {
   uint8_t st = reply.body[0];
-  if (st != STATUS_OK) {
-    lua_pushnil(L);
-    lua_pushinteger(L, st);
-    return 2;
-  }
+  if (st != STATUS_OK) return push_file_err(L, st);
   // Tail: [u64 BE new_origin_balance]
   if (reply.body.size() < sizeof(uint8_t) + sizeof(uint64_t))
     return push_file_err(L, STATUS_INTERNAL);

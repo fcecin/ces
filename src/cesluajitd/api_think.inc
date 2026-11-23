@@ -69,7 +69,7 @@ int think_finish(lua_State* L, uint16_t corr, const Frame& reply) {
     st = ces::CES_ERROR_INTERNAL;
   if (st != ces::CES_OK) {
     lua_pushnil(L);
-    lua_pushinteger(L, st);
+    lua_pushinteger(L, lua_code(st));
     lua_pushlstring(L, call.text.data(), call.text.size());
     return 3;
   }
