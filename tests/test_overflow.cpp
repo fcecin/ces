@@ -368,6 +368,48 @@ BOOST_FIXTURE_TEST_CASE(VmBuyAssetNearCapSellerNoBurn, OverflowFixture) {
                  ces::BALANCE_MAX - static_cast<int64_t>(maxPrice));
 }
 
+// A program that pays `amount` from its owner to `dest`.
+static AssetData buildOwnerPaysProgram(const minx::Hash& dest, uint64_t amount) {
+  VmProgram pgm;
+  Region keyReg = pgm.allocHash();
+  pgm.writeBytesToIo(keyReg.cell, dest.data(), 32);
+  pgm.sysOwnerTransfer({keyReg, Imm(amount)});
+  pgm.term();
+  return pgm.buildBootBlock();
+}
+
+// A scheduled run takes its whole budget before it starts, and gives the rest
+// back at its end. One with a budget that its caller cannot pay does not run. Its
+// caller keeps its credits, and gets none.
+BOOST_FIXTURE_TEST_CASE(ScheduledRunBudgetNobodyCanPay, OverflowFixture) {
+  KeyPair owner, caller;
+  fund(owner.getPublicKeyAsHash(), 1'000'000'000);
+  fund(caller.getPublicKeyAsHash(), 1'000'000'000);
+  const HashPrefix ownerPfx  = Account::getMapKey(owner.getPublicKeyAsHash());
+  const HashPrefix callerPfx = Account::getMapKey(caller.getPublicKeyAsHash());
+  minx::Hash progId; progId.fill(0xB9);
+  CES_REQUIRE_OK(server->createAsset(owner.getPublicKeyAsHash(), ownerPfx, progId,
+                                     buildOwnerPaysProgram(caller.getPublicKeyAsHash(), 1000),
+                                     /*days=*/100, 0));
+  server->_drainLogic();
+  const uint64_t top = std::numeric_limits<int64_t>::max();
+  const int64_t ownerBal = bal(owner.getPublicKeyAsHash()), callerBal = bal(caller.getPublicKeyAsHash());
+  const int64_t circBefore = circ();
+  for (uint64_t budget : {uint64_t(callerBal) + 1, uint64_t(ces::BALANCE_MAX) + 1, top, top + 1,
+                          top + 2, 2 * top, 2 * top + 1}) {
+    BOOST_TEST_CONTEXT(budget) {
+      BOOST_CHECK(!server->_executeScheduledRunSync(
+        callerPfx, progId, budget, std::numeric_limits<uint64_t>::max(), {}));
+      BOOST_CHECK_EQUAL(bal(caller.getPublicKeyAsHash()), callerBal);
+      BOOST_CHECK_EQUAL(bal(owner.getPublicKeyAsHash()), ownerBal);
+      BOOST_CHECK_EQUAL(circ(), circBefore);
+    }
+  }
+  BOOST_CHECK(server->_executeScheduledRunSync(
+    callerPfx, progId, 10'000'000, std::numeric_limits<uint64_t>::max(), {}));
+  BOOST_CHECK_EQUAL(bal(owner.getPublicKeyAsHash()), ownerBal - 1000);
+}
+
 BOOST_FIXTURE_TEST_CASE(NetworkBillBeyondInt64NeverMints, OverflowFixture) {
   KeyPair payer;
   const minx::Hash k = payer.getPublicKeyAsHash();

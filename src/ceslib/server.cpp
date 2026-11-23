@@ -8250,7 +8250,7 @@ bool CesServer::executeScheduledRun(ScheduledRun& run) {
   // A prepaid run (future-time wire CES_RUN_ASSET) was already debited at
   // submission — don't double-charge it.
   if (!run.prepaid) {
-    if (origin.balance() < static_cast<int64_t>(run.budget))
+    if (!balanceCovers(origin.balance(), run.budget))
       return false;
     origin.debit(run.budget);
     accounts_.checkFlush(run.budget);
