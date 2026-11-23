@@ -72,7 +72,8 @@ back. The memo and the reply have at most 64 KB each.
 The reply comes when `on_l2call` returns. A program that takes the call and
 then ends, or does not return in 30 seconds, gives an empty reply and keeps
 `raw`. So an empty reply is not an answer. Let a program answer a paid call
-with a text.
+with a text. A program that calls another one inside `on_l2call` has less
+than 30 seconds in all, because its own caller waits 30 seconds.
 
 A call that fails gives `nil` and a code of `ces.err`:
 
@@ -80,6 +81,7 @@ A call that fails gives `nil` and a code of `ces.err`:
 | --- | --- |
 | `COMPUTE_INSTANCE_NOT_FOUND` | No program runs with that pid. `raw` did not go, or came back |
 | `UNSUPPORTED` | The program has no `on_l2call`. `raw` came back |
+| `BALANCE_OVERFLOW` | The program's account is full. `raw` came back |
 | `INSUFFICIENT_BALANCE`, `ORIGIN_NOT_FOUND` | The caller's account on that server has too few credits, or there is no account |
 | `QUEUE_FULL` | Too many calls wait on that server. Try again later |
 | `BAD_INPUT` | The memo is too large |

@@ -1679,7 +1679,7 @@ private:
   // holds (totalCredits_ recomputes from the loaded accounts and matches the
   // sum; nothing is minted), so this is a durability/fairness gap, NOT a ledger
   // integrity bug. It is bounded: only calls in-flight at the instant of a hard
-  // crash, and a graceful shutdown drains cleanly.
+  // crash, or of a shutdown, which does not settle them.
   //
   // To close it: make the pending set a persisted, transactional
   // logKV structure. The burn+enqueue already commit atomically; also durably
@@ -1700,10 +1700,11 @@ private:
       std::numeric_limits<uint64_t>::max();
     uint32_t followupTag = 0;
     std::shared_ptr<CesPlexRequest> replyCtx;   // client CALL sink (null = VM)
-    // Synchronous handler refusal code (0 = none): the concrete reason the
-    // built-in rejected the call (e.g. instance died mid-flight). The channel
-    // sink answers with it instead of the generic outcome mapping.
-    uint8_t syncRefuseRc = 0;
+    // The reason of a refund (0 = the one of its outcome): the code of the
+    // built-in that refused the call (e.g. the instance is gone), or of the
+    // payee's account that cannot take the payment. The channel sink answers
+    // with it.
+    uint8_t refuseRc = 0;
     bool resolved = false;               // logic-strand-guarded idempotency
   };
 

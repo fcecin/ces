@@ -117,14 +117,19 @@ public:
   // delivers `memo` (up to CES_L2_CALL_MAX_MEMO) to its on_l2call handler, and
   // returns the handler's reply bytes in `reply` (digest-verified). value may
   // be 0; the per-op fee is charged regardless and never refunded. The escrow
-  // is refunded only if the call is never delivered, one code per cause:
+  // is refunded when the server gives one of these codes, one per cause:
   // CES_ERROR_UNSUPPORTED = the program defines no on_l2call;
-  // CES_ERROR_TIMEOUT = no delivery ack before the deadline;
-  // CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND = `pid` is not live (checked before
-  // any charge, and also if the instance dies mid-flight). Delivery is final:
-  // a delivered call that never replies keeps the payment and returns CES_OK
-  // with an empty reply -- the payment lands in the program account only
-  // after on_l2call returns.
+  // CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND = `pid` is not live when the server
+  // gets the call (no charge) or hands it to the instance;
+  // CES_ERROR_TIMEOUT = the instance got it and did not take it before the
+  // deadline (30 s) or before its own end;
+  // CES_ERROR_BALANCE_OVERFLOW, or another code of the transfer, = the program
+  // account cannot take `value`.
+  // CES_ERROR_TIMEOUT also comes when the server gives no answer, and then the
+  // outcome is not known. Delivery is final: a delivered call that gets no
+  // reply before the deadline or before the end of the instance keeps the
+  // payment and returns CES_OK with an empty reply -- the payment lands in the
+  // program account only after on_l2call returns.
   uint8_t call(uint64_t pid, uint64_t value, const ces::Bytes& memo,
                ces::Bytes& reply);
 

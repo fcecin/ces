@@ -8597,7 +8597,7 @@ void CesServer::drainL2Call(std::shared_ptr<PendingL2Call> pending) {
     // Synchronous refuse (e.g. the target instance is gone): refund the payer.
     // Keep the concrete code so a channel caller sees why, not the generic
     // outcome mapping.
-    pending->syncRefuseRc = rc;
+    pending->refuseRc = rc;
     boost::asio::post(logicStrand_,
       [this, pending]() {
         completeL2Call(pending, L2CallOutcome::NoHandler, minx::Hash{},
@@ -8618,33 +8618,43 @@ void CesServer::completeL2Call(std::shared_ptr<PendingL2Call> pending,
   // fees so exactly `value` passes through. Delivered pays the payee; a
   // failure (NoHandler / Timeout) refunds the payer. The payee is never drawn
   // from: a payment, once delivered, is final. A Delivered report with no
-  // payee is treated as a refund (handler-contract violation, fail safe).
+  // payee is treated as a refund (handler-contract violation, fail safe), and
+  // so is one whose payee's account cannot take the payment (its balance cap).
   minx::Hash selfKey = serverKeyPair_.getPublicKeyAsHash();
+  auto settle = [&](const minx::Hash& target) -> uint8_t {
+    if (pending->value == 0) return CES_OK;
+    int64_t outBal = 0;
+    return transfer(selfKey, target, pending->value,
+                    TransferMode::Open, 0, CES_NONCELESS, outBal,
+                    /*txFee=*/0, /*rentFee=*/0, /*errFee=*/0);
+  };
   bool payeeZero = true;
   for (auto b : payee) if (b) { payeeZero = false; break; }
   bool delivered = (outcome == L2CallOutcome::Delivered && !payeeZero);
-  minx::Hash target = delivered ? payee : pending->payerKey;
-  int64_t outBal = 0;
-  uint8_t rc = transfer(selfKey, target, pending->value,
-                        TransferMode::Open, 0, CES_NONCELESS, outBal,
-                        /*txFee=*/0, /*rentFee=*/0, /*errFee=*/0);
+  uint8_t rc = settle(delivered ? payee : pending->payerKey);
+  if (delivered && rc != CES_OK) {
+    delivered = false;
+    outcome = L2CallOutcome::NoHandler;
+    pending->refuseRc = rc;
+    rc = settle(pending->payerKey);
+  }
   if (rc != CES_OK) {
-    LOGDEBUG << "completeL2Call: settle transfer failed"
-             << VAR(int(rc)) << VAR(int(outcome)) << VAR(pending->value);
+    LOGWARNING << "completeL2Call: the refund failed"
+               << VAR(int(rc)) << VAR(int(outcome)) << VAR(pending->value);
   }
 
   // Reply sink. A client CALL verb (replyCtx set) responds on its held request;
   // a VM caller resolves through the INVOKE_L2_RETURN followup run. Exactly one.
   if (pending->replyCtx) {
     auto ctx = pending->replyCtx;
-    // Failure mapping for the channel caller, one code per cause: a
-    // synchronous handler refusal carries its concrete code (e.g.
-    // COMPUTE_INSTANCE_NOT_FOUND when the instance died mid-flight);
-    // NoHandler = the program defines no on_l2call (UNSUPPORTED); a call
-    // never delivered before the deadline = TIMEOUT.
+    // Failure mapping for the channel caller, one code per cause: a refund
+    // with a reason carries its code (e.g. COMPUTE_INSTANCE_NOT_FOUND when the
+    // instance died before the delivery); NoHandler = the program defines no
+    // on_l2call (UNSUPPORTED); a call that is not delivered before the
+    // deadline or before the end of the instance = TIMEOUT.
     uint8_t errRc =
-      pending->syncRefuseRc != 0
-        ? pending->syncRefuseRc
+      pending->refuseRc != 0
+        ? pending->refuseRc
         : static_cast<uint8_t>(outcome == L2CallOutcome::Timeout
                                  ? CES_ERROR_TIMEOUT
                                  : CES_ERROR_UNSUPPORTED);
@@ -8680,8 +8690,10 @@ void CesServer::completeL2Call(std::shared_ptr<PendingL2Call> pending,
     ces::Bytes fin(16, 0);
     ces::Buffer::pokeLE<uint64_t>(fin.data() + 0, pending->followupTag);
     ces::Buffer::pokeLE<uint64_t>(fin.data() + 8, static_cast<uint64_t>(outcome));
-    size_t n = std::min<size_t>(reply.size(), CES_L2_CALL_VM_REPLY);
-    fin.insert(fin.end(), reply.begin(), reply.begin() + n);
+    if (delivered) {
+      size_t n = std::min<size_t>(reply.size(), CES_L2_CALL_VM_REPLY);
+      fin.insert(fin.end(), reply.begin(), reply.begin() + n);
+    }
     if (scheduleRun(Account::getMapKey(pending->payerKey),
                     pending->followupProgramKey, pending->followupBudget,
                     pending->followupAllowance, fin, 0, false, 0,
