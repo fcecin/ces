@@ -290,6 +290,15 @@ inline uint64_t kbCeil(uint64_t bytes) {
   return (bytes + 1023u) / 1024u;
 }
 
+// The sum and the product of two amounts. One that does not fit is the largest
+// number, which no account can pay.
+inline uint64_t addAmounts(uint64_t a, uint64_t b) {
+  return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+}
+inline uint64_t mulAmounts(uint64_t a, uint64_t b) {
+  return b != 0 && a > UINT64_MAX / b ? UINT64_MAX : a * b;
+}
+
 std::filesystem::path resolveContentPath(const std::string& dir,
                                          const std::string& name) {
   // name starts with '/', strip it for relative path under dir.
@@ -1302,17 +1311,17 @@ void noteServerZoneMutation(CesServer* server, const std::string& name) {
 // not duplicate proceeds with the mutation. The session adapter supplies
 // signerBilling (network signer + dedup); the in-process adapter supplies a
 // source-balance policy.
-struct L2ChargeResult { uint8_t rc; bool duplicate; };
-using L2Billing = std::function<L2ChargeResult(ces::LedgerTxn&, int64_t cost)>;
+struct L2ChargeResult { uint8_t rc; bool duplicate; bool paid = true; };
+using L2Billing = std::function<L2ChargeResult(ces::LedgerTxn&, uint64_t cost)>;
 
 // Network billing: signer pays `cost`, with NONCELESS replay dedup.
 inline L2Billing signerBilling(const ces::PublicKey& signer, uint32_t reqNonce,
                                uint64_t sigHash, int64_t errFee) {
   minx::Hash signerHash = signer.getHash();
   return [signerHash, reqNonce, sigHash, errFee]
-         (ces::LedgerTxn& t, int64_t cost) -> L2ChargeResult {
+         (ces::LedgerTxn& t, uint64_t cost) -> L2ChargeResult {
     if (reqNonce == CES_NONCELESS && t.isReplay(sigHash)) return { CES_OK, true };
-    uint8_t rc = t.signerSpend(signerHash, static_cast<uint64_t>(cost), reqNonce, errFee);
+    uint8_t rc = t.signerSpend(signerHash, cost, reqNonce, errFee);
     if (rc != CES_OK) return { rc, false };
     if (reqNonce == CES_NONCELESS) t.recordDedup(sigHash);
     return { CES_OK, false };
@@ -1350,8 +1359,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   }
   const uint64_t programAccountInitial =
       initialDeposit > upfrontBurn ? initialDeposit - upfrontBurn : 0;
-  const uint64_t costDebited =
-      static_cast<uint64_t>(cfg.feeQuery) + initialDeposit;
+  const uint64_t costDebited = addAmounts(cfg.feeQuery, initialDeposit);
 
   ces::KeyPair kp = ces::KeyPair::generate();   // off-strand; never on the logic strand
   minx::Hash progPub = kp.getPublicKeyAsHash();
@@ -1360,7 +1368,7 @@ CreateOutcome createCore(CesServer* server, const std::string& name,
   uint8_t status = CES_ERROR_INTERNAL;
   bool duplicate = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult c = bill(t, static_cast<int64_t>(costDebited));
+    L2ChargeResult c = bill(t, costDebited);
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; return; }
     // Flat files hold a real, withdrawable balance in a program account. kv
@@ -1525,7 +1533,7 @@ WriteOutcome writeCore(CesServer* server, const std::string& name,
     if (writeCost > 0 && t.balance(prog) < static_cast<int64_t>(writeCost)) {
       status = CES_ERROR_INSUFFICIENT_BALANCE; return;          // before fee
     }
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; newBal = static_cast<uint64_t>(t.balance(prog)); return; }
     if (writeCost > 0) t.debitAccount(prog, writeCost);
@@ -1637,9 +1645,9 @@ ReadOutcome readCore(CesServer* server, const std::string& name,
   const bool isOwner = (std::memcmp(sc.owner_pubkey.data(), caller.data(), 32) == 0);
   const bool serverZone = isServerZone(name);
   const uint64_t readIoCost = serverZone ? 0 : kbCeil(length) * uint64_t(cfg.feeFileRead);
-  const uint64_t readPrice = (!serverZone && !isOwner) ? kbCeil(length) * sc.price_per_kb : 0;
-  const int64_t cost = static_cast<int64_t>(cfg.feeQuery) +
-                       static_cast<int64_t>(readIoCost) + static_cast<int64_t>(readPrice);
+  const uint64_t readPrice =
+    (!serverZone && !isOwner) ? mulAmounts(kbCeil(length), sc.price_per_kb) : 0;
+  const uint64_t cost = addAmounts(addAmounts(cfg.feeQuery, readIoCost), readPrice);
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
 
@@ -1648,7 +1656,7 @@ ReadOutcome readCore(CesServer* server, const std::string& name,
   server->_l2Transact([&](ces::LedgerTxn& t) {
     L2ChargeResult c = bill(t, cost);
     if (c.rc != CES_OK) { status = c.rc; return; }
-    if (!c.duplicate && readPrice > 0) {     // owner already excluded (readPrice==0)
+    if (c.paid && !c.duplicate && readPrice > 0) {     // owner already excluded (readPrice==0)
       t.credit(prog, static_cast<int64_t>(readPrice));
       credited = true;
     }
@@ -1716,8 +1724,7 @@ DepositOutcome depositCore(CesServer* server, const std::string& name,
   if (!readSidecar(sPath, sc)) return { CES_ERROR_FILE_NOT_FOUND, 0 };
   minx::Hash prog{};
   std::memcpy(prog.data(), sc.program_pubkey.data(), 32);
-  const int64_t cost = static_cast<int64_t>(cfg.feeQuery) +
-                       static_cast<int64_t>(amount);
+  const uint64_t cost = addAmounts(cfg.feeQuery, amount);
 
   uint8_t status = CES_ERROR_INTERNAL;
   uint64_t bal = 0;
@@ -1799,7 +1806,7 @@ WithdrawOutcome withdrawCore(CesServer* server, const std::string& name,
     if (!balanceCovers(t.balance(prog), amount)) {
       status = CES_ERROR_INSUFFICIENT_BALANCE; return;          // before fee
     }
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { status = CES_OK; bal = static_cast<uint64_t>(t.balance(prog)); return; }
     t.debitAccount(prog, amount);                  // balance checked above
@@ -1869,7 +1876,7 @@ SetPriceOutcome setPriceCore(CesServer* server, const std::string& name,
   uint8_t status = CES_ERROR_INTERNAL;
   bool mutated = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     status = CES_OK; mutated = !c.duplicate;
   });
@@ -1960,7 +1967,7 @@ StatOutcome statCore(CesServer* server, const std::string& name,
   uint8_t status = CES_ERROR_INTERNAL;
   uint64_t bal = 0;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     bal = static_cast<uint64_t>(t.balance(prog));   // read-only, dup-safe
     status = CES_OK;
@@ -2036,7 +2043,7 @@ DeleteOutcome deleteCore(CesServer* server, const std::string& name,
   uint64_t refund = 0;
   bool mutated = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK)  { status = c.rc; return; }
     if (c.duplicate)     { status = CES_OK; return; }       // already deleted
     int64_t bal = t.balance(prog);                          // drain to dest
@@ -2157,7 +2164,7 @@ AppendOutcome appendCore(CesServer* server, const std::string& name,
     if (totalDebit > 0 && t.balance(prog) < static_cast<int64_t>(totalDebit)) {
       status = CES_ERROR_INSUFFICIENT_BALANCE; return;          // before fee
     }
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; newBal = static_cast<uint64_t>(t.balance(prog)); return; }
     if (totalDebit > 0) t.debitAccount(prog, totalDebit);
@@ -2290,7 +2297,7 @@ ResizeOutcome resizeCore(CesServer* server, const std::string& name,
     if (upfront > 0 && t.balance(prog) < static_cast<int64_t>(upfront)) {
       status = CES_ERROR_INSUFFICIENT_BALANCE; return;          // before fee
     }
-    L2ChargeResult c = bill(t, static_cast<int64_t>(cfg.feeQuery));
+    L2ChargeResult c = bill(t, cfg.feeQuery);
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; bal = static_cast<uint64_t>(t.balance(prog)); return; }
     if (upfront > 0) t.debitAccount(prog, upfront);
@@ -2486,7 +2493,7 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
   uint8_t status = CES_ERROR_INTERNAL;
   bool duplicate = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult c = bill(t, static_cast<int64_t>(writeCost + deposit));
+    L2ChargeResult c = bill(t, addAmounts(writeCost, deposit));
     if (c.rc != CES_OK) { status = c.rc; return; }
     if (c.duplicate) { duplicate = true; status = CES_OK; return; }
     // The deposit is burned here (charged via bill, never credited to any
@@ -2497,7 +2504,7 @@ KvPutOutcome kvPutCore(CesServer* server, const std::string& name,
   if (status != CES_OK) return { status, 0, 0 };
   if (duplicate) return { CES_OK, cellBalance, sc.size };
 
-  cellBalance += deposit;
+  cellBalance = addAmounts(cellBalance, deposit);
   logkv::Bytes nv = kvCellBuild(cellBalance, lastCharged,
       reinterpret_cast<const char*>(value.data()), value.size());
   st->update(k, nv);
@@ -2532,12 +2539,13 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
   KvCell c{};
   if (!kvCellParse(it->second, c)) return { CES_ERROR_INTERNAL, 0 };
   // Copy the user bytes before the update (c.user points into the stored value).
-  logkv::Bytes nv = kvCellBuild(c.balance + amount, c.lastChargedUs, c.user, c.userLen);
+  const uint64_t funded = addAmounts(c.balance, amount);
+  logkv::Bytes nv = kvCellBuild(funded, c.lastChargedUs, c.user, c.userLen);
 
   uint8_t status = CES_ERROR_INTERNAL;
   bool duplicate = false;
   server->_l2Transact([&](ces::LedgerTxn& t) {
-    L2ChargeResult ch = bill(t, static_cast<int64_t>(amount));
+    L2ChargeResult ch = bill(t, amount);
     if (ch.rc != CES_OK) { status = ch.rc; return; }
     if (ch.duplicate) { duplicate = true; status = CES_OK; return; }
     // Burned, not credited: the cell's prepaid-rent counter (updated below) is
@@ -2552,7 +2560,7 @@ KvDepositOutcome kvDepositCore(CesServer* server, const std::string& name,
   // A deposit rewrites only the fixed header, so the live size is unchanged;
   // still check compaction, since the rewrite appended to the events log.
   kvOnMutationLocked(server, cfg.cesFileStoreDir, name, st, 0);
-  return { CES_OK, c.balance + amount };
+  return { CES_OK, funded };
 }
 
 KvGetOutcome kvGetCore(CesServer* server, const std::string& name,
@@ -2885,9 +2893,9 @@ void deleteExhaustedSource(CesServer* server, const std::string& sourceName) {
 inline L2Billing sourceBilling(minx::Hash sourceProg, bool metered,
                                bool* sourceInsufficient) {
   return [sourceProg, metered, sourceInsufficient]
-         (ces::LedgerTxn& t, int64_t cost) -> L2ChargeResult {
-    if (!metered) return { CES_OK, false };            // /s/ unmetered
-    if (!t.debitAccount(sourceProg, static_cast<uint64_t>(cost))) {
+         (ces::LedgerTxn& t, uint64_t cost) -> L2ChargeResult {
+    if (!metered) return { CES_OK, false, false };     // /s/ unmetered
+    if (!t.debitAccount(sourceProg, cost)) {
       if (sourceInsufficient) *sourceInsufficient = true;
       return { CES_ERROR_INSUFFICIENT_BALANCE, false };
     }
@@ -2898,16 +2906,16 @@ inline L2Billing sourceBilling(minx::Hash sourceProg, bool metered,
 // Account billing: `payer` pays `cost` from its ledger account. No dedup (the
 // in-process caller made one request).
 inline L2Billing accountBilling(minx::Hash payer) {
-  return [payer](ces::LedgerTxn& t, int64_t cost) -> L2ChargeResult {
-    if (cost <= 0) return { CES_OK, false };
-    if (!t.debitAccount(payer, static_cast<uint64_t>(cost)))
+  return [payer](ces::LedgerTxn& t, uint64_t cost) -> L2ChargeResult {
+    if (cost == 0) return { CES_OK, false };
+    if (!t.debitAccount(payer, cost))
       return { CES_ERROR_INSUFFICIENT_BALANCE, false };
     return { CES_OK, false };
   };
 }
 
 inline L2Billing noBilling() {
-  return [](ces::LedgerTxn&, int64_t) -> L2ChargeResult { return { CES_OK, false }; };
+  return [](ces::LedgerTxn&, uint64_t) -> L2ChargeResult { return { CES_OK, false, false }; };
 }
 
 inline minx::Hash hashOf(const std::array<uint8_t, 32>& a) {

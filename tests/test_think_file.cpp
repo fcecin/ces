@@ -328,4 +328,28 @@ BOOST_AUTO_TEST_CASE(OwnPrivateZone_IsAConversation) {
   BOOST_CHECK_EQUAL(backend->calls.load(), calls);
 }
 
+// A price above all that an account can hold refuses the read, and makes no
+// credits.
+BOOST_AUTO_TEST_CASE(APriceNobodyCanPay) {
+  putFile(chat(), "x");
+  CesFileClient fc;
+  fc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(fc.connect("localhost", rpcPort, owner));
+  const uint64_t top = std::numeric_limits<int64_t>::max();
+  for (uint64_t price : {top, top - 1, top + 1, top + 2, 2 * top + 1, uint64_t(1) << 47}) {
+    uint64_t set = 0;
+    CES_REQUIRE_OK(fc.setPrice(chat(), price, set));
+    CesFileClient::StatInfo before{}, after{};
+    CES_REQUIRE_OK(fc.stat(chat(), before));
+    std::string reply;
+    uint8_t appendError = 0xFF;
+    BOOST_CHECK_MESSAGE(think(other, "hi!", chat(), reply, appendError) ==
+                          CES_ERROR_INSUFFICIENT_BALANCE, price);
+    CES_REQUIRE_OK(fc.stat(chat(), after));
+    BOOST_CHECK_MESSAGE(after.fileBalance <= before.fileBalance,
+                        price << ": " << before.fileBalance << " to " << after.fileBalance);
+  }
+  BOOST_CHECK_EQUAL(backend->calls.load(), 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
