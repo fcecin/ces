@@ -447,6 +447,33 @@ BOOST_FIXTURE_TEST_CASE(ServerSignDeniedForUserProgram, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 4);
 }
 
+// The path of a program gives its zone, and a program in /s/ has the operator
+// calls. So LAUNCH takes only a valid path: one that starts in /s/ and goes to
+// the owner's own file does not start that file as an operator program.
+BOOST_FIXTURE_TEST_CASE(LaunchTakesOnlyAValidPath, LuaRpcFixture) {
+  KeyPair beacon;
+  const auto beaconPk = beacon.getPublicKeyAsHash();
+  server->_brr(beaconPk, 1);
+  BOOST_REQUIRE(server->fileHandler()->writeServerFile("/s/here.lua", "-- x"));
+  const std::string ownPath = "/h/" + ownerKey.getPublicKeyHexStr() + "/probe.bin";
+  const auto probePk = deploy(ownPath,
+    "if ces.add_peer then ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 7)\n"
+    "else ces.transfer('" + luaBytes(beaconPk.data(), 32) + "', 3) end\n"
+    "ces.run()\n");
+  server->_brr(probePk, 1'000'000'000);
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  for (const std::string& path : {"/s/.." + ownPath, "/s/here.lua/../.." + ownPath,
+                                  "/p/.." + ownPath, "/" + ownPath, ownPath.substr(1)}) {
+    uint64_t pid = 0, started = 0;
+    BOOST_CHECK_MESSAGE(cc.launch(path, pid, started) == CES_ERROR_BAD_NAME, path);
+  }
+  cc.disconnect();
+  std::this_thread::sleep_for(std::chrono::seconds(2));
+  BOOST_CHECK_EQUAL(balanceOf(beaconPk), 1);   // 8 for a program with operator calls
+}
+
 // Gossip consumer: a program that defines a global on_gossip receives flooded
 // messages, including ones THIS node originates itself (self-delivery). On
 // receipt the handler (a coroutine — it calls the yielding ces.transfer)

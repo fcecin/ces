@@ -3415,6 +3415,10 @@ bool FileHandler::readProgramPrivkey(
   return true;
 }
 
+uint8_t FileHandler::checkName(const std::string& name) {
+  return validateCesFileName(name);
+}
+
 bool FileHandler::readOwnerAndBalance(
     const std::string& name,
     std::array<uint8_t, 32>& outOwnerPubkey,

@@ -170,6 +170,10 @@ public:
   // monitoring. Fills the totals (0/0 when empty). Any-thread safe.
   bool storeStats(uint64_t& outTotalFiles, uint64_t& outTotalBytes);
 
+  // The rule for the form and the zone of a path. CES_OK, or the code of the
+  // fault. A handler that takes a path from outside checks it before its use.
+  static uint8_t checkName(const std::string& name);
+
   // -------------------------------------------------------------------------
   // Cross-handler primitives (builtin:compute). In-process, unsigned; no
   // feeQuery / nonce / dedup. See the per-method comments in file_handler.cpp.

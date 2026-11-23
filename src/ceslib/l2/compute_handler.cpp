@@ -2955,6 +2955,11 @@ void dispatchLaunch(std::shared_ptr<ReqCtx> ctx, ces::Bytes pre) {
     sendErrorAndLoop(ctx, CES_ERROR_BAD_NAME); return;
   }
   std::string name(reinterpret_cast<const char*>(pre.data() + 2), nameLen);
+  // The path gives the zone of the program, and a program in /s/ has the
+  // operator calls. A path such as "/s/../h/..." is a file of another zone.
+  if (uint8_t rc = FileHandler::checkName(name); rc != CES_OK) {
+    sendErrorAndLoop(ctx, rc); return;
+  }
 
   const auto& cfg = reqServer(ctx)->_config();
 
