@@ -60,6 +60,68 @@ The compute handle:
 | `cc:stat(pid)` | A table: `pid`, `source_name`, `started_at_us`, `file_balance`, `cpu_basis_points`, `rss_bytes`, `client_port`, `rpc_port`, `program_pubkey` |
 | `cc:list()` | An array of the program key's instances, as `stat` |
 | `cc:instances(path)` | An array of the instances of a source file |
+| `cc:call(pid, raw [, memo])` | The reply of the program's `on_l2call` (see [Paid calls](calls.md)), as a string. Pays `raw` to the program |
+
+## Call another program
+
+`cc:call` calls a program of any owner. The program gets `memo`, the
+caller's program key as `info.payer`, and `raw` as `info.value`. The
+caller's account on that server pays `raw`, and a fee that does not come
+back. The memo and the reply have at most 64 KB each.
+
+The reply comes when `on_l2call` returns. A program that takes the call and
+then ends, or does not return in 30 seconds, gives an empty reply and keeps
+`raw`. So an empty reply is not an answer. Let a program answer a paid call
+with a text.
+
+A call that fails gives `nil` and a code of `ces.err`:
+
+| Code | Meaning |
+| --- | --- |
+| `COMPUTE_INSTANCE_NOT_FOUND` | No program runs with that pid. `raw` did not go, or came back |
+| `UNSUPPORTED` | The program has no `on_l2call`. `raw` came back |
+| `INSUFFICIENT_BALANCE`, `ORIGIN_NOT_FOUND` | The caller's account on that server has too few credits, or there is no account |
+| `QUEUE_FULL` | Too many calls wait on that server. Try again later |
+| `BAD_INPUT` | The memo is too large |
+| `TIMEOUT`, `CONNECTION_LOST`, `INTERNAL` | No sure result came. The program can have the call and `raw`, and a second call can pay twice |
+
+A pid changes with each launch. A source path stays, so find the program by
+its path. This program asks a shop program for a price, on any server.
+
+```lua
+-- "price <host:port> <path> <item>" asks the shop program at <path>.
+local function newest(cc, path)
+  local best
+  for _, i in ipairs(cc:instances(path) or {}) do
+    if not best or i.started_at_us > best.started_at_us then best = i end
+  end
+  return best
+end
+
+function on_l2call(memo)
+  local server, path, item = memo:match("^price (%S+) (%S+) (.+)$")
+  if not server then return "price <host:port> <path> <item>" end
+  local info, err = ces.ping(server)
+  if not info then return "no server: " .. err end
+  local host = server:match("^(.*):%d+$")
+  local cc, why = ces.compute_client(host .. ":" .. info.rpc_port, info.pubkey)
+  if not cc then return "no programs there: " .. tostring(why) end
+  local shop = newest(cc, path)
+  local reply, code
+  if shop then
+    reply, code = cc:call(shop.pid, 0, "price " .. item)   -- 0: the call pays only the fee
+  end
+  cc:close()
+  if not shop then return "the shop does not run" end
+  if not reply then return "error " .. tostring(code) end
+  return reply
+end
+
+ces.run()
+```
+
+The program key needs credit on that server for the fee, as for a file
+there. The next example sends it.
 
 ## Example: a file on another server
 

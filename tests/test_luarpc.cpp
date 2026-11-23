@@ -974,6 +974,71 @@ BOOST_FIXTURE_TEST_CASE(ProgramComputeClient, LuaRpcFixture) {
   BOOST_CHECK_EQUAL(bal, 10);
 }
 
+// compute_client:call: a program pays another program and gets its reply. The
+// payer is the calling program, and its account on that server pays.
+BOOST_FIXTURE_TEST_CASE(ProgramCallsProgram, LuaRpcFixture) {
+  const std::string home = "/h/" + ownerKey.getPublicKeyHexStr() + "/";
+  const auto shopPk = deploy(home + "shop.bin",
+    "local function hex(s) return (s:gsub('.', function(c) return string.format('%02x', c:byte()) end)) end\n"
+    "function on_l2call(memo, info)\n"
+    "  if memo == 'bytes' then return 'a\\0b' end\n"
+    "  if memo == 'nothing' then return nil end\n"
+    "  return memo .. ' for ' .. info.value .. ' from ' .. hex(info.payer)\n"
+    "end\n"
+    "ces.run()\n");
+  deploy(home + "mute.bin", "ces.run()\n");   // no on_l2call
+  const auto buyerPk = deploy(home + "buyer.bin",
+    "local ADDR = '127.0.0.1:" + std::to_string(rpcPort) + "'\n"
+    "function on_l2call(memo)\n"
+    "  local pid, raw, text = memo:match('^(%S+) (%S+) (.*)$')\n"
+    "  local cc, err = ces.compute_client(ADDR)\n"
+    "  if not cc then return 'no client: ' .. tostring(err) end\n"
+    "  if text == 'big' then text = string.rep('x', 65537) end\n"
+    "  raw = raw == 'nan' and 0 / 0 or tonumber(raw)\n"
+    "  local ok, reply, why = pcall(cc.call, cc, tonumber(pid), raw, text)\n"
+    "  cc:close()\n"
+    "  if not ok then return 'lua: ' .. tostring(reply):match('[^:]*$') end\n"
+    "  if not reply then\n"
+    "    for k, v in pairs(ces.err) do if v == why then why = k end end\n"
+    "    return 'error ' .. tostring(why)\n"
+    "  end\n"
+    "  return #reply .. ' ' .. reply\n"
+    "end\n"
+    "ces.run()\n");
+  server->_brr(buyerPk, 1'000'000'000);
+  const std::string buyerHex = minx::hashToString(buyerPk);
+  const uint64_t shop = launch(home + "shop.bin");
+  const uint64_t mute = launch(home + "mute.bin");
+  const uint64_t buyer = launch(home + "buyer.bin");
+  auto call = [&](uint64_t pid, const std::string& raw, const std::string& text) {
+    return callText(buyer, std::to_string(pid) + " " + raw + " " + text);
+  };
+
+  // The payment goes from the buyer to the shop, and the reply comes back.
+  const int64_t shop0 = balanceOf(shopPk), buyer0 = balanceOf(buyerPk);
+  const std::string bread = "bread for 5000000 from " + buyerHex;
+  BOOST_CHECK_EQUAL(call(shop, "5000000", "bread"), std::to_string(bread.size()) + " " + bread);
+  waitUntil([&] { return balanceOf(shopPk) >= shop0 + 5'000'000 - 100'000; });
+  BOOST_CHECK_GE(balanceOf(shopPk), shop0 + 5'000'000 - 100'000);   // less its rent
+  BOOST_CHECK_LE(balanceOf(buyerPk), buyer0 - 5'000'000);
+
+  // A call that pays nothing, a reply of any bytes, and no reply.
+  const std::string hi = "hi for 0 from " + buyerHex;
+  BOOST_CHECK_EQUAL(call(shop, "0", "hi"), std::to_string(hi.size()) + " " + hi);
+  BOOST_CHECK_EQUAL(call(shop, "0", "bytes"), std::string("3 a\0b", 5));
+  BOOST_CHECK_EQUAL(call(shop, "0", "nothing"), "0 ");
+
+  // A call that does not reach a program says why, and gives the payment back.
+  const int64_t before = balanceOf(buyerPk);
+  BOOST_CHECK_EQUAL(call(shop + mute + buyer + 1000, "5000000", "x"), "error COMPUTE_INSTANCE_NOT_FOUND");
+  BOOST_CHECK_EQUAL(call(mute, "5000000", "x"), "error UNSUPPORTED");
+  BOOST_CHECK_EQUAL(call(shop, "900000000000", "x"), "error INSUFFICIENT_BALANCE");
+  BOOST_CHECK_EQUAL(call(shop, "0", "big"), "error BAD_INPUT");
+  for (const char* raw : {"-1", "nan", "1e19"})
+    BOOST_CHECK_MESSAGE(call(shop, raw, "x").find("out of range") != std::string::npos, raw);
+  BOOST_CHECK_GE(balanceOf(buyerPk), before - 1'000'000);   // fees and rent only
+}
+
 // STAT/INSTANCES are public and expose a live instance's REAL leased ports,
 // so anyone (not just the owner) can discover a running service and learn
 // where to dial it. This fixture runs real cesluajitd instances against a

@@ -5,8 +5,9 @@ order: 1
 ---
 
 A paid call sends a memo to the program and gets a reply. It comes from
-`cesh compute call <pid> <raw> --in "text:<memo>"`, or from a site. The
-caller pays `<raw>` credits with the call, and 0 is a valid amount.
+`cesh compute call <pid> <raw> --in "text:<memo>"`, from a site, or from
+another program (`cc:call`, see [Other servers](servers.md)). The caller
+pays `<raw>` credits with the call, and 0 is a valid amount.
 
 ```lua
 function on_l2call(memo, info)

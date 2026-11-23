@@ -50,7 +50,7 @@ uint64_t client_handle_id(lua_State* L, int idx) {
 }
 uint64_t client_arg_u64(lua_State* L, int idx) {
   const lua_Number v = luaL_checknumber(L, idx);
-  if (v < 0 || v > 9.2233720368547e18) luaL_argerror(L, idx, "out of range");
+  if (!(v >= 0 && v <= 9.2233720368547e18)) luaL_argerror(L, idx, "out of range");  // NaN too
   return static_cast<uint64_t>(v);
 }
 int client_push_closed(lua_State* L) {
@@ -618,6 +618,31 @@ int lua_cc_instances(lua_State* L) {
   });
 }
 
+// cc:call(pid, raw [, memo]) -> reply | nil, code. A paid call to a program: its
+// on_l2call gets the memo, the program key as info.payer, and `raw` from the
+// program key's account on that server.
+int lua_cc_call(lua_State* L) {
+  auto* e = compute_entry(client_handle_id(L, 1));
+  if (!e) return client_push_closed(L);
+  uint64_t pid = client_arg_u64(L, 2);
+  uint64_t raw = client_arg_u64(L, 3);
+  size_t mlen = 0; const char* m = luaL_optlstring(L, 4, "", &mlen);
+  if (mlen > ces::CES_L2_CALL_MAX_MEMO) return client_push_err(L, ces::CES_ERROR_BAD_INPUT);
+  ces::Bytes memo(reinterpret_cast<const uint8_t*>(m),
+                  reinterpret_cast<const uint8_t*>(m) + mlen);
+  ces::CesComputeClient* cc = e->cc.get();
+  return client_call(L, g_compute_clients, [cc, pid, raw, memo = std::move(memo)]() -> OffloadDeliver {
+    ces::Bytes reply;
+    uint8_t rc = cc->call(pid, raw, memo, reply);
+    if (rc != ces::CES_OK)
+      return [rc](lua_State* L) { return client_push_err(L, rc); };
+    return [reply](lua_State* L) -> int {
+      lua_pushlstring(L, reinterpret_cast<const char*>(reply.data()), reply.size());
+      return 1;
+    };
+  });
+}
+
 int lua_cc_close(lua_State* L) {
   uint64_t id = client_handle_id(L, 1);
   auto it = g_compute_clients.find(id);
@@ -635,6 +660,7 @@ void push_compute_handle(lua_State* L, uint64_t id) {
   lua_pushcfunction(L, guarded<lua_cc_stat>);      lua_setfield(L, -2, "stat");
   lua_pushcfunction(L, guarded<lua_cc_list>);      lua_setfield(L, -2, "list");
   lua_pushcfunction(L, guarded<lua_cc_instances>); lua_setfield(L, -2, "instances");
+  lua_pushcfunction(L, guarded<lua_cc_call>);      lua_setfield(L, -2, "call");
   lua_pushcfunction(L, guarded<lua_cc_close>);     lua_setfield(L, -2, "close");
 }
 
