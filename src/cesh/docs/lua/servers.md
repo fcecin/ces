@@ -12,18 +12,24 @@ it credit first (see [Credits](credits.md)).
 ## Find a server
 
 `ces.ping(addr)` asks a server at `host:port` for its facts, free, and
-returns `{pubkey, rpc_port, min_difficulty}`, or `nil, error`. The clients
-below dial the rpc port, `host:<rpc_port>`, not the main port.
+returns `{pubkey, rpc_port, min_difficulty}`, or `nil, error`.
 
 ## Accounts
 
+`addr` is the main address of the server, `host:port`, as in the `address`
+of `ces.peers()`. It is not the rpc port. When no server answers there, a
+call gives `nil` and `ces.err.UNREACHABLE`.
+
 | Call | Returns |
 | --- | --- |
-| `ces.remote_account_read(addr, key)` | `balance, nonce, last_dest, last_amount, last_time` of a key on the server at `addr`. Free |
+| `ces.remote_account_read(addr, key)` | Five values: `balance, nonce, last_dest, last_amount, last_time` of a key on the server at `addr`. Free |
 | `ces.remote_transfer(addr, key, raw)` | `true, balance_left`. Pays from the program key's account on that server |
 | `ces.remote_cross_transfer(addr, key, raw, server)` | `true, balance_left`. From the program key's account at `addr` to a key on `server`, a peer of `addr` |
 
 ## Clients
+
+`rpc_addr` is the rpc port of the server, `host:<rpc_port>`, not its main
+port. `ces.ping` gives `rpc_port`.
 
 | Call | Returns |
 | --- | --- |
