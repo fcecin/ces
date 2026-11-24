@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <thread>
 #include <fstream>
 #include <filesystem>
@@ -25,6 +27,7 @@
 #include <ces/l2/think_client.h>
 #include <unistd.h>
 #include <ces/ramfilestore.h>
+#include <ces/util/ctrlc.h>
 #include <ces/util/log.h>
 #include <ces/util/hex.h>
 #include <ces/util/resolver.h>
@@ -771,9 +774,10 @@ int ceshRun(int argc, char* argv[]) {
   auto* cmd_ccall = cmd_compute->add_subcommand(
     "call",
     "Paid call into a running instance's on_l2call. Escrows `value` credits "
-    "from the signer (settled to the instance on delivery, refunded on "
-    "no-handler or timeout), delivers the --in memo, and prints the "
-    "program's reply bytes (raw on stdout in -q mode).");
+    "from the signer (settled to the instance that starts the call, refunded "
+    "if it does not), delivers the --in memo, and prints the program's reply "
+    "bytes (raw on stdout in -q mode). It waits with no limit, and Ctrl+C "
+    "hangs up.");
   cmd_ccall->add_option("pid", compute_pid_arg,
                         "pid returned from launch")->required();
   cmd_ccall->add_option("value", compute_value_arg,
@@ -2922,8 +2926,18 @@ int ceshRun(int argc, char* argv[]) {
 
       if (cmd_ccall->parsed()) {
         ces::Bytes reply;
+        // A call has no time limit, so Ctrl+C hangs up on it.
+        std::atomic<bool> ended{false};
+        std::thread hangUp([&] {
+          while (!ended.load()) {
+            if (interrupted()) return cc2.cancel();
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          }
+        });
         uint8_t crc = cc2.call(compute_pid_arg, compute_value_arg,
                                compute_memo_data, reply);
+        ended = true;
+        hangUp.join();
         if (crc != CES_OK) {
           std::cerr << "CALL Failed: " << errorString(crc) << "\n";
           return 1;

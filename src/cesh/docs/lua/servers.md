@@ -75,11 +75,14 @@ caller's program key as `info.payer`, and `raw` as `info.value`. The
 caller's account on that server pays `raw`, and a fee that does not come
 back. The memo and the reply have at most 64 KB each.
 
-The reply comes when `on_l2call` returns. A program that takes the call and
-then ends, or does not return in 30 seconds, gives an empty reply and keeps
-`raw`. So an empty reply is not an answer. Let a program answer a paid call
-with a text. A program that calls another one inside `on_l2call` has less
-than 30 seconds in all, because its own caller waits 30 seconds.
+The reply comes when `on_l2call` returns. A call has no time limit. A program
+that starts the call and then ends gives an empty reply and keeps `raw`. So an
+empty reply is not an answer. Let a program answer a paid call with a text.
+
+`cc:close()` hangs up, also while a call waits. A program that has not started
+the call gives `raw` back then, and does not run it. A program that has started
+it goes on, and keeps `raw`. The calls of a program run in a few workers (4 by
+default), and each waiting call holds one.
 
 A call that fails gives `nil` and a code of `ces.err`:
 
@@ -91,7 +94,8 @@ A call that fails gives `nil` and a code of `ces.err`:
 | `INSUFFICIENT_BALANCE`, `ORIGIN_NOT_FOUND` | The caller's account on that server has too few credits, or there is no account |
 | `QUEUE_FULL` | Too many calls wait on that server. Try again later |
 | `BAD_INPUT` | The memo is too large |
-| `TIMEOUT`, `CONNECTION_LOST`, `INTERNAL` | No sure result came. The program can have the call and `raw`, and a second call can pay twice |
+| `TIMEOUT` | The program ended before it started the call, and `raw` came back. A server that stops in the middle of its answer gives the same code, and then `raw` does not come back |
+| `CONNECTION_LOST`, `INTERNAL` | No sure result came. The program can have the call and `raw`, and a second call can pay twice |
 
 A pid changes with each launch. A source path stays, so find the program by
 its path. This program asks a shop program for a price, on any server.

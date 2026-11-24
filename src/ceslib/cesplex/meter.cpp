@@ -216,6 +216,7 @@ void ChannelMeter::closed(const minx::SockAddr& peer, uint32_t channelId,
   if (it == channels_.end()) return;
   report(it->first, it->second, final, nowMicros(), true);
   channels_.erase(it);
+  if (host_) host_->cesplexChannelClosed(peer, channelId);
 }
 
 void ChannelMeter::report(const ChannelKey& key, MeteredChannel& mc,

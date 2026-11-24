@@ -112,6 +112,11 @@ namespace ces {
 constexpr uint8_t CES_PLEX_OK   = 0x01;
 constexpr uint8_t CES_PLEX_NACK = 0x00;
 
+// A verb byte that a client sends while it waits for an answer with no limit. It
+// has no envelope and no reply. It keeps the channel from looking idle, and a
+// server that loops on its verbs skips it. No protocol has a verb 0.
+constexpr uint8_t CES_PLEX_VERB_NOP = 0x00;
+
 // Initial server protocol version. Iterated freely inside the bound
 // contract without re-bumping the protocol name (`/ces/file/N`).
 // The protocol-name version reserves itself for handshake-shape

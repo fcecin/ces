@@ -175,7 +175,8 @@ constexpr uint8_t kIpcTagGossipOut      = 0x14;  // child → server (ces.gossip
 
 // Paid L2 call routed into a live instance's on_l2call (VM syscall or CALL verb).
 constexpr uint8_t kIpcTagL2CallIn       = 0x1c;  // server → child (paid call)
-constexpr uint8_t kIpcTagL2CallResult   = 0x1d;  // child → server (delivered/no-handler)
+constexpr uint8_t kIpcTagL2CallResult   = 0x1d;  // child → server (asks to start / no-handler)
+constexpr uint8_t kIpcTagL2CallGo       = 0x21;  // server -> child ([u64 callId][u8 start?])
 constexpr uint8_t kIpcTagL2CallReply    = 0x1f;  // child → server (on_l2call return bytes)
 // ces.think reply text, one frame per piece, under the API call's corr_id.
 constexpr uint8_t kIpcTagThinkPiece     = 0x20;  // server → child
@@ -4156,6 +4157,8 @@ uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
   auto it = instances_.find(pid);
   if (it == instances_.end()) return CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND;
   auto inst = it->second;
+  // A caller that hung up before this gets its credits back, and nothing runs.
+  if (req.caller && !server_->channelAlive(*req.caller)) return CES_ERROR_CONNECTION_LOST;
   // Frame body: [u64 callId][u64 value][32 payer][u32 payloadLen][payload].
   ces::Bytes b;
   ces::Buffer::put<uint64_t>(b, req.callId);
@@ -4171,22 +4174,31 @@ uint8_t ComputeHandler::cesplexL2Call(const L2CallRequest& req,
   p.report     = std::move(report);
   p.pid        = pid;
   p.payee      = payee;
-  p.deadline   = std::chrono::steady_clock::now() + l2CallTimeout_;
+  p.caller     = req.caller;
+  p.deadline   = req.caller ? std::chrono::steady_clock::time_point::max()
+                            : std::chrono::steady_clock::now() + l2CallTimeout_;
   pendingL2_[req.callId] = std::move(p);
-  // callIds grow, and each call has the same time, so the first one of the map
-  // has the next deadline.
-  if (pendingL2_.size() == 1) l2Deadlines();
-  return CES_OK;   // accepted; the reply, the end of the instance or the deadline settles it
+  if (!req.caller) l2Deadlines();
+  return CES_OK;   // accepted; the reply, or one of the ends above settles it
 }
 
 void ComputeHandler::l2Result(uint64_t pid, uint64_t callId, bool delivered) {
   auto it = pendingL2_.find(callId);
   // Already settled, or a call of another instance.
-  if (it == pendingL2_.end() || it->second.pid != pid) return;
+  const bool live = it != pendingL2_.end() && it->second.pid == pid;
   if (delivered) {
-    it->second.delivered = true;        // wait for the reply frame to settle
+    // The program starts the call only if the call did not end meanwhile. An ended
+    // call gave its credits back, so it must not run.
+    if (live) it->second.delivered = true;   // wait for the reply frame to settle
+    if (auto inst = instances_.find(pid); inst != instances_.end()) {
+      ces::Bytes b;
+      ces::Buffer::put<uint64_t>(b, callId);
+      b.push_back(live ? 1 : 0);
+      enqueueOutbound(inst->second, makeFrame(kIpcTagL2CallGo, 0, b.data(), b.size()));
+    }
     return;
   }
+  if (!live) return;
   // No on_l2call handler: refund now (empty reply), the payee is never touched.
   it->second.report(callId, L2CallOutcome::NoHandler, minx::Hash{}, ces::Bytes{});
   pendingL2_.erase(it);
@@ -4211,6 +4223,17 @@ ComputeHandler::l2NoAnswer(std::map<uint64_t, PendingL2>::iterator it) {
   return pendingL2_.erase(it);
 }
 
+void ComputeHandler::callerGone(const minx::SockAddr& peer, uint32_t channelId) {
+  for (auto it = pendingL2_.begin(); it != pendingL2_.end();) {
+    const auto& c = it->second.caller;
+    it = c && c->peer == peer && c->channelId == channelId ? l2NoAnswer(it) : std::next(it);
+  }
+}
+
+void ComputeHandler::endCalls() {
+  for (auto it = pendingL2_.begin(); it != pendingL2_.end();) it = l2NoAnswer(it);
+}
+
 void ComputeHandler::l2InstanceEnded(uint64_t pid) {
   for (auto it = pendingL2_.begin(); it != pendingL2_.end();)
     it = it->second.pid == pid ? l2NoAnswer(it) : std::next(it);
@@ -4218,10 +4241,14 @@ void ComputeHandler::l2InstanceEnded(uint64_t pid) {
 
 void ComputeHandler::l2Deadlines() {
   const auto now = std::chrono::steady_clock::now();
-  auto it = pendingL2_.begin();
-  while (it != pendingL2_.end() && it->second.deadline <= now) it = l2NoAnswer(it);
-  if (it == pendingL2_.end() || !l2Timer_) return;
-  l2Timer_->expires_at(it->second.deadline);
+  auto next = std::chrono::steady_clock::time_point::max();
+  for (auto it = pendingL2_.begin(); it != pendingL2_.end();) {
+    if (it->second.deadline <= now) { it = l2NoAnswer(it); continue; }
+    next = std::min(next, it->second.deadline);
+    ++it;
+  }
+  if (next == std::chrono::steady_clock::time_point::max() || !l2Timer_) return;
+  l2Timer_->expires_at(next);
   l2Timer_->async_wait([this](const boost::system::error_code& ec) {
     if (!ec) l2Deadlines();
   });

@@ -49,6 +49,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -115,6 +116,12 @@ struct CesPlexHost {
   virtual bool cesplexChannelMetered(const std::string& /*proto*/) {
     return true;
   }
+
+  // A bound metered channel ended, for whatever reason (a hang-up, the idle time,
+  // no payment). It runs on the Rudp's thread, inside the Rudp's close, so it must
+  // not call into the Rudp.
+  virtual void cesplexChannelClosed(const minx::SockAddr& /*peer*/,
+                                    uint32_t /*channelId*/) {}
 };
 
 // Graceful-close timeout for server-initiated channel teardown across
@@ -177,6 +184,13 @@ inline constexpr auto kRudpStreamCloseTimeout = std::chrono::seconds(3);
 // Timeout is give-up after the built-in could not hand off to a live target.
 enum class L2CallOutcome { Delivered, NoHandler, Timeout };
 
+// The connection that a caller waits on. It names one incarnation of a channel.
+struct L2CallerChannel {
+  minx::SockAddr peer{};
+  uint32_t channelId = 0;
+  uint64_t token = 0;     // the RUDP session token, 0 if the channel ended before the call
+};
+
 // A routed L2 call handed to a built-in. The discriminator already selected
 // the handler; `blob` is the provider-ABI payload, opaque to core.
 struct L2CallRequest {
@@ -184,6 +198,9 @@ struct L2CallRequest {
   minx::Hash payer;        // the burned account (full key); the refund target
   uint64_t   value = 0;    // credits burned; minted to payee on Delivered
   Bytes      blob;         // provider-ABI payload (target + inner request)
+  // Set for a call over a connection. The call has no deadline then, and it ends
+  // with the connection. A call from a VM run has none.
+  std::optional<L2CallerChannel> caller;
 };
 
 // The built-in reports the terminal outcome, possibly later and from another

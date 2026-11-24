@@ -914,7 +914,7 @@ public:
     uint64_t discKey = ces::Buffer::peek<uint64_t>(disc);
     auto it = server_.l2Registry_.find(discKey);
     if (it == server_.l2Registry_.end()) return CES_ERROR_UNSUPPORTED;
-    if (server_.l2PendingCount_.load() >= server_.cfg_.l2MaxPending)
+    if (server_.l2CallsFull())
       return CES_ERROR_QUEUE_FULL;   // backpressure; nothing burned
     // Burn: park `value` in the bottomless self-account. Undo-logged (caller
     // and self both saved), so an abort rolls it back; on commit executeVmRun
@@ -1649,6 +1649,7 @@ void CesServer::stop(bool flushEvents) {
   // End the builtin:think calls in flight first, while the logic strand
   // takes their refunds and the rpc port still carries their last replies.
   if (thinkHandler_) thinkHandler_->stop();
+  endL2Calls();   // the paid calls too, for the same reason
   const int maxCtrlCCount = 5;
   // Without a usable PoW engine verifyPoWs() bails before popping work, so
   // the queue can never drain; waiting on it would hang shutdown forever
@@ -6933,6 +6934,15 @@ std::vector<PeerLinkTarget> CesServer::_peerLinkTargets() {
   return out;
 }
 
+bool CesServer::channelAlive(const L2CallerChannel& c) const {
+  return c.token != 0 && rpcRudp_ &&
+         rpcRudp_->sessionToken(c.peer, c.channelId) == c.token;
+}
+
+void CesServer::cesplexChannelClosed(const minx::SockAddr& peer, uint32_t channelId) {
+  if (computeHandler_) computeHandler_->callerGone(peer, channelId);
+}
+
 bool CesServer::cesplexChannelMetered(const std::string& proto) {
   // POSSIBLE TODO: this keys off the proto NAME, not the handler identity. If
   // builtin:peer is ever wired at a non-standard proto name, its channel would
@@ -8579,6 +8589,7 @@ void CesServer::drainL2Call(std::shared_ptr<PendingL2Call> pending) {
   req.payer  = pending->payerKey;
   req.value  = pending->value;
   req.blob   = pending->blob;
+  req.caller = pending->caller;
   // The handler either refuses synchronously (returns non-OK => refund now)
   // or accepts (CES_OK) and reports the delivery outcome later via this
   // callback, which hops to the logic strand and settles exactly once.
@@ -8707,7 +8718,7 @@ uint8_t CesServer::enqueueChannelL2Call(CesPlexHandler* handler,
                                         const minx::Hash& payer, uint64_t value,
                                         ces::Bytes blob,
                                         std::shared_ptr<CesPlexRequest> replyCtx) {
-  if (l2PendingCount_.load() >= cfg_.l2MaxPending) return CES_ERROR_QUEUE_FULL;
+  if (l2CallsFull()) return CES_ERROR_QUEUE_FULL;
   // Escrow burn: park `value` in the bottomless self-account. Same model as
   // the VM syscall; settlement mints self -> payee or refunds self -> payer.
   if (value > 0 &&
@@ -8718,6 +8729,10 @@ uint8_t CesServer::enqueueChannelL2Call(CesPlexHandler* handler,
   pending->payerKey = payer;
   pending->value    = value;
   pending->blob     = std::move(blob);
+  if (replyCtx)
+    pending->caller = L2CallerChannel{
+      replyCtx->bound.peer, replyCtx->bound.channelId,
+      rpcRudp_ ? rpcRudp_->sessionToken(replyCtx->bound.peer, replyCtx->bound.channelId) : 0};
   pending->replyCtx = std::move(replyCtx);
   postLogic([this, pending]() {
     pending->callId = l2NextCallId_++;
@@ -8725,6 +8740,17 @@ uint8_t CesServer::enqueueChannelL2Call(CesPlexHandler* handler,
     boost::asio::post(rpcTaskIO_, [this, pending]() { drainL2Call(pending); });
   });
   return CES_OK;
+}
+
+void CesServer::endL2Calls() {
+  if (!computeHandler_) return;
+  const auto rpc = rpcTaskIO_.get_executor();
+  // receiving_ is false, so no new call starts. One that started has its drain on
+  // rpcTaskIO_ after these two, so the handler has it before it ends them all.
+  runSync(rpc, [] {});
+  logicSync([] {});
+  runSync(rpc, [this] { computeHandler_->endCalls(); });
+  logicSync([] {});   // and they are settled
 }
 
 bool CesServer::l2TransferSync(const minx::Hash& from, const minx::Hash& to,

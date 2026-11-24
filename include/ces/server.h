@@ -781,12 +781,21 @@ public:
   // Client CALL-verb entry into the same L2-call machinery. Called on
   // rpcTaskIO_ by a handler's verb dispatcher: applies backpressure, burns
   // payer -> self (escrow), mints the callId, and posts drainL2Call. The reply
-  // sink is the held request. Returns CES_OK once escrowed (response is then
-  // deferred to completeL2Call), or an error to answer synchronously (nothing
-  // burned).
+  // sink is the held request, and the call ends with its connection. Returns
+  // CES_OK once escrowed (response is then deferred to completeL2Call), or an
+  // error to answer synchronously (nothing burned).
   uint8_t enqueueChannelL2Call(CesPlexHandler* handler, const minx::Hash& payer,
                                uint64_t value, ces::Bytes blob,
                                std::shared_ptr<CesPlexRequest> replyCtx);
+
+  // No L2 call can start: too many are in flight, or the server stops.
+  bool l2CallsFull() const {
+    return !receiving_.load() || l2PendingCount_.load() >= cfg_.l2MaxPending;
+  }
+  // The server stops: settle every L2 call in flight, while the logic strand and
+  // rpcTaskIO_ still run. A started call pays its program, and the others are
+  // refunded.
+  void endL2Calls();
 
   uint8_t crossTransfer(const minx::Hash& originKey,
                         const minx::Hash& destKey, uint64_t amount,
@@ -1609,6 +1618,11 @@ public:
   // protocol is metered. Defined in server.cpp. (The peer-only access gate
   // lives in PeerHandler::serve, not here.)
   bool cesplexChannelMetered(const std::string& proto) override;
+  // True while the connection that a call came over is still that connection. On
+  // rpcTaskIO_, as the other access to rpcRudp_.
+  bool channelAlive(const L2CallerChannel& c) const;
+  // A connection ended, so its calls end (ComputeHandler::callerGone).
+  void cesplexChannelClosed(const minx::SockAddr& peer, uint32_t channelId) override;
 
   // Price a CesPlexUsage tick at the live discounted feeNet* rates -> credits
   // (0 = free). Shared by cesplexReportUsage and the compute handler's
@@ -1679,7 +1693,8 @@ private:
   // holds (totalCredits_ recomputes from the loaded accounts and matches the
   // sum; nothing is minted), so this is a durability/fairness gap, NOT a ledger
   // integrity bug. It is bounded: only calls in-flight at the instant of a hard
-  // crash, or of a shutdown, which does not settle them.
+  // crash. A call over a connection has no time limit, so it can be an old one.
+  // A shutdown settles them (endL2Calls).
   //
   // To close it: make the pending set a persisted, transactional
   // logKV structure. The burn+enqueue already commit atomically; also durably
@@ -1700,6 +1715,8 @@ private:
       std::numeric_limits<uint64_t>::max();
     uint32_t followupTag = 0;
     std::shared_ptr<CesPlexRequest> replyCtx;   // client CALL sink (null = VM)
+    // The connection that the caller waits on, with the sink. The call ends with it.
+    std::optional<L2CallerChannel> caller;
     // The reason of a refund (0 = the one of its outcome): the code of the
     // built-in that refused the call (e.g. the instance is gone), or of the
     // payee's account that cannot take the payment. The channel sink answers

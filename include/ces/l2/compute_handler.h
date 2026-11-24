@@ -186,14 +186,21 @@ public:
                      const uint8_t* msg, std::size_t len);
 
   // SYS_L2_CALL delivery: route the paid call into the target live instance
-  // (blob = [u64 pid BE][payload]) via TAG_L2_CALL_IN; the child settles it
-  // with a TAG_L2_CALL_RESULT (delivered / no-handler) and a TAG_L2_CALL_REPLY,
-  // else the end of the instance or the deadline does (l2NoAnswer). Runs on
-  // the CesPlex strand (like every handler entry).
+  // (blob = [u64 pid BE][payload]) via TAG_L2_CALL_IN. The child asks to start it
+  // with a TAG_L2_CALL_RESULT, gets a TAG_L2_CALL_GO, and settles it with a
+  // TAG_L2_CALL_REPLY. The end of the instance settles it too. A call over a
+  // connection ends with the connection, and a call of a VM run has a deadline
+  // (l2NoAnswer). Runs on the CesPlex strand (like every handler entry).
   uint8_t cesplexL2Call(const L2CallRequest& req, L2CallReport report) override;
-  // The child's TAG_L2_CALL_RESULT: delivered marks the pending call (settle
-  // waits for the reply); no-handler reports it (refund) at once.
+  // The child's TAG_L2_CALL_RESULT: the child asks to start the call, and the server
+  // answers with TAG_L2_CALL_GO, "start" or "it ended" (then the credits went back).
+  // With no handler, it reports the call (refund) at once.
   void l2Result(uint64_t pid, uint64_t callId, bool delivered);
+  // The connection of a caller ended, so its calls end. One that has not started is
+  // refunded, and never starts. One that started pays its program, which goes on.
+  void callerGone(const minx::SockAddr& peer, uint32_t channelId);
+  // The server stops: end every call in the same way (CesServer::endL2Calls).
+  void endCalls();
   // The child's TAG_L2_CALL_REPLY: on_l2call's return bytes. Reports the call
   // as Delivered, carrying the reply to the sink (channel respond / followup).
   void l2Reply(uint64_t pid, uint64_t callId, const uint8_t* data, size_t len);
@@ -241,8 +248,8 @@ public:
   // this instead of sleeping for a guessed time. Any thread.
   bool testInstanceConnected(uint64_t pid);
 
-  // The deadline of the paid calls from now on. Set it on the rpc strand while
-  // no call is in flight.
+  // The deadline of the calls of VM runs from now on. Set it on the rpc strand
+  // while no call is in flight.
   void testSetL2CallTimeout(std::chrono::microseconds t) { l2CallTimeout_ = t; }
 
   // Count of child instances that terminated by a signal (a crash, e.g. SIGSEGV
@@ -264,8 +271,9 @@ public:
     L2CallReport report;
     uint64_t pid = 0;
     minx::Hash payee;          // instance program pubkey, minted on delivery
-    bool delivered = false;    // RESULT(delivered) seen -> keep money on timeout
-    std::chrono::steady_clock::time_point deadline;
+    bool delivered = false;    // the program started it: it keeps the credits
+    std::optional<L2CallerChannel> caller;   // no deadline: it ends with the connection
+    std::chrono::steady_clock::time_point deadline;   // of a call with no connection
   };
   std::map<uint64_t, PendingL2> pendingL2_;
   std::chrono::microseconds l2CallTimeout_ = std::chrono::seconds(30);

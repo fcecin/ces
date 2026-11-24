@@ -205,6 +205,16 @@ public:
   // task io_context's, it waits at most 1 s for that thread.
   void close();
 
+  // Hang up on the verb that waits for its answer with no limit (untilClosed). It
+  // ends with CES_ERROR_CONNECTION_LOST, and its channel with HS_CLOSE. When none
+  // waits, the next one ends so, before it sends anything. A verb after that opens a
+  // new channel. Other verbs ignore it. From any thread.
+  void cancel();
+
+  // How often a verb that waits with no limit tells the server that its client is
+  // there (CES_PLEX_VERB_NOP). A test makes it short.
+  void _testSetNopEvery(std::chrono::milliseconds every);
+
   // Provide the server pubkey so response signatures verify (else each
   // response logs one LOGERROR and is treated as unverifiable).
   void setServerPubkey(const minx::Hash& pk);
@@ -212,7 +222,11 @@ public:
   // See CesPlexClient::buildEnvelope.
   minx::Bytes buildEnvelope(uint8_t verb, std::span<const uint8_t> preamble);
 
-  // See CesPlexClient::driveVerb (both overloads).
+  // See CesPlexClient::driveVerb (both overloads). With `untilClosed` the wait for
+  // the answer has no limit: it ends with the answer, or when the channel closes
+  // (CES_ERROR_CONNECTION_LOST) or cancel() hangs up. While it waits, the client
+  // tells the server that it is there (CES_PLEX_VERB_NOP), so that the channel does
+  // not look idle to either end.
   uint8_t driveVerb(
       uint8_t verb,
       const minx::Bytes& envelope,
@@ -221,7 +235,8 @@ public:
       const std::function<uint64_t(const ces::Bytes& preamble)>& respBodyLen,
       const ces::Bytes& extraBodyToSend,
       ces::Bytes& outPreamble,
-      ces::Bytes& outBody);
+      ces::Bytes& outBody,
+      bool untilClosed = false);
 
   uint8_t driveVerb(
       uint8_t verb,

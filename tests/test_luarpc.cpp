@@ -1039,6 +1039,34 @@ BOOST_FIXTURE_TEST_CASE(ProgramCallsProgram, LuaRpcFixture) {
   BOOST_CHECK_GE(balanceOf(buyerPk), before - 1'000'000);   // fees and rent only
 }
 
+// A program hangs up on a call by closing its handle, also while the call waits. The
+// call ends with CONNECTION_LOST, and a call that had not started gives back its credits.
+BOOST_FIXTURE_TEST_CASE(ClosingAHandleHangsUpOnACall, LuaRpcFixture) {
+  const std::string home = "/h/" + ownerKey.getPublicKeyHexStr() + "/";
+  deploy(home + "busy2.bin",
+    "local t = ces.now()\nwhile ces.now() - t < 4000000 do end\n"
+    "function on_l2call() return 'late' end\nces.run()\n");
+  const auto callerPk = deploy(home + "hanger.bin",
+    "local ADDR = '127.0.0.1:" + std::to_string(rpcPort) + "'\n"
+    "function on_l2call(memo)\n"
+    "  local cc, err = ces.compute_client(ADDR)\n"
+    "  if not cc then return 'no client: ' .. tostring(err) end\n"
+    "  ces.spawn(function() ces.sleep(700) cc:close() end)\n"
+    "  local ok, reply, why = pcall(cc.call, cc, tonumber(memo), 5000000, 'x')\n"
+    "  for k, v in pairs(ces.err) do if v == why then why = k end end\n"
+    "  return tostring(ok) .. ' ' .. tostring(reply) .. ' ' .. tostring(why)\n"
+    "end\nces.run()\n");
+  server->_brr(callerPk, 1'000'000'000);
+  const uint64_t busy = launch(home + "busy2.bin");
+  const uint64_t caller = launch(home + "hanger.bin");
+  const int64_t before = balanceOf(callerPk);
+  const auto t0 = std::chrono::steady_clock::now();
+  BOOST_CHECK_EQUAL(callText(caller, std::to_string(busy)), "true nil CONNECTION_LOST");
+  BOOST_CHECK_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(4));
+  waitUntil([&] { return balanceOf(callerPk) >= before - 1'000'000; });
+  BOOST_CHECK_GE(balanceOf(callerPk), before - 1'000'000);   // fees only: the 5000000 came back
+}
+
 // STAT/INSTANCES are public and expose a live instance's REAL leased ports,
 // so anyone (not just the owner) can discover a running service and learn
 // where to dial it. This fixture runs real cesluajitd instances against a

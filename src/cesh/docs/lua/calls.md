@@ -26,9 +26,11 @@ ces.run()
 - The caller pays also when `on_l2call` fails with an error, and gets an
   empty reply. With no error handler (see [Errors](errors.md)), the error
   also ends the program.
-- The caller waits at most 30 seconds. After that, when the program took the
-  call, the caller gets an empty reply and the program keeps the payment. A
-  program that is too busy to take a call gives the payment back.
+- A call has no time limit. It ends when the program answers, when the program
+  ends, or when the caller's connection ends. The caller can hang up.
+- A caller that hangs up before the program starts the call gets the payment
+  back, and the program never runs the call. A call that the program has started
+  goes on, and the program gets the payment at the hang-up.
 - A program with no `on_l2call` gives every payment back.
 - `on_l2call` runs as a task, so it can wait (`ces.sleep`, file calls) and
   other calls run meanwhile.

@@ -300,6 +300,8 @@ Coroutine contexts (calls yield; the VM keeps serving others): `ces.spawn(fn)`; 
 
 Invariant: every wait has an external backstop (a network `timeout_ms`, the host reply, or process death). No primitive waits on a program-internal event that may never arrive; `recv`'s default timeout keeps channels inside that rule.
 
+A paid call (`cc:call`, the CALL verb) has no time limit. It ends with the answer, the end of the program, or the connection, and `cc:close()` hangs up on it, also while it waits. The server settles a call when its connection ends (`CesPlexHost::cesplexChannelClosed`, `ComputeHandler::callerGone`), and all calls when it stops (`CesServer::endL2Calls`). A call that its program has not started is refunded. One that its program started pays the program, which goes on with it. The program asks the server to start a call (`TAG_L2_CALL_RESULT`) and waits for `TAG_L2_CALL_GO`, so it never runs a call that was refunded. A client that waits sends `CES_PLEX_VERB_NOP` so that its channel does not look idle. A call of a VM run has no connection, and keeps its 30 s deadline.
+
 ## The Hyle layer (`ces.hyle`, `--hyle`)
 
 An application-system built ON CES, not part of it: CES is the low-level service (carrier, identity, metering), hyle is a BFT chain riding it, and the K,V service rides hyle. Built only with `--hyle` (`--hyle-src <path>` to build against a local hyle checkout); `hyle_services` is statically linked into `cesluajitd`, so `ces.hyle` drives a `hyle::services::Runtime` directly, no IPC. Extension-only (`/s/`). Without `--hyle` the binding is absent and hylesolo says so.

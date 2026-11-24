@@ -88,6 +88,14 @@ void CesComputeClient::disconnect() {
   impl_->chan = nullptr;
 }
 
+void CesComputeClient::_testSetNopEvery(std::chrono::milliseconds every) {
+  if (impl_->chan) impl_->chan->_testSetNopEvery(every);
+}
+
+void CesComputeClient::cancel() {
+  if (impl_->chan) impl_->chan->cancel();
+}
+
 void CesComputeClient::setServerPubkey(const minx::Hash& pk) {
   if (impl_->chan) impl_->chan->setServerPubkey(pk);
   else impl_->owned.setServerPubkey(pk);
@@ -263,7 +271,8 @@ uint8_t CesComputeClient::call(uint64_t pid, uint64_t value,
   ces::Bytes outPre;
   uint8_t rc = impl_->chan->driveVerb(kVerbCall, env, /*fixedPre=*/kCallRespPre,
                                      /*readVariablePreamble=*/nullptr, bodyLen,
-                                     /*extraBodyToSend=*/memo, outPre, reply);
+                                     /*extraBodyToSend=*/memo, outPre, reply,
+                                     /*untilClosed=*/true);
   if (rc != CES_OK) { reply.clear(); return rc; }
   // The response sig covers only the preamble; the digest in it is what
   // authenticates the reply bytes.

@@ -126,10 +126,16 @@ void plexReadVerb(std::shared_ptr<minx::RudpStream> stream,
     (const boost::system::error_code& ec, std::size_t) {
       if (ec) return;
       uint8_t verb = (*verbBuf)[0];
+      if (verb == CES_PLEX_VERB_NOP) {   // a client that waits for an answer
+        plexReadVerb(sharedStream, std::move(*sharedBound), host, proto);
+        return;
+      }
       if (!proto->accepts || !proto->accepts(verb)) {
-        LOGDEBUG << "cesplex: unaccepted verb; dropping channel"
+        LOGDEBUG << "cesplex: unaccepted verb; closing the channel"
                  << VAR(int(verb));
-        return;  // drop — stream closes when captured refs release
+        // The client waits for an answer, so it must see the end.
+        sharedStream->shutdown(kRudpStreamCloseTimeout);
+        return;
       }
       auto req = std::make_shared<CesPlexRequest>();
       req->stream = sharedStream;
@@ -306,6 +312,11 @@ void CesPlexReplyStream::pump() {
 namespace {
 
 constexpr auto kVerbTimeout = std::chrono::seconds(60);
+// How often a verb that waits with no limit (untilClosed) sends a byte, and how
+// often it looks at cancel(). A server drops an idle channel after 60 s or more, so
+// three bytes fit before that.
+constexpr auto kNopEvery = std::chrono::seconds(20);
+constexpr auto kCancelPoll = std::chrono::milliseconds(100);
 constexpr uint32_t kMaxStreamFrame = 1024 * 1024;   // one reply frame
 constexpr auto kConnectTimeout = std::chrono::seconds(10);
 
@@ -422,6 +433,9 @@ public:
   }
 
   void markDirty() { streamDirty_ = true; }
+
+  void cancel() { cancelled_.store(true); }
+  void setNopEvery(std::chrono::milliseconds every) { nopEvery_ = every; }
 
   // Record why a read or write failed, for stepRc.
   bool ioFailed(uint8_t rc) {
@@ -548,6 +562,37 @@ public:
     return true;
   }
 
+  // Read the first byte of an answer, with no limit (see untilClosed). It returns
+  // false when the channel ended, or when cancel() hung up on it.
+  bool awaitAnswer(ces::Bytes& out) {
+    if (!stream_) return ioFailed(CES_ERROR_CONNECTION_LOST);
+    auto buf = std::make_shared<ces::Bytes>(1);
+    auto run = std::make_shared<std::promise<bool>>();
+    auto fut = run->get_future();
+    auto strm = stream_;
+    boost::asio::post(taskIO_, [strm, buf, run]() mutable {
+      boost::asio::async_read(
+        *strm, boost::asio::buffer(*buf),
+        [run, buf](const boost::system::error_code& ec, std::size_t) {
+          run->set_value(!ec);
+        });
+    });
+    auto nextNop = std::chrono::steady_clock::now() + nopEvery_;
+    while (fut.wait_for(kCancelPoll) != std::future_status::ready) {
+      if (cancelled_.exchange(false)) {
+        close();
+        return ioFailed(CES_ERROR_CONNECTION_LOST);
+      }
+      const auto now = std::chrono::steady_clock::now();
+      if (now < nextNop) continue;
+      if (!writeAll(ces::Bytes{CES_PLEX_VERB_NOP})) return false;
+      nextNop = now + nopEvery_;
+    }
+    if (!fut.get()) return ioFailed(CES_ERROR_CONNECTION_LOST);
+    out = std::move(*buf);
+    return true;
+  }
+
   minx::Bytes buildEnvelope(uint8_t verb,
                             std::span<const uint8_t> preamble) {
     // The signature covers the bind digest of the channel, so open the new one
@@ -584,7 +629,9 @@ public:
       const std::function<uint64_t(const ces::Bytes&)>& respBodyLen,
       const ces::Bytes& extraBodyToSend,
       ces::Bytes& outPreamble,
-      ces::Bytes& outBody) {
+      ces::Bytes& outBody,
+      bool untilClosed) {
+    if (untilClosed && cancelled_.exchange(false)) return CES_ERROR_CONNECTION_LOST;
     const uint8_t clean = ensureClean();
     if (clean != CES_OK) return clean;
     ioRc_ = CES_OK;
@@ -601,7 +648,8 @@ public:
       return fail(stepRc());
 
     ces::Bytes statusBuf;
-    if (!readExact(statusBuf, 1)) return fail(stepRc());
+    if (!(untilClosed ? awaitAnswer(statusBuf) : readExact(statusBuf, 1)))
+      return fail(stepRc());
     uint8_t status = statusBuf[0];
 
     outPreamble.clear();
@@ -832,6 +880,8 @@ private:
   std::shared_ptr<std::shared_ptr<minx::RudpStream>> attempt_;
   std::shared_ptr<std::shared_ptr<minx::RudpStream>> closeBefore_;
   uint8_t ioRc_ = CES_OK;           // why the last read or write failed
+  std::atomic<bool> cancelled_{false};
+  std::chrono::milliseconds nopEvery_ = kNopEvery;
 };
 
 // ---- CesPlexChannel public forwards ----
@@ -868,10 +918,17 @@ uint8_t CesPlexChannel::driveVerb(
     const std::function<uint64_t(const ces::Bytes&)>& respBodyLen,
     const ces::Bytes& extraBodyToSend,
     ces::Bytes& outPreamble,
-    ces::Bytes& outBody) {
+    ces::Bytes& outBody,
+    bool untilClosed) {
   return impl_->driveVerb(verb, envelope, respFixedPreambleLen,
                           readVariablePreamble, respBodyLen,
-                          extraBodyToSend, outPreamble, outBody);
+                          extraBodyToSend, outPreamble, outBody, untilClosed);
+}
+
+void CesPlexChannel::cancel() { impl_->cancel(); }
+
+void CesPlexChannel::_testSetNopEvery(std::chrono::milliseconds every) {
+  impl_->setNopEvery(every);
 }
 
 uint8_t CesPlexChannel::driveVerb(
@@ -883,7 +940,7 @@ uint8_t CesPlexChannel::driveVerb(
   ces::Bytes dummyBody;
   return impl_->driveVerb(verb, envelope, respFixedPreambleLen,
                           readVariablePreamble, nullptr, {}, outPreamble,
-                          dummyBody);
+                          dummyBody, false);
 }
 
 bool CesPlexChannel::readExact(ces::Bytes& out, size_t n) {
@@ -1054,7 +1111,7 @@ public:
     if (!chan_) return CES_ERROR_INTERNAL;
     return chan_->driveVerb(verb, envelope, respFixedPreambleLen,
                             readVariablePreamble, respBodyLen,
-                            extraBodyToSend, outPreamble, outBody);
+                            extraBodyToSend, outPreamble, outBody, false);
   }
   bool readExact(ces::Bytes& out, size_t n) {
     return chan_ && chan_->readExact(out, n);

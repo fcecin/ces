@@ -17,7 +17,8 @@
 // the Lua thread). At most one in flight per handle — a second verb on a busy
 // handle errors instead of racing a second worker on the same client. closePending:
 // close() was called while inflight; the close is deferred to completion so the
-// worker's raw client pointer can't be freed under it. Together these stop a
+// worker's raw client pointer can't be freed under it. For a compute client the
+// verb in flight is also told to end (a call has no time limit). Together these stop a
 // program from corrupting the host by sharing a handle across coroutines.
 struct LuaFileClientEntry {
   std::unique_ptr<ces::CesPlexChannel> ch;
@@ -647,7 +648,11 @@ int lua_cc_close(lua_State* L) {
   uint64_t id = client_handle_id(L, 1);
   auto it = g_compute_clients.find(id);
   if (it == g_compute_clients.end()) return 0;
-  if (it->second.inflight) { it->second.closePending = true; return 0; }  // defer
+  if (it->second.inflight) {   // hang up, and close when the verb ends
+    it->second.closePending = true;
+    if (it->second.ch) it->second.ch->cancel();
+    return 0;
+  }
   client_close(g_compute_clients, id);
   return 0;
 }

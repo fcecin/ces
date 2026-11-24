@@ -32,6 +32,7 @@
 #include <ces/types.h>
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -121,17 +122,27 @@ public:
   // CES_ERROR_UNSUPPORTED = the program defines no on_l2call;
   // CES_ERROR_COMPUTE_INSTANCE_NOT_FOUND = `pid` is not live when the server
   // gets the call (no charge) or hands it to the instance;
-  // CES_ERROR_TIMEOUT = the instance got it and did not take it before the
-  // deadline (30 s) or before its own end;
+  // CES_ERROR_TIMEOUT = the instance ended before it started the call;
   // CES_ERROR_BALANCE_OVERFLOW, or another code of the transfer, = the program
   // account cannot take `value`.
-  // CES_ERROR_TIMEOUT also comes when the server gives no answer, and then the
-  // outcome is not known. Delivery is final: a delivered call that gets no
-  // reply before the deadline or before the end of the instance keeps the
-  // payment and returns CES_OK with an empty reply -- the payment lands in the
-  // program account only after on_l2call returns.
+  // The call has no time limit: it ends with the answer, the end of the instance, or
+  // the connection (cancel(), a hang-up, the idle time, no payment for it), with
+  // CES_ERROR_CONNECTION_LOST. A call that the program has not started gives
+  // the credits back. A started call is final: it pays the program, and the program
+  // goes on with it when its connection ends. One that ends with its instance returns
+  // CES_OK with an empty reply. The payment lands in the program account when
+  // on_l2call returns, or before, when the connection ends.
+  // CES_ERROR_TIMEOUT also comes when the server stops in the middle of its answer.
+  // With that, as with CES_ERROR_CONNECTION_LOST, the caller does not know the outcome.
   uint8_t call(uint64_t pid, uint64_t value, const ces::Bytes& memo,
                ces::Bytes& reply);
+
+  // Hang up on the call in flight, or on the next one, from any thread
+  // (CesPlexChannel::cancel).
+  void cancel();
+
+  // How often a waiting call tells the server that its caller is there (a test hook).
+  void _testSetNopEvery(std::chrono::milliseconds every);
 
   // Implementation detail; public only so the .cpp-local helpers can
   // take Impl& without forward-declaring everything inside the .cpp.

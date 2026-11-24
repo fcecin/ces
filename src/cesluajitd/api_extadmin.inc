@@ -423,56 +423,77 @@ static void drain_gossip(lua_State* mainL) {
   }
 }
 
-// Dispatch a paid L2 call to the program's global on_l2call. Frame body:
+// Start a paid L2 call that the server said to start: run on_l2call(memo, {payer,
+// value, callid}) as a coroutine. Its return value (a string, or nothing) is sent as
+// TAG_L2_CALL_REPLY when it finishes: the reply the caller gets on its channel
+// (client verb) or followup run (VM syscall). Settlement is reply-time: the host
+// mints `value` into the program account only then, so the program's balance during
+// on_l2call does not yet include it.
+static void start_l2call(lua_State* mainL, const Frame& f) {
+  const uint8_t* b = f.body.data();
+  const uint64_t callId = get_u64(b), value = get_u64(b + 8);
+  const uint8_t* payer = b + 16;                     // 32-byte account key
+  const uint32_t mlen = get_u32(b + 48);
+  const uint8_t* memo = b + sizeof(uint64_t) * 2 + 32 + sizeof(uint32_t);
+  lua_getglobal(mainL, "on_l2call");
+  if (!lua_isfunction(mainL, -1)) {                  // it went away meanwhile
+    lua_pop(mainL, 1);
+    std::vector<uint8_t> rb;
+    put_u64(rb, callId);
+    write_frame(TAG_L2_CALL_REPLY, 0, rb.data(), rb.size());
+    return;
+  }
+  lua_State* co = lua_newthread(mainL);              // mainL: [handler, co]
+  int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);      // pop co, ref it
+  g_coro_refs[co] = ref;
+  g_l2call_co[co] = callId;                          // capture on_l2call's reply
+  lua_xmove(mainL, co, 1);                           // handler -> co
+
+  lua_pushlstring(co, reinterpret_cast<const char*>(memo), mlen);  // arg1: memo
+  lua_createtable(co, 0, 3);                                        // arg2
+  lua_pushlstring(co, reinterpret_cast<const char*>(payer), 32);
+  lua_setfield(co, -2, "payer");
+  lua_pushnumber(co, static_cast<lua_Number>(value));
+  lua_setfield(co, -2, "value");
+  lua_pushnumber(co, static_cast<lua_Number>(callId));
+  lua_setfield(co, -2, "callid");
+  g_ready.push_back({co, 2});
+}
+
+// Dispatch the paid L2 calls. Frame body:
 //   [u64 callId][u64 value][32 payer][u32 memoLen][memo]
-// Acceptance-based: the instant a handler exists we ack DELIVERED and run
-// on_l2call(memo, {payer, value, callid}) as a coroutine; with no handler we ack
-// NO_HANDLER so the host refunds. When the coroutine finishes, its return value
-// (a string, or nothing) is sent as TAG_L2_CALL_REPLY -- the reply the caller
-// gets on its channel (client verb) or followup run (VM syscall). Settlement
-// is reply-time: the host mints `value` into the program account only after
-// the coroutine finishes, so the program's balance during on_l2call does not
-// yet include it.
+// With a handler, the program asks the host to start the call (delivered) and waits
+// for TAG_L2_CALL_GO, because the call can have ended while it waited in this queue:
+// the host gave the credits back, and the program must not serve it. With no
+// handler, the host refunds at once.
 static void drain_l2call(lua_State* mainL) {
   constexpr size_t H = sizeof(uint64_t) + sizeof(uint64_t) + 32 + sizeof(uint32_t);
   while (!g_l2call_q.empty()) {
     Frame f = std::move(g_l2call_q.front());
     g_l2call_q.pop_front();
     if (f.body.size() < H) continue;
-    const uint8_t* b = f.body.data();
-    uint64_t callId = get_u64(b);
-    uint64_t value  = get_u64(b + 8);
-    const uint8_t* payer = b + 16;                   // 32-byte account key
-    uint32_t mlen = get_u32(b + 48);
-    if (f.body.size() < H + mlen) continue;
-    const uint8_t* memo = b + H;
+    const uint64_t callId = get_u64(f.body.data());
+    if (f.body.size() < H + get_u32(f.body.data() + 48)) continue;
 
     lua_getglobal(mainL, "on_l2call");
-    bool haveHandler = lua_isfunction(mainL, -1);
+    const bool haveHandler = lua_isfunction(mainL, -1);
+    lua_pop(mainL, 1);
 
-    // Settle to the host: delivered iff a handler exists.
     std::vector<uint8_t> rb;
     put_u64(rb, callId);
-    rb.push_back(haveHandler ? 0 : 1);               // 0 delivered, 1 no-handler
+    rb.push_back(haveHandler ? 0 : 1);               // 0 asks to start, 1 no-handler
+    if (haveHandler) g_l2call_wait[callId] = std::move(f);
     write_frame(TAG_L2_CALL_RESULT, 0, rb.data(), rb.size());
-
-    if (!haveHandler) { lua_pop(mainL, 1); continue; }
-
-    lua_State* co = lua_newthread(mainL);            // mainL: [handler, co]
-    int ref = luaL_ref(mainL, LUA_REGISTRYINDEX);    // pop co, ref it
-    g_coro_refs[co] = ref;
-    g_l2call_co[co] = callId;                         // capture on_l2call's reply
-    lua_xmove(mainL, co, 1);                          // handler -> co
-
-    lua_pushlstring(co, reinterpret_cast<const char*>(memo), mlen);  // arg1: memo
-    lua_createtable(co, 0, 3);                                          // arg2
-    lua_pushlstring(co, reinterpret_cast<const char*>(payer), 32);
-    lua_setfield(co, -2, "payer");
-    lua_pushnumber(co, static_cast<lua_Number>(value));
-    lua_setfield(co, -2, "value");
-    lua_pushnumber(co, static_cast<lua_Number>(callId));
-    lua_setfield(co, -2, "callid");
-    g_ready.push_back({co, 2});
+  }
+  while (!g_l2call_go_q.empty()) {
+    Frame g = std::move(g_l2call_go_q.front());
+    g_l2call_go_q.pop_front();
+    if (g.body.size() < sizeof(uint64_t) + 1) continue;
+    auto it = g_l2call_wait.find(get_u64(g.body.data()));
+    if (it == g_l2call_wait.end()) continue;
+    const Frame f = std::move(it->second);
+    g_l2call_wait.erase(it);
+    if (g.body[sizeof(uint64_t)] != 0) start_l2call(mainL, f);
   }
 }
 

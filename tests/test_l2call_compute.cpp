@@ -17,6 +17,7 @@
 #include <ces/keys.h>
 #include <ces/ramfilestore.h>          // ces::sha256
 #include <ces/server.h>
+#include <ces/cesplex/session.h>
 #include <ces/l2/compute_client.h>
 #include <ces/l2/compute_handler.h>
 #include <ces/l2/file_client.h>
@@ -30,6 +31,7 @@
 #include <array>
 #include <chrono>
 #include <cstring>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -117,7 +119,8 @@ struct L2ComputeFixture {
   uint16_t mainPort = 0, rpcPort = 0;
   KeyPair ownerKey;
 
-  L2ComputeFixture() {
+  // With `idleSecs`, the server drops a connection that is idle for that long.
+  explicit L2ComputeFixture(uint32_t idleSecs = 0) {
     blog::init();
     blog::set_level(blog::fatal);
     dir = makeUniqueTempDir("l2compute");
@@ -137,6 +140,7 @@ struct L2ComputeFixture {
     cfg.computePortBase = findFreeUdpPortRange(16);
     cfg.computePortCount = 16;
     cfg.feeComputeSlotSec = 1;
+    if (idleSecs > 0) cfg.rpcRudpChannelIdleSecs = idleSecs;
     cfg.cesComputeChildBinary = ces::e2e::findBinary("cesluajitd");
     cfg.cesComputeWorkDir = (dir / "cescompute").string();
     server = std::make_unique<CesServer>(cfg);
@@ -405,29 +409,21 @@ BOOST_AUTO_TEST_CASE(CallVerb_LargeMemoAndReply_RoundTrip) {
   BOOST_CHECK(std::equal(reply.begin(), reply.end(), big.begin()));
 }
 
-// A paid call that gets no answer ends at once when its program ends, and at
-// its deadline when the program goes on. It does not wait for the supervisor
-// tick (60 s). A call that the program took keeps the payment and has an empty
-// reply. A call that it did not take gives the payment back.
-BOOST_AUTO_TEST_CASE(CallVerb_NoAnswer_EndsAtTheProgramsEndOrTheDeadline) {
+// A paid call that gets no answer ends at once when its program ends. A program that
+// started the call keeps the payment, and its caller has an empty reply.
+BOOST_AUTO_TEST_CASE(CallVerb_NoAnswer_EndsWithTheProgram) {
   using clock = std::chrono::steady_clock;
   struct Case {
     const char* name;
     std::string src;
     bool kill;          // the owner kills the program during the call
-    bool taken;         // the program took the call
-    std::chrono::milliseconds limit;   // the deadline of the call
   };
-  // Only the end of the program can end a call with the long deadline in time.
-  const std::chrono::milliseconds longLimit(30'000), shortLimit(1'500);
   const std::vector<Case> cases = {
-    {"error", "function on_l2call() error('no') end\nces.run()\n", false, true, longLimit},
-    {"exit", "function on_l2call() ces.exit() end\nces.run()\n", false, true, longLimit},
+    {"error", "function on_l2call() error('no') end\nces.run()\n", false},
+    {"exit", "function on_l2call() ces.exit() end\nces.run()\n", false},
     {"killed", "local taken\nfunction on_l2call(m)\n"
                "  if m == 'taken?' then return taken and 'yes' or 'no' end\n"
-               "  taken = true ces.sleep(120000)\nend\nces.run()\n", true, true, longLimit},
-    {"silent", "function on_l2call() ces.sleep(120000) end\nces.run()\n", false, true, shortLimit},
-    {"stuck", "ces.sleep = nil\nwhile true do end\n", false, false, shortLimit},
+               "  taken = true ces.sleep(120000)\nend\nces.run()\n", true},
   };
   const int64_t fee = (int64_t)server->_config().feeQuery;
   const KeyPair pollKey;
@@ -438,8 +434,6 @@ BOOST_AUTO_TEST_CASE(CallVerb_NoAnswer_EndsAtTheProgramsEndOrTheDeadline) {
       const auto progPk = deploy(path, c.src);
       const uint64_t pid = launch(path);
       std::this_thread::sleep_for(std::chrono::milliseconds(800));
-      runSync(server->_rpcTaskIOExecutor(),
-              [&] { server->computeHandler()->testSetL2CallTimeout(c.limit); });
       const int64_t sBefore = signerBalance(), pBefore = balanceOf(progPk);
       std::thread killer([&] {
         if (!c.kill) return;
@@ -461,21 +455,340 @@ BOOST_AUTO_TEST_CASE(CallVerb_NoAnswer_EndsAtTheProgramsEndOrTheDeadline) {
       const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
       killer.join();
       BOOST_CHECK_LT(ms, 10'000);
-      if (c.limit == shortLimit) BOOST_CHECK_GE(ms, c.limit.count());
-      BOOST_CHECK_EQUAL(rc, c.taken ? CES_OK : CES_ERROR_TIMEOUT);
+      BOOST_CHECK_EQUAL(rc, CES_OK);
       BOOST_CHECK(reply.empty());
-      const int64_t sWant = sBefore - (c.taken ? (int64_t)V : 0);
+      const int64_t sWant = sBefore - (int64_t)V;
       bool ok = false;
       for (int i = 0; i < 100 && !ok; ++i) {
         // Less the fees of the caller, and the rent of the program.
         ok = signerBalance() <= sWant && signerBalance() >= sWant - 10 * fee &&
-             (!c.taken || balanceOf(progPk) >= pBefore + (int64_t)V - 100'000);
+             balanceOf(progPk) >= pBefore + (int64_t)V - 100'000;
         if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
       }
       BOOST_CHECK_MESSAGE(ok, "signer " << signerBalance() << " want " << sWant << ", program "
                               << balanceOf(progPk) << " before " << pBefore);
     }
   }
+}
+
+// A call over a connection has no deadline, so a slow program answers. The deadline
+// of the calls of VM runs does not touch it.
+BOOST_AUTO_TEST_CASE(CallVerb_HasNoTimeLimit) {
+  const std::string path = "/h/" + myHex() + "/slow.lua";
+  deploy(path, "function on_l2call() ces.sleep(4000) return 'late' end\nces.run()\n");
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  runSync(server->_rpcTaskIOExecutor(),
+          [&] { server->computeHandler()->testSetL2CallTimeout(std::chrono::seconds(1)); });
+  ces::Bytes reply;
+  BOOST_CHECK_EQUAL(callVerb(pid, V, "x", reply), CES_OK);
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "late");
+}
+
+// A program that is busy for 5 s before it takes calls. "ran?" tells how many other
+// calls it ran.
+const char* const kBusyThenTakes =
+  "local t = ces.now()\nwhile ces.now() - t < 5000000 do end\n"
+  "local ran = 0\nfunction on_l2call(m)\n"
+  "  if m == 'ran?' then return tostring(ran) end\n"
+  "  ran = ran + 1\n  return 'ok'\nend\nces.run()\n";
+
+template <class F> bool waitUntil(F&& done) {
+  for (int i = 0; i < 200; ++i) {
+    if (done()) return true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  return false;
+}
+
+// A call of V credits on its own thread, with the client to hang up on.
+struct HangUpCall {
+  CesComputeClient cc;
+  std::thread t;
+  uint8_t rc = 0xff;
+  ces::Bytes reply;
+  void start(L2ComputeFixture& f, uint64_t pid, const std::string& memo) {
+    start(f, pid, memo, f.ownerKey);
+  }
+  void start(L2ComputeFixture& f, uint64_t pid, const std::string& memo, const KeyPair& payer) {
+    cc.setServerPubkey(f.server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", f.rpcPort, payer));
+    t = std::thread([this, pid, memo] {
+      rc = cc.call(pid, V, ces::Bytes(memo.begin(), memo.end()), reply);
+    });
+  }
+  ~HangUpCall() {
+    cc.cancel();
+    if (t.joinable()) t.join();
+  }
+};
+
+// Asks a program, as another account than the owner's.
+struct Asker {
+  KeyPair key;
+  CesComputeClient cc;
+  uint64_t pid;
+  Asker(L2ComputeFixture& f, uint64_t pid) : pid(pid) {
+    f.server->_brr(key.getPublicKeyAsHash(), 1'000'000'000);
+    cc.setServerPubkey(f.server->_serverKeyPair().getPublicKeyAsHash());
+    CES_REQUIRE_OK(cc.connect("localhost", f.rpcPort, key));
+  }
+  std::string ask(const std::string& memo) {
+    ces::Bytes reply;
+    if (cc.call(pid, 0, ces::Bytes(memo.begin(), memo.end()), reply) != CES_OK) return "error";
+    return std::string(reply.begin(), reply.end());
+  }
+  bool becomes(const std::string& memo, const std::string& want) {
+    return waitUntil([&] { return ask(memo) == want; });
+  }
+};
+
+// A caller that hangs up before the program starts its call gets its credits back,
+// and the program never runs the call, also when it takes calls later.
+BOOST_AUTO_TEST_CASE(CallVerb_HangUpBeforeTheProgramStarts_Refunds) {
+  const std::string path = "/h/" + myHex() + "/busy.lua";
+  const auto progPk = deploy(path, kBusyThenTakes);
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));   // its busy time began
+  const int64_t sBefore = signerBalance(), pBefore = balanceOf(progPk);
+  const int64_t fee = (int64_t)server->_config().feeQuery;
+  HangUpCall h;
+  h.start(*this, pid, "x");
+  std::this_thread::sleep_for(std::chrono::milliseconds(700));
+  h.cc.cancel();
+  h.t.join();
+  BOOST_CHECK_EQUAL(h.rc, CES_ERROR_CONNECTION_LOST);
+  bool ok = false;
+  for (int i = 0; i < 100 && !ok; ++i) {
+    // Less the fee of the call, which stays.
+    ok = signerBalance() <= sBefore && signerBalance() >= sBefore - 10 * fee;
+    if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_MESSAGE(ok, "signer " << signerBalance() << " before " << sBefore);
+  BOOST_CHECK_LE(balanceOf(progPk), pBefore);
+
+  // The program goes on and takes calls. The ended one did not run.
+  ces::Bytes reply;
+  std::string got = "none";
+  for (int i = 0; i < 100 && got != "0"; ++i) {
+    if (callVerb(pid, 0, "ran?", reply) == CES_OK) got = std::string(reply.begin(), reply.end());
+    if (got != "0" && got != "none" && got != "1") break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  BOOST_CHECK_EQUAL(got, "0");
+}
+
+// A program that starts a call and holds it until a call "go" comes. "started?" and
+// "finished?" tell how far it is.
+const char* const kHoldsACall =
+  "local started, finished, go = 'no', 'no', false\n"
+  "function on_l2call(m)\n"
+  "  if m == 'started?' then return started end\n"
+  "  if m == 'finished?' then return finished end\n"
+  "  if m == 'go' then go = true return 'ok' end\n"
+  "  started = 'yes'\n  while not go do ces.sleep(20) end\n"
+  "  finished = 'yes'\n  return 'done'\nend\nces.run()\n";
+
+// A caller that hangs up on a call that the program started does not get its credits
+// back. The program is paid then, and goes on with the call. It is not paid again when
+// it finishes, with nobody to answer.
+BOOST_AUTO_TEST_CASE(CallVerb_HangUpAfterTheProgramStarts_PaysTheProgram) {
+  const std::string path = "/h/" + myHex() + "/started.lua";
+  const auto progPk = deploy(path, kHoldsACall);
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  const int64_t sBefore = signerBalance(), pBefore = balanceOf(progPk);
+  const int64_t fee = (int64_t)server->_config().feeQuery;
+  Asker asker(*this, pid);
+  HangUpCall h;
+  h.start(*this, pid, "x");
+  BOOST_REQUIRE(asker.becomes("started?", "yes"));
+  h.cc.cancel();
+  h.t.join();
+  BOOST_CHECK_EQUAL(h.rc, CES_ERROR_CONNECTION_LOST);
+  // The program holds the call still, and has its payment, less its rent.
+  BOOST_CHECK(waitUntil([&] { return balanceOf(progPk) >= pBefore + (int64_t)V - 100'000; }));
+  BOOST_CHECK_EQUAL(asker.ask("finished?"), "no");
+  BOOST_CHECK_LE(signerBalance(), sBefore - (int64_t)V);
+  BOOST_CHECK_GE(signerBalance(), sBefore - (int64_t)V - 10 * fee);
+  BOOST_CHECK_EQUAL(asker.ask("go"), "ok");
+  BOOST_CHECK(asker.becomes("finished?", "yes"));
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));   // its late reply came
+  BOOST_CHECK_LE(balanceOf(progPk), pBefore + (int64_t)V);
+  BOOST_CHECK_GE(signerBalance(), sBefore - (int64_t)V - 10 * fee);
+}
+
+// A server that stops settles the calls in flight. One that the program started pays
+// it, and one that the program did not start gives the credits back.
+BOOST_AUTO_TEST_CASE(ServerStop_SettlesTheCallsInFlight) {
+  const std::string held = "/h/" + myHex() + "/held.lua", busy = "/h/" + myHex() + "/neverruns.lua";
+  const auto heldPk = deploy(held, kHoldsACall);
+  const auto busyPk = deploy(busy, "while true do end\n");
+  const uint64_t heldPid = launch(held), busyPid = launch(busy);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  const int64_t funds = 1'000'000'000;
+  const KeyPair a, b;
+  for (const KeyPair* k : {&a, &b}) server->_brr(k->getPublicKeyAsHash(), funds);
+  auto hashOf = [](const std::array<uint8_t, 32>& pk) {
+    minx::Hash h;
+    std::memcpy(h.data(), pk.data(), 32);
+    return h;
+  };
+  auto arrayOf = [](const KeyPair& k) {
+    std::array<uint8_t, 32> pk{};
+    std::memcpy(pk.data(), k.getPublicKeyAsHash().data(), 32);
+    return pk;
+  };
+  const int64_t pHeld = balanceOf(heldPk), pBusy = balanceOf(busyPk);
+  HangUpCall started, waits;
+  started.start(*this, heldPid, "x", a);
+  waits.start(*this, busyPid, "x", b);
+  Asker asker(*this, heldPid);
+  BOOST_REQUIRE(asker.becomes("started?", "yes"));
+  // The other one is escrowed too, and waits.
+  BOOST_REQUIRE(waitUntil([&] { return balanceOf(arrayOf(b)) <= funds - (int64_t)V; }));
+  asker.cc.disconnect();
+  client->stop();
+  client.reset();
+  server->stop();
+  const int64_t fees = 10 * (int64_t)server->_config().feeQuery;
+  const int64_t aLeft = server->_balanceOf(a.getPublicKeyAsHash());
+  const int64_t bLeft = server->_balanceOf(b.getPublicKeyAsHash());
+  BOOST_CHECK_LE(aLeft, funds - (int64_t)V);
+  BOOST_CHECK_GE(aLeft, funds - (int64_t)V - fees);
+  BOOST_CHECK_GE(bLeft, funds - fees);   // the credits came back
+  BOOST_CHECK_GE(server->_balanceOf(hashOf(heldPk)), pHeld + (int64_t)V - 100'000);
+  BOOST_CHECK_LE(server->_balanceOf(hashOf(busyPk)), pBusy);
+  // The server is gone, so a caller with no answer ends when it hangs up.
+  started.cc.cancel();
+  waits.cc.cancel();
+}
+
+// A caller that hung up before the server had the call takes nothing to the program:
+// the call is refused, and the server gives the credits back.
+BOOST_AUTO_TEST_CASE(CallVerb_HungUpBeforeHandOver_IsRefused) {
+  const std::string path = "/h/" + myHex() + "/handover.lua";
+  deploy(path, "local ran = 0\nfunction on_l2call(m)\n"
+               "  if m == 'ran?' then return tostring(ran) end\n  ran = ran + 1\nend\nces.run()\n");
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  // The token of a connection that ended, and the one of a connection that ended before
+  // the server read the call (0).
+  for (uint64_t token : {42, 0}) {
+    uint8_t rc = CES_OK;
+    bool reported = false;
+    runSync(server->_rpcTaskIOExecutor(), [&] {
+      L2CallRequest req;
+      req.callId = 999'999;
+      std::memcpy(req.payer.data(), ownerKey.getPublicKeyAsHash().data(), req.payer.size());
+      req.value = V;
+      ces::Buffer::put<uint64_t>(req.blob, pid);
+      req.caller = L2CallerChannel{{}, 7, token};
+      rc = server->computeHandler()->cesplexL2Call(
+        req, [&](uint64_t, L2CallOutcome, const minx::Hash&, const ces::Bytes&) { reported = true; });
+    });
+    BOOST_CHECK_EQUAL(rc, CES_ERROR_CONNECTION_LOST);
+    BOOST_CHECK(!reported);
+  }
+  ces::Bytes reply;
+  CES_REQUIRE_OK(callVerb(pid, 0, "ran?", reply));
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "0");
+}
+
+// A hang-up that comes before the call ends it before it is sent, so it costs nothing.
+BOOST_AUTO_TEST_CASE(CallVerb_HungUpBeforeItIsSent_IsNotSent) {
+  const std::string path = "/h/" + myHex() + "/notsent.lua";
+  const auto progPk = deploy(path, "function on_l2call(m) return m end\nces.run()\n");
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  const int64_t sBefore = signerBalance(), pBefore = balanceOf(progPk);
+  const std::string memo = "x";
+  ces::Bytes reply;
+  cc.cancel();
+  BOOST_CHECK_EQUAL(cc.call(pid, V, ces::Bytes(memo.begin(), memo.end()), reply), CES_ERROR_CONNECTION_LOST);
+  BOOST_CHECK_GT(signerBalance(), sBefore - (int64_t)V);
+  BOOST_CHECK_LE(balanceOf(progPk), pBefore);
+  BOOST_CHECK_EQUAL(cc.call(pid, 0, ces::Bytes(memo.begin(), memo.end()), reply), CES_OK);   // the next one goes
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "x");
+  cc.disconnect();
+}
+
+// A server that does not know a verb ends the connection, so its client does not wait
+// on a connection that nobody reads.
+BOOST_AUTO_TEST_CASE(AVerbThatTheServerDoesNotKnowEndsTheConnection) {
+  CesPlexClient pc;
+  pc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(pc.connect("localhost", rpcPort, "/ces/compute/1", ownerKey));
+  const std::string pre = "x";
+  auto env = pc.buildEnvelope(0x55, std::span<const uint8_t>(
+                                      reinterpret_cast<const uint8_t*>(pre.data()), pre.size()));
+  ces::Bytes out;
+  const auto t0 = std::chrono::steady_clock::now();
+  BOOST_CHECK_EQUAL(pc.driveVerb(0x55, env, 0, nullptr, out), CES_ERROR_CONNECTION_LOST);
+  BOOST_CHECK_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(10));
+  pc.disconnect();
+}
+
+struct ShortIdleFixture : L2ComputeFixture {
+  ShortIdleFixture() : L2ComputeFixture(2) {}
+};
+
+// A call that lasts longer than the idle time of the connection stays, because the
+// waiting client tells the server that it is there. The bytes that it sends do not
+// disturb the next call on the same connection.
+BOOST_FIXTURE_TEST_CASE(CallVerb_ALongWaitKeepsItsConnection, ShortIdleFixture) {
+  const std::string path = "/h/" + myHex() + "/longwait.lua";
+  deploy(path, "function on_l2call(m)\n  if m == 'long' then ces.sleep(5000) end\n"
+               "  return m .. '!'\nend\nces.run()\n");
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(800));
+  CesComputeClient cc;
+  cc.setServerPubkey(server->_serverKeyPair().getPublicKeyAsHash());
+  CES_REQUIRE_OK(cc.connect("localhost", rpcPort, ownerKey));
+  cc._testSetNopEvery(std::chrono::milliseconds(300));
+  ces::Bytes reply;
+  const std::string longMemo = "long", shortMemo = "short";
+  BOOST_CHECK_EQUAL(cc.call(pid, 0, ces::Bytes(longMemo.begin(), longMemo.end()), reply), CES_OK);
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "long!");
+  BOOST_CHECK_EQUAL(cc.call(pid, 0, ces::Bytes(shortMemo.begin(), shortMemo.end()), reply), CES_OK);
+  BOOST_CHECK_EQUAL(std::string(reply.begin(), reply.end()), "short!");
+  cc.disconnect();
+}
+
+// A call of a VM run has no connection, so it keeps its deadline. A program that does
+// not start it by then gives the credits back, and does not run it later.
+BOOST_AUTO_TEST_CASE(VmCall_NotStartedByItsDeadline_Refunds) {
+  const std::string path = "/h/" + myHex() + "/vmbusy.lua";
+  deploy(path, kBusyThenTakes);
+  const uint64_t pid = launch(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(300));
+  runSync(server->_rpcTaskIOExecutor(),
+          [&] { server->computeHandler()->testSetL2CallTimeout(std::chrono::milliseconds(700)); });
+  const int64_t sBefore = signerBalance();
+  const int64_t fee = (int64_t)server->_config().feeQuery;
+  BOOST_REQUIRE_EQUAL(runGateway(pid, V), CES_OK);
+  // The gas of the run and of the gateway's make stays; the amount of the call comes back.
+  const int64_t gone = sBefore - signerBalance();
+  BOOST_CHECK_GT(gone, (int64_t)V - 1);
+  bool ok = false;
+  for (int i = 0; i < 100 && !ok; ++i) {
+    ok = signerBalance() >= sBefore - gone + (int64_t)V - 10 * fee &&
+         signerBalance() <= sBefore - gone + (int64_t)V + 1;
+    if (!ok) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_MESSAGE(ok, "signer " << signerBalance() << " before " << sBefore << " gone " << gone);
+  // It takes calls again after its busy time, and the ended one did not run.
+  ces::Bytes reply;
+  std::string got = "none";
+  for (int i = 0; i < 100 && got != "0"; ++i) {
+    if (callVerb(pid, 0, "ran?", reply) == CES_OK) got = std::string(reply.begin(), reply.end());
+    if (got != "0" && got != "none" && got != "1") break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+  }
+  BOOST_CHECK_EQUAL(got, "0");
 }
 
 // A payment that the program's account cannot take goes back to the payer, and

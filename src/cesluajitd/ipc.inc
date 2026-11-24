@@ -32,7 +32,8 @@ constexpr uint8_t  TAG_EXT_UI_PUSH      = 0x1a;  // child → server (panel rend
 constexpr uint8_t  TAG_EXT_UI_WATCH     = 0x1b;  // server → child ([u8 on]; drives the change-detect tick)
 
 constexpr uint8_t  TAG_L2_CALL_IN       = 0x1c;  // server → child (paid L2 call -> on_l2call)
-constexpr uint8_t  TAG_L2_CALL_RESULT   = 0x1d;  // child → server (delivered / no-handler)
+constexpr uint8_t  TAG_L2_CALL_RESULT   = 0x1d;  // child → server (asks to start / no-handler)
+constexpr uint8_t  TAG_L2_CALL_GO       = 0x21;  // server -> child ([u64 callId][u8 start?])
 constexpr uint8_t  TAG_L2_CALL_REPLY    = 0x1f;  // child → server (on_l2call return bytes)
 constexpr uint8_t  TAG_THINK_PIECE      = 0x20;  // server → child (ces.think reply text)
 #ifdef CES_MAIL
@@ -182,6 +183,8 @@ std::map<uint64_t, ConnExec>    g_conn_exec;     // relay conn id -> serialized 
 std::map<lua_State*, HandlerCo> g_handler_co;    // handler coroutine -> its conn
 std::deque<uint64_t>            g_conn_advance;   // relay conns with an event ready
 std::map<lua_State*, int>       g_coro_refs;     // coroutine -> registry ref (keeps it alive)
+std::deque<Frame> g_l2call_go_q;                 // TAG_L2_CALL_GO frames
+std::map<uint64_t, Frame> g_l2call_wait;         // asked to start, by callId
 std::map<lua_State*, uint64_t>  g_l2call_co;     // on_l2call coroutine -> its callId (reply)
 static void resume_coro(lua_State* mainL, lua_State* co, int nargs);
 static void flush_net_usage();
@@ -338,6 +341,7 @@ void route_to_queue(Frame f) {
   else if (f.tag == TAG_GOSSIP_IN) g_gossip_q.push_back(std::move(f));
   else if (f.tag == TAG_PEER_MSG_IN) g_peer_q.push_back(std::move(f));
   else if (f.tag == TAG_L2_CALL_IN) g_l2call_q.push_back(std::move(f));
+  else if (f.tag == TAG_L2_CALL_GO) g_l2call_go_q.push_back(std::move(f));
   else if (f.tag == TAG_THINK_PIECE) g_think_q.push_back(std::move(f));
   // Ignore other tags (BOOTSTRAP is only at startup).
 }

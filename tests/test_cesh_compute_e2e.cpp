@@ -107,12 +107,15 @@ struct CeshComputeFixture {
 
   // `cesh --server localhost --rpc-port <rpc> -l fatal compute call <args>`
   // with the owner wallet inline via CESH_WALLET.
-  RunResult ceshCall(const std::string& args) { return ceshCompute("call " + args); }
+  // `under` is a command that runs it.
+  RunResult ceshCall(const std::string& args, const std::string& under = "") {
+    return ceshCompute("call " + args, under);
+  }
 
   // `cesh ... compute <args>`, as the owner.
-  RunResult ceshCompute(const std::string& args) {
+  RunResult ceshCompute(const std::string& args, const std::string& under = "") {
     std::string wallet = "00" + ownerKey.getPrivateKeyHexStr();
-    std::string cmd = "CESH_WALLET=\"" + wallet + "\" " + ceshBin +
+    std::string cmd = "CESH_WALLET=\"" + wallet + "\" " + under + ceshBin +
                       " --server localhost:" + std::to_string(mainPort) +
                       " --rpc-port " + std::to_string(rpcPort) +
                       " -l fatal compute " + args;
@@ -196,6 +199,41 @@ BOOST_AUTO_TEST_CASE(CallUnknownPidFails) {
   RunResult r = ceshCall("999999 0 --in text:x");
   BOOST_CHECK_NE(r.exitCode, 0);
   assertContains(r.out, "Failed", "error diagnostic");
+}
+
+// A call has no time limit, so Ctrl+C hangs up on it. The program never took this one,
+// so the credits come back.
+BOOST_AUTO_TEST_CASE(CallCtrlCHangsUp) {
+  const std::string path = "/h/" + ownerHex() + "/stuck.lua";
+  uploadScript(path, "while true do end\n");
+  const uint64_t pid = launchScript(path);
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  CesClient client(boost::asio::ip::udp::endpoint(
+                     boost::asio::ip::address_v6::loopback(), mainPort), false);
+  client.start(0);
+  client.setKey(ownerKey);
+  client.connect();
+  auto balance = [&] {
+    int64_t bal = 0;
+    uint32_t nonce = 0;
+    client.queryAccount(Account::getMapKey(ownerKey.getPublicKeyAsHash()), bal, nonce);
+    return bal;
+  };
+  const int64_t before = balance();
+  BOOST_REQUIRE_GT(before, 0);
+  const auto t0 = std::chrono::steady_clock::now();
+  RunResult r = ceshCall(std::to_string(pid) + " 5000000 --in text:hi",
+                         "timeout --preserve-status -s INT -k 20 3 ");
+  BOOST_CHECK_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(30));
+  BOOST_CHECK_EQUAL(r.exitCode, 1);
+  assertContains(r.out, "CALL Failed", "hang-up");
+  int64_t left = 0;
+  for (int i = 0; i < 100 && left < before - 1'000'000; ++i) {
+    left = balance();
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  }
+  BOOST_CHECK_GE(left, before - 1'000'000);   // less the fees: the 5000000 came back
+  client.stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
