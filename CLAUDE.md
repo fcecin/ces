@@ -505,6 +505,7 @@ Network simulator:
 - Cross-transfers are fire-and-forget: CES_OK to the user before async delivery to the peer.
 - Payment account `nonce` is days-until-expiry, not a replay counter.
 - `isConnected() == true` bypasses the spam filter and tickets; only for authenticated peers.
+- A ticket of the main port names the address that it goes to (`CesServer::named`). An unsigned reply goes out only through `sendUnsignedReply`, which checks that. Without it, a server takes the reply of another server as a query, and the two answer each other for ever.
 - `rpc_port = 0` disables SYS_RPC and CesPlex entirely (VM gets `CES_ERROR_DISABLED`; no L2 binds; no ChannelMeter; no peer mesh). With the plex port up, CesPlex is always constructed (even with zero handlers mounted), so inbound channels are accepted at the channel level and rejected at the per-protocol bind gate, not at channel accept.
 - `builtin:peer` (`/ces/peer/1`): mounted only when wired in `[cesplex_mounts]` (no auto-mount); admits only peer-table members and is never metered (server-to-server, both ends bottomless). One channel per pair (lower pubkey dials), held open by keepalives, reconciled against the peer table on the rpcTaskIO tick. No new thread.
 - `cesFileStoreMaxBytes = 0` disables the file handler entirely; compute requires file.

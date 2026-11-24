@@ -1396,6 +1396,64 @@ BOOST_AUTO_TEST_CASE(IsConnectedRequiresVerifiedPeer) {
   bfs::remove_all(dir, ec);
 }
 
+// An unsigned answer goes only to the address that the ticket of its question went
+// to. MINX asks no ticket of a connected or a loopback address, and the server does
+// not answer there without one.
+BOOST_FIXTURE_TEST_CASE(AnUnsignedAnswerGoesWhereItsTicketWent, CesFixture) {
+  boost::asio::io_context io;
+  boost::asio::ip::udp::socket s(
+    io, minx::SockAddr(boost::asio::ip::address_v6::loopback(), 0));
+  const minx::SockAddr me = s.local_endpoint();
+  const minx::SockAddr peer(boost::asio::ip::make_address("10.20.30.50"), 7000);
+  minx::Hash k; k.fill(0x46);
+  server->_testAddPeerWithRpc(k, "10.20.30.50:7000", peer.address(), 0);
+  BOOST_REQUIRE(server->_setPeerVerifiedForTest(k, true));
+
+  // The next new ticket that comes to `s`, or 0. Each answer comes three times.
+  s.non_blocking(true);
+  std::set<uint64_t> seen;
+  const auto ticket = [&]() -> uint64_t {
+    for (int i = 0; i < 1500; ++i) {
+      uint8_t in[2048];
+      boost::system::error_code ec;
+      if (s.receive(boost::asio::buffer(in), 0, ec) >= 10 && !ec) {
+        const uint64_t t = ces::Buffer::peek<uint64_t>(in + 2);
+        if (seen.insert(t).second) return t;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    return 0;
+  };
+  const auto question = CesUnsignedQueryAccount{getMyId()}.toBytes();
+  const auto answers = [&](const minx::SockAddr& from, uint64_t t) {
+    const uint64_t n = server->getTxCount();
+    server->incomingMessage(from, minx::MinxMessage{0, 1, t, question});
+    server->_drainLogic();
+    return server->getTxCount() - n;
+  };
+
+  server->incomingInit(me, minx::MinxInit{0, 7, {}});
+  BOOST_CHECK_EQUAL(answers(me, ticket()), 1u);
+  const uint64_t ofAnswer = ticket();
+  BOOST_CHECK_EQUAL(answers(me, ofAnswer), 1u);
+  ticket();
+  CesQueryAccount signedOne{};
+  signedOne.originId = clientKey.getPublicKeyAsHash();
+  signedOne.serverId = Account::getMapKey(server->_serverKeyPair().getPublicKeyAsHash());
+  signedOne.queryId = getMyId();
+  server->incomingMessage(me, minx::MinxMessage{0, 1, 0, signedOne.toBytes(clientKey)});
+  BOOST_CHECK_EQUAL(answers(me, ticket()), 1u);
+  ticket();
+  server->incomingGetInfo(me, minx::MinxGetInfo{{0, 7, {}}});
+  const uint64_t mine = ticket();
+  BOOST_CHECK_EQUAL(answers(me, mine), 1u);
+
+  BOOST_CHECK_EQUAL(answers(me, 0), 0u);
+  BOOST_CHECK_EQUAL(answers(minx::SockAddr(me.address(), me.port() ^ 1), mine), 0u);
+  BOOST_CHECK_EQUAL(answers(peer, 0), 0u);
+  BOOST_CHECK_EQUAL(answers(peer, mine), 0u);
+}
+
 // A settlement counts only when the known peer key signed it. A server that
 // answers on the peer's address with another key is not the peer.
 BOOST_AUTO_TEST_CASE(SettlementIgnoresAnswerFromAnotherKey) {

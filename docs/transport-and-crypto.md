@@ -36,7 +36,8 @@ The parts:
 | MINX ticket | `MESSAGE`, `INFO`, `PROVE_WORK` | that the sender got a packet from this node, in the last 60 to 120 s | packets from a party that got no ticket | a ticket spent from a forged address; a party on the path |
 | RUDP channel | MINX `EXTENSION` messages | an address, by the session token | off-path injection into a channel | a party on the path; reading |
 | Signed requests | MINX `MESSAGE` on the main port | an identity, by a signature | copies at another server; copies at the same server | reading; a forged `INFO` key |
-| Unsigned queries and application datagrams | MINX `MESSAGE` and `APPLICATION` on the main port | nothing | nothing | a changed reply; a forged sender |
+| Unsigned queries | MINX `MESSAGE` on the main port | an address, by the ticket (section 3) | answers to a forged address | a changed reply; a party on the path |
+| Application datagrams | MINX `APPLICATION` on the main port | nothing | nothing | a forged sender |
 | CesPlex bind | the first bytes of a RUDP channel | an identity, by a signature over a server key and a challenge | copies on another channel or at another server | a relay through a server that a no-key client dials, or through a party on the path |
 | Per-op signatures | each verb on a bound channel | an identity, per operation, on one channel of one server | copies on another channel or at another server | a copy on the same channel; a relay through a server that a no-key client dials, or through a party on the path, as for the bind; reading |
 | Raw pipes | the bytes after a bind | nothing more | nothing more | a party on the path, inside that channel |
@@ -51,6 +52,8 @@ A MINX message is one UDP datagram. MINX does not divide a message. The `DATA` f
 **Tickets.** MINX checks senders with tickets. A node sends a random 64-bit value (`GPASSWORD`) and keeps it for 60 to 120 seconds. The other node spends it (`SPASSWORD`) in a later packet. A `MESSAGE`, an `INFO` or a `PROVE_WORK` with an unknown ticket is dropped, unless the sender is connected (see below) or a trusted loopback address. Each ticket is good one time. `INIT`, `GET_INFO`, `EXTENSION` and `APPLICATION` messages carry no ticket to spend.
 
 The MINX specification lets an implementation tie a ticket to the address that it went to, or not. The reference implementation does not: it keeps its tickets in one set (`Minx::allocatePassword`, `Minx::spendPassword`). So a party can get a ticket at its own address, and spend it in a packet with another source address. A ticket proves that the sender got a packet from this node, not that the sender is at the source address of its packet.
+
+The application picks the value of a ticket. A CES server picks it on the main port so that the ticket names its address. One half is random. The other half is a keyed hash of that half and of the address and port that the ticket goes to, and the key is random at boot (`CesServer::named`). The server gives an unsigned reply only when the ticket of the query names the source of the query. It asks this of connected and loopback addresses too. So two servers cannot answer each other without end, and an unsigned reply does not go to a forged address. A client whose address changes asks with a ticket of its old address, gets no reply, and gets a new ticket.
 
 **First contact.** An `INIT` or a `GET_INFO` carries no ticket. A node must not ban its source, because the source can be forged. The reply is small: an `INFO` for a `GET_INFO`, and in CES an empty `MESSAGE` for an `INIT`. Each reply carries a ticket.
 
@@ -248,7 +251,7 @@ The page signs for the server key that cesweb reports, and it has no field for a
 | --- | --- | --- |
 | Off the path | Make a server send small replies to a forged address. The spam filter limits `INFO` and the empty `MESSAGE`. No limit for each address block applies to `HS_ACCEPT` and the empty `CHANNEL` packet. | Send on a RUDP channel; get a server hello or channel data sent to another address; guess a live channel id |
 | Off the path | Fill the memory of a server with forged opens, each kept until the idle time ends | — |
-| Off the path, with a ticket from its own address | Make the server answer one request to a forged address, for each ticket | — |
+| Off the path, with a ticket from its own address | Make the server answer one signed request to a forged address, for each ticket | Make the server send an unsigned reply to a forged address |
 | Off the path, with a ticket from its own address | Ban the address block of another address on the main port, with a bad proof of work | — |
 | Off the path | Fill the spam budget of an address block with about 200,000 forged `GET_INFO` packets. The server then drops the first contacts, the requests and the proofs of work of that block for one to two hours. | — |
 | On the path, reading only | Read each channel and each request | Use a signature at another server or on another channel |
@@ -279,7 +282,7 @@ These effects reach past one channel:
 | Intended identity | The signer signs the identity that it meant, from a key that it already holds, not one that the other side announced | Each client with an expected key. A client with no expected key accepts this risk (rule 5). |
 | No signing oracle | An untrusted party cannot make a trusted key sign what it chooses | Each VM program can make its server bind with the server key through `SYS_RPC`, and this is an open design question. `ces.serverSign` puts a domain tag before the data. |
 | Authenticate the whole session | Each message is signed, or the session has a key that only the two ends hold | The per-op verbs. The raw pipes are not, and the design accepts this (rule 4). The C++ client does not enforce the response signatures (section 6). |
-| Address before answer | Answer an unproven address with small replies only | The RUDP accept and token; the CesPlex protocol name first. MINX tickets, without the tie to an address. |
+| Address before answer | Answer an unproven address with small replies only | The RUDP accept and token; the CesPlex protocol name first; the ticket of each unsigned query, which names its address. MINX tickets, without the tie to an address, for the rest. |
 
 ## 13. Open items
 

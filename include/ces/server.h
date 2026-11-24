@@ -32,6 +32,7 @@
 #include <ces/cesplex/mux.h>   // CesPlexHost (CesServer implements it)
 #include <ces/protocol.h>
 #include <minx/bucketcache.h>
+#include <cppsiphash/siphash.hpp>
 #include <minx/rudp/rudp.h>
 
 using namespace minx;
@@ -1926,6 +1927,12 @@ private:
   CesConfig cfg_;
 
   std::unique_ptr<minx::Minx> minx_;
+  // `ticket` with the name of `addr` as its low half. The name is a keyed hash of
+  // `addr` and of the high half. A ticket names `addr` when this gives it back.
+  // So the number that a server picks shows the address that it went to, as the
+  // first sequence number of a TCP connection does (RFC 6528).
+  uint64_t named(uint64_t ticket, const SockAddr& addr) const;
+  siphash::Key ticketKey_{0, 0};   // random at boot
   IOContext netIO_, taskIO_;
   std::thread netIOThread_;
   std::vector<std::thread> taskIOThreads_;

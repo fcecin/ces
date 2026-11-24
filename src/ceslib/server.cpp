@@ -1140,6 +1140,7 @@ CesServer::CesServer(const CesConfig& config)
       .spamSampleRate = SPAM_SAMPLE_RATE,
       .trustLoopback = true,
       .recvBuffersSize = cfg_.recvBuffersSize});
+  ticketKey_ = siphash::Key(minx_->generatePassword(), minx_->generatePassword());
   if (cfg_.taskThreads < 1 || cfg_.taskThreads > MAX_TASK_THREADS) {
     throw std::runtime_error("bad value for taskThreads");
   }
@@ -1951,12 +1952,20 @@ void CesServer::checkAutoSnapshot() {
 // DISPATCH HELPERS
 // ----------------------------------------------------------------------------
 
+uint64_t CesServer::named(uint64_t ticket, const SockAddr& addr) const {
+  const uint64_t random = ticket >> 32;
+  const std::string s = addr.address().to_string() + ' ' +
+                        std::to_string(addr.port()) + ' ' + std::to_string(random);
+  return random << 32 |
+         static_cast<uint32_t>(siphash::siphash24(s.data(), s.size(), &ticketKey_));
+}
+
 template <typename ResT>
 void CesServer::sendSignedReply(const SockAddr& addr, const MinxMessage& msg,
                                 ResT res) {
   tpsInc();
   boost::asio::post(taskIO_, [this, addr, msg, res = std::move(res)]() mutable {
-    reply(addr, MinxMessage{msg.version, minx_->generatePassword(),
+    reply(addr, MinxMessage{msg.version, named(minx_->generatePassword(), addr),
                             msg.gpassword, res.toBytes(serverKeyPair_)});
   });
 }
@@ -1964,9 +1973,13 @@ void CesServer::sendSignedReply(const SockAddr& addr, const MinxMessage& msg,
 template <typename ResT>
 void CesServer::sendUnsignedReply(const SockAddr& addr, const MinxMessage& msg,
                                   ResT res) {
+  // No signature shows who asks, so the ticket must show from where. MINX asks no
+  // ticket of a connected or a loopback address.
+  if (msg.spassword != named(msg.spassword, addr))
+    return;
   tpsInc();
   boost::asio::post(taskIO_, [this, addr, msg, res = std::move(res)]() {
-    reply(addr, MinxMessage{msg.version, minx_->generatePassword(),
+    reply(addr, MinxMessage{msg.version, named(minx_->generatePassword(), addr),
                             msg.gpassword, res.toBytes()});
   });
 }
@@ -3483,7 +3496,7 @@ void CesServer::incomingInit(const SockAddr& addr, const MinxInit& msg) {
   LOGTRACE << "got MinxInit" << VAR(addr);
   minx_->sendMessage(
     addr,
-    MinxMessage{msg.version, minx_->generatePassword(), msg.gpassword, {}});
+    MinxMessage{msg.version, named(minx_->generatePassword(), addr), msg.gpassword, {}});
 }
 
 void CesServer::incomingMessage(const SockAddr& addr, const MinxMessage& msg) {
@@ -5018,7 +5031,7 @@ void CesServer::incomingGetInfo(const SockAddr& addr, const MinxGetInfo& msg) {
   rces.put(rpcPort);
   rces.put(powFlags);
   auto rmsg =
-    MinxInfo{msg.version,  minx_->generatePassword(),     msg.gpassword,
+    MinxInfo{msg.version,  named(minx_->generatePassword(), addr),     msg.gpassword,
              cfg_.minDiff, serverKeyPair_.getPublicKeyAsHash(), std::move(rdata)};
   minx_->sendInfo(addr, rmsg);
 }
@@ -5128,7 +5141,7 @@ void CesServer::incomingProveWork(const SockAddr& addr,
                            getSecsSinceEpoch(), {}};
 
     boost::asio::post(taskIO_, [this, addr, msg, res]() mutable {
-      reply(addr, MinxMessage{msg.version, minx_->generatePassword(),
+      reply(addr, MinxMessage{msg.version, named(minx_->generatePassword(), addr),
                               msg.gpassword, res.toBytes(serverKeyPair_)});
     });
   });
