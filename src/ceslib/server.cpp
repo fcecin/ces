@@ -1016,7 +1016,11 @@ private:
     if (amount == 0) return CES_OK;
     auto ownerIt = server_.accounts_->find(programOwnerPrefix_);
     if (ownerIt == server_.accounts_->end()) return CES_ERROR_ORIGIN_NOT_FOUND;
-    if (!balanceCovers(ownerIt->second.getBalance(), amount))
+    // The gas that a hook got with SYS_REFILL stays in its account until the
+    // charge at the end of the run.
+    const int64_t owed = programOwnerPrefix_ == caller_
+                           ? static_cast<int64_t>(this->refilledTotal) : 0;
+    if (!balanceCovers(ownerIt->second.getBalance() - owed, amount))
       return CES_ERROR_INSUFFICIENT_BALANCE;
     maybeSaveAccount(programOwnerPrefix_);
     ownerIt->second.setBalance(ownerIt->second.getBalance() -

@@ -237,12 +237,13 @@ minimum-compute at live rates, debited from no one) with the hooked account
 as caller and allowance 0 (a hook cannot spend its account through the
 caller lane). A WATCH may `SYS_REFILL` additional gas, funded by the hooked
 account, capped by the cell's ceiling (trailer for inline, content[32..40)
-for pointer). GATES run as PURE PREDICATES: ceiling forced 0 and no
-principal, so a gate has no money side effect at all; that purity is what
-makes the composed sequence (out-gate + in-gate + transfer) atomic without
-any enclosing journal. The event descriptor arrives in io[INPUT]:
-counterparty pubkey (32), amount (u64 LE), account balance at fire time
-(u64 LE; pre-mutation for a gate, post for a watch).
+for pointer). That gas stays in the account until the charge at the end of
+the run, so the hook cannot give it away. GATES run as PURE PREDICATES:
+ceiling forced 0 and no principal, so a gate has no money side effect at
+all; that purity is what makes the composed sequence (out-gate + in-gate +
+transfer) atomic without any enclosing journal. The event descriptor
+arrives in io[INPUT]: counterparty pubkey (32), amount (u64 LE), account
+balance at fire time (u64 LE; pre-mutation for a gate, post for a watch).
 
 Pointer-hook install/patch validation: the trigger asset must be immutable
 or owned by the setter, checked on every patch that results in a pointer

@@ -301,6 +301,29 @@ BOOST_AUTO_TEST_CASE(RefillChargeSurvivesCrash) {
   BOOST_CHECK_LT(after, before + 1'000'000 - 100'000);  // charged despite abort
 }
 
+// A hook pays for the gas that it got with SYS_REFILL, also when it gives all the
+// credits of its account away before it uses that gas.
+BOOST_AUTO_TEST_CASE(RefilledGasCannotBeGivenAway) {
+  const uint64_t kRefill = 3'000'000'000;
+  VmProgram p;
+  Region key = p.allocHash();
+  const minx::Hash to = send.getPublicKeyAsHash();
+  p.writeBytesToIo(key.cell, to.data(), 32);
+  p.sysRefill({Imm(kRefill)});
+  p.hostv(SYS_OWNER_TRANSFER, {key, Ref(CESVM_IO_INPUT + 5)});   // does not abort
+  p.set(Imm(CESVM_CELL_GPR0), Imm(1'000'000));                   // 1'000'000'000 units of gas
+  VmLabel top = p.label();
+  p.place(top);
+  p.dec(Imm(CESVM_CELL_GPR0));
+  p.jt(Ref(CESVM_CELL_GPR0), top);
+  p.term();
+  installGate(p.buildBootBlock(), ALIAS_OP_HOOK_WATCH, /*ceiling=*/kRefill);
+  const int64_t mine = bal(recv), both = bal(recv) + bal(send);
+  BOOST_CHECK_EQUAL(sendToRecv(kAbove), static_cast<int>(CES_OK));
+  BOOST_CHECK_LT(bal(recv) + bal(send), both - 1'000'000'000);
+  BOOST_CHECK_GT(bal(recv), mine - static_cast<int64_t>(kRefill));
+}
+
 // With no refill ceiling (0), the same burn loop runs out of the free grant and
 // dies, but the account is charged nothing (the free grant is free).
 BOOST_AUTO_TEST_CASE(NoCeilingMeansNoChargeEvenIfHookDies) {
