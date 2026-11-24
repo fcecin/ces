@@ -222,8 +222,9 @@ BOOST_AUTO_TEST_CASE(CallCtrlCHangsUp) {
   const int64_t before = balance();
   BOOST_REQUIRE_GT(before, 0);
   const auto t0 = std::chrono::steady_clock::now();
+  // No -k: with it, the timeout of Ubuntu 26.04 sends SIGKILL at once.
   RunResult r = ceshCall(std::to_string(pid) + " 5000000 --in text:hi",
-                         "timeout --preserve-status -s INT -k 20 3 ");
+                         "timeout --preserve-status -s INT 3 ");
   BOOST_CHECK_LT(std::chrono::steady_clock::now() - t0, std::chrono::seconds(30));
   BOOST_CHECK_EQUAL(r.exitCode, 1);
   assertContains(r.out, "CALL Failed", "hang-up");
