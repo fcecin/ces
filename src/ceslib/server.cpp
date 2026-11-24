@@ -2164,6 +2164,8 @@ uint8_t CesServer::transfer(const minx::Hash& originKey,
       newAccount = Account(destKey, amount, 0);
     }
     accounts_.createAccount(destId, newAccount);
+    // The new account can move the others in the map.
+    origin.it = accounts_->find(origin.id);
 
   } else {
     // Destination exists
@@ -2284,6 +2286,8 @@ uint8_t CesServer::bulkTransfer(const minx::Hash& originKey,
 
       Account newAccount(item.destKey, item.amount, 0);
       accounts_.createAccount(destId, newAccount);
+      // The new account can move the others in the map.
+      origin.it = accounts_->find(origin.id);
     } else {
       if (dest.data().getKey(dest.id) != item.destKey) {
         origin.chargeError(errFee);

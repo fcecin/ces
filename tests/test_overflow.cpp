@@ -9,6 +9,8 @@
 #include "test_common.h"
 
 #include <ces/account.h>
+#include <ces/buffer.h>
+#include <ces/protocol.h>
 #include <ces/types.h>
 #include <ces/util/vmprogram.h>
 
@@ -366,6 +368,38 @@ BOOST_FIXTURE_TEST_CASE(VmBuyAssetNearCapSellerNoBurn, OverflowFixture) {
   BOOST_CHECK_EQUAL(bal(seller.getPublicKeyAsHash()), ces::BALANCE_MAX - headroom);
   BOOST_CHECK_GT(bal(buyer.getPublicKeyAsHash()),
                  ces::BALANCE_MAX - static_cast<int64_t>(maxPrice));
+}
+
+// A transfer to a new account can move the accounts in the map. Its payer pays.
+BOOST_FIXTURE_TEST_CASE(ATransferThatGrowsTheTable, OverflowFixture) {
+  KeyPair payer;
+  const minx::Hash k = payer.getPublicKeyAsHash();
+  fund(k, 1'000'000'000);
+  const int64_t all = circ();
+  int64_t left = bal(k);
+  uint32_t next = 0;
+  const auto newKey = [&next] {
+    minx::Hash h{};
+    ces::Buffer::poke<uint32_t>(h.data() + 4, ++next);
+    return h;
+  };
+  for (int i = 0; i < 3000; ++i) {
+    CES_REQUIRE_OK(xfer(k, newKey(), 10));
+    left -= 10;
+    BOOST_REQUIRE_EQUAL(bal(k), left);
+  }
+  for (int i = 0; i < 800; ++i) {
+    std::vector<BulkTransferItem> items;
+    for (int j = 0; j < 10; ++j) items.push_back({newKey(), 10});
+    int64_t out = 0;
+    uint8_t done = 0;
+    CES_REQUIRE_OK(server->bulkTransfer(k, items, 0, out, done));
+    BOOST_REQUIRE_EQUAL(int(done), 10);
+    left -= 100;
+    BOOST_REQUIRE_EQUAL(out, left);
+    BOOST_REQUIRE_EQUAL(bal(k), left);
+  }
+  BOOST_CHECK_EQUAL(circ(), all);
 }
 
 // A program that pays `amount` from its owner to `dest`.
